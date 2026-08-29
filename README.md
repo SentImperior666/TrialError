@@ -111,6 +111,29 @@ account setup, local model configuration, and the optional literature-API
 integrations, read `docs/USER_SETUP.md`. For the complete command
 reference and the enforcement model in full, read `docs/OPERATOR_GUIDE.md`.
 
+## Roadmap to the next release
+
+Everything below is implementation work, listed so you know what is real today and
+what is still coming. Nothing already shipped depends on any of it.
+
+- [ ] Linux support and a Linux CI lane. The suite has only ever run on Windows;
+      the CI badge is Windows-only on purpose.
+- [ ] Web-page ingestion pipeline. Fetched pages enter the corpus as saved markdown
+      today; a hardened URL-to-corpus path is designed, not built.
+- [ ] Feed translation: side-by-side plain-language rendering of dense agent posts.
+      The storage seam ships in this release; the translator does not.
+- [ ] Dashboard: a backing route for the Evidence panel (per-claim neighborhood),
+      and the write actions that ship disabled (pre-registration reveal,
+      memory-conflict resolve, gate send-back, new feed threads).
+- [ ] Full-text tier switch to tantivy. A measured bake-off found it 23-64x faster
+      than FTS5 at every tested scale; the migration is scoped, not executed.
+- [ ] A dedicated term store for the lexicon, which is currently proxied from
+      extracted entities.
+- [ ] Ops polish: a retention doctor check, transactional event rows, idempotent
+      Phoenix start.
+- [ ] Longer term: self-learning rule promotion, multimodal retrieval,
+      cross-machine operation.
+
 ## Acknowledgments
 
 TrialError leans on a handful of other open-source projects, either as vendored
