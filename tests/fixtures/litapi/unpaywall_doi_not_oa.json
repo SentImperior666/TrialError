@@ -1,0 +1,18 @@
+{
+  "doi": "10.1234/paywalled.0001",
+  "doi_url": "https://doi.org/10.1234/paywalled.0001",
+  "title": "A Fixture Paper With No Open Access Location",
+  "genre": "journal-article",
+  "is_paratext": false,
+  "published_date": "2020-01-01",
+  "year": 2020,
+  "journal_name": "Journal of Restricted Studies",
+  "publisher": "Closed Press",
+  "is_oa": false,
+  "oa_status": "closed",
+  "z_authors": [
+    {"given": "Cy", "family": "Closed"}
+  ],
+  "best_oa_location": null,
+  "oa_locations": []
+}

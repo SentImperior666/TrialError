@@ -1,0 +1,42 @@
+{
+  "id": "https://openalex.org/W2741809807",
+  "doi": "https://doi.org/10.1234/fixture.5678",
+  "title": "A Fixture Paper About Tabletop Engine Metadata Reconciliation",
+  "publication_year": 2021,
+  "ids": {
+    "openalex": "https://openalex.org/W2741809807",
+    "doi": "https://doi.org/10.1234/fixture.5678",
+    "mag": "2741809807"
+  },
+  "authorships": [
+    {
+      "author_position": "first",
+      "author": {"id": "https://openalex.org/A1", "display_name": "Ada Fixture"}
+    },
+    {
+      "author_position": "last",
+      "author": {"id": "https://openalex.org/A2", "display_name": "Bo Canned"}
+    }
+  ],
+  "primary_location": {
+    "source": {"display_name": "Journal of Fixture Studies", "issn_l": "0000-0000"},
+    "pdf_url": "https://example.org/fixture.pdf",
+    "is_oa": true
+  },
+  "open_access": {
+    "is_oa": true,
+    "oa_url": "https://example.org/fixture.pdf"
+  },
+  "cited_by_count": 42,
+  "abstract_inverted_index": {
+    "This": [0],
+    "is": [1],
+    "a": [2],
+    "canned": [3],
+    "abstract.": [4]
+  },
+  "referenced_works": [
+    "https://openalex.org/W1",
+    "https://openalex.org/W2"
+  ]
+}

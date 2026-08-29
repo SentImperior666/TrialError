@@ -1,0 +1,80 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trialerror"
+version = "0.1.0"
+description = "TrialError - a reusable research-operations exoskeleton for Claude Code (research-harness platform core)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "TrialError contributors" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+]
+# pypdf: pure-Python PDF text extraction for M7's pdf-text normalizer
+# (design Section 6, ingestion stage 3). BSD-3-Clause; no native build step
+# (Windows-first concern), so this is a core dependency rather than an
+# optional extra -- unlike sqlite-vec (M1), pdf-text normalization is
+# required v0 scope (design Section 12, M7 row), not an optional backend.
+dependencies = ["pypdf>=5"]
+
+[project.scripts]
+trialerror = "trialerror.cli:main"
+
+[project.optional-dependencies]
+# sqlite-vec is optional by design (M1 build brief): trialerror.stores.vecindex
+# probes for it at call time and falls back to a pure-stdlib table when
+# it's absent, so tests must pass either way. It's included in `dev` so the
+# real-extension code path is exercised in the standard test run; `vec` is
+# the standalone extra for a production install that wants vector search
+# without pulling in pytest.
+dev = ["pytest>=8", "sqlite-vec>=0.1.0"]
+vec = ["sqlite-vec>=0.1.0"]
+# M12 (trialerror/obs/): OTel GenAI span emission + a local Arize Phoenix trace
+# sink, both OPTIONAL by design (Section 4.5 / Section 12 M12 row's
+# "graceful NO-OP degradation when Phoenix/OTel deps are absent" -- core
+# install must stay dependency-light). opentelemetry-sdk pulls in
+# opentelemetry-semantic-conventions (the GenAI attribute vocabulary
+# trialerror.obs.semconv pins its literal string values against -- see that
+# module's docstring for why it doesn't import from the package directly)
+# as a transitive dep; the otlp-http exporter is what actually POSTs spans
+# to Phoenix's OTLP/HTTP collector. arize-phoenix (ELv2 -- served as a
+# local tool over the network, never forked/embedded; see
+# trialerror/obs/tracer.py's module docstring) is the trace sink itself,
+# launched via `trialerror obs start-phoenix`.
+#
+# TRIALERROR-DEV-NOTE (deviation from the M1 sqlite-vec `dev`-extra precedent):
+# `obs` is deliberately NOT folded into `dev` below. sqlite-vec is one
+# small package; arize-phoenix's own dependency tree is ~140 packages
+# (fastapi, sqlalchemy, pandas, scikit-learn, grpc, boto3, ...) -- pulling
+# that into every lane's standard `pip install -e .[dev]` would itself
+# contradict this same block's "core install must stay dependency-light"
+# framing for what is explicitly an optional local dev tool. The real-path
+# ("with deps") test suite instead ran against `obs` installed directly
+# into .venv312 for this build; the no-deps path is proven by a genuine
+# subprocess test (tests/test_obs_noop_subprocess.py) rather than by
+# relying on `dev` omitting it. Flagged here per instruction (deviation =
+# TRIALERROR-DEV-NOTE + report) -- see the M12 build report for the full case.
+obs = [
+    "opentelemetry-sdk>=1.44.0,<1.45",
+    "opentelemetry-exporter-otlp-proto-http>=1.44.0,<1.45",
+    "arize-phoenix>=8",
+]
+
+[tool.setuptools.packages.find]
+include = ["trialerror*"]
+
+# FX-9: trialerror/artifacts/templates/*.md (the bundled, byte-exact port of
+# origin-project's 12 research/templates/*.md files) must ship in a built wheel/sdist,
+# not just be readable from an editable-install source checkout.
+[tool.setuptools.package-data]
+"trialerror.artifacts" = ["templates/*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "acceptance: end-to-end acceptance-criteria tests for a build module",
+]

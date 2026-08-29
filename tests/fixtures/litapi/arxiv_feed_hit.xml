@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <link href="http://export.arxiv.org/api/query?id_list=2101.00001" rel="self" type="application/atom+xml"/>
+  <title type="html">ArXiv Query: id_list=2101.00001</title>
+  <id>http://export.arxiv.org/api/QUERY_ID_FIXTURE</id>
+  <updated>2026-08-29T00:00:00-05:00</updated>
+  <opensearch:totalResults xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">1</opensearch:totalResults>
+  <opensearch:startIndex xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">0</opensearch:startIndex>
+  <opensearch:itemsPerPage xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">1</opensearch:itemsPerPage>
+  <entry>
+    <id>http://arxiv.org/abs/2101.00001v2</id>
+    <updated>2021-01-05T00:00:00Z</updated>
+    <published>2021-01-01T00:00:00Z</published>
+    <title>
+  A Fixture Paper About Tabletop Engine Metadata Reconciliation
+</title>
+    <summary>
+  This is a canned arXiv abstract for the fixture paper, spanning what
+  would normally wrap across several lines in a real feed response.
+</summary>
+    <author><name>Ada Fixture</name></author>
+    <author><name>Bo Canned</name></author>
+    <arxiv:doi xmlns:arxiv="http://arxiv.org/schemas/atom">10.1234/fixture.5678</arxiv:doi>
+    <arxiv:journal_ref xmlns:arxiv="http://arxiv.org/schemas/atom">Journal of Fixture Studies 12, 34 (2021)</arxiv:journal_ref>
+    <link href="http://arxiv.org/abs/2101.00001v2" rel="alternate" type="text/html"/>
+    <link title="pdf" href="http://arxiv.org/pdf/2101.00001v2" rel="related" type="application/pdf"/>
+    <arxiv:primary_category xmlns:arxiv="http://arxiv.org/schemas/atom" term="cs.AI" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.AI" scheme="http://arxiv.org/schemas/atom"/>
+  </entry>
+</feed>

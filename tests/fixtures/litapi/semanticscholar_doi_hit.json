@@ -1,0 +1,25 @@
+{
+  "paperId": "649def34f8be52c8b66281af98ae884c09aef38",
+  "title": "A Fixture Paper About Tabletop Engine Metadata Reconciliation",
+  "externalIds": {
+    "DOI": "10.1234/fixture.5678",
+    "ArXiv": "2101.00001",
+    "CorpusId": 12345678
+  },
+  "authors": [
+    {"authorId": "1000", "name": "Ada Fixture"},
+    {"authorId": "1001", "name": "Bo Canned"}
+  ],
+  "publicationDate": "2021-03-15",
+  "year": 2021,
+  "journal": {"name": "Journal of Fixture Studies", "volume": "12", "pages": "1-20"},
+  "venue": "Journal of Fixture Studies",
+  "url": "https://www.semanticscholar.org/paper/649def34f8be52c8b66281af98ae884c09aef38",
+  "openAccessPdf": {"url": "https://example.org/fixture.pdf", "status": "GREEN"},
+  "citationStyles": {"bibtex": "@article{fixture2021, title={A Fixture Paper}, year={2021}}"},
+  "isOpenAccess": true,
+  "influentialCitationCount": 5,
+  "publicationTypes": ["JournalArticle"],
+  "citationCount": 42,
+  "abstract": "This is a canned abstract from the Semantic Scholar fixture."
+}

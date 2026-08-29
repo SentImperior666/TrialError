@@ -1,0 +1,24 @@
+{
+  "offset": 0,
+  "next": 2,
+  "data": [
+    {
+      "citingPaper": {
+        "paperId": "aaaa0000000000000000000000000000000001",
+        "title": "A Fixture Paper That Cites The Target Work",
+        "externalIds": {"DOI": "10.1234/citer.0001"},
+        "year": 2022,
+        "authors": [{"authorId": "2000", "name": "Cy Referrer"}]
+      }
+    },
+    {
+      "citingPaper": {
+        "paperId": "aaaa0000000000000000000000000000000002",
+        "title": "A Second Fixture Paper With No DOI Yet",
+        "externalIds": {"ArXiv": "2305.00002"},
+        "year": 2023,
+        "authors": [{"authorId": "2001", "name": "Dee Preprint"}]
+      }
+    }
+  ]
+}

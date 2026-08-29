@@ -1,0 +1,24 @@
+[
+  {
+    "id": "2101.02120",
+    "journal": "arxiv",
+    "title": "A Fixture Paper About Ludic Rule Engines",
+    "abstract": "This is a canned arxivxplorer abstract about game rule engines.",
+    "authors": "Ada Fixture, Bo Canned, Cy Third",
+    "date": "2021-01-06T00:00:00",
+    "categories": ["cs.AI", "cs.LG"],
+    "short_author": "A. Fixture, et al.",
+    "score": 0.4738487601280212
+  },
+  {
+    "id": "10.1101/2022.05.01.490123",
+    "journal": "biorxiv",
+    "title": "A Fixture bioRxiv Paper With No arXiv Id",
+    "abstract": "This canned fixture proves non-arxiv journals never get a guessed arxiv.org URL.",
+    "authors": "Dee Fourth",
+    "date": "2022-05-01T00:00:00",
+    "categories": ["q-bio.PE"],
+    "short_author": "D. Fourth",
+    "score": 0.401
+  }
+]

@@ -1,0 +1,2302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>TrialError dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  HALIDE re-skin (stage 2 of the dashboard-v2 build). Design source of truth:
+  design/dashboard-v2/*.dc.html (Tokens.dc.html = the build contract this
+  markup + dashboard.css implement). Data source of truth:
+  docs/DASHBOARD_V2_API.md (trialerror/dashboard/data.py wins on any disagreement).
+
+  Structure: a persistent left rail (KNOW / RUN groups + per-project
+  extension panels) and one <section class="panel"> per surface, switched by
+  JS. Every panel's markup is real (not JS-templated from scratch) so a
+  served-but-unexecuted page still carries every DOM hook a string/regex
+  test can assert on; the JS below only fills CONTENT into these containers.
+
+  Google Fonts is the one external resource this page ever requests, and
+  every rule that uses it names a system fallback stack first
+  (dashboard.css's --font-sans/--font-mono) -- a file:// export with no
+  network access still renders legibly.
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="dashboard.css">
+</head>
+<body>
+<div class="shell" data-role="shell">
+
+  <!-- ======================================================================
+       NAV RAIL -- KNOW (research surfaces) / RUN (operator surfaces), one
+       health glyph pinned to the floor. Extension panels (C-0070) inject
+       their own rail-item under whichever group their manifest declares.
+       ====================================================================== -->
+  <nav class="rail" data-role="rail" aria-label="primary navigation">
+    <div class="rail-brand">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <g class="loop-arrow a1">
+          <path class="loop-arc" d="M5.88 10.13 A 6.4 6.4 0 0 1 18.12 10.13" fill="none" stroke="#E13A47" stroke-width="2.4" stroke-linecap="round"/>
+          <polygon class="loop-head" points="18.59,11.66 15.95,9.85 19.77,8.69" fill="#E13A47"/>
+        </g>
+        <g class="loop-arrow a2">
+          <path class="loop-arc" d="M18.12 13.87 A 6.4 6.4 0 0 1 5.88 13.87" fill="none" stroke="#E13A47" stroke-width="2.4" stroke-linecap="round"/>
+          <polygon class="loop-head" points="5.41,12.34 8.05,14.15 4.23,15.31" fill="#E13A47"/>
+        </g>
+      </svg>
+    </div>
+
+    <div class="rail-group-label">KNOW</div>
+    <button type="button" class="rail-item is-active" data-panel="home" data-role="rail-item">
+      <svg width="17" height="17" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><rect x="1.5" y="2" width="15" height="4" stroke-width="1.3"/><rect x="1.5" y="8.5" width="9" height="7.5" stroke-width="1.3"/><rect x="12.5" y="8.5" width="4" height="7.5" stroke-width="1.3"/></svg>
+      <span class="rail-label">HOME</span>
+    </button>
+    <button type="button" class="rail-item" data-panel="search" data-role="rail-item">
+      <svg width="17" height="17" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M2.5 4 L7 9 L2.5 14" stroke-width="1.5"/><path d="M9 14.5 H15.5" stroke-width="1.7"/></svg>
+      <span class="rail-label">ASK</span>
+    </button>
+    <button type="button" class="rail-item" data-panel="evidence" data-role="rail-item">
+      <svg width="17" height="17" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><circle cx="4" cy="9" r="2"/><circle cx="14" cy="4" r="2"/><circle cx="14" cy="14" r="2"/><path d="M5.8 8 L12.2 4.7 M5.8 10 L12.2 13.3" stroke-width="1.2"/></svg>
+      <span class="rail-label">EVIDENCE</span>
+    </button>
+    <button type="button" class="rail-item" data-panel="lexicon" data-role="rail-item">
+      <svg width="17" height="17" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M2 3.5 H8 M2 7 H12.5 M2 10.5 H7 M2 14 H11" stroke-width="1.4"/><circle cx="15" cy="10.5" r="2.2" stroke-width="1.3"/></svg>
+      <span class="rail-label">LEXICON</span>
+    </button>
+    <button type="button" class="rail-item" data-panel="dossier" data-role="rail-item">
+      <svg width="17" height="17" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M3.5 1.8 H11 L14.5 5.4 V16.2 H3.5 Z" stroke-width="1.3"/><path d="M10.8 1.8 V5.6 H14.5" stroke-width="1.3"/><path d="M6 9.5 H12 M6 12.3 H10" stroke-width="1.2"/></svg>
+      <span class="rail-label">DOSSIER</span>
+    </button>
+    <button type="button" class="rail-item" data-panel="course" data-role="rail-item">
+      <svg width="17" height="17" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M2 15 C5 15 4.5 9 8 9 C11.5 9 11 3 16 3" stroke-width="1.4" fill="none"/><circle cx="8" cy="9" r="2.1"/></svg>
+      <span class="rail-label">COURSE</span>
+    </button>
+    <div data-role="rail-ext-KNOW"></div>
+
+    <div class="rail-sep"></div>
+    <div class="rail-group-label">RUN</div>
+    <button type="button" class="rail-item" data-panel="rooms" data-role="rail-item">
+      <svg width="17" height="17" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><rect x="1.5" y="2.5" width="11" height="8" stroke-width="1.3"/><path d="M4.5 10.5 V13.5 L7.5 10.5" stroke-width="1.3" fill="none"/><rect x="7.5" y="8" width="9" height="6.5" stroke-width="1.3"/></svg>
+      <span class="rail-label">ROOMS</span>
+      <span class="rail-live-dot is-hidden" data-role="rooms-live-dot" aria-hidden="true">&#9679;</span>
+    </button>
+    <button type="button" class="rail-item" data-panel="feed" data-role="rail-item">
+      <svg width="17" height="17" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M2 3.5 H16 M2 7.5 H16 M2 11.5 H11 M2 15.5 H8" stroke-width="1.4"/></svg>
+      <span class="rail-label">FEED</span>
+    </button>
+    <button type="button" class="rail-item rail-item--decide" data-panel="determinations" data-role="rail-item">
+      <svg width="17" height="17" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M1.8 10.5 H5.5 L7 13 H11 L12.5 10.5 H16.2" stroke-width="1.4" fill="none"/><path d="M1.8 10.5 L4 3.5 H14 L16.2 10.5 V15.5 H1.8 Z" stroke-width="1.4" fill="none"/></svg>
+      <span class="rail-label">DECIDE</span>
+      <span class="rail-badge is-hidden" data-role="determ-badge">0</span>
+    </button>
+    <button type="button" class="rail-item" data-panel="console" data-role="rail-item">
+      <svg width="17" height="17" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><rect x="1.5" y="2.5" width="15" height="11" stroke-width="1.3"/><path d="M5 17 H13 M9 13.5 V17" stroke-width="1.3"/></svg>
+      <span class="rail-label">CONSOLE</span>
+    </button>
+    <div data-role="rail-ext-RUN"></div>
+
+    <div class="rail-spacer"></div>
+    <button type="button" class="rail-health" data-role="rail-health" data-panel="console" data-health="ok" title="program health -- opens Console">
+      <svg width="19" height="14" viewBox="0 0 22 14" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><polyline points="0,7 5,7 7,2 9,12 11,7 22,7" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linejoin="round"/></svg>
+      <span class="rail-label" data-role="rail-health-label">--</span>
+    </button>
+  </nav>
+
+  <!-- ====================================================================
+       MAIN COLUMN
+       ==================================================================== -->
+  <div class="main-col">
+    <header class="topbar" data-role="topbar">
+      <span class="topbar-brand">TRIALERROR</span>
+      <span class="topbar-sep"></span>
+      <span class="topbar-field">PROGRAM <span class="v" data-role="topbar-program">&mdash;</span></span>
+      <span class="topbar-goal" data-role="topbar-goal"></span>
+      <span class="topbar-fill"></span>
+      <span class="topbar-field" data-role="topbar-session">&mdash;</span>
+      <span class="topbar-field" data-role="topbar-mode" data-state="static">static</span>
+    </header>
+
+    <main class="content" data-role="content">
+      <div class="dashboard-notice is-hidden" data-role="notice"></div>
+
+      <!-- ============================== HOME ============================== -->
+      <section class="panel is-active" id="panel-home" data-panel="home">
+        <div class="content-inner">
+          <div class="home-cmd-wrap">
+            <form data-role="home-search-form" autocomplete="off">
+              <div class="cmdbar">
+                <span class="prompt">&gt;</span>
+                <input type="text" data-role="home-search-input" placeholder="ask the corpus, e.g. what absorbs harm before consequences?" autocomplete="off">
+                <span class="caret" aria-hidden="true"></span>
+                <span class="modebadge">FTS + VECTOR + GRAPH</span>
+                <button type="submit" class="hint" style="background:none;border:none;cursor:pointer;">ENTER TO ASK THE CORPUS</button>
+              </div>
+            </form>
+            <div class="tension-row" data-role="home-tensions"></div>
+          </div>
+
+          <div class="lanes">
+            <div class="lane lane-a">
+              <div class="section-head"><span class="h">WHAT THE PROGRAM LEARNED</span><span class="sub" data-role="since-you-left-sub">plain english. every line opens its evidence.</span></div>
+
+              <div class="card lane-since" data-role="since-card">
+                <div class="card-body" data-role="since-you-left-list" style="padding:4px 0;"><div class="panel-loading">loading&hellip;</div></div>
+                <div class="card-footer" data-role="since-you-left-footer"></div>
+              </div>
+
+              <div class="card finding-card" data-role="finding-card"></div>
+              <div class="card corpus-card" data-role="corpus-card"></div>
+            </div>
+
+            <div class="lane lane-b">
+              <div class="section-head"><span class="h">WHAT NEEDS A HUMAN</span><span class="sub">nothing merges without you</span></div>
+
+              <div class="card needs-card card--accent-crit" data-role="needs-card"></div>
+              <div class="card live-room-card" data-role="live-room-card"></div>
+              <div class="card mission-card" data-role="mission-card"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="ops-ribbon" data-role="ops-ribbon"></div>
+      </section>
+
+      <!-- ============================== SEARCH (ASK) ============================== -->
+      <section class="panel" id="panel-search" data-panel="search">
+        <div class="panel-body-pad" style="padding-top:16px;">
+          <form data-role="search-form" autocomplete="off">
+            <div class="cmdbar">
+              <span class="prompt">&gt;</span>
+              <input type="text" data-role="search-input" placeholder="ask the corpus..." autocomplete="off">
+              <span class="hint">RANK BY</span>
+              <select data-role="search-mode" class="modebadge" style="cursor:pointer;">
+                <option value="auto">AUTO</option>
+                <option value="hybrid">HYBRID</option>
+                <option value="fts">FTS</option>
+                <option value="vector">VECTOR</option>
+                <option value="graph">GRAPH</option>
+                <option value="summary">SUMMARY</option>
+              </select>
+            </div>
+          </form>
+          <div class="telemetry-strip" data-role="search-telemetry"></div>
+
+          <div class="two-col" style="flex-grow:1; margin-top:12px;">
+            <div style="display:flex; flex-direction:column; min-height:0;">
+              <div class="section-head"><span class="h" data-role="search-results-count">0 RESULTS</span><span class="sub">every row carries its own anchor. a row without a citation is a bug, not a result.</span></div>
+              <div class="table-scroll" style="flex-grow:1; overflow-y:auto;" data-role="search-results-list"></div>
+            </div>
+            <div style="display:flex; flex-direction:column; gap:12px; min-height:0;">
+              <div class="card">
+                <div class="card-header"><span class="title">LICENSE TIER</span><span class="fill"></span><span class="sub">of results shown</span></div>
+                <div class="card-body facet-list" data-role="search-license-facets"><div class="empty">no results yet</div></div>
+              </div>
+              <div class="card">
+                <div class="card-header"><span class="title">TRY A QUESTION</span></div>
+                <div class="card-body" data-role="search-shortcuts" style="display:flex; flex-direction:column; gap:8px; font-family:var(--font-mono); font-size:11px;"></div>
+                <div class="card-footer">NO RESULTS NEVER READS "0 RESULTS" WITHOUT SAYING WHY.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================== EVIDENCE (documented API gap) ============================== -->
+      <section class="panel" id="panel-evidence" data-panel="evidence">
+        <div class="subbar"><span class="t">EVIDENCE</span><span class="m">claim-trace neighbourhood graph</span></div>
+        <div class="gap-notice">
+          <div class="head">&#9650; THIS SURFACE HAS NO BACKING ROUTE YET</div>
+          <div class="body">
+            Evidence.dc.html's claim-trace view (a single claim's grounding anchors,
+            contradictions, and its 2-hop knowledge-graph neighbourhood) needs a
+            per-claim detail route this build's API does not expose &mdash;
+            <code>docs/DASHBOARD_V2_API.md</code> ships <code>feed</code>,
+            <code>rooms</code>, <code>determinations</code>, <code>dossier</code>,
+            <code>lexicon</code>, <code>course</code>, <code>since_you_left</code> and
+            <code>search</code> only. <code>search</code>'s own results carry a
+            citation (anchor, page, quote) but not a claim id, contradiction edges,
+            or a neighbourhood adjacency list. Rather than fabricate a graph from
+            data that isn't there, this tab says so in place, per Tokens.dc.html's
+            own honesty rule 12. See the build report's API-gap list.
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================== LEXICON ============================== -->
+      <section class="panel" id="panel-lexicon" data-panel="lexicon">
+        <div class="lexicon-layout">
+          <div class="lexicon-index">
+            <div class="term-filter-row">
+              <div class="term-search"><span class="prompt" style="font-size:13px;">&gt;</span><input type="text" data-role="lexicon-filter" placeholder="filter terms, definitions, source ids"></div>
+              <div class="term-kind-chips" data-role="lexicon-kind-chips"></div>
+            </div>
+            <div data-role="lexicon-index-list"><div class="panel-loading">loading&hellip;</div></div>
+            <div style="margin-top:auto; padding:11px 14px;" data-role="lexicon-seam"></div>
+          </div>
+          <div class="lexicon-detail" data-role="lexicon-detail"></div>
+        </div>
+      </section>
+
+      <!-- ============================== DOSSIER ============================== -->
+      <section class="panel" id="panel-dossier" data-panel="dossier">
+        <div class="dossier-layout">
+          <div class="dossier-rail">
+            <div class="subbar" style="padding:0 12px;"><span class="t">REGISTRY</span><span class="m" data-role="dossier-registry-count"></span></div>
+            <div class="type-chip-row" data-role="dossier-type-chips"></div>
+            <div data-role="dossier-registry-list"><div class="panel-loading">loading&hellip;</div></div>
+            <div class="note-strip" style="margin-top:auto; padding:10px 12px;">SUPERSEDED VERSIONS ARE RETAINED, NEVER DELETED.</div>
+          </div>
+          <div class="dossier-detail" data-role="dossier-detail"></div>
+        </div>
+      </section>
+
+      <!-- ============================== COURSE ============================== -->
+      <section class="panel" id="panel-course" data-panel="course">
+        <div class="subbar"><span class="t">THE COURSE</span><span class="m" data-role="course-sub"></span></div>
+        <div class="panel-body-pad" data-role="course-body"><div class="panel-loading">loading&hellip;</div></div>
+      </section>
+
+      <!-- ============================== ROOMS ============================== -->
+      <section class="panel" id="panel-rooms" data-panel="rooms">
+        <div class="rooms-layout">
+          <div class="rooms-rail">
+            <div class="subbar" style="padding:0 12px;"><span class="t">ROOMS</span><span class="m" data-role="rooms-count"></span></div>
+            <div data-role="rooms-list"><div class="panel-loading">loading&hellip;</div></div>
+            <div class="note-strip" style="margin-top:auto; padding:11px 12px;">PARTICIPANTS NEVER VET THEIR OWN IDEAS.</div>
+          </div>
+          <div class="rooms-transcript">
+            <div class="subbar" data-role="rooms-transcript-header"></div>
+            <div data-role="rooms-turns" class="turn-list"><div class="panel-loading">loading&hellip;</div></div>
+            <div class="write-form-bar" style="padding:10px 14px; display:flex; flex-direction:column; gap:8px;">
+              <div class="write-form-row">
+                <span class="prompt" style="font-size:12px; color:var(--live); font-family:var(--font-mono);">&gt;</span>
+                <select class="write-select" data-role="room-turn-dp"></select>
+                <input type="text" class="write-input" data-role="room-turn-launch" placeholder="your launch_id" style="width:230px;">
+                <span class="fill" style="flex-grow:1;"></span>
+                <button type="button" class="btn btn--primary" disabled title="live mode required" data-role="room-turn-btn">POST TURN</button>
+              </div>
+              <textarea class="write-textarea" data-role="room-turn-body" rows="2" placeholder="write this round's turn&hellip;"></textarea>
+              <div class="note-strip" data-role="room-turn-note"></div>
+            </div>
+          </div>
+          <div class="rooms-side" data-role="rooms-side"></div>
+        </div>
+      </section>
+
+      <!-- ============================== FEED ============================== -->
+      <section class="panel" id="panel-feed" data-panel="feed">
+        <div class="feed-layout">
+          <div class="feed-threads">
+            <div class="subbar" style="padding:0 12px;"><span class="t">THREADS</span><span class="fill"></span><span class="m" data-role="feed-unread-count"></span></div>
+            <div data-role="feed-thread-list"><div class="panel-loading">loading&hellip;</div></div>
+            <div style="padding:12px; border-top:1px solid var(--hairline-soft); margin-top:12px; display:flex; flex-direction:column; gap:8px;">
+              <span class="note-strip" style="letter-spacing:0.1em;">READING ORDER</span>
+              <span class="chip chip--live" style="cursor:pointer;" data-role="feed-order-arrived">AS IT ARRIVED</span>
+              <span class="chip chip--neutral" style="cursor:not-allowed;" title="needs goal-grouping logic this API stage does not provide" aria-disabled="true">GROUPED BY GOAL</span>
+            </div>
+            <div class="note-strip" style="margin-top:auto; padding:11px 12px;">POSTS ARE APPEND-ONLY.<br>AUTHORSHIP IS SERVER-DERIVED.</div>
+          </div>
+          <div class="feed-main">
+            <div class="subbar" data-role="feed-thread-header"></div>
+            <div class="feed-posts" data-role="feed-post-list"><div class="panel-loading">loading&hellip;</div></div>
+            <div class="write-form-bar" style="display:flex; align-items:center; gap:11px; padding:10px 14px;">
+              <span class="prompt" style="font-size:12px; color:var(--live); font-family:var(--font-mono);">&gt;</span>
+              <input type="text" class="write-input" data-role="feed-compose-input" style="flex-grow:1;" maxlength="4000" placeholder="transmit a directive to this thread (posts as orchestrator -- authorship is server-derived)">
+              <button type="button" class="btn btn--destructive" disabled title="live mode required" data-role="feed-transmit-btn">TRANSMIT</button>
+            </div>
+            <div class="note-strip" data-role="feed-compose-note" style="padding:0 14px 8px 14px;"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================== DETERMINATIONS (DECIDE) ============================== -->
+      <section class="panel" id="panel-determinations" data-panel="determinations">
+        <div class="determ-layout">
+          <div class="determ-queue">
+            <div class="subbar" style="padding:0 14px;"><span class="t">AWAITING YOU</span><span class="m" data-role="determ-summary"></span></div>
+            <div data-role="determ-list"><div class="panel-loading">loading&hellip;</div></div>
+            <div class="note-strip" style="margin-top:auto; padding:11px 14px;">NOTHING MERGES, REGISTERS OR SHIPS WITHOUT A DECISION ON THIS SCREEN.</div>
+          </div>
+          <div class="determ-detail" data-role="determ-detail"></div>
+        </div>
+      </section>
+
+      <!-- ============================== CONSOLE ============================== -->
+      <section class="panel" id="panel-console" data-panel="console">
+        <div class="subbar">
+          <span class="t">THE MACHINE</span>
+          <span class="m">everything the old landing page used to be, on one screen you open on purpose</span>
+          <span class="fill"></span>
+          <span class="m">LOOPBACK ONLY, NO AUTHENTICATION</span>
+          <button type="button" class="btn btn--secondary is-hidden" data-role="doctor-run-btn">RUN THE CHECK SWEEP</button>
+        </div>
+        <div class="console-grid" data-role="console-grid">
+          <div class="card" id="console-card-session"><div class="card-header"><span class="title">SESSION</span></div><div class="card-body" data-role="console-body-session"><div class="panel-loading">loading&hellip;</div></div></div>
+          <div class="card" id="console-card-budget"><div class="card-header"><span class="title">BUDGET / POOLS</span></div><div class="card-body" data-role="console-body-budget"><div class="panel-loading">loading&hellip;</div></div></div>
+          <div class="card" id="console-card-jobs"><div class="card-header"><span class="title">JOBS</span></div><div class="card-body" data-role="console-body-jobs"><div class="panel-loading">loading&hellip;</div></div></div>
+          <div class="card" id="console-card-gates"><div class="card-header"><span class="title">GATES</span></div><div class="card-body" data-role="console-body-gates"><div class="panel-loading">loading&hellip;</div></div></div>
+          <div class="card" id="console-card-corpus"><div class="card-header"><span class="title">CORPUS / DIAGNOSTICS</span></div><div class="card-body" data-role="console-body-corpus"><div class="panel-loading">loading&hellip;</div></div></div>
+          <div class="card" id="console-card-doctor"><div class="card-header"><span class="title">DOCTOR</span></div><div class="card-body" data-role="console-body-doctor"><div class="panel-loading">loading&hellip;</div></div></div>
+        </div>
+      </section>
+
+      <!-- extension panel <section>s are injected here at runtime, id="panel-ext-<name>" -->
+    </main>
+  </div>
+</div>
+
+<div id="peek-root" aria-live="polite"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ==========================================================================
+     0. CONSTANTS
+     ========================================================================== */
+  var CORE_PANELS = ["session", "budget", "jobs", "gates", "corpus", "feed", "rooms",
+    "determinations", "dossier", "lexicon", "course", "since_you_left", "doctor"];
+
+  var KIND_LABELS = {
+    gate_edit: "GATE EDITS · VERIFICATION DUE",
+    kg_merge: "KNOWLEDGE-GRAPH MERGES · NEVER SILENT",
+    memory_conflict: "MEMORY CONFLICTS · NEVER SILENT",
+    prereg_reveal: "PRE-REGISTRATION REVEALS",
+    room_escalation: "ROOM ESCALATIONS · FROZEN",
+    acquisition: "ACQUISITIONS · ONLY YOU CAN DELIVER THESE"
+  };
+  var KIND_ORDER = ["gate_edit", "kg_merge", "memory_conflict", "prereg_reveal", "room_escalation", "acquisition"];
+
+  var GATE_STEPS = ["draft", "submitted", "gated", "union_applied", "registered"];
+
+  var state = {
+    mode: null,                // "static" | "live"
+    staticPayload: null,       // {meta, panels} embedded by `trialerror dashboard export`
+    meta: {},
+    activePanel: "home",
+    errorCount: 0,
+    eventSource: null,
+    loadedOnce: {},            // panel name -> true once fetched at least once
+    // per-surface selection state
+    feedThreadId: null,
+    roomsRoomId: null,
+    roomsSelectedDp: null,
+    dossierArtifactId: null,
+    dossierTypeFilter: "ALL",
+    lexiconFilterText: "",
+    lexiconKindFilter: "all",
+    lexiconSelected: null,     // {kind:'entity'|'claim'|'merge', id}
+    determSelectedId: null,
+    determItemsFlat: [],
+    searchK: 12,
+    searchLicenseExclude: {},
+    sinceSeenIds: null,        // Set, populated after first render
+    homeLoadedOnce: false
+  };
+
+  /* ==========================================================================
+     1. SMALL DOM / FORMAT HELPERS
+     ========================================================================== */
+  function qs(sel, root) { return (root || document).querySelector(sel); }
+  function qsa(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
+
+  function el(tag, attrs, children) {
+    var node = document.createElement(tag);
+    if (attrs) {
+      Object.keys(attrs).forEach(function (k) {
+        if (k === "class") node.className = attrs[k];
+        else if (k === "text") node.textContent = attrs[k];
+        else if (k === "html") node.innerHTML = attrs[k];
+        else if (k.indexOf("on") === 0 && typeof attrs[k] === "function") node.addEventListener(k.slice(2), attrs[k]);
+        else node.setAttribute(k, attrs[k]);
+      });
+    }
+    (children || []).forEach(function (c) {
+      if (c === null || c === undefined) return;
+      node.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+    });
+    return node;
+  }
+
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+  function show(node) { node.classList.remove("is-hidden"); }
+  function hide(node) { node.classList.add("is-hidden"); }
+
+  function fmtHM(iso) {
+    if (!iso) return "—";
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return String(iso).slice(0, 16);
+    return String(d.getUTCHours()).padStart(2, "0") + ":" + String(d.getUTCMinutes()).padStart(2, "0");
+  }
+  function fmtElapsed(iso) {
+    if (!iso) return null;
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return null;
+    var ms = Date.now() - d.getTime();
+    if (ms < 0) ms = 0;
+    var totalMin = Math.floor(ms / 60000);
+    var h = Math.floor(totalMin / 60), m = totalMin % 60;
+    return h + "h " + m + "m";
+  }
+  function fmtDate(iso) {
+    if (!iso) return "—";
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return String(iso).slice(0, 10);
+    return d.toISOString().slice(0, 10);
+  }
+
+  function statusEl(kind, label, opts) {
+    opts = opts || {};
+    var glyphs = {
+      live: "●", settled: "✓", warn: "▲", crit: "✗",
+      pending: "○", paused: "⬣", stale: "□", "new": "◆",
+      split: "▲", fenced: "■", notscored: "♦"
+    };
+    var span = el("span", { "class": "status status--" + kind });
+    var g = el("span", { "class": "g" + (opts.pulse ? " pulse" : ""), text: glyphs[kind] || "○" });
+    span.appendChild(g);
+    span.appendChild(document.createTextNode(" " + label));
+    return span;
+  }
+
+  function chip(text, variant) {
+    return el("span", { "class": "chip" + (variant ? " chip--" + variant : ""), text: text });
+  }
+
+  function meterRow(label, pct, valueText, opts) {
+    opts = opts || {};
+    pct = Math.max(0, Math.min(100, pct));
+    var row = el("div", { "class": "meter-row" }, [
+      el("span", { "class": "k", text: label }),
+      el("span", { "class": "v", text: valueText })
+    ]);
+    var track = el("div", { "class": "meter" + (opts.thin ? " meter--thin" : "") });
+    var fill = el("div", { "class": "meter__fill" + (opts.warn ? " meter__fill--warn" : opts.live ? " meter__fill--live" : "") });
+    fill.style.width = pct + "%";
+    track.appendChild(fill);
+    if (typeof opts.tick === "number") {
+      var tick = el("div", { "class": "meter__tick" });
+      tick.style.left = Math.max(0, Math.min(100, opts.tick)) + "%";
+      track.appendChild(tick);
+    }
+    var wrap = el("div", {});
+    wrap.appendChild(row);
+    wrap.appendChild(track);
+    return wrap;
+  }
+
+  function anchorQuote(text, opts) {
+    opts = opts || {};
+    var cls = "anchor-quote" + (opts.warn ? " anchor-quote--warn" : opts.crit ? " anchor-quote--crit" : "");
+    return el("span", { "class": cls, text: "“" + text + "”" });
+  }
+
+  /* ---- anchor-peek: hover/focus any [data-peek] element, 200ms delay ---- */
+  var peekTimer = null;
+  var peekRoot = document.getElementById("peek-root");
+  function makePeekable(node, opts) {
+    node.setAttribute("data-peek", "1");
+    node.tabIndex = node.tabIndex || 0;
+    node._peekOpts = opts;
+    node.addEventListener("mouseenter", function () { schedulePeek(node); });
+    node.addEventListener("focus", function () { schedulePeek(node); });
+    node.addEventListener("mouseleave", hidePeek);
+    node.addEventListener("blur", hidePeek);
+  }
+  function schedulePeek(node) {
+    clearTimeout(peekTimer);
+    peekTimer = setTimeout(function () { showPeek(node); }, 200);
+  }
+  function showPeek(node) {
+    var opts = node._peekOpts || {};
+    clear(peekRoot);
+    var pop = el("div", { "class": "peek-popover" + (opts.fenced ? " is-fenced" : "") });
+    if (opts.quote) pop.appendChild(anchorQuote(opts.quote, { crit: opts.fenced }));
+    if (opts.meta) pop.appendChild(el("div", { "class": "anchor-meta", text: opts.meta }));
+    if (opts.fenced) pop.appendChild(el("div", { "class": "fenced-note", text: "FENCED SOURCE — 20 WORDS MAXIMUM" }));
+    peekRoot.appendChild(pop);
+    var r = node.getBoundingClientRect();
+    var top = r.bottom + 6, left = r.left;
+    var maxLeft = window.innerWidth - 380;
+    if (left > maxLeft) left = Math.max(8, maxLeft);
+    pop.style.top = top + "px";
+    pop.style.left = left + "px";
+    show(pop.parentElement === peekRoot ? peekRoot : peekRoot);
+  }
+  function hidePeek() {
+    clearTimeout(peekTimer);
+    clear(peekRoot);
+  }
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape") hidePeek(); });
+
+  /* ==========================================================================
+     2. GENERIC JSON -> DOM RENDERER (Console + ext panels + fallback).
+     Carried over from the V1 scaffold: every panel builder in
+     trialerror.dashboard.data already returns a shape that reads cleanly as
+     nested key/value + row tables, so a bespoke layout is only worth
+     building where the brief calls for one.
+     ========================================================================== */
+  function isPlainObject(v) { return v !== null && typeof v === "object" && !Array.isArray(v); }
+
+  function fmtScalar(v) {
+    if (v === null || v === undefined) return document.createTextNode("—");
+    if (typeof v === "boolean") return el("span", { "class": "status-badge", text: v ? "true" : "false" });
+    return document.createTextNode(String(v));
+  }
+  function renderValueG(v) {
+    if (Array.isArray(v)) return renderArrayG(v);
+    if (isPlainObject(v)) return renderObjectG(v);
+    var wrap = el("span", { "class": "scalar-value" });
+    wrap.appendChild(fmtScalar(v));
+    return wrap;
+  }
+  function renderObjectG(obj) {
+    var keys = Object.keys(obj);
+    if (keys.length === 0) return el("div", { "class": "empty", text: "(empty)" });
+    var table = el("table", { "class": "kv-table" });
+    keys.forEach(function (k) {
+      var tr = el("tr", {}, [
+        el("td", { "class": "kv-key", text: k }),
+        el("td", { "class": "kv-value" }, [renderValueG(obj[k])])
+      ]);
+      table.appendChild(tr);
+    });
+    return table;
+  }
+  function renderArrayG(arr) {
+    if (arr.length === 0) return el("div", { "class": "empty", text: "(none)" });
+    var allScalar = arr.every(function (x) { return !isPlainObject(x) && !Array.isArray(x); });
+    if (allScalar) return el("span", { "class": "scalar-list", text: arr.join(", ") });
+    var allObjects = arr.every(isPlainObject);
+    if (allObjects) {
+      var cols = [];
+      arr.forEach(function (row) { Object.keys(row).forEach(function (k) { if (cols.indexOf(k) === -1) cols.push(k); }); });
+      var table = el("table", { "class": "rows-table" });
+      var thead = el("tr", {}, cols.map(function (c) { return el("th", { text: c }); }));
+      table.appendChild(thead);
+      arr.forEach(function (row) {
+        var tr = el("tr", {}, cols.map(function (c) { return el("td", {}, [renderValueG(row[c])]); }));
+        table.appendChild(tr);
+      });
+      return el("div", { "class": "table-scroll" }, [table]);
+    }
+    var container = el("div", { "class": "mixed-list" });
+    arr.forEach(function (item) { container.appendChild(renderValueG(item)); });
+    return container;
+  }
+  function renderGeneric(container, data) {
+    clear(container);
+    if (data === undefined || data === null) { container.appendChild(el("div", { "class": "empty", text: "no data yet" })); return; }
+    if (data.status && data.status !== "ok") {
+      container.appendChild(el("div", { "class": "warn-callout" }, [
+        el("div", { "class": "head", text: (data.status || "").toUpperCase() }),
+        el("div", { "class": "body", text: data.message || "" })
+      ]));
+      return;
+    }
+    container.appendChild(renderObjectG(data));
+  }
+
+  /* ==========================================================================
+     3. DATA LAYER -- static (embedded snapshot) or live (fetch + SSE)
+     ========================================================================== */
+  function fetchPanel(name, params) {
+    if (state.mode === "static") {
+      var p = (state.staticPayload.panels || {})[name];
+      return Promise.resolve(p === undefined ? { status: "not_initialized", message: "not present in this snapshot" } : p);
+    }
+    var qs2 = "";
+    if (params) {
+      var pairs = Object.keys(params).filter(function (k) { return params[k] !== null && params[k] !== undefined && params[k] !== ""; })
+        .map(function (k) { return encodeURIComponent(k) + "=" + encodeURIComponent(params[k]); });
+      if (pairs.length) qs2 = "?" + pairs.join("&");
+    }
+    return fetch("/dashboard/api/" + name + qs2, { cache: "no-store" }).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    });
+  }
+
+  function fetchAll() {
+    if (state.mode === "static") return Promise.resolve(state.staticPayload);
+    return fetch("/dashboard/api/all", { cache: "no-store" }).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    });
+  }
+
+  function fetchExtPanel(name) {
+    if (state.mode === "static") {
+      var ext = ((state.staticPayload.panels || {}).ext || {});
+      return Promise.resolve(ext[name] || { status: "ext_error", message: "not present in this snapshot" });
+    }
+    return fetch("/dashboard/api/ext/" + encodeURIComponent(name), { cache: "no-store" }).then(function (r) { return r.json(); });
+  }
+
+  function runSearch(params) {
+    if (state.mode !== "live") {
+      return Promise.resolve({
+        status: "static_no_engine",
+        message: "This is a static snapshot (trialerror dashboard export). It has no retrieval engine embedded -- run `trialerror dashboard serve` for live search.",
+        results: [], tiers_used: [], stats: {}
+      });
+    }
+    var pairs = Object.keys(params).filter(function (k) { return params[k] !== null && params[k] !== undefined && params[k] !== ""; })
+      .map(function (k) { return encodeURIComponent(k) + "=" + encodeURIComponent(params[k]); });
+    return fetch("/dashboard/api/search?" + pairs.join("&"), { cache: "no-store" }).then(function (r) { return r.json(); });
+  }
+
+  /* ==========================================================================
+     3b. WRITES (Stage 3: operator write actions)
+     Every write POSTs to /dashboard/api/write/<action> with the
+     per-serve-process token (embedded server-side into this page as
+     <meta name="dashboard-write-token"> -- see trialerror.dashboard.serve's
+     _serve_index) on the X-TrialError-Dashboard-Token header. A static
+     snapshot (`trialerror dashboard export`) never has that <meta> tag, so
+     writesEnabled() is false there and every write control stays
+     disabled -- honest by construction, not by a convention that could
+     drift (design constraint: "static exports contain NO token").
+     ========================================================================== */
+  function getWriteToken() {
+    var m = document.querySelector('meta[name="dashboard-write-token"]');
+    return m ? m.getAttribute("content") : null;
+  }
+  var WRITE_TOKEN = getWriteToken();
+
+  function writesEnabled() { return state.mode === "live" && !!WRITE_TOKEN; }
+
+  function postWrite(action, body) {
+    return fetch("/dashboard/api/write/" + encodeURIComponent(action), {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json", "X-TrialError-Dashboard-Token": WRITE_TOKEN || "" },
+      body: JSON.stringify(body || {})
+    }).then(function (r) {
+      return r.json().then(function (data) { return { httpStatus: r.status, data: data }; }, function () {
+        return { httpStatus: r.status, data: { ok: false, message: "HTTP " + r.status + " (no JSON body)" } };
+      });
+    });
+  }
+
+  /** Wires one write-action button: validates `requiredFields` are present
+   * (focuses+flags the first missing one instead of calling the API),
+   * disables the button + shows "WORKING…" while in flight, and on
+   * success calls `onSuccess()` (typically a panel reload -- design
+   * constraint: "a successful action re-fetches the affected panel").
+   * `bodyFn()` is called fresh at submit time (not once at wire time) so
+   * it always reads current form/state values. `fieldEls` maps a required
+   * field name to the input element to focus on a client-side validation
+   * failure (optional per field). */
+  function wireWriteAction(btn, msgEl, action, bodyFn, requiredFields, fieldEls, onSuccess) {
+    btn.addEventListener("click", function () {
+      var body = bodyFn();
+      for (var i = 0; i < (requiredFields || []).length; i++) {
+        var f = requiredFields[i];
+        var v = body[f];
+        if (v === undefined || v === null || (typeof v === "string" && v.trim() === "")) {
+          msgEl.textContent = f + " is required.";
+          msgEl.style.color = "var(--warn)";
+          var focusEl = fieldEls && fieldEls[f];
+          if (focusEl) focusEl.focus();
+          return;
+        }
+      }
+      var origText = btn.textContent;
+      btn.disabled = true; btn.textContent = "WORKING…";
+      msgEl.textContent = ""; msgEl.style.color = "var(--ink-3)";
+      postWrite(action, body).then(function (res) {
+        if (res.data && res.data.ok) {
+          msgEl.textContent = "done.";
+          msgEl.style.color = "var(--live)";
+          if (onSuccess) onSuccess(res.data.result);
+        } else {
+          msgEl.textContent = (res.data && res.data.message) || ("HTTP " + res.httpStatus);
+          msgEl.style.color = "var(--crit-text)";
+        }
+      }).catch(function (e) {
+        msgEl.textContent = "network error: " + e;
+        msgEl.style.color = "var(--crit-text)";
+      }).finally(function () {
+        btn.disabled = !writesEnabled();
+        btn.textContent = origText;
+      });
+    });
+  }
+
+  /* ==========================================================================
+     4. RAIL / TOPBAR / TAB SWITCHING
+     ========================================================================== */
+  function switchPanel(name, opts) {
+    opts = opts || {};
+    state.activePanel = name;
+    qsa(".rail-item[data-panel]").forEach(function (b) { b.classList.toggle("is-active", b.getAttribute("data-panel") === name); });
+    qsa(".panel[data-panel]").forEach(function (p) { p.classList.toggle("is-active", p.getAttribute("data-panel") === name); });
+    if (!opts.noHash) { try { history.replaceState(null, "", "#" + name); } catch (e) {} }
+    loadPanelContent(name);
+  }
+
+  function loadPanelContent(name) {
+    switch (name) {
+      case "home": return loadHome();
+      case "search": /* query-driven, nothing to prefetch */ return;
+      case "evidence": return;
+      case "lexicon": return loadLexicon();
+      case "dossier": return loadDossier();
+      case "course": return loadCourse();
+      case "rooms": return loadRooms();
+      case "feed": return loadFeed();
+      case "determinations": return loadDeterminations();
+      case "console": return loadConsole();
+      default:
+        if (name.indexOf("ext-") === 0) return loadExt(name.slice(4));
+    }
+  }
+
+  function setTopbar(meta) {
+    qs('[data-role="topbar-program"]').textContent = (meta && meta.program_root) ? meta.program_root.split(/[\\/]/).pop() : "—";
+    qs('[data-role="topbar-mode"]').textContent = state.mode === "static" ? "static" : "live";
+    qs('[data-role="topbar-mode"]').setAttribute("data-state", state.mode || "static");
+  }
+
+  function setHealth(bundle) {
+    var panels = bundle.panels || {};
+    var dangling = ((panels.budget || {}).dangling_bookings || []).length;
+    var pendingEdits = ((panels.gates || {}).pending_edits || []).length;
+    var doctor = panels.doctor || {};
+    var doctorFail = 0, doctorWarn = 0;
+    if (doctor.status === "ok" && doctor.last_run && Array.isArray(doctor.last_run.checks)) {
+      doctor.last_run.checks.forEach(function (c) {
+        if (c.status === "fail") doctorFail++;
+        else if (c.status === "warn") doctorWarn++;
+      });
+    }
+    var badge = qs('[data-role="rail-health"]');
+    var label = qs('[data-role="rail-health-label"]');
+    var level = "ok", text = "OK";
+    if (dangling > 0 || doctorFail > 0) { level = "crit"; text = (dangling + doctorFail) + " CRIT"; }
+    else if (pendingEdits > 0 || doctorWarn > 0) { level = "warn"; text = (pendingEdits + doctorWarn) + " WARN"; }
+    badge.setAttribute("data-health", level);
+    label.textContent = text;
+
+    var determ = panels.determinations || {};
+    var determBadge = qs('[data-role="determ-badge"]');
+    if (determ.status === "ok" && determ.total) { determBadge.textContent = String(determ.total); show(determBadge); }
+    else hide(determBadge);
+
+    var rooms = panels.rooms || {};
+    var anyOpen = rooms.status === "ok" && (rooms.rooms || []).some(function (r) { return r.state === "open"; });
+    var dot = qs('[data-role="rooms-live-dot"]');
+    dot.classList.toggle("is-hidden", !anyOpen);
+  }
+
+  /* ==========================================================================
+     5. HOME
+     ========================================================================== */
+  var lastBundle = null;
+
+  function loadHome() {
+    fetchAll().then(function (bundle) {
+      lastBundle = bundle;
+      state.meta = bundle.meta || {};
+      setTopbar(state.meta);
+      setHealth(bundle);
+      renderHome(bundle);
+      state.homeLoadedOnce = true;
+    }).catch(function (e) { console.error("home load failed", e); });
+  }
+
+  function renderHome(bundle) {
+    var panels = bundle.panels || {};
+    renderSinceYouLeft(panels.since_you_left);
+    renderFinding(panels.feed);
+    renderCorpusCard(panels.corpus);
+    renderNeeds(panels.determinations);
+    renderLiveRoom(panels.rooms);
+    renderMission(panels.course);
+    renderOpsRibbon(panels);
+    renderHomeTensions(panels);
+  }
+
+  var DELTA_STATUS = {
+    room_dp_scored: ["settled", "✓ CONVERGED"], room_turn: ["pending", "○ TURN"],
+    room_created: ["live", "◆ NEW ROOM"], room_converged: ["settled", "✓ CONVERGED"],
+    room_frozen: ["crit", "✗ FROZEN"], room_deliverable_registered: ["settled", "✓ REGISTERED"],
+    feed_post: ["live", "◆ NEW POST"], gate_transition: ["warn", "▲ GATE MOVED"],
+    artifact_registered: ["settled", "✓ REGISTERED"], ingest_complete: ["settled", "✓ INGESTED"]
+  };
+  function deltaStatusFor(kind) { return DELTA_STATUS[kind] || ["pending", kind.toUpperCase()]; }
+
+  function renderSinceYouLeft(p) {
+    var list = qs('[data-role="since-you-left-list"]');
+    var footer = qs('[data-role="since-you-left-footer"]');
+    clear(list); clear(footer);
+    if (!p || p.status !== "ok") {
+      list.appendChild(el("div", { "class": "warn-callout" }, [el("div", { "class": "body", text: p ? p.message : "no data" }) ]));
+      return;
+    }
+    var isFirstRender = state.sinceSeenIds === null;
+    if (state.sinceSeenIds === null) state.sinceSeenIds = new Set();
+    var items = p.items || [];
+    if (items.length === 0) {
+      list.appendChild(el("div", { "class": "empty", text: "nothing since " + (p.since || "the last check") }));
+    }
+    items.slice(0, 12).forEach(function (item) {
+      var idKey = item.kind + "|" + item.ts;
+      var isNew = !isFirstRender && !state.sinceSeenIds.has(idKey);
+      state.sinceSeenIds.add(idKey);
+      var pair = deltaStatusFor(item.kind);
+      var row = el("div", { "class": "delta-row" + (isNew ? " is-new" : "") });
+      if (isNew) row.appendChild(el("div", { "class": "flare-bar" }));
+      row.appendChild(el("span", { "class": "ts", text: fmtHM(item.ts) }));
+      row.appendChild(statusEl(pair[0], pair[1]));
+      row.appendChild(el("span", { "class": "body", text: item.summary }));
+      list.appendChild(row);
+    });
+    footer.appendChild(el("span", { text: Math.min(items.length, 12) + " OF " + p.count + " EVENTS" }));
+    footer.appendChild(el("span", { "class": "fill" }));
+    footer.appendChild(el("span", { text: "SINCE " + (p.since_source || "").replace(/_/g, " ").toUpperCase() }));
+  }
+
+  function renderFinding(feedPanel) {
+    var card = qs('[data-role="finding-card"]');
+    clear(card);
+    card.appendChild(el("div", { "class": "card-header" }, [
+      el("span", { "class": "title", text: "THE FINDING" }),
+      el("span", { "class": "sub", text: "most recent post in the busiest thread" }),
+      el("span", { "class": "fill" })
+    ]));
+    var body = el("div", { "class": "card-body" });
+    card.appendChild(body);
+    if (!feedPanel || feedPanel.status !== "ok" || !(feedPanel.posts || []).length) {
+      body.appendChild(el("div", { "class": "empty", text: "no posts yet" }));
+      return;
+    }
+    var post = feedPanel.posts[feedPanel.posts.length - 1];
+    var kind = (post.author || "unknown").split(":", 1)[0];
+    var meta = el("div", { "style": "display:flex; gap:10px; align-items:center; font-family:var(--font-mono); font-size:10px; color:var(--ink-3); margin-bottom:8px; flex-wrap:wrap;" });
+    meta.appendChild(chip(kind.toUpperCase(), "settled"));
+    meta.appendChild(el("span", { text: post.author }));
+    meta.appendChild(el("span", { text: fmtHM(post.ts) + " UTC" }));
+    body.appendChild(meta);
+    body.appendChild(el("div", { "style": "font-size:12.5px; line-height:1.55; color:var(--ink);", text: post.body }));
+    var foot = el("div", { "class": "card-footer" });
+    var link = el("span", { "class": "link", text: "OPEN IN FEED ▸" });
+    link.addEventListener("click", function () { state.feedThreadId = post.thread_id; switchPanel("feed"); });
+    foot.appendChild(link);
+    card.appendChild(foot);
+  }
+
+  function renderCorpusCard(p) {
+    var card = qs('[data-role="corpus-card"]');
+    clear(card);
+    card.appendChild(el("div", { "class": "card-header" }, [
+      el("span", { "class": "title", text: "THE CORPUS" }),
+      el("span", { "class": "sub", text: p && p.status === "ok" ? (p.counts.sources + " sources, " + p.counts.documents + " documents, " + p.counts.chunks + " chunks") : "" })
+    ]));
+    var body = el("div", { "class": "card-body" });
+    card.appendChild(body);
+    if (!p || p.status !== "ok") { body.appendChild(el("div", { "class": "empty", text: p ? p.message : "no data" })); return; }
+    var row = el("div", { "style": "display:flex; gap:16px; flex-wrap:wrap; font-family:var(--font-mono); font-size:11px;" });
+    [["SOURCES", p.counts.sources], ["DOCUMENTS", p.counts.documents], ["CHUNKS", p.counts.chunks], ["ANCHORS", p.counts.quote_anchors], ["STALE ANCHORS", p.stale_anchors]].forEach(function (pair) {
+      row.appendChild(el("span", {}, [el("span", { "class": "k", "style": "color:var(--ink-3); margin-right:5px;", text: pair[0] }), el("span", { "style": "color:var(--ink-hi);", text: String(pair[1]) })]));
+    });
+    body.appendChild(row);
+    var tierRow = el("div", { "style": "display:flex; gap:2px; height:10px; margin-top:10px;" });
+    var total = Object.values(p.license_tier_counts || {}).reduce(function (a, b) { return a + b; }, 0) || 1;
+    var colors = { open: "var(--settled)", academic_oa: "var(--settled)", user_owned_scan: "var(--ink-2)", commercial_restricted: "var(--crit-fill)" };
+    Object.keys(p.license_tier_counts || {}).forEach(function (tier) {
+      var seg = el("div", { title: tier + ": " + p.license_tier_counts[tier] });
+      seg.style.flexGrow = String(p.license_tier_counts[tier]);
+      seg.style.background = colors[tier] || "var(--hairline)";
+      tierRow.appendChild(seg);
+    });
+    body.appendChild(tierRow);
+  }
+
+  function renderNeeds(p) {
+    var card = qs('[data-role="needs-card"]');
+    clear(card);
+    if (!p || p.status !== "ok") {
+      card.appendChild(el("div", { "class": "card-body empty", text: p ? p.message : "no data" }));
+      return;
+    }
+    card.appendChild(el("div", { "class": "card-header" }, [
+      el("span", { "class": "title", "style": "color:var(--crit-text);", text: p.total + " AWAITING DECISION" }),
+      el("span", { "class": "fill" }),
+      el("span", { "class": "sub", "style": "color:var(--crit-text);", text: p.blocking_count + " BLOCKING" })
+    ]));
+    var body = el("div", { "class": "card-body" });
+    card.appendChild(body);
+    var top = p.items.find(function (i) { return i.blocking; }) || p.items[0];
+    if (!top) { body.appendChild(el("div", { "class": "empty", text: "queue is empty" })); return; }
+    body.appendChild(el("div", { "style": "font-size:13px; color:var(--ink-hi); font-weight:600; margin-bottom:6px;", text: determItemTitle(top) }));
+    body.appendChild(el("div", { "style": "font-size:12px; line-height:1.5; color:var(--ink);", text: top.consequence }));
+    var btnRow = el("div", { "class": "btn-row", "style": "margin-top:10px;" });
+    var openBtn = el("button", { "class": "btn btn--secondary", type: "button", text: "OPEN IN DECIDE" });
+    openBtn.addEventListener("click", function () { state.determSelectedId = top.id; switchPanel("determinations"); });
+    btnRow.appendChild(openBtn);
+    body.appendChild(btnRow);
+    var foot = el("div", { "class": "card-footer" }, [el("span", { text: "SHOWING 1 OF " + p.total + " ITEMS IN THE QUEUE" + (p.total > 1 ? " — OPEN DECIDE FOR THE REST" : "") })]);
+    card.appendChild(foot);
+  }
+
+  function renderLiveRoom(p) {
+    var card = qs('[data-role="live-room-card"]');
+    clear(card);
+    var openRoom = p && p.status === "ok" && p.active_room && p.active_room.state === "open" ? p.active_room : null;
+    card.appendChild(el("div", { "class": "card-header" }, [
+      openRoom ? statusEl("live", (openRoom.room_id || "") + " IN SESSION", { pulse: true }) : el("span", { "class": "title", text: "NO ROOM OPEN" })
+    ]));
+    var body = el("div", { "class": "card-body" });
+    card.appendChild(body);
+    if (!openRoom) { body.appendChild(el("div", { "class": "empty", text: "no room is currently open" })); return; }
+    body.appendChild(el("div", { "style": "font-size:11.5px; color:var(--ink-2); margin-bottom:8px;", text: openRoom.topic }));
+    var perDp = (p.convergence && p.convergence.per_dp) || [];
+    if (perDp.length) {
+      var last = perDp[perDp.length - 1];
+      body.appendChild(meterRow("DP " + last.dp_id, last.agreement_pct, last.agreement_pct.toFixed(0) + "%", { warn: !last.converged, live: last.converged, tick: openRoom_bar(openRoom) }));
+    }
+    var turns = p.turns || [];
+    if (turns.length) {
+      var lt = turns[turns.length - 1];
+      body.appendChild(el("div", { "style": "margin-top:10px; font-size:11.5px; line-height:1.45; color:var(--ink);", text: lt.body }));
+    }
+    var foot = el("div", { "class": "card-footer" });
+    var watch = el("span", { "class": "link", text: "WATCH ▸" });
+    watch.addEventListener("click", function () { state.roomsRoomId = openRoom.room_id; switchPanel("rooms"); });
+    foot.appendChild(watch);
+    foot.appendChild(el("span", { "class": "fill" }));
+    foot.appendChild(el("span", { text: "TURNS ARRIVE OVER SSE" }));
+    card.appendChild(foot);
+  }
+  function openRoom_bar(room) {
+    // honest: a room whose dps JSON doesn't match the expected shape (the
+    // same anomaly the server's own detail_error reports) yields null, not
+    // an invented number -- never silently default to 90 and pretend it's
+    // this room's real bar.
+    try {
+      var parsed = JSON.parse(room.dps);
+      return typeof parsed.convergence_bar_pct === "number" ? parsed.convergence_bar_pct : null;
+    } catch (e) { return null; }
+  }
+
+  function renderMission(p) {
+    var card = qs('[data-role="mission-card"]');
+    clear(card);
+    card.appendChild(el("div", { "class": "card-header" }, [el("span", { "class": "title", text: "THE MISSION" })]));
+    var body = el("div", { "class": "card-body" });
+    card.appendChild(body);
+    if (!p || p.status !== "ok") { body.appendChild(el("div", { "class": "empty", text: p ? p.message : "no data" })); return; }
+    var dims = el("div", { "class": "mission-dims" });
+    (p.phases || []).forEach(function (ph) {
+      var done = ph.open === 0 && ph.blocked === 0;
+      dims.appendChild(el("div", { "class": "mission-dim" }, [
+        done ? statusEl("settled", ph.phase.toUpperCase(), {}) : statusEl("live", ph.phase.toUpperCase(), { pulse: true })
+      ]));
+    });
+    var right = el("div", { "style": "flex-grow:1; display:flex; flex-direction:column; gap:8px; min-width:0;" });
+    var discharged = p.criteria.filter(function (c) { return c.state === "discharged"; }).length;
+    right.appendChild(el("div", { "style": "font-size:11.5px; line-height:1.45; color:var(--ink);", text: discharged + " of " + p.criteria.length + " criteria discharged." }));
+    var bars = el("div", { "class": "mission-bars" });
+    (p.phases || []).forEach(function (ph) {
+      var pct = ph.total ? (ph.discharged / ph.total * 100) : 0;
+      bars.appendChild(el("div", { "style": "display:flex; justify-content:space-between;" }, [el("span", { "class": "k", text: ph.phase }), el("span", { "class": "v", text: ph.discharged + "/" + ph.total }) ]));
+      var track = el("div", { "style": "height:4px; background:var(--hairline-soft);" });
+      var fill = el("div", { "style": "height:4px; background:var(--settled); width:" + pct + "%;" });
+      track.appendChild(fill);
+      bars.appendChild(track);
+    });
+    right.appendChild(bars);
+    var row = el("div", { "class": "mission-body" }, [dims, right]);
+    body.appendChild(row);
+    var foot = el("div", { "class": "card-footer" }, [el("span", { text: "NO SINGLE NUMBER. EVERY DIMENSION CLEARS ITS OWN BAR." })]);
+    var link = el("span", { "class": "link", text: "OPEN COURSE ▸" });
+    link.addEventListener("click", function () { switchPanel("course"); });
+    foot.appendChild(link);
+    card.appendChild(foot);
+  }
+
+  function renderHomeTensions(panels) {
+    var row = qs('[data-role="home-tensions"]');
+    clear(row);
+    row.appendChild(el("span", { "style": "color:var(--ink-3); font-family:var(--font-mono); font-size:10px;", text: "OPEN TENSIONS" }));
+    var any = false;
+    var determ = panels.determinations;
+    if (determ && determ.status === "ok") {
+      var blocking = determ.items.filter(function (i) { return i.blocking; });
+      if (blocking.length) {
+        any = true;
+        var c1 = el("span", { "class": "tension-chip tension-chip--warn", text: "▲ " + determItemTitle(blocking[0]) });
+        c1.addEventListener("click", function () { state.determSelectedId = blocking[0].id; switchPanel("determinations"); });
+        row.appendChild(c1);
+      }
+    }
+    var course = panels.course;
+    if (course && course.status === "ok" && course.drift_log && course.drift_log.length) {
+      var latestDrift = course.drift_log.find(function (d) { return d.course_check && d.course_check.on_course === false; });
+      if (latestDrift) {
+        any = true;
+        var c2 = el("span", { "class": "tension-chip tension-chip--warn", text: "▲ drift declared: " + (latestDrift.course_check.note || "").slice(0, 60) });
+        c2.addEventListener("click", function () { switchPanel("course"); });
+        row.appendChild(c2);
+      }
+    }
+    if (!any) row.appendChild(el("span", { "style": "color:var(--ink-3); font-family:var(--font-mono); font-size:10px;", text: "none right now" }));
+    row.appendChild(el("span", { "class": "fill", "style": "flex-grow:1;" }));
+    row.appendChild(el("span", { "style": "color:var(--ink-3); font-family:var(--font-mono); font-size:10px;" }, [el("span", { "style": "color:var(--live);", text: "/" }), document.createTextNode(" FOCUSES FROM ANYWHERE")]));
+  }
+
+  function ribbonMeterPct(pool) {
+    if (!pool.cap_tokens) return 0;
+    return Math.max(0, Math.min(100, pool.projected_billed_tokens / pool.cap_tokens * 100));
+  }
+
+  function renderOpsRibbon(panels) {
+    var ribbon = qs('[data-role="ops-ribbon"]');
+    clear(ribbon);
+    function seg(children) {
+      var b = el("button", { type: "button", "class": "ribbon-seg" }, children);
+      b.addEventListener("click", function () { switchPanel("console"); setTimeout(function () {
+        var target = document.getElementById("console-card-" + (b._scrollTarget || "session"));
+        if (target) target.scrollIntoView({ block: "nearest" });
+      }, 30); });
+      return b;
+    }
+    // SESSION
+    var sessionP = panels.session || {};
+    var open = sessionP.status === "ok" && sessionP.open_session;
+    var sSeg = seg([
+      open ? statusEl("settled", "SESSION") : statusEl("pending", "SESSION"),
+      el("span", { "class": "v", text: open ? (fmtElapsed(open.opened_ts) + " OPEN") : "NONE OPEN" })
+    ]);
+    sSeg._scrollTarget = "session"; ribbon.appendChild(sSeg);
+
+    // POOLS
+    var budgetP = panels.budget || {};
+    var pools = [];
+    (budgetP.accounts || []).forEach(function (a) { pools = pools.concat((a.budget_status && a.budget_status.pools) || []); });
+    var overSoft = pools.filter(function (p) { return p.over_soft; }).length;
+    var pSeg = seg([
+      el("span", { "class": "k", text: "POOLS" }),
+      el("span", { "class": "v", text: pools.length + " TRACKED, " + overSoft + " OVER SOFT" })
+    ]);
+    pSeg._scrollTarget = "budget"; ribbon.appendChild(pSeg);
+
+    // JOBS
+    var jobsP = panels.jobs || {};
+    var running = (jobsP.live_jobs || []).length;
+    var jSeg = seg([
+      running > 0 ? statusEl("live", "JOBS", { pulse: true }) : statusEl("pending", "JOBS"),
+      el("span", { "class": "v", text: running + " RUNNING" })
+    ]);
+    jSeg._scrollTarget = "jobs"; ribbon.appendChild(jSeg);
+
+    // GATES
+    var gatesP = panels.gates || {};
+    var pendingEdits = (gatesP.pending_edits || []).length;
+    var gSeg = seg([
+      pendingEdits > 0 ? statusEl("warn", "GATES") : statusEl("settled", "GATES"),
+      el("span", { "class": "v", text: pendingEdits + " WITH PENDING EDITS" })
+    ]);
+    gSeg._scrollTarget = "gates"; ribbon.appendChild(gSeg);
+
+    // DIAGNOSTICS
+    var doctorP = panels.doctor || {};
+    var dtext = "NEVER RUN";
+    var dstatus = "pending";
+    if (doctorP.status === "ok" && doctorP.last_run) {
+      var checks = doctorP.last_run.checks || [];
+      var fail = checks.filter(function (c) { return c.status === "fail"; }).length;
+      var warn = checks.filter(function (c) { return c.status === "warn"; }).length;
+      dtext = fail + " FAIL, " + warn + " WARN OF " + checks.length;
+      dstatus = fail ? "crit" : warn ? "warn" : "settled";
+    }
+    var dSeg = seg([statusEl(dstatus, "DIAGNOSTICS"), el("span", { "class": "v", text: dtext })]);
+    dSeg._scrollTarget = "doctor"; ribbon.appendChild(dSeg);
+
+    // LAUNCHES
+    var dangling = (budgetP.dangling_bookings || []).length;
+    var lSeg = seg([
+      dangling > 0 ? statusEl("crit", "LAUNCHES") : statusEl("settled", "LAUNCHES"),
+      el("span", { "class": "v", text: dangling + " DANGLING" })
+    ]);
+    lSeg._scrollTarget = "budget"; ribbon.appendChild(lSeg);
+
+    ribbon.appendChild(el("span", { "class": "ribbon-fill" }));
+    ribbon.appendChild(el("span", { "class": "ribbon-as-of", text: "AS OF " + fmtHM(lastBundle && lastBundle.meta ? lastBundle.meta.generated_ts : null) + " UTC" }));
+  }
+
+  function determItemTitle(item) {
+    switch (item.kind) {
+      case "gate_edit": return item.gate_id + " · " + item.edit_id;
+      case "kg_merge": return "merge into " + item.canonical_entity;
+      case "acquisition": return item.title;
+      case "prereg_reveal": return item.title;
+      case "room_escalation": return item.topic;
+      case "memory_conflict": return item.key;
+      default: return item.id;
+    }
+  }
+
+  /* ==========================================================================
+     6. SEARCH
+     ========================================================================== */
+  var SEARCH_SHORTCUTS = [
+    "what absorbs harm before consequences?",
+    "how does a resource pool replenish?",
+    "what triggers a move in this family of systems?"
+  ];
+
+  function initSearchOnce() {
+    var shortcuts = qs('[data-role="search-shortcuts"]');
+    clear(shortcuts);
+    SEARCH_SHORTCUTS.forEach(function (q) {
+      var s = el("span", { "style": "color:var(--ink-2); cursor:pointer;", text: "▸ " + q });
+      s.addEventListener("click", function () { qs('[data-role="search-input"]').value = q; doSearch(q); });
+      shortcuts.appendChild(s);
+    });
+    qs('[data-role="search-form"]').addEventListener("submit", function (e) {
+      e.preventDefault();
+      state.searchK = 12;
+      doSearch(qs('[data-role="search-input"]').value);
+    });
+    qs('[data-role="home-search-form"]').addEventListener("submit", function (e) {
+      e.preventDefault();
+      var q = qs('[data-role="home-search-input"]').value;
+      qs('[data-role="search-input"]').value = q;
+      switchPanel("search");
+      state.searchK = 12;
+      doSearch(q);
+    });
+  }
+
+  var lastSearchQuery = "";
+  function doSearch(q) {
+    lastSearchQuery = q || "";
+    var mode = qs('[data-role="search-mode"]').value || "auto";
+    var excluded = Object.keys(state.searchLicenseExclude).filter(function (t) { return state.searchLicenseExclude[t]; });
+    var params = { q: q, k: state.searchK, mode: mode };
+    runSearch(params).then(function (resp) { renderSearchResults(resp, excluded); });
+  }
+
+  function renderSearchResults(resp, excludedTiers) {
+    var telemetry = qs('[data-role="search-telemetry"]');
+    var countEl = qs('[data-role="search-results-count"]');
+    var list = qs('[data-role="search-results-list"]');
+    var facets = qs('[data-role="search-license-facets"]');
+    clear(telemetry); clear(list); clear(facets);
+
+    if (resp.status === "static_no_engine") {
+      list.appendChild(el("div", { "class": "warn-callout" }, [el("div", { "class": "head", text: "NO LIVE ENGINE" }), el("div", { "class": "body", text: resp.message })]));
+      countEl.textContent = "0 RESULTS";
+      return;
+    }
+    if (resp.status === "invalid_mode" || resp.status === "not_initialized") {
+      list.appendChild(el("div", { "class": "warn-callout" }, [el("div", { "class": "head", text: (resp.status || "").toUpperCase() }), el("div", { "class": "body", text: resp.message || "" })]));
+      countEl.textContent = "0 RESULTS";
+      return;
+    }
+
+    var stats = resp.stats || {};
+    var order = ["fts_candidates", "vector_scored", "graph_candidates", "summary_candidates"];
+    var labels = { fts_candidates: "FTS5 BM25", vector_scored: "VECTOR COSINE", graph_candidates: "GRAPH", summary_candidates: "SUMMARY" };
+    order.forEach(function (k, i) {
+      if (stats[k] === undefined) return;
+      if (i > 0) telemetry.appendChild(el("span", { "class": "arrow", text: "→" }));
+      telemetry.appendChild(el("span", { "class": "seg" }, [el("span", { "class": "k", text: labels[k] }), document.createTextNode(" "), el("span", { "class": "v", text: String(stats[k]) })]));
+    });
+    telemetry.appendChild(el("span", { "class": "fill" }));
+    telemetry.appendChild(el("span", { "class": "seg", text: (stats.elapsed_ms !== undefined ? stats.elapsed_ms.toFixed(2) : "0") + " ms" }));
+    telemetry.appendChild(el("span", { "class": "seg", text: "tiers: " + ((resp.tiers_used || []).join(", ") || "none") }));
+
+    var results = resp.results || [];
+    var visible = results.filter(function (r) { return excludedTiers.indexOf(r.citation.license_tier) === -1; });
+    countEl.textContent = visible.length + " OF " + results.length + " RESULTS" + (results.length === 0 ? " — try a broader query or a different mode" : "");
+
+    if (visible.length === 0 && lastSearchQuery) {
+      list.appendChild(el("div", { "class": "empty", text: "no results for “" + lastSearchQuery + "” in this mode. try AUTO/HYBRID, or a broader phrase." }));
+    }
+    visible.forEach(function (r, i) {
+      var row = el("div", { "class": "result-row" + (i === 0 ? " is-top" : "") });
+      var left = el("div", { "style": "display:flex; flex-direction:column; gap:5px;" }, [
+        el("span", { "class": "score", text: r.score.toFixed(4) }),
+        chip(r.fenced ? "■ FENCED" : "■ CHUNK", r.fenced ? "crit" : "live"),
+        el("span", { "class": "tier-tag", text: "RANK #" + r.rank })
+      ]);
+      var text = (r.text || "").replace("<untrusted-document-content>", "").replace("</untrusted-document-content>", "").trim();
+      var right = el("div", { "style": "display:flex; flex-direction:column; gap:6px; min-width:0;" });
+      right.appendChild(el("span", { "class": "title", text: r.citation.title || r.source_id }));
+      var q = el("span", { "class": "anchor-quote" + (r.fenced ? " anchor-quote--crit" : ""), text: "“" + (r.citation.quote || "") + "”" });
+      makePeekable(q, { quote: r.citation.quote, meta: (r.citation.source_id || "") + " · page " + (r.citation.anchor && r.citation.anchor.page) + " · chars " + (r.citation.anchor && r.citation.anchor.char_start) + "–" + (r.citation.anchor && r.citation.anchor.char_end), fenced: r.fenced });
+      right.appendChild(q);
+      right.appendChild(el("span", { "class": "snippet", text: text.slice(0, 320) }));
+      var meta = el("div", { "class": "meta" });
+      meta.appendChild(el("span", { text: r.citation.source_id }));
+      if (r.citation.anchor) meta.appendChild(el("span", { text: "PAGE " + r.citation.anchor.page }));
+      meta.appendChild(chip(r.citation.license_tier, r.fenced ? "crit" : "settled"));
+      right.appendChild(meta);
+      row.appendChild(left); row.appendChild(right);
+      list.appendChild(row);
+    });
+    if (results.length >= state.searchK && state.searchK < 50) {
+      var more = el("button", { type: "button", "class": "btn btn--secondary", text: (results.length) + " RESULTS — SHOW MORE" });
+      more.addEventListener("click", function () { state.searchK = Math.min(50, state.searchK + 12); doSearch(lastSearchQuery); });
+      list.appendChild(el("div", { "style": "padding:12px 8px;" }, [more]));
+    }
+
+    var tierCounts = {};
+    results.forEach(function (r) { var t = r.citation.license_tier; tierCounts[t] = (tierCounts[t] || 0) + 1; });
+    if (Object.keys(tierCounts).length === 0) facets.appendChild(el("div", { "class": "empty", text: "no results yet" }));
+    Object.keys(tierCounts).forEach(function (tier) {
+      var row = el("div", { "class": "facet-row" });
+      var excluded = !!state.searchLicenseExclude[tier];
+      row.appendChild(el("span", { text: excluded ? "○" : "✓", "style": "color:" + (excluded ? "var(--ink-3)" : "var(--settled)") + "; cursor:pointer;" }));
+      var nameEl = el("span", { "class": "name", text: tier });
+      row.appendChild(nameEl);
+      row.appendChild(el("span", { "class": "n", text: String(tierCounts[tier]) }));
+      row.style.cursor = "pointer";
+      row.addEventListener("click", function () {
+        state.searchLicenseExclude[tier] = !state.searchLicenseExclude[tier];
+        renderSearchResults(resp, Object.keys(state.searchLicenseExclude).filter(function (t) { return state.searchLicenseExclude[t]; }));
+      });
+      facets.appendChild(row);
+    });
+  }
+
+  /* ==========================================================================
+     7. FEED
+     ========================================================================== */
+  function loadFeed() {
+    fetchPanel("feed", { thread_id: state.feedThreadId }).then(renderFeed);
+  }
+  function renderFeed(p) {
+    var threadList = qs('[data-role="feed-thread-list"]');
+    var header = qs('[data-role="feed-thread-header"]');
+    var posts = qs('[data-role="feed-post-list"]');
+    var unreadCount = qs('[data-role="feed-unread-count"]');
+    clear(threadList); clear(header); clear(posts);
+    if (!p || p.status !== "ok") {
+      posts.appendChild(el("div", { "class": "warn-callout" }, [el("div", { "class": "body", text: p ? p.message : "no data" })]));
+      return;
+    }
+    state.feedThreadId = p.active_thread_id;
+    var transmitBtn = qs('[data-role="feed-transmit-btn"]');
+    transmitBtn.disabled = !(writesEnabled() && p.active_thread_id);
+    transmitBtn.title = writesEnabled() ? "" : "live mode + a write token are required (static snapshots are read-only)";
+    unreadCount.textContent = (p.unread_directives || []).length + " UNREAD DIRECTIVES";
+    (p.threads || []).forEach(function (t) {
+      var row = el("div", { "class": "thread-row" + (t.thread_id === p.active_thread_id ? " is-active" : "") }, [
+        el("span", { "class": "name", text: t.title })
+      ]);
+      row.addEventListener("click", function () { state.feedThreadId = t.thread_id; loadFeed(); });
+      threadList.appendChild(row);
+    });
+
+    var activeThread = (p.threads || []).find(function (t) { return t.thread_id === p.active_thread_id; });
+    header.appendChild(el("span", { "class": "t", text: activeThread ? activeThread.title : "no thread" }));
+    if (activeThread) header.appendChild(el("span", { "class": "m", text: "created " + fmtDate(activeThread.created_ts) + " · " + activeThread.status }));
+
+    if ((p.unread_directives || []).length) {
+      var dirCard = el("div", { "class": "directive-card" });
+      dirCard.appendChild(el("div", { "class": "post-card-head" }, [
+        el("span", { "class": "chip--role", "style": "background:var(--crit-fill); color:var(--bg); font-family:var(--font-mono); font-size:10px; padding:2px 7px; font-weight:600;", text: "OPERATOR" }),
+        el("span", { text: "INBOX · " + p.unread_directives.length + " unread" })
+      ]));
+      var dirBody = el("div", { "class": "post-body-single" });
+      p.unread_directives.forEach(function (d) {
+        dirBody.appendChild(el("div", { "style": "font-size:13px; color:var(--ink-hi); line-height:1.5; margin-bottom:8px;", text: d.body }));
+        dirBody.appendChild(el("div", { "class": "anchor-meta", "style": "margin-bottom:10px;", text: fmtHM(d.ts) + " UTC · source: " + d.source }));
+      });
+      dirCard.appendChild(dirBody);
+      posts.appendChild(dirCard);
+    }
+
+    if (!(p.posts || []).length) { posts.appendChild(el("div", { "class": "empty", text: "no posts in this thread yet" })); return; }
+    p.posts.forEach(function (post) {
+      var kind = (post.author || "").split(":", 1)[0];
+      var card = el("div", { "class": "post-card" });
+      var head = el("div", { "class": "post-card-head" }, [
+        chip(kind.toUpperCase(), "settled"),
+        el("span", { text: post.author }),
+        el("span", { "class": "fill", "style": "flex-grow:1;" }),
+        el("span", { text: fmtHM(post.ts) + " UTC" })
+      ]);
+      card.appendChild(head);
+      if (post.translation) {
+        var split = el("div", { "class": "post-body-split" });
+        var origCol = el("div", { "class": "post-body-col original" }, [el("div", { "class": "label", text: "AS POSTED" }), el("div", { "class": "text", text: post.body })]);
+        var faith = post.translation.faithfulness_score;
+        var trLabel = "PLAIN ENGLISH · v" + post.translation.translator_version + (faith !== null && faith !== undefined ? " · faithfulness " + faith : "");
+        var trCol = el("div", { "class": "post-body-col translation" }, [el("div", { "class": "label", text: trLabel }), el("div", { "class": "text", text: post.translation.body })]);
+        split.appendChild(origCol); split.appendChild(trCol);
+        card.appendChild(split);
+      } else {
+        var single = el("div", { "class": "post-body-single" }, [
+          el("div", { "class": "text", text: post.body }),
+          el("div", { "class": "note-strip", "style": "margin-top:8px;", text: p.translator_table_available ? "PLAIN ENGLISH — not yet translated" : "PLAIN ENGLISH — unavailable, this program predates schema v4" })
+        ]);
+        card.appendChild(single);
+      }
+      posts.appendChild(card);
+    });
+  }
+  qs('[data-role="feed-order-arrived"]').addEventListener("click", function () {});
+
+  wireWriteAction(
+    qs('[data-role="feed-transmit-btn"]'),
+    qs('[data-role="feed-compose-note"]'),
+    "feed-post",
+    function () {
+      return { thread_id: state.feedThreadId, body: qs('[data-role="feed-compose-input"]').value };
+    },
+    ["thread_id", "body"],
+    { body: qs('[data-role="feed-compose-input"]') },
+    function () {
+      qs('[data-role="feed-compose-input"]').value = "";
+      loadFeed();
+    }
+  );
+
+  /* ==========================================================================
+     8. ROOMS
+     ========================================================================== */
+  function buildRoomScoreForm(roomId, dpId, onCancel) {
+    var wrap = el("div", { "class": "write-form" });
+    var pctInput = el("input", { type: "number", "class": "write-input", min: "0", max: "100", step: "0.1", placeholder: "agreement %", style: "width:120px;" });
+    var noteInput = el("input", { type: "text", "class": "write-input", placeholder: "note (optional)", style: "flex-grow:1;" });
+    var launchInput = el("input", { type: "text", "class": "write-input", placeholder: "your launch_id", style: "width:220px;" });
+    var msg = el("div", { "class": "write-form-msg" });
+    var submitBtn = el("button", { type: "button", "class": "btn btn--primary", text: "SUBMIT SCORE" });
+    var cancelBtn = el("button", { type: "button", "class": "btn btn--secondary", text: "CANCEL" });
+    cancelBtn.addEventListener("click", function () { hide(wrap); if (onCancel) onCancel(); });
+    wrap.appendChild(el("div", { "class": "note-strip", text: "discussion point: " + (dpId || "(none selected)") }));
+    wrap.appendChild(el("div", { "class": "write-form-row" }, [pctInput, noteInput]));
+    wrap.appendChild(el("div", { "class": "write-form-row" }, [launchInput, submitBtn, cancelBtn]));
+    wrap.appendChild(msg);
+    wireWriteAction(
+      submitBtn, msg, "room-score",
+      function () { return { room_id: roomId, dp_id: dpId, agreement_pct: pctInput.value, by_launch: launchInput.value, note: noteInput.value }; },
+      ["room_id", "dp_id", "agreement_pct", "by_launch"],
+      { agreement_pct: pctInput, by_launch: launchInput },
+      function () { loadRooms(); }
+    );
+    return wrap;
+  }
+
+  function buildRoomFreezeForm(roomId, onCancel) {
+    var wrap = el("div", { "class": "write-form" });
+    var reasonInput = el("textarea", { "class": "write-textarea", rows: "2", placeholder: "reason for freeze-and-escalate (required)" });
+    var launchInput = el("input", { type: "text", "class": "write-input", placeholder: "your launch_id", style: "width:220px;" });
+    var msg = el("div", { "class": "write-form-msg" });
+    var submitBtn = el("button", { type: "button", "class": "btn btn--destructive", text: "CONFIRM FREEZE" });
+    var cancelBtn = el("button", { type: "button", "class": "btn btn--secondary", text: "CANCEL" });
+    cancelBtn.addEventListener("click", function () { hide(wrap); if (onCancel) onCancel(); });
+    wrap.appendChild(reasonInput);
+    wrap.appendChild(el("div", { "class": "write-form-row" }, [launchInput, submitBtn, cancelBtn]));
+    wrap.appendChild(msg);
+    wireWriteAction(
+      submitBtn, msg, "room-freeze",
+      function () { return { room_id: roomId, by_launch: launchInput.value, reason: reasonInput.value }; },
+      ["room_id", "by_launch", "reason"],
+      { by_launch: launchInput, reason: reasonInput },
+      function () { loadRooms(); }
+    );
+    return wrap;
+  }
+
+  /** Refreshes the persistent "POST TURN" compose bar's discussion-point
+   * options (preserving the current selection when it still names a real
+   * dp) and the submit button's enabled state -- called from every
+   * `renderRooms` exit path, including the early "no data"/"no rooms yet"
+   * returns, so a stale dp list from a previously-viewed room never lingers. */
+  function setRoomTurnComposeEnabled(enabled, dps) {
+    var select = qs('[data-role="room-turn-dp"]');
+    var btn = qs('[data-role="room-turn-btn"]');
+    var prevValue = select.value;
+    clear(select);
+    (dps || []).forEach(function (dp) {
+      select.appendChild(el("option", { value: dp.dp_id, text: dp.dp_id + ": " + (dp.prompt || "").slice(0, 40) }));
+    });
+    var hasDps = !!(dps && dps.length);
+    if (hasDps) {
+      var stillValid = dps.some(function (dp) { return dp.dp_id === prevValue; });
+      select.value = stillValid ? prevValue : dps[0].dp_id;
+    }
+    btn.disabled = !(enabled && hasDps);
+    btn.title = enabled ? "" : "live mode, a write token, and an OPEN room are required";
+  }
+
+  function loadRooms() {
+    fetchPanel("rooms", { room_id: state.roomsRoomId }).then(renderRooms);
+  }
+  function renderRooms(p) {
+    var list = qs('[data-role="rooms-list"]');
+    var count = qs('[data-role="rooms-count"]');
+    var header = qs('[data-role="rooms-transcript-header"]');
+    var turnsEl = qs('[data-role="rooms-turns"]');
+    var side = qs('[data-role="rooms-side"]');
+    clear(list); clear(header); clear(turnsEl); clear(side);
+    if (!p || p.status !== "ok") {
+      turnsEl.appendChild(el("div", { "class": "warn-callout" }, [el("div", { "class": "body", text: p ? p.message : "no data" })]));
+      setRoomTurnComposeEnabled(false, []);
+      return;
+    }
+    state.roomsRoomId = p.active_room_id;
+    count.textContent = String((p.rooms || []).length);
+
+    (p.rooms || []).forEach(function (r) {
+      var stateEl2 = r.state === "open" ? statusEl("live", "OPEN", { pulse: true }) : r.state === "frozen" ? statusEl("crit", "FROZEN") : statusEl("settled", "CONVERGED");
+      var row = el("div", { "class": "room-row" + (r.room_id === p.active_room_id ? " is-active" : "") }, [
+        el("div", { "class": "topline" }, [el("span", { "class": "id", text: r.room_id }), stateEl2]),
+        el("div", { "class": "sub", text: (r.topic || "").slice(0, 60) })
+      ]);
+      row.addEventListener("click", function () { state.roomsRoomId = r.room_id; loadRooms(); });
+      list.appendChild(row);
+    });
+
+    if (!p.active_room) {
+      turnsEl.appendChild(el("div", { "class": "empty", text: "no rooms yet" }));
+      setRoomTurnComposeEnabled(false, []);
+      return;
+    }
+    header.appendChild(el("span", { "class": "t", text: p.active_room.room_id }));
+    header.appendChild(el("span", { "class": "m", text: p.active_room.topic }));
+    if (p.freeze_reason) header.appendChild(el("span", { "class": "m", "style": "color:var(--crit-text);", text: "FROZEN: " + p.freeze_reason }));
+
+    if (p.detail_error) {
+      turnsEl.appendChild(el("div", { "class": "warn-callout" }, [el("div", { "class": "head", text: "COULD NOT READ THIS ROOM'S DISCUSSION POINTS" }), el("div", { "class": "body", text: p.detail_error })]));
+    }
+    if (!(p.turns || []).length) turnsEl.appendChild(el("div", { "class": "empty", text: "no turns recorded yet" }));
+    var authorLabel = {}, nextLabel = 1;
+    (p.turns || []).forEach(function (t) {
+      if (!authorLabel[t.author_launch]) authorLabel[t.author_launch] = "P" + (nextLabel++);
+      var row = el("div", { "class": "turn-row" }, [
+        el("span", { "class": "turn-badge", "style": "background:var(--ink-2); color:var(--bg);", text: authorLabel[t.author_launch] }),
+        el("div", { "class": "turn-body" }, [document.createTextNode(t.body), el("div", { "class": "turn-meta", text: "SEQ " + t.seq + " · " + fmtHM(t.ts) + " UTC · " + t.author_launch })])
+      ]);
+      turnsEl.appendChild(row);
+    });
+    if ((p.moderator_events || []).length) {
+      var modCard = el("div", { "class": "card", "style": "margin-top:8px;" });
+      modCard.appendChild(el("div", { "class": "card-header" }, [el("span", { "class": "title", text: "MODERATOR EVENT LOG" }), el("span", { "class": "sub", text: p.moderator_events.length + " events, oldest first" })]));
+      var modBody = el("div", { "class": "card-body", "style": "display:flex; flex-direction:column; gap:6px;" });
+      p.moderator_events.forEach(function (ev) {
+        modBody.appendChild(el("div", { "class": "mod-row" }, [el("span", { text: ev.type.toUpperCase() }), el("span", { "class": "fill" }), el("span", { "style": "color:var(--ink-3);", text: fmtHM(ev.ts) + " UTC" })]));
+      });
+      modCard.appendChild(modBody);
+      turnsEl.appendChild(modCard);
+    }
+
+    // ---- convergence side panel ----
+    var roomBar = openRoom_bar(p.active_room);
+    side.appendChild(el("div", { "class": "subbar", "style": "padding:0 13px;" }, [
+      el("span", { "class": "t", text: "CONVERGENCE" }), el("span", { "class": "fill" }),
+      el("span", { "class": "m", text: roomBar !== null ? ("BAR " + roomBar + "%, FIXED") : "BAR NOT AVAILABLE" })
+    ]));
+    var seriesWrap = el("div", { "style": "padding:13px; border-bottom:1px solid var(--hairline-soft);" });
+    var dpIds = Object.keys(p.dp_agreement_series || {});
+    var selectedDp = state.roomsSelectedDp && dpIds.indexOf(state.roomsSelectedDp) !== -1 ? state.roomsSelectedDp : dpIds[dpIds.length - 1];
+    if (selectedDp) {
+      var series = p.dp_agreement_series[selectedDp];
+      seriesWrap.appendChild(drawTrajectory(series, roomBar));
+      seriesWrap.appendChild(el("div", { "class": "note-strip", "style": "margin-top:6px;", text: selectedDp + ": " + series.length + " scoring round(s) recorded." }));
+    } else {
+      seriesWrap.appendChild(el("div", { "class": "empty", text: "no scoring rounds yet" }));
+    }
+    side.appendChild(seriesWrap);
+
+    var ladder = el("div", { "style": "padding:11px 13px; display:flex; flex-direction:column; gap:8px; border-bottom:1px solid var(--hairline-soft);" });
+    var perDpMap = {};
+    ((p.convergence && p.convergence.per_dp) || []).forEach(function (d) { perDpMap[d.dp_id] = d; });
+    var dps = [];
+    try { dps = (JSON.parse(p.active_room.dps).discussion_points || []); } catch (e) {}
+    dps.forEach(function (dp) {
+      var scored = perDpMap[dp.dp_id];
+      var row = el("div", { "class": "dp-ladder-row" + (dp.dp_id === selectedDp ? " is-active" : "") });
+      row.appendChild(scored ? (scored.converged ? statusEl("settled", "") : statusEl("warn", "")) : statusEl("notscored", ""));
+      row.appendChild(el("span", { "class": "name", text: dp.dp_id + " " + (dp.prompt || "").slice(0, 34) }));
+      row.appendChild(el("span", { "style": scored ? (scored.converged ? "color:var(--settled)" : "color:var(--warn)") : "color:var(--ink-3)", text: scored ? scored.agreement_pct.toFixed(0) + "%" : "NOT SCORED" }));
+      row.style.cursor = "pointer";
+      row.addEventListener("click", function () { state.roomsSelectedDp = dp.dp_id; renderRooms(p); });
+      ladder.appendChild(row);
+    });
+    ladder.appendChild(el("div", { "class": "note-strip", "style": "border-top:1px solid var(--hairline-soft); padding-top:8px;", text: "NOT SCORED IS NOT PASSING. \"ALL SCORED\" AND \"ALL CONVERGED\" ARE TWO SEPARATE FACTS: " + ((p.convergence && p.convergence.all_scored) ? "SCORED" : "NOT ALL SCORED") + ", " + ((p.convergence && p.convergence.all_converged) ? "CONVERGED" : "NOT ALL CONVERGED") + "." }));
+    side.appendChild(ladder);
+
+    var actions = el("div", { "style": "margin-top:auto; padding:12px 13px; display:flex; flex-direction:column; gap:9px;" });
+    var canWrite = writesEnabled();
+    var roomOpen = p.active_room.state === "open";
+
+    var scoreBtn = el("button", { type: "button", "class": "btn btn--secondary", text: "SCORE THE ROUND" });
+    var scoreForm = buildRoomScoreForm(p.active_room_id, selectedDp, function () { hide(scoreForm); });
+    hide(scoreForm);
+    scoreBtn.disabled = !(canWrite && selectedDp);
+    scoreBtn.title = !canWrite ? "static snapshot or no write token" : (selectedDp ? "" : "select a discussion point in the ladder above first");
+    scoreBtn.addEventListener("click", function () { if (scoreForm.classList.contains("is-hidden")) { show(scoreForm); hide(freezeForm); } else { hide(scoreForm); } });
+
+    var freezeBtn = el("button", { type: "button", "class": "btn btn--destructive", text: "FREEZE AND ESCALATE" });
+    var freezeForm = buildRoomFreezeForm(p.active_room_id, function () { hide(freezeForm); });
+    hide(freezeForm);
+    freezeBtn.disabled = !(canWrite && roomOpen);
+    freezeBtn.title = !canWrite ? "static snapshot or no write token" : (roomOpen ? "" : "room is " + p.active_room.state + " -- freeze only applies to an open room");
+    freezeBtn.addEventListener("click", function () { if (freezeForm.classList.contains("is-hidden")) { show(freezeForm); hide(scoreForm); } else { hide(freezeForm); } });
+
+    var exportBtn = el("button", {
+      type: "button", "class": "btn btn--secondary", disabled: "disabled",
+      title: "no server-side output-path picker in this build -- use `trialerror room export --id ... --out ...`",
+      text: "EXPORT TRANSCRIPT",
+    });
+
+    actions.appendChild(scoreBtn); actions.appendChild(scoreForm);
+    actions.appendChild(freezeBtn); actions.appendChild(freezeForm);
+    actions.appendChild(exportBtn);
+    if (!canWrite) actions.appendChild(el("div", { "class": "note-strip", text: "STATIC SNAPSHOT OR NO WRITE TOKEN: THESE ACTIONS ARE READ-ONLY HERE." }));
+    side.appendChild(actions);
+
+    setRoomTurnComposeEnabled(canWrite && roomOpen, dps);
+  }
+
+  wireWriteAction(
+    qs('[data-role="room-turn-btn"]'),
+    qs('[data-role="room-turn-note"]'),
+    "room-turn",
+    function () {
+      return {
+        room_id: state.roomsRoomId,
+        dp_id: qs('[data-role="room-turn-dp"]').value,
+        launch_id: qs('[data-role="room-turn-launch"]').value,
+        body: qs('[data-role="room-turn-body"]').value,
+      };
+    },
+    ["room_id", "dp_id", "launch_id", "body"],
+    { launch_id: qs('[data-role="room-turn-launch"]'), body: qs('[data-role="room-turn-body"]') },
+    function () {
+      qs('[data-role="room-turn-body"]').value = "";
+      loadRooms();
+    }
+  );
+
+  function drawTrajectory(series, bar) {
+    var w = 260, h = 100, padL = 26, padB = 16, padT = 8;
+    var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 " + w + " " + h);
+    svg.setAttribute("width", "100%"); svg.setAttribute("height", "110");
+    function y(pct) { return padT + (100 - pct) / 100 * (h - padT - padB); }
+    function line(x1, y1, x2, y2, stroke, dash) {
+      var l = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      l.setAttribute("x1", x1); l.setAttribute("y1", y1); l.setAttribute("x2", x2); l.setAttribute("y2", y2);
+      l.setAttribute("stroke", stroke); l.setAttribute("stroke-width", "1");
+      if (dash) l.setAttribute("stroke-dasharray", dash);
+      return l;
+    }
+    // the bar threshold line is only drawn when this room's convergence_bar_pct
+    // is actually known -- an unreadable dps shape means "not available", not
+    // an invented 90% line.
+    if (typeof bar === "number") {
+      svg.appendChild(line(padL, y(bar), w - 4, y(bar), "#E7F0E9", "4 3"));
+      var txt = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      txt.setAttribute("x", "0"); txt.setAttribute("y", y(bar) + 4); txt.setAttribute("font-size", "9"); txt.setAttribute("fill", "#E7F0E9");
+      txt.textContent = String(bar);
+      svg.appendChild(txt);
+    }
+    if (series.length) {
+      var n = series.length;
+      var stepX = n > 1 ? (w - padL - 8) / (n - 1) : 0;
+      var pts = series.map(function (s, i) { return (padL + i * stepX) + "," + y(s.agreement_pct); }).join(" ");
+      var poly = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+      poly.setAttribute("points", pts); poly.setAttribute("fill", "none");
+      poly.setAttribute("stroke", "#E0A92A"); poly.setAttribute("stroke-width", "2");
+      svg.appendChild(poly);
+      var last = series[n - 1];
+      var c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      c.setAttribute("cx", padL + (n - 1) * stepX); c.setAttribute("cy", y(last.agreement_pct)); c.setAttribute("r", "3.4");
+      c.setAttribute("fill", last.converged ? "#84B592" : "#E0A92A");
+      svg.appendChild(c);
+    }
+    var wrap = el("div", {});
+    wrap.appendChild(svg);
+    return wrap;
+  }
+
+  /* ==========================================================================
+     9. DETERMINATIONS
+     ========================================================================== */
+  function loadDeterminations() { fetchPanel("determinations").then(renderDeterminations); }
+  function renderDeterminations(p) {
+    var list = qs('[data-role="determ-list"]');
+    var summary = qs('[data-role="determ-summary"]');
+    var detail = qs('[data-role="determ-detail"]');
+    clear(list); clear(detail);
+    if (!p || p.status !== "ok") { detail.appendChild(el("div", { "class": "warn-callout" }, [el("div", { "class": "body", text: p ? p.message : "no data" })])); return; }
+    summary.textContent = p.blocking_count + " BLOCKING · " + p.total + " OPEN";
+    state.determItemsFlat = [];
+    if (!state.determSelectedId && p.items.length) state.determSelectedId = p.items[0].id;
+
+    KIND_ORDER.forEach(function (kind) {
+      var items = p.items.filter(function (i) { return i.kind === kind; });
+      if (!items.length) return;
+      list.appendChild(el("div", { "class": "determ-group-label", "style": "color:" + (items.some(function (i) { return i.blocking; }) ? "var(--crit-text)" : "var(--warn)") + ";", text: KIND_LABELS[kind] }));
+      items.forEach(function (item) {
+        state.determItemsFlat.push(item.id);
+        var row = el("div", { "class": "determ-item" + (item.id === state.determSelectedId ? " is-active" : "") });
+        row.appendChild(el("div", { "class": "topline" }, [el("span", { "class": "id", text: determItemTitle(item) }), el("span", { "class": "fill" }), item.blocking ? el("span", { "style": "color:var(--crit-text); font-family:var(--font-mono); font-size:10px;", text: "BLOCKING" }) : null]));
+        row.appendChild(el("div", { "class": "body", text: item.consequence }));
+        row.addEventListener("click", function () { state.determSelectedId = item.id; renderDeterminations(p); });
+        row.id = "determ-item-" + item.id.replace(/[^a-zA-Z0-9]/g, "_");
+        list.appendChild(row);
+      });
+    });
+
+    var selected = p.items.find(function (i) { return i.id === state.determSelectedId; });
+    if (!selected) { detail.appendChild(el("div", { "class": "empty", text: "select an item from the queue" })); return; }
+    renderDeterminationDetail(detail, selected);
+  }
+
+  function renderDeterminationDetail(detail, item) {
+    var header = el("div", { "class": "subbar" }, [
+      el("span", { "class": "t", text: determItemTitle(item) }),
+      item.blocking ? chip("BLOCKING", "crit") : chip(item.kind, "neutral"),
+      el("span", { "class": "fill" })
+    ]);
+    detail.appendChild(header);
+    var body = el("div", { "class": "panel-body-pad" });
+    var summaryCard = el("div", { "class": "card card--accent-crit" }, [
+      el("div", { "class": "card-header" }, [el("span", { "class": "sub", "style": "color:var(--crit-text); letter-spacing:0.12em;", text: "WHAT'S BEING ASKED" })]),
+      el("div", { "class": "card-body", "style": "font-size:14px; color:var(--ink-hi); line-height:1.5;", text: (item.text || item.reason || item.consequence) })
+    ]);
+    body.appendChild(summaryCard);
+
+    var fieldsCard = el("div", { "class": "card" });
+    fieldsCard.appendChild(el("div", { "class": "card-header" }, [el("span", { "class": "title", text: "DETAIL" })]));
+    var fieldsBody = el("div", { "class": "card-body" });
+    fieldsCard.appendChild(fieldsBody);
+    fieldsBody.appendChild(renderObjectG(item));
+    body.appendChild(fieldsCard);
+
+    var whyCard = el("div", { "class": "card" });
+    whyCard.appendChild(el("div", { "class": "card-header" }, [el("span", { "class": "title", text: "CONSEQUENCE" }), el("span", { "class": "sub", text: "what resolving this item unblocks" })]));
+    whyCard.appendChild(el("div", { "class": "card-body", "style": "font-size:12.5px; line-height:1.5; color:var(--ink);", text: item.consequence }));
+    body.appendChild(whyCard);
+
+    var actions = el("div", { "class": "card" });
+    var actionsBody = el("div", { "class": "card-body", "style": "display:flex; flex-direction:column; gap:10px;" });
+    actionsBody.appendChild(buildDeterminationActions(item));
+    actions.appendChild(actionsBody);
+    actions.appendChild(el("div", { "class": "card-footer", text: "USE THE CLI VERB THIS ITEM'S KIND MAPS TO FOR ANYTHING NOT WIRED HERE (trialerror gate / trialerror extract / trialerror source / trialerror prereg / trialerror rooms / trialerror memory)." }));
+    body.appendChild(actions);
+    detail.appendChild(body);
+  }
+
+  //: item.kind -> a one-line reason a kind's buttons stay disabled --
+  //: either the underlying module genuinely has no callable for it, or a
+  //: real callable exists but resolving it wasn't in this build's named
+  //: write-action list (see trialerror.dashboard.writes' own module docstring).
+  var DETERM_DISABLED_REASONS = {
+    prereg_reveal: "trialerror.verify.prereg has a reveal callable, but pre-registration reveal wasn't in this build's write-action list.",
+    room_escalation: "resolve from the Rooms panel instead (post a turn on the frozen room's discussion point, or converge-check) -- no direct \"resolve escalation\" callable exists.",
+    memory_conflict: "trialerror.memory.merge.resolve_conflict exists, but memory-conflict resolution wasn't in this build's write-action list.",
+  };
+
+  function buildDeterminationActions(item) {
+    var writable = writesEnabled();
+    var wrap = el("div", { "class": "write-form", "style": "border:none; background:none; padding:0;" });
+    var msg = el("div", { "class": "write-form-msg" });
+
+    function launchField(placeholder) {
+      return el("input", { type: "text", "class": "write-input", placeholder: placeholder || "your launch_id", style: "width:230px;" });
+    }
+    function disabledPair(reason) {
+      wrap.appendChild(el("div", { "class": "btn-row" }, [
+        el("button", { type: "button", "class": "btn btn--primary", disabled: "disabled", title: reason, text: "VERIFY / ACCEPT" }),
+        el("button", { type: "button", "class": "btn btn--secondary", disabled: "disabled", title: reason, text: "SEND BACK / REJECT" }),
+      ]));
+      wrap.appendChild(el("div", { "class": "note-strip", text: reason }));
+    }
+
+    if (item.kind === "gate_edit") {
+      var byLaunch = launchField();
+      var noteInput = el("input", { type: "text", "class": "write-input", placeholder: "verified note (optional)", style: "flex-grow:1;" });
+      var verifyBtn = el("button", { type: "button", "class": "btn btn--primary", text: "VERIFY EDIT" });
+      var rejectBtn = el("button", {
+        type: "button", "class": "btn btn--secondary", disabled: "disabled",
+        title: "trialerror.artifacts.gates has no reject/send-back callable for a blocking edit -- only verify_edit exists.",
+        text: "SEND BACK / REJECT",
+      });
+      verifyBtn.disabled = !writable;
+      wrap.appendChild(el("div", { "class": "write-form-row" }, [byLaunch, noteInput]));
+      wrap.appendChild(el("div", { "class": "btn-row" }, [verifyBtn, rejectBtn]));
+      wireWriteAction(
+        verifyBtn, msg, "verify-edit",
+        function () { return { gate_id: item.gate_id, edit_id: item.edit_id, by_launch: byLaunch.value, verified_note: noteInput.value }; },
+        ["gate_id", "edit_id", "by_launch"], { by_launch: byLaunch },
+        function () { state.determSelectedId = null; loadDeterminations(); }
+      );
+    } else if (item.kind === "kg_merge") {
+      var byLaunch2 = launchField();
+      var acceptBtn = el("button", { type: "button", "class": "btn btn--primary", text: "ACCEPT MERGE" });
+      var rejectBtn2 = el("button", { type: "button", "class": "btn btn--secondary", text: "REJECT MERGE" });
+      acceptBtn.disabled = !writable; rejectBtn2.disabled = !writable;
+      wrap.appendChild(el("div", { "class": "write-form-row" }, [byLaunch2]));
+      wrap.appendChild(el("div", { "class": "btn-row" }, [acceptBtn, rejectBtn2]));
+      wireWriteAction(
+        acceptBtn, msg, "merge-accept",
+        function () { return { prop_id: item.id, by_launch: byLaunch2.value }; },
+        ["prop_id", "by_launch"], { by_launch: byLaunch2 },
+        function () { state.determSelectedId = null; loadDeterminations(); }
+      );
+      wireWriteAction(
+        rejectBtn2, msg, "merge-reject",
+        function () { return { prop_id: item.id, by_launch: byLaunch2.value }; },
+        ["prop_id", "by_launch"], { by_launch: byLaunch2 },
+        function () { state.determSelectedId = null; loadDeterminations(); }
+      );
+    } else if (item.kind === "acquisition") {
+      var launchOpt = launchField("your launch_id (optional)");
+      var canDeliver = writable && item.request_state === "requested";
+      var deliverBtn = el("button", { type: "button", "class": "btn btn--primary", text: "MARK DELIVERED" });
+      deliverBtn.disabled = !canDeliver;
+      deliverBtn.title = canDeliver || !writable ? "" : ("only legal from request_state='requested' -- this source is " + item.request_state);
+      var otherBtn = el("button", {
+        type: "button", "class": "btn btn--secondary", disabled: "disabled",
+        title: "only the delivered transition is wired from the dashboard -- use `trialerror ingest request --to <state>` for others.",
+        text: "OTHER TRANSITION",
+      });
+      wrap.appendChild(el("div", { "class": "write-form-row" }, [launchOpt]));
+      wrap.appendChild(el("div", { "class": "btn-row" }, [deliverBtn, otherBtn]));
+      wireWriteAction(
+        deliverBtn, msg, "acquisition-delivered",
+        function () { return { source_id: item.id, launch_id: launchOpt.value }; },
+        ["source_id"], {},
+        function () { state.determSelectedId = null; loadDeterminations(); }
+      );
+    } else {
+      disabledPair(DETERM_DISABLED_REASONS[item.kind] || "no write action is wired for this item kind.");
+    }
+    wrap.appendChild(msg);
+    return wrap;
+  }
+
+  document.addEventListener("keydown", function (e) {
+    if (state.activePanel !== "determinations") return;
+    var tag = (document.activeElement && document.activeElement.tagName) || "";
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+    if (e.key !== "j" && e.key !== "k" && e.key !== "J" && e.key !== "K") return;
+    var ids = state.determItemsFlat;
+    if (!ids.length) return;
+    var idx = ids.indexOf(state.determSelectedId);
+    if (e.key.toLowerCase() === "j") idx = Math.min(ids.length - 1, idx + 1);
+    else idx = Math.max(0, idx - 1);
+    state.determSelectedId = ids[idx];
+    fetchPanel("determinations").then(renderDeterminations);
+    var target = document.getElementById("determ-item-" + ids[idx].replace(/[^a-zA-Z0-9]/g, "_"));
+    if (target) target.scrollIntoView({ block: "nearest" });
+  });
+
+  /* ==========================================================================
+     10. DOSSIER
+     ========================================================================== */
+  function loadDossier() { fetchPanel("dossier", { artifact_id: state.dossierArtifactId }).then(renderDossier); }
+  function renderDossier(p) {
+    var typeChips = qs('[data-role="dossier-type-chips"]');
+    var registryList = qs('[data-role="dossier-registry-list"]');
+    var registryCount = qs('[data-role="dossier-registry-count"]');
+    var detail = qs('[data-role="dossier-detail"]');
+    clear(typeChips); clear(registryList); clear(detail);
+    if (!p || p.status !== "ok") { detail.appendChild(el("div", { "class": "warn-callout" }, [el("div", { "class": "body", text: p ? p.message : "no data" })])); return; }
+    state.dossierArtifactId = p.active_artifact_id;
+    registryCount.textContent = (p.registry || []).length + " TOTAL";
+
+    var allChip = el("span", { "class": "type-chip" + (state.dossierTypeFilter === "ALL" ? " is-active" : ""), text: "ALL" });
+    allChip.addEventListener("click", function () { state.dossierTypeFilter = "ALL"; renderDossier(p); });
+    typeChips.appendChild(allChip);
+    (p.type_filters || []).forEach(function (tf) {
+      var c = el("span", { "class": "type-chip" + (state.dossierTypeFilter === tf.type_key ? " is-active" : ""), text: tf.type_key });
+      c.addEventListener("click", function () { state.dossierTypeFilter = tf.type_key; renderDossier(p); });
+      typeChips.appendChild(c);
+    });
+
+    var registry = (p.registry || []).filter(function (a) { return state.dossierTypeFilter === "ALL" || a.type === state.dossierTypeFilter; });
+    registry.forEach(function (a) {
+      var row = el("div", { "class": "registry-row" + (a.artifact_id === p.active_artifact_id ? " is-active" : "") }, [
+        el("div", { "class": "topline" }, [el("span", { "class": "id", text: a.artifact_id }), el("span", { "style": "color:var(--ink-3); font-size:10px;", text: a.status })]),
+        el("div", { "class": "sub", text: a.title })
+      ]);
+      row.addEventListener("click", function () { state.dossierArtifactId = a.artifact_id; loadDossier(); });
+      registryList.appendChild(row);
+    });
+
+    if (!p.artifact) { detail.appendChild(el("div", { "class": "empty", text: "no artifacts registered yet" })); return; }
+    var a = p.artifact;
+    var header = el("div", { "class": "subbar" }, [
+      el("span", { "class": "t", "style": "font-family:var(--font-mono);", text: a.artifact_id }),
+      el("span", { "class": "t", "style": "font-weight:400;", text: a.title }),
+      el("span", { "class": "m", text: a.type + ", " + a.status })
+    ]);
+    detail.appendChild(header);
+    var body = el("div", { "class": "panel-body-pad" });
+
+    if (a.purpose) {
+      body.appendChild(el("div", { "class": "purpose-strip" }, [el("span", { "class": "k", text: "PURPOSE" }), el("span", { "class": "v", text: a.purpose })]));
+    }
+
+    var frameCard = el("div", { "class": "card" });
+    frameCard.appendChild(el("div", { "class": "card-header" }, [el("span", { "class": "title", text: "WHERE THIS CAME FROM" })]));
+    var frameBody = el("div", { "class": "card-body" });
+    if (p.context_frame && isPlainObject(p.context_frame) && Object.keys(p.context_frame).length) {
+      var grid = el("div", { "class": "context-frame-grid" });
+      Object.keys(p.context_frame).forEach(function (k) { grid.appendChild(el("span", { "class": "k", text: k.replace(/_/g, " ").toUpperCase() })); grid.appendChild(el("span", { text: String(p.context_frame[k]) })); });
+      frameBody.appendChild(grid);
+    } else {
+      frameBody.appendChild(el("div", { "class": "empty", text: "context_frame is not populated on this artifact yet (attrs.context_frame has no writer for most artifacts today)." }));
+    }
+    frameCard.appendChild(frameBody);
+    body.appendChild(frameCard);
+
+    var twoCol = el("div", { "class": "two-col" });
+    var left = el("div", { "style": "display:flex; flex-direction:column; gap:12px;" });
+    var versionCard = el("div", { "class": "card" });
+    versionCard.appendChild(el("div", { "class": "card-header" }, [el("span", { "class": "title", text: "VERSION CHAIN" })]));
+    var vBody = el("div", { "class": "card-body", "style": "display:flex; flex-direction:column; gap:6px;" });
+    (p.version_chain || []).forEach(function (v) {
+      var row = el("div", { "style": "display:flex; gap:8px; align-items:baseline; font-family:var(--font-mono); font-size:11px; cursor:pointer;" }, [
+        el("span", { "style": v.artifact_id === a.artifact_id ? "color:var(--ink-hi); font-weight:600;" : "color:var(--ink-2);", text: v.artifact_id }),
+        el("span", { "class": "fill" }), el("span", { "style": "color:var(--ink-3);", text: v.status })
+      ]);
+      row.addEventListener("click", function () { state.dossierArtifactId = v.artifact_id; loadDossier(); });
+      vBody.appendChild(row);
+    });
+    if (!(p.version_chain || []).length) vBody.appendChild(el("div", { "class": "empty", text: "no version chain data" }));
+    versionCard.appendChild(vBody);
+    left.appendChild(versionCard);
+    twoCol.appendChild(left);
+
+    var right = el("div", { "style": "display:flex; flex-direction:column; gap:12px; min-height:0;" });
+    var gateCard = el("div", { "class": "card" });
+    gateCard.appendChild(el("div", { "class": "card-header" }, [el("span", { "class": "title", text: p.gate ? ("GATE " + p.gate.gate_id) : "GATE" })]));
+    var gateBody = el("div", { "class": "card-body" });
+    if (p.gate) {
+      var track = el("div", { "class": "gate-track" });
+      var reachedIdx = GATE_STEPS.indexOf(p.gate.state);
+      GATE_STEPS.forEach(function (s, i) {
+        track.appendChild(el("span", { "class": "step" + (i <= reachedIdx ? "" : " is-pending"), text: (i <= reachedIdx ? "✓ " : "") + s.toUpperCase() }));
+        if (i < GATE_STEPS.length - 1) track.appendChild(el("span", { "class": "sep", text: "—" }));
+      });
+      gateBody.appendChild(track);
+      gateBody.appendChild(el("div", { "style": "border-top:1px solid var(--hairline-soft); margin-top:9px; padding-top:9px; display:flex; flex-direction:column; gap:6px;" }, [
+        el("div", { "class": "kv-mini" }, [el("span", { "class": "k", text: "VERDICT" }), el("span", { "class": "v", text: p.gate.verdict || "—" })]),
+        el("div", { "class": "kv-mini" }, [el("span", { "class": "k", text: "EDITS" }), el("span", { "class": "v", text: (p.gate.edits_parsed || []).length + " ON RECORD" })]),
+        el("div", { "class": "kv-mini" }, [el("span", { "class": "k", text: "REPRODUCTION" }), el("span", { "class": "v", text: p.gate.reproduction_status || "unrun" })])
+      ]));
+    } else {
+      gateBody.appendChild(el("div", { "class": "empty", text: "no gate opened on this artifact" }));
+    }
+    gateCard.appendChild(gateBody);
+    right.appendChild(gateCard);
+
+    var verdictCard = el("div", { "class": "card" });
+    verdictCard.appendChild(el("div", { "class": "card-header" }, [el("span", { "class": "title", text: "VERDICTS" })]));
+    var vdBody = el("div", { "class": "card-body", "style": "display:flex; flex-direction:column; gap:6px;" });
+    (p.verdicts || []).forEach(function (v) {
+      vdBody.appendChild(el("div", { "style": "display:flex; gap:8px; font-family:var(--font-mono); font-size:10px;" }, [
+        el("span", { "style": "color:var(--ink-3); width:90px; flex-shrink:0;", text: v.procedure }),
+        el("span", { "style": "color:var(--ink-hi); flex-grow:1;", text: v.label }),
+        el("span", { "style": "color:var(--ink-3);", text: fmtDate(v.ts) })
+      ]));
+    });
+    if (!(p.verdicts || []).length) vdBody.appendChild(el("div", { "class": "empty", text: "no verdicts recorded" }));
+    vdBody.appendChild(el("div", { "class": "note-strip", "style": "border-top:1px solid var(--hairline-soft); padding-top:7px;", text: "DIFFERENT PROCEDURES WRITE DIFFERENT LABEL VOCABULARIES. THESE ARE NOT ONE SHARED SCALE." }));
+    verdictCard.appendChild(vdBody);
+    right.appendChild(verdictCard);
+
+    var lineageCard = el("div", { "class": "card" });
+    lineageCard.appendChild(el("div", { "class": "card-header" }, [el("span", { "class": "title", text: "LINEAGE" })]));
+    var lnBody = el("div", { "class": "card-body", "style": "display:flex; flex-direction:column; gap:6px;" });
+    var lin = p.lineage || {};
+    if (lin.produced_by_launch) lnBody.appendChild(el("div", { "class": "kv-mini" }, [el("span", { "class": "k", text: "PRODUCED BY" }), el("span", { "class": "v", text: lin.produced_by_launch.launch_id + " " + lin.produced_by_launch.agent_kind })]));
+    lnBody.appendChild(el("div", { "class": "kv-mini" }, [el("span", { "class": "k", text: "IN SESSION" }), el("span", { "class": "v", text: lin.in_session || "—" })]));
+    lnBody.appendChild(el("div", { "class": "kv-mini" }, [el("span", { "class": "k", text: "SUPERSEDES" }), el("span", { "class": "v", text: lin.supersedes || "—" })]));
+    lnBody.appendChild(el("div", { "class": "kv-mini" }, [el("span", { "class": "k", text: "REGISTERS" }), el("span", { "class": "v", text: (lin.registers_records || 0) + " RECORDS" })]));
+    lnBody.appendChild(el("div", { "class": "kv-mini" }, [el("span", { "class": "k", text: "DISCHARGES" }), el("span", { "class": "v", text: (lin.discharges_criteria || []).map(function (c) { return c.criterion_id; }).join(", ") || "—" })]));
+    lineageCard.appendChild(lnBody);
+    if (lin.note) lineageCard.appendChild(el("div", { "class": "lineage-note" }, [el("span", { "style": "color:var(--warn); font-family:var(--font-mono); font-size:10px;", text: "▲" }), el("span", { "style": "font-size:11px; line-height:1.5; color:var(--ink);", text: lin.note })]));
+    right.appendChild(lineageCard);
+    twoCol.appendChild(right);
+
+    body.appendChild(twoCol);
+    detail.appendChild(body);
+  }
+
+  /* ==========================================================================
+     11. LEXICON
+     ========================================================================== */
+  function loadLexicon() { fetchPanel("lexicon").then(renderLexicon); }
+  var LEXICON_PANEL_CACHE = null;
+  function renderLexicon(p) {
+    LEXICON_PANEL_CACHE = p;
+    var idxList = qs('[data-role="lexicon-index-list"]');
+    var kindChips = qs('[data-role="lexicon-kind-chips"]');
+    var seam = qs('[data-role="lexicon-seam"]');
+    var detail = qs('[data-role="lexicon-detail"]');
+    clear(idxList); clear(kindChips); clear(seam); clear(detail);
+    if (!p || p.status !== "ok") { idxList.appendChild(el("div", { "class": "warn-callout" }, [el("div", { "class": "body", text: p ? p.message : "no data" })])); return; }
+
+    if (p.seam_note) seam.appendChild(el("div", { "class": "warn-callout" }, [el("div", { "class": "head", text: "▲ THIS SURFACE NEEDS NEW TABLES" }), el("div", { "class": "body", text: p.seam_note })]));
+
+    var kinds = ["all"].concat(Array.from(new Set((p.entities || []).map(function (e) { return e.entity_type; }))));
+    kinds.forEach(function (k) {
+      var c = el("span", { "class": "chip" + (state.lexiconKindFilter === k ? " chip--live" : " chip--neutral"), "style": "cursor:pointer;", text: k.toUpperCase() });
+      c.addEventListener("click", function () { state.lexiconKindFilter = k; renderLexicon(p); });
+      kindChips.appendChild(c);
+    });
+
+    var q = state.lexiconFilterText.toLowerCase();
+    var entities = (p.entities || []).filter(function (e) {
+      if (state.lexiconKindFilter !== "all" && e.entity_type !== state.lexiconKindFilter) return false;
+      if (!q) return true;
+      return (e.name || "").toLowerCase().indexOf(q) !== -1 || (e.summary || "").toLowerCase().indexOf(q) !== -1;
+    });
+
+    idxList.appendChild(el("div", { "class": "term-row", "style": "border-left:none; cursor:default;" }, [
+      el("div", { text: "TERM" }), el("div", { text: "SUMMARY" }), el("div", { text: "RELS" }), el("div", { text: "STATE" })
+    ]));
+    entities.forEach(function (e) {
+      var stateBadge = e.resolution === "confirmed" ? statusEl("settled", "") : e.resolution === "rejected" ? statusEl("crit", "") : statusEl("pending", "");
+      var row = el("div", { "class": "term-row" + (state.lexiconSelected && state.lexiconSelected.kind === "entity" && state.lexiconSelected.id === e.entity_id ? " is-active" : "") }, [
+        el("div", { "class": "name", text: e.name }),
+        el("div", { "class": "def", text: e.summary || "(no summary)" }),
+        el("div", { "style": "color:var(--ink-3);", text: String(e.relation_count || 0) }),
+        stateBadge
+      ]);
+      row.addEventListener("click", function () { state.lexiconSelected = { kind: "entity", id: e.entity_id }; renderLexiconDetail(p); });
+      idxList.appendChild(row);
+    });
+
+    var defs = (p.definition_claims || []).filter(function (c) { return !q || (c.text || "").toLowerCase().indexOf(q) !== -1; });
+    if (defs.length) {
+      idxList.appendChild(el("div", { "class": "determ-group-label", text: "DEFINITION CLAIMS · " + defs.length }));
+      defs.forEach(function (c) {
+        var row = el("div", { "class": "term-row", "style": "grid-template-columns: minmax(0,1fr) 84px;" }, [
+          el("div", { "class": "def", text: c.text }),
+          el("div", { "style": "color:var(--ink-3);", text: c.kind || "" })
+        ]);
+        row.addEventListener("click", function () { state.lexiconSelected = { kind: "claim", id: c.claim_id }; renderLexiconDetail(p); });
+        idxList.appendChild(row);
+      });
+    }
+    if (!entities.length && !defs.length) idxList.appendChild(el("div", { "class": "empty", text: "no matches" }));
+
+    if ((p.merge_proposals_draft || []).length) {
+      var mCard = el("div", { "style": "padding:11px 14px; border-top:1px solid var(--hairline-soft);" });
+      mCard.appendChild(el("div", { "style": "font-size:11px; font-weight:700; letter-spacing:0.12em; color:var(--ink-hi); margin-bottom:8px;", text: "DRAFT MERGE PROPOSALS" }));
+      p.merge_proposals_draft.forEach(function (mp) {
+        var members = []; try { members = JSON.parse(mp.members); } catch (e) {}
+        mCard.appendChild(el("div", { "style": "font-family:var(--font-mono); font-size:10.5px; color:var(--ink-2); margin-bottom:6px;", text: mp.prop_id + ": " + members.join(" + ") + " → " + mp.canonical_entity }));
+      });
+      idxList.appendChild(mCard);
+    }
+
+    renderLexiconDetail(p);
+  }
+  qs('[data-role="lexicon-filter"]').addEventListener("input", function (e) {
+    state.lexiconFilterText = e.target.value;
+    if (LEXICON_PANEL_CACHE) renderLexicon(LEXICON_PANEL_CACHE);
+  });
+  function renderLexiconDetail(p) {
+    var detail = qs('[data-role="lexicon-detail"]');
+    clear(detail);
+    var sel = state.lexiconSelected;
+    if (!sel) { detail.appendChild(el("div", { "class": "empty", text: "select a term or claim from the index" })); return; }
+    if (sel.kind === "entity") {
+      var e = (p.entities || []).find(function (x) { return x.entity_id === sel.id; });
+      if (!e) { detail.appendChild(el("div", { "class": "empty", text: "not found" })); return; }
+      detail.appendChild(el("div", { "style": "display:flex; align-items:baseline; gap:12px;" }, [
+        el("span", { "style": "font-size:22px; color:var(--ink-hi);", text: e.name }),
+        chip(e.entity_type, "neutral")
+      ]));
+      var card = el("div", { "class": "card" });
+      card.appendChild(el("div", { "class": "card-body" }, [renderObjectG(e)]));
+      detail.appendChild(card);
+    } else if (sel.kind === "claim") {
+      var c = (p.definition_claims || []).find(function (x) { return x.claim_id === sel.id; });
+      if (!c) { detail.appendChild(el("div", { "class": "empty", text: "not found" })); return; }
+      detail.appendChild(el("div", { "style": "font-size:19px; color:var(--ink-hi); line-height:1.4;", text: c.text }));
+      var card = el("div", { "class": "card" });
+      card.appendChild(el("div", { "class": "card-body" }, [renderObjectG(c)]));
+      detail.appendChild(card);
+    }
+  }
+
+  /* ==========================================================================
+     12. COURSE
+     ========================================================================== */
+  function loadCourse() { fetchPanel("course").then(renderCourse); }
+  function renderCourse(p) {
+    var sub = qs('[data-role="course-sub"]');
+    var bodyRoot = qs('[data-role="course-body"]');
+    clear(bodyRoot);
+    if (!p || (p.status !== "ok" && p.status !== "awaiting_migration")) {
+      bodyRoot.appendChild(el("div", { "class": "warn-callout" }, [el("div", { "class": "body", text: p ? p.message : "no data" })]));
+      return;
+    }
+    if (p.status === "awaiting_migration") {
+      bodyRoot.appendChild(el("div", { "class": "warn-callout" }, [el("div", { "class": "head", text: "AWAITING MIGRATION" }), el("div", { "class": "body", text: p.message })]));
+      return;
+    }
+    var discharged = p.criteria.filter(function (c) { return c.state === "discharged"; }).length;
+    var open = p.criteria.filter(function (c) { return c.state === "open"; }).length;
+    var blocked = p.criteria.filter(function (c) { return c.state === "blocked"; }).length;
+    sub.textContent = discharged + "/" + p.criteria.length + " criteria discharged";
+
+    var goalCard = el("div", { "class": "card goal-card" });
+    goalCard.appendChild(el("div", { "class": "goal-col" }, [
+      el("span", { "class": "k", text: "CRITERIA" }),
+      el("span", { "class": "v", text: discharged + " discharged, " + open + " open, " + blocked + " blocked, of " + p.criteria.length + " total" })
+    ]));
+    var phasesCol = el("div", { "class": "phases-col" });
+    p.phases.forEach(function (ph) { phasesCol.appendChild(el("span", { "style": "font-family:var(--font-mono); font-size:10.5px; color:var(--ink-2);" }, [el("span", { "style": "color:var(--ink-hi);", text: ph.phase }), document.createTextNode(": " + ph.discharged + "/" + ph.total)])); });
+    goalCard.appendChild(phasesCol);
+    goalCard.appendChild(el("div", { "class": "note-col" }, [el("span", { "class": "note-strip", text: "No coverage/theory/validation rollups here: this API stage only computes phases' own total/discharged counts, honestly. See docs/DASHBOARD_V2_API.md §7." })]));
+    bodyRoot.appendChild(goalCard);
+
+    var spineCard = el("div", { "class": "card" });
+    var spine = el("div", { "class": "phase-spine" });
+    var currentIdx = p.phases.findIndex(function (ph) { return ph.open > 0 || ph.blocked > 0; });
+    p.phases.forEach(function (ph, i) {
+      var cls = "phase-node";
+      if (currentIdx === -1 ? true : i < currentIdx) cls += " is-done";
+      else if (i === currentIdx) cls += " is-current";
+      spine.appendChild(el("div", { "class": cls }, [el("div", { "class": "dot" }), el("div", { "class": "label", text: (i < currentIdx || currentIdx === -1 ? "✓ " : i === currentIdx ? "● " : "○ ") + ph.phase.toUpperCase() })]));
+      if (i < p.phases.length - 1) spine.appendChild(el("div", { "class": "phase-connector" + (i < currentIdx || currentIdx === -1 ? " is-done" : "") }));
+    });
+    spineCard.appendChild(el("div", { "class": "card-body" }, [spine]));
+    bodyRoot.appendChild(spineCard);
+
+    var twoCol = el("div", { "class": "two-col", "style": "flex-grow:1;" });
+    var ladderCard = el("div", { "class": "card" });
+    ladderCard.appendChild(el("div", { "class": "card-header" }, [el("span", { "class": "title", text: "CRITERION LADDER" }), el("span", { "class": "sub", text: "grouped by phase, insertion order" })]));
+    var ladderBody = el("div", { "class": "card-body", "style": "display:flex; flex-direction:column; gap:10px; overflow-y:auto;" });
+    p.phases.forEach(function (ph) {
+      var criteriaInPhase = p.criteria.filter(function (c) { return c.phase === ph.phase; });
+      if (!criteriaInPhase.length) return;
+      ladderBody.appendChild(el("div", { "style": "font-family:var(--font-mono); font-size:10px; letter-spacing:0.1em; color:var(--ink-3); margin-top:4px;", text: ph.phase.toUpperCase() }));
+      criteriaInPhase.forEach(function (c) {
+        var row = el("div", { "class": "ladder-row" + (c.state === "open" ? " is-open" : "") }, [
+          c.state === "discharged" ? statusEl("settled", "") : c.state === "blocked" ? statusEl("warn", "") : statusEl("live", "", { pulse: true }),
+          el("span", { "class": "name", text: c.label }),
+          el("span", { "class": "dots" }),
+          el("span", { "class": "val", text: c.discharged_by_artifact_title || c.state.toUpperCase() })
+        ]);
+        ladderBody.appendChild(row);
+      });
+    });
+    ladderCard.appendChild(ladderBody);
+    twoCol.appendChild(ladderCard);
+
+    var driftCard = el("div", { "class": "card" });
+    driftCard.appendChild(el("div", { "class": "card-header" }, [el("span", { "class": "title", text: "COURSE-CHECK LOG" }), el("span", { "class": "sub", text: "quoted from the session close, never editorialised" })]));
+    var driftBody = el("div", { "class": "card-body", "style": "display:flex; flex-direction:column; gap:11px; overflow-y:auto;" });
+    (p.drift_log || []).forEach(function (d) {
+      var cc = d.course_check || {};
+      var onCourse = cc.on_course !== false;
+      driftBody.appendChild(el("div", { "class": "drift-entry" }, [
+        el("span", { "class": "tag", "style": "color:" + (onCourse ? "var(--settled)" : "var(--warn)") + ";", text: onCourse ? "✓" : "▲" }),
+        el("div", {}, [
+          el("div", { "style": "font-family:var(--font-mono); font-size:10px; color:var(--ink-3);", text: (d.ts ? fmtDate(d.ts) + " · " : "") + (d.session_id || "") + " · " + d.source }),
+          el("div", { "class": "quote", text: JSON.stringify(cc) })
+        ])
+      ]));
+    });
+    if (!(p.drift_log || []).length) driftBody.appendChild(el("div", { "class": "empty", text: "no course checks recorded yet" }));
+    driftCard.appendChild(driftBody);
+    twoCol.appendChild(driftCard);
+
+    bodyRoot.appendChild(twoCol);
+  }
+
+  /* ==========================================================================
+     13. CONSOLE (reuses the generic renderer -- see brief: "compressed, still
+     works, keeps Console cheap")
+     ========================================================================== */
+  function loadConsole() {
+    fetchAll().then(function (bundle) {
+      lastBundle = bundle;
+      setHealth(bundle);
+      var panels = bundle.panels || {};
+      renderGeneric(qs('[data-role="console-body-session"]'), panels.session);
+      renderGeneric(qs('[data-role="console-body-budget"]'), panels.budget);
+      renderGeneric(qs('[data-role="console-body-jobs"]'), panels.jobs);
+      renderGeneric(qs('[data-role="console-body-gates"]'), panels.gates);
+      renderGeneric(qs('[data-role="console-body-corpus"]'), panels.corpus);
+      renderGeneric(qs('[data-role="console-body-doctor"]'), panels.doctor);
+    });
+  }
+  qs('[data-role="doctor-run-btn"]').addEventListener("click", function () {
+    var btn = qs('[data-role="doctor-run-btn"]');
+    if (!writesEnabled()) return;
+    btn.disabled = true; btn.textContent = "RUNNING…";
+    // Stage 3: doctor/run now WRITES a sidecar state file, so it moved to
+    // POST + the same token guard every other write action uses.
+    fetch("/dashboard/api/doctor/run", {
+      method: "POST", cache: "no-store",
+      headers: { "X-TrialError-Dashboard-Token": WRITE_TOKEN || "" },
+    }).then(function (r) { return r.json(); }).then(function (doctorPanel) {
+      renderGeneric(qs('[data-role="console-body-doctor"]'), doctorPanel);
+    }).catch(function () {}).finally(function () { btn.disabled = !writesEnabled(); btn.textContent = "RUN THE CHECK SWEEP"; });
+  });
+
+  /* ==========================================================================
+     14. EXTENSION PANELS (C-0070)
+     ========================================================================== */
+  function buildExtNav(extPanels) {
+    var knowSlot = qs('[data-role="rail-ext-KNOW"]');
+    var runSlot = qs('[data-role="rail-ext-RUN"]');
+    clear(knowSlot); clear(runSlot);
+    qsa('.panel[id^="panel-ext-"]').forEach(function (n) { n.remove(); });
+    (extPanels || []).forEach(function (entry) {
+      var group = entry.nav_group === "RUN" ? runSlot : knowSlot;
+      var name = "ext-" + entry.name;
+      var btn = el("button", { type: "button", "class": "rail-item", "data-panel": name, "data-role": "rail-item" }, [
+        el("span", { "aria-hidden": "true", "style": "font-size:15px; line-height:1;", text: "◆" }),
+        el("span", { "class": "rail-label", text: (entry.title || entry.name).slice(0, 10).toUpperCase() })
+      ]);
+      btn.addEventListener("click", function () { switchPanel(name); });
+      group.appendChild(btn);
+
+      var section = el("section", { "class": "panel", id: "panel-" + name, "data-panel": name });
+      var sub = el("div", { "class": "subbar" }, [
+        el("span", { "class": "t", text: entry.title || entry.name }),
+        el("span", { "class": "m", text: entry.description || "" })
+      ]);
+      var body = el("div", { "class": "panel-body-pad" });
+      if (entry.manifest_status !== "ok") {
+        body.appendChild(el("div", { "class": "warn-callout" }, [el("div", { "class": "head", text: "MANIFEST ERROR" }), el("div", { "class": "body", text: entry.error || "invalid extension panel manifest" })]));
+      } else {
+        body.appendChild(el("div", { "class": "card" }, [el("div", { "class": "card-body", "data-role": "ext-body-" + entry.name }, [el("div", { "class": "panel-loading", text: "loading…" })])]));
+      }
+      section.appendChild(sub); section.appendChild(body);
+      qs('[data-role="content"]').appendChild(section);
+    });
+  }
+  function loadExt(name) {
+    var container = qs('[data-role="ext-body-' + name + '"]');
+    if (!container) return;
+    fetchExtPanel(name).then(function (data) { renderGeneric(container, data); });
+  }
+
+  /* ==========================================================================
+     15. RAIL WIRING / KEYBOARD / STATIC + LIVE BOOT
+     ========================================================================== */
+  qsa('.rail-item[data-panel]').forEach(function (btn) {
+    btn.addEventListener("click", function () { switchPanel(btn.getAttribute("data-panel")); });
+  });
+  qs('[data-role="rail-health"]').addEventListener("click", function () { switchPanel("console"); });
+
+  document.addEventListener("keydown", function (e) {
+    if (e.key !== "/" || e.metaKey || e.ctrlKey || e.altKey) return;
+    var tag = (document.activeElement && document.activeElement.tagName) || "";
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
+    e.preventDefault();
+    if (state.activePanel === "home") { qs('[data-role="home-search-input"]').focus(); }
+    else { switchPanel("search"); qs('[data-role="search-input"]').focus(); }
+  });
+
+  function showNotice(html) {
+    var n = qs('[data-role="notice"]');
+    n.innerHTML = html;
+    show(n);
+    qsa(".panel").forEach(hide);
+  }
+
+  function tryStaticMode() {
+    var tag = document.getElementById("dashboard-data");
+    if (!tag || !tag.textContent.trim()) return false;
+    var payload;
+    try { payload = JSON.parse(tag.textContent); } catch (e) { return false; }
+    state.mode = "static";
+    state.staticPayload = payload;
+    state.meta = payload.meta || {};
+    setTopbar(state.meta);
+    buildExtNav(state.meta.ext_panels || []);
+    setHealth(payload);
+    initSearchOnce();
+    switchPanel(initialPanelFromHash(), { noHash: true });
+    return true;
+  }
+
+  var MAX_CONSECUTIVE_ERRORS = 6;
+  function connectSSE() {
+    if (!window.EventSource) return;
+    var es = new EventSource("/dashboard/events");
+    state.eventSource = es;
+    es.addEventListener("hello", function (ev) {
+      state.errorCount = 0;
+      try {
+        var meta = JSON.parse(ev.data);
+        state.meta = meta;
+        setTopbar(meta);
+        buildExtNav(meta.ext_panels || []);
+      } catch (e) {}
+      qs('[data-role="topbar-mode"]').textContent = "live";
+    });
+    es.addEventListener("changed", function () {
+      qs('[data-role="topbar-mode"]').textContent = "live";
+      fetchAll().then(function (bundle) { lastBundle = bundle; setHealth(bundle); if (state.activePanel === "home") renderHome(bundle); });
+      loadPanelContent(state.activePanel);
+    });
+    es.onerror = function () {
+      state.errorCount += 1;
+      qs('[data-role="topbar-mode"]').textContent = state.errorCount >= MAX_CONSECUTIVE_ERRORS ? "manual" : "reconnecting";
+    };
+  }
+
+  function initialPanelFromHash() {
+    var h = (location.hash || "").replace("#", "");
+    var known = ["home", "search", "evidence", "lexicon", "dossier", "course", "rooms", "feed", "determinations", "console"];
+    return known.indexOf(h) !== -1 ? h : "home";
+  }
+
+  function tryLiveMode() {
+    state.mode = "live";
+    initSearchOnce();
+    fetchAll().then(function (bundle) {
+      lastBundle = bundle;
+      state.meta = bundle.meta || {};
+      setTopbar(state.meta);
+      buildExtNav(state.meta.ext_panels || []);
+      setHealth(bundle);
+      switchPanel(initialPanelFromHash(), { noHash: true });
+      show(qs('[data-role="doctor-run-btn"]'));
+      connectSSE();
+    }).catch(function () {
+      qs('[data-role="topbar-mode"]').textContent = "reconnecting";
+      connectSSE();
+    });
+  }
+
+  /* ==========================================================================
+     16. BOOT
+     ========================================================================== */
+  document.documentElement.classList.add("boot-play");
+
+  if (tryStaticMode()) {
+    // static snapshot -- nothing else to do.
+  } else if (location.protocol === "file:") {
+    setTopbar({});
+    showNotice(
+      "<p>This page has no embedded data and was opened directly (<code>file://</code>).</p>" +
+      "<p>Run <code>trialerror dashboard serve</code> and open the printed URL, or run " +
+      "<code>trialerror dashboard export --out snapshot.html</code> for an offline snapshot.</p>"
+    );
+  } else {
+    tryLiveMode();
+  }
+
+  window.addEventListener("hashchange", function () {
+    var p = initialPanelFromHash();
+    if (p !== state.activePanel) switchPanel(p, { noHash: true });
+  });
+})();
+</script>
+</body>
+</html>

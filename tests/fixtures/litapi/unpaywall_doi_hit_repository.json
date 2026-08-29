@@ -1,0 +1,32 @@
+{
+  "doi": "10.1234/repo.0002",
+  "doi_url": "https://doi.org/10.1234/repo.0002",
+  "title": "A Fixture Paper Whose Best OA Location Is A Repository Mirror",
+  "genre": "journal-article",
+  "is_paratext": false,
+  "published_date": "2019-06-01",
+  "year": 2019,
+  "journal_name": "Journal of Repository Studies",
+  "publisher": "Repo Press",
+  "is_oa": true,
+  "oa_status": "green",
+  "z_authors": [
+    {"given": "Rae", "family": "Repository"}
+  ],
+  "best_oa_location": {
+    "url": "https://institution.example.edu/repo/item123",
+    "url_for_pdf": "https://institution.example.edu/repo/item123.pdf",
+    "host_type": "repository",
+    "license": null,
+    "version": "acceptedVersion"
+  },
+  "oa_locations": [
+    {
+      "url": "https://institution.example.edu/repo/item123",
+      "url_for_pdf": "https://institution.example.edu/repo/item123.pdf",
+      "host_type": "repository",
+      "license": null,
+      "version": "acceptedVersion"
+    }
+  ]
+}
