@@ -1,5 +1,7 @@
 # TrialError
 
+[![CI](https://github.com/SentImperior666/TrialError/actions/workflows/ci.yml/badge.svg)](https://github.com/SentImperior666/TrialError/actions/workflows/ci.yml)
+
 TrialError is a research-operations harness for Claude Code. Iteration is the
 method: a long-running research system that churns through tasks in rounds,
 built for one researcher running long, multi-session AI-agent research
