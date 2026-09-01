@@ -119,6 +119,9 @@ def test_obs_start_phoenix_spawns_detached_with_expected_argv(tmp_path, capsys, 
     if sys.platform == "win32":
         assert captured["kwargs"]["creationflags"] & subprocess.DETACHED_PROCESS
         assert captured["kwargs"]["creationflags"] & subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        assert captured["kwargs"]["start_new_session"] is True
+        assert "creationflags" not in captured["kwargs"]
     log_path = tmp_path / "obs" / "phoenix_serve.log"
     assert log_path.is_file()
 

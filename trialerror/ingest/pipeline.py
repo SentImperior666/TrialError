@@ -25,6 +25,7 @@ from trialerror.ingest.normalizers import (
 from trialerror.jobs import ledger
 from trialerror.stores.store import Store
 from trialerror.stores.writer import get, insert
+from trialerror.util.config import ConfigError, foreign_absolute_kind
 from trialerror.util.ids import new_id
 from trialerror.util.timeutil import now
 
@@ -114,6 +115,16 @@ def resolve_ingest_roots(program_root: Path, config: dict[str, Any] | None) -> l
     roots = paths_cfg.get("ingest_roots", list(DEFAULT_INGEST_ROOTS))
     resolved: list[Path] = []
     for r in roots:
+        # Same cross-platform trap resolve_configured_path guards: an entry
+        # that is absolute for the OTHER OS reads as relative here and gets
+        # joined onto the program root, quietly fencing ingest to a
+        # directory the operator never named. Refuse instead.
+        foreign = foreign_absolute_kind(str(r))
+        if foreign is not None:
+            raise ConfigError(
+                f"[paths].ingest_roots entry {str(r)!r} is an absolute {foreign} path, but this "
+                f"is not {foreign}. It would be treated as relative and joined onto {program_root}."
+            )
         p = Path(r)
         resolved.append(p if p.is_absolute() else (program_root / p))
     return [p.resolve() for p in resolved]

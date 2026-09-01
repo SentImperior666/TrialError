@@ -44,13 +44,28 @@ Example:
 ```toml
 [ingest.ocr]
 backend = "marker"
-marker_single_exe = "C:/tools/marker/venv/Scripts/marker_single.exe"
+marker_single_exe = "/home/you/tools/marker/venv/bin/marker_single"
 
 [ingest.embed]
 backend = "qwen3-4b"
-python_exe = "C:/research/tools/embeddings_local/venv/Scripts/python.exe"
-module_dir = "C:/research/tools/embeddings_local"
+python_exe = "/home/you/research/tools/embeddings_local/venv/bin/python"
+module_dir = "/home/you/research/tools/embeddings_local"
+
+# Windows equivalents — same keys, drive-letter paths, and a venv keeps its
+# interpreter under Scripts/ rather than bin/:
+#   marker_single_exe = "C:/tools/marker/venv/Scripts/marker_single.exe"
+#   python_exe = "C:/research/tools/embeddings_local/venv/Scripts/python.exe"
+#   module_dir = "C:/research/tools/embeddings_local"
 ```
+
+**"Absolute" means absolute for the platform actually running the command.** `pathlib`
+decides that against the host, so a `C:/...` value read on Linux has no drive, reads as
+*relative*, and gets joined onto the program root — a real directory, created without
+complaint, in the wrong place. Every `[paths]` key (`stores_dir`, `archive_dir`,
+`law_digest_path`, `handoffs_dir`, `requests_path`, `memory_dir`, `ingest_roots`) now
+raises a `ConfigError` naming the mismatch rather than resolving it silently; the three
+`[ingest.*]` paths above are handed straight to the OS, so a wrong-platform value there
+surfaces as a job failure on a missing executable instead.
 
 **Why "your existing" tools**: the design ports the operator's own already-proven local
 `marker_ocr`/`embeddings_local` tooling rather than reimplementing OCR or embedding —
@@ -68,11 +83,15 @@ real ingest you run with these configured *is* the live verification.
 Entirely optional observability — every span emission no-ops silently if this isn't
 installed or isn't running, so skipping this costs you nothing but trace visibility.
 
-```powershell
-pip install -e .[obs]
+```console
+pip install -e '.[obs]'
 trialerror obs start-phoenix
 trialerror obs status
 ```
+
+The extras are quoted deliberately: `[obs]` is a glob pattern to most shells, so a bare
+`pip install -e .[obs]` happens to work under bash but dies under zsh with `no matches
+found` — quoting costs nothing and is correct everywhere.
 
 `start-phoenix` launches a detached local `phoenix serve` (SQLite-backed, zero Docker,
 zero account) at `http://localhost:6006`. `trialerror obs smoke` emits one span of each kind
@@ -135,9 +154,16 @@ per Claude Code account. In `~/.claude/settings.json` (top level) add:
 ```json
 "statusLine": {
   "type": "command",
-  "command": "python <path-to-your-trialerror-checkout>/trialerror/obs/statusline_capture.py"
+  "command": "<path-to-your-venv>/bin/python <path-to-your-trialerror-checkout>/trialerror/obs/statusline_capture.py"
 }
 ```
+
+**Name an interpreter by absolute path, not a bare `python`.** A stock Linux install ships
+`python3` and no `python` at all, so `"command": "python <path>/statusline_capture.py"`
+exits 127 and the status line simply never appears — and even where `python` does resolve
+it is not necessarily the interpreter that has `trialerror` importable. Your venv's own
+`bin/python` (Windows: `Scripts\python.exe`) settles both questions at once, regardless of
+what is on `PATH` when Claude Code spawns the command.
 
 What you get:
 
@@ -194,7 +220,7 @@ page-level PDF Q&A, and a researcher graph (follow/profile lookups). Findings as
    directly.
 3. Register the MCP server. OAuth mode (simplest -- a browser sign-in prompt appears on
    first use):
-   ```powershell
+   ```console
    claude mcp add --transport http alphaxiv https://api.alphaxiv.org/mcp/v1
    ```
    Or, equivalent `.mcp.json` (same shape `docs/OPERATOR_GUIDE.md` uses for the two
@@ -301,8 +327,8 @@ raw vectors dominate the payload either way).
    - Manual browser download: `https://www.kaggle.com/datasets/tomtum/openai-arxiv-embeddings`
      → Download button (needs the free account from step 1, no payment).
 3. **Build the index**:
-   ```powershell
-   trialerror lit arxiv-index build --zip <download-dir>\openai-arxiv-embeddings.zip --program-root .
+   ```console
+   trialerror lit arxiv-index build --zip <download-dir>/openai-arxiv-embeddings.zip --program-root .
    ```
    Runs in-process by default (Ctrl+C-safe — re-run the exact same command to resume; it
    picks up from the last committed batch via the jobs ledger's checkpoint, never
@@ -314,7 +340,7 @@ raw vectors dominate the payload either way).
    zip decompression + insert throughput, not network or GPU), and budget accordingly before
    walking away from it unattended for the first run.
 4. **Query it**:
-   ```powershell
+   ```console
    trialerror lit arxiv-semantic --q "formal semantics for tabletop game rules engines" --k 10
    ```
    Requires `[litapi.arxiv_index].api_key_path` pointed at a file holding your OpenAI API
@@ -360,7 +386,7 @@ they require your actual GPU and an actual live Claude Code session with this pl
 installed. `trialerror accept` enumerates all eight automatically on every run (as `skip`
 entries, never silently omitted) so you always know what's outstanding:
 
-```powershell
+```console
 trialerror accept
 ```
 

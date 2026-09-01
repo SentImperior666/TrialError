@@ -97,9 +97,16 @@ id = "{program_id}"
 # deterministic FakeOcrBackend (zero-GPU, zero-model) when this table is
 # absent -- fine to start with; point at real marker_single once you have
 # local GPU tooling set up (docs/USER_SETUP.md).
+#
+# Absolute paths below must be absolute FOR THE PLATFORM YOU RUN ON --
+# `pathlib` decides absoluteness against the host, so a "C:/..." value on
+# Linux reads as relative and would be joined onto the program root.
+# trialerror.util.config refuses that rather than resolving it somewhere
+# surprising; use the line for your own OS.
 # [ingest.ocr]
 # backend = "marker"
-# marker_single_exe = "C:/path/to/marker_single.exe"
+# marker_single_exe = "/opt/marker/bin/marker_single"       # Linux/macOS
+# marker_single_exe = "C:/path/to/marker_single.exe"        # Windows
 # timeout_s = 900
 
 # Embedding backend (trialerror.ingest.backends.load_embed_backend). Defaults
@@ -107,8 +114,10 @@ id = "{program_id}"
 # is absent.
 # [ingest.embed]
 # backend = "qwen3-4b"
-# python_exe = "C:/path/to/embeddings_local/venv/Scripts/python.exe"
-# module_dir = "C:/path/to/research/tools/embeddings_local"
+# python_exe = "/home/you/research/tools/embeddings_local/venv/bin/python"   # Linux/macOS
+# python_exe = "C:/path/to/embeddings_local/venv/Scripts/python.exe"         # Windows
+# module_dir = "/home/you/research/tools/embeddings_local"                   # Linux/macOS
+# module_dir = "C:/path/to/research/tools/embeddings_local"                  # Windows
 # dims = 2048
 # timeout_s = 1800
 

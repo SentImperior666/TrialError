@@ -57,7 +57,7 @@ that parser recognizes.
 | `gate` | `open`, `submit`, `verdict`, `apply-union`, `verify-edit`, `advance` | The state machine: `draft → submitted → gated|failed → union_applied → registered`. `advance` is the generic low-level entry point (refuses any illegal edge); the others are named shortcuts for specific legal transitions. `apply-union` is the terminal-pass gate: it enforces verdict ∈ {PASS, PASS_WITH_EDITS}, every **blocking** edit `verified=true`, and `reproduction_status != mismatch`. |
 | `memory` | `search`, `put`, `sync-export`, `sync-import`, `merge` | `search --id <item_id>` fetches one item's full body (the progressive-disclosure "step 2"); `search --boot-bundle` returns the same L0-index-plus-targeted-abstracts payload session boot injects. `put` upserts by `(key, account)`. `sync-export`/`sync-import` round-trip `memory/*.md` for git sync; a merge conflict from `sync-import` is never auto-resolved — list it with bare `memory merge`, resolve with `--group <id> --keep left\|right\|both`. |
 | `lens` | `roster`, `stratify`, `assign`, `log`, `export` | AMENDMENT-3 ideation machinery, generalized. `stratify` is a dry-run score+tercile-cut (no write); `assign` does the real seeded quota draw and writes `lens_assignment` rows (default weights 40/40/20 near/moderate/far, far-arm floor 2). `export` hands back rows shaped for `budget book`. |
-| `obs` | `status`, `start-phoenix`, `smoke` | All no-op gracefully if the `obs` extra isn't installed. `start-phoenix` launches a detached local `phoenix serve` (same Windows `DETACHED_PROCESS` technique as job workers). `smoke` emits one span of each of the four kinds (launch/retrieval/verification/job) and reports whether they flushed. |
+| `obs` | `status`, `start-phoenix`, `smoke` | All no-op gracefully if the `obs` extra isn't installed. `start-phoenix` launches a detached local `phoenix serve` (the same detach technique as job workers: `DETACHED_PROCESS \| CREATE_NEW_PROCESS_GROUP` on Windows, `start_new_session=True` — i.e. `setsid()` — on POSIX). `smoke` emits one span of each of the four kinds (launch/retrieval/verification/job) and reports whether they flushed. |
 | `mcp` | `ops`, `knowledge` | Starts the named stdio MCP server; **blocks** for its lifetime (serves until stdin closes). Not meant to be run interactively — see **Registering the MCP servers** below. |
 | `accept` | *(no subcommands)* | Runs the M15 acceptance harness: a full clean-checkout-shaped smoke journey against a scratch program (discarded after), plus an enumeration of the GPU/live-Claude-Code items that still need a real machine. `--skip-gpu-live-cc-enumeration` to omit the latter. |
 | `doctor` | *(top-level, no subcommands)* | `--license-audit` for just the vendored-file header scan; `--only CHECK_NAME` (repeatable) to run specific checks; **`--program-root` is required to see program-scoped checks** (schema version, dangling XIDs, stale chunks/embeddings/anchors) — without it they silently skip. See the full catalog below. |
@@ -85,7 +85,11 @@ carries no `mcpServers` entry, and no `.mcp.json` ships in this repo. Register e
 yourself with `claude mcp add`, e.g. scoped to your program directory so it's only active
 there:
 
-```powershell
+```console
+# Linux / macOS
+claude mcp add --scope project --transport stdio trialerror-ops -- trialerror mcp ops --program-root ~/research/demo-program
+claude mcp add --scope project --transport stdio trialerror-knowledge -- trialerror mcp knowledge --program-root ~/research/demo-program
+# Windows PowerShell
 claude mcp add --scope project --transport stdio trialerror-ops -- trialerror mcp ops --program-root C:\research\demo-program
 claude mcp add --scope project --transport stdio trialerror-knowledge -- trialerror mcp knowledge --program-root C:\research\demo-program
 ```
@@ -100,20 +104,26 @@ user-wide across every project. The equivalent hand-written `.mcp.json`:
     "trialerror-ops": {
       "type": "stdio",
       "command": "trialerror",
-      "args": ["mcp", "ops", "--program-root", "C:\\research\\demo-program"]
+      "args": ["mcp", "ops", "--program-root", "/home/you/research/demo-program"]
     },
     "trialerror-knowledge": {
       "type": "stdio",
       "command": "trialerror",
-      "args": ["mcp", "knowledge", "--program-root", "C:\\research\\demo-program"]
+      "args": ["mcp", "knowledge", "--program-root", "/home/you/research/demo-program"]
     }
   }
 }
 ```
 
+No shell reads this file, so the path must be a real absolute path — `~` is not expanded
+here. On Windows the same field is `"C:\\research\\demo-program"`: the doubled backslashes
+are JSON's own escaping, not a second path separator, which is why `"C:/research/demo-program"`
+(forward slashes, no escaping to get wrong) is the easier thing to write.
+
 To load the Claude Code **plugin** (hooks + skills) for a session without installing it
 anywhere permanent, point Claude Code at the `plugin/` directory directly:
-`claude --plugin-dir C:\research\research-harness\plugin`. This is stated for completeness
+`claude --plugin-dir ~/research/research-harness/plugin` (Windows:
+`claude --plugin-dir C:\research\research-harness\plugin`). This is stated for completeness
 — **live verification of hooks/MCP inside an actual Claude Code session has not yet been
 done on this build** (see **What's unverified** below); everything above is exercised only
 by real-subprocess tests (`tests/test_mcp_ops_protocol.py`,
@@ -132,6 +142,16 @@ real code (not policy text):
 | **`Stop` hook** (`plugin/hooks/stop_check.py`) | Stopping a session that still has dangling launches or a stale law pin | Blocks **once** with a checklist (exit 2); Claude Code's own `stop_hook_active` flag means the *second* stop attempt always passes — it can never trap the user in a loop. Fails **open** (allows the stop) on any internal error, unlike the spawn gate. |
 | **`trialerror session close`** | The same dangling-launch/stale-digest condition, plus an unread inbox, plus (unless `--override-ruling-id` cites an existing ruling) a session where hooks were never observed to fire at all (`hook_alive` event count = 0) | Returns a structured error naming the exact fix in `nextActions` — reconcile a launch, read the inbox, or `law diff-foreign`. |
 | **`trialerror gate` / `trialerror artifact register`** | Registering a `gated=1` artifact type whose gate isn't in `union_applied`; any gate-state transition that isn't a legal edge in the state machine; entering `union_applied` with an unverified blocking edit or a `reproduction_status=mismatch` | `IllegalTransitionError`/`GateEntryConditionError` → structured error; `gate advance` is the one mutation path and rejects every illegal edge (property-tested). |
+
+**A hook that fails closed still has to run at all.** `plugin/hooks/hooks.json` invokes all
+four hooks through the `trialerror` console script — `trialerror hook session-start`,
+`hook spawn-gate`, `hook post-task`, `hook stop-check` — rather than `python <path>/<name>.py`,
+because a bare `python` does not exist on a stock Linux install (only `python3` does) and a
+hook whose interpreter is missing exits 127 without ever evaluating anything. That turns the
+spawn gate's fail-closed refusal into a silent no-op, which is strictly worse than a refusal;
+naming the program instead of an interpreter also guarantees the hook runs in the same
+environment `trialerror` was installed into. The `plugin/hooks/*.py` files remain as
+by-path-invocable shims for an older `hooks.json` or a hand-rolled `settings.json`.
 
 **Mid-flight staleness is visible, not silently prevented**: a law ruling appended by a
 concurrent session while your subagent is already running does not kill that subagent —
@@ -155,8 +175,9 @@ the `atomic` scheduler pattern).
   exits; `--mode loop` polls until idle (`--max-idle-polls`, default 3) or
   `--max-iterations` is hit. `--foreground` runs inline in your terminal (what a detached
   child itself invokes); omit it and the command spawns a real detached background
-  process (Windows `DETACHED_PROCESS`) and returns immediately with its `pid` and
-  `log_path`.
+  process — `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` on Windows, `start_new_session=True`
+  (a `setsid()` in the child, detaching it from the controlling terminal) on POSIX — and
+  returns immediately with its `pid` and `log_path`.
 - **Lease/heartbeat**: default lease 900s (15 min), heartbeats renew it; a crashed
   worker's job is reclaimed by the next `trialerror jobs tick` and resumes from its
   `checkpoint` — no work is silently lost, and there's no separate watchdog process to

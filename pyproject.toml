@@ -13,6 +13,7 @@ authors = [{ name = "TrialError contributors" }]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
 ]
 # pypdf: pure-Python PDF text extraction for M7's pdf-text normalizer
 # (design Section 6, ingestion stage 3). BSD-3-Clause; no native build step
@@ -70,8 +71,17 @@ include = ["trialerror*"]
 # FX-9: trialerror/artifacts/templates/*.md (the bundled, byte-exact port of
 # origin-project's 12 research/templates/*.md files) must ship in a built wheel/sdist,
 # not just be readable from an editable-install source checkout.
+#
+# The dashboard's static assets are the same class of bug, caught the same
+# way FX-9 was: trialerror.dashboard.serve and .export read dashboard.html /
+# dashboard.css from STATIC_DIR at runtime, but nothing declared them as
+# package data, so a built wheel shipped ZERO of them and `trialerror
+# dashboard serve` failed on any non-editable install. Editable installs
+# (how this project has always been developed and CI-tested) mask it
+# completely, which is why it survived this long.
 [tool.setuptools.package-data]
 "trialerror.artifacts" = ["templates/*.md"]
+"trialerror.dashboard" = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

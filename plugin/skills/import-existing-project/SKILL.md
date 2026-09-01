@@ -1,6 +1,6 @@
 ---
 name: import-existing-project
-description: Guided procedure to bring an existing (non-TrialError) research project into TrialError WITHOUT moving or restructuring it — inventory the foreign project, interview the user on what maps where, bridge via trialerror.toml [paths] + [paths].ingest_roots (or a Windows directory junction when a true link is unavoidable), register sources, and validate with doctor + a search smoke. Use this when the user has an existing research project (papers, notes, a corpus, ledgers, a differently-shaped repo) organized their own way and wants to start using TrialError against it, or asks how to "import"/"switch to"/"migrate into"/"get started with" TrialError without losing or restructuring their existing files.
+description: Guided procedure to bring an existing (non-TrialError) research project into TrialError WITHOUT moving or restructuring it — inventory the foreign project, interview the user on what maps where, bridge via trialerror.toml [paths] + [paths].ingest_roots (or a directory junction or symlink when a true link is unavoidable), register sources, and validate with doctor + a search smoke. Use this when the user has an existing research project (papers, notes, a corpus, ledgers, a differently-shaped repo) organized their own way and wants to start using TrialError against it, or asks how to "import"/"switch to"/"migrate into"/"get started with" TrialError without losing or restructuring their existing files.
 ---
 
 # /import-existing-project — bridge, don't move
@@ -53,20 +53,34 @@ gated import), not a turnkey command.
   doctor` unambiguous and keeps the foreign repo's own git history and
   citation web (relative-path references inside its notes/ledgers)
   completely untouched.
-- Windows-first: every command below is PowerShell or `cmd.exe`. If the
-  user is on macOS/Linux, the `[paths]` config-bridge steps (§4a) are
-  identical; swap the junction step (§4b) for a plain `ln -s`.
+- Linux, macOS, and Windows are all supported and CI-tested. The
+  `[paths]` config-bridge steps (§4a) — the ones that cover almost every
+  import — are byte-identical on all three. Where a command genuinely
+  differs, both forms are given below, bash first and PowerShell second;
+  establish which shell the user is in before you start pasting, and
+  don't hand them the other platform's form.
 
 ## 1. Inventory the foreign project
 
 Before proposing any mapping, actually look. Don't ask the user to
 describe their project from memory when you can enumerate it yourself:
 
-```powershell
-Get-ChildItem -Path <foreign-root> -Depth 1 | Select-Object Name, Mode
+bash:
+
+```bash
+ls -la <foreign-root>
 # per top-level dir: size + rough file count (skip .git and any obvious
 # model-cache/vendor dir up front -- these can be tens of GB and you only
 # need an order-of-magnitude read, not a byte-exact count)
+du -sh <foreign-root>/<dir>
+find <foreign-root>/<dir> -type f | wc -l
+```
+
+PowerShell:
+
+```powershell
+Get-ChildItem -Path <foreign-root> -Depth 1 | Select-Object Name, Mode
+# same two numbers, one pass: Count is the file count, Sum is the byte total
 Get-ChildItem <foreign-root>\<dir> -Recurse -File | Measure-Object -Property Length -Sum
 ```
 
@@ -92,7 +106,7 @@ For each top-level directory, form a hypothesis before asking:
   candidates for `[ingest.ocr]`/`[ingest.embed]` config pathing (already
   fully config-driven — see the shipped `trialerror.toml` template's commented
   `[ingest.ocr]`/`[ingest.embed]` tables), never for copying or a
-  junction. the import-design notes (internal, not in this export)'s own inventory found a single 34GB
+  symlink/junction. the import-design notes (internal, not in this export)'s own inventory found a single 34GB
   model-cache directory — the strongest argument in that document for why
   "bridge, don't move" matters in practice, not just in principle.
 - **Everything else** (build/tool scripts, an old pre-TrialError enforcement
@@ -141,7 +155,7 @@ different root, or a `[paths]` config edit racing an in-flight ingest job).
 
 ## 3. Scaffold (if not already done)
 
-```powershell
+```console
 trialerror program init <name> --dir <new-program-root>
 ```
 
@@ -160,9 +174,26 @@ the new program's `trialerror.toml`:
 
 ```toml
 [paths]
-# point INTO the foreign project -- absolute paths, forward slashes even
-# on Windows (pathlib accepts them, and it sidesteps TOML's backslash
-# escaping rules entirely)
+# point INTO the foreign project -- absolute paths. On Windows use forward
+# slashes anyway (pathlib accepts them, and it sidesteps TOML's backslash
+# escaping rules entirely).
+ingest_roots = ["/home/you/foreign-project/papers", "/home/you/foreign-project/scans"]
+
+[ingest.embed]
+backend = "qwen3-4b"
+python_exe = "/home/you/foreign-project/tools/embeddings_local/venv/bin/python"
+module_dir = "/home/you/foreign-project/tools/embeddings_local"
+
+[ingest.ocr]
+backend = "marker"
+marker_single_exe = "/home/you/foreign-project/tools/marker_ocr/bin/marker_single"
+```
+
+The same file on Windows — identical keys, drive-letter paths, and a venv that keeps its
+interpreter under `Scripts/` rather than `bin/`:
+
+```toml
+[paths]
 ingest_roots = ["C:/path/to/foreign-project/papers", "C:/path/to/foreign-project/scans"]
 
 [ingest.embed]
@@ -190,7 +221,17 @@ its commented-out default unless the user has a specific reason to move
 it — relocating `stores_dir`/`archive_dir` etc. without a reason just adds
 indirection for no benefit.
 
-### 4b. Windows directory junctions — only when a TRUE link is needed
+**Absoluteness is judged against the running platform, so never carry a
+`[paths]` value across from the other OS.**
+`Path("C:/path/to/foreign-project/papers").is_absolute()` is `False` on
+Linux — no drive — so the value would read as *relative* and be joined
+onto the program root, quietly fencing ingest to a directory the user
+never named. `resolve_configured_path` and `resolve_ingest_roots` now
+raise a `ConfigError` naming the mismatch rather than resolving it
+wrongly; if the user hits that error, the fix is to rewrite the path for
+this machine, not to work around it.
+
+### 4b. A true link — a symlink on Linux/macOS, a junction on Windows
 
 Reach for this only when some tool or convention needs a path to
 physically exist at a fixed location relative to the program root or the
@@ -198,41 +239,71 @@ foreign tree (not just "TrialError needs to read from here" — §4a already
 covers that) — e.g. the user wants `<program-root>/raw` to transparently
 BE a foreign directory for a workflow that hardcodes that relative path.
 
-**Use a directory junction (`mklink /J`), not a symlink.** A junction
-needs no admin privileges and no Developer Mode; a symlink
+**Linux / macOS — `ln -s`.** There is no privilege question here: any
+user who can write the link's parent directory can symlink a directory
+into it. Note the argument order is the REVERSE of `mklink`'s below —
+target first, link second — which is a genuine footgun if you are
+translating one form to the other.
+
+```bash
+# create <program-root>/raw as a symlink pointing at the foreign tree's
+# own document directory. TARGET first, LINK second.
+ln -s /home/you/foreign-project/papers <program-root>/raw
+
+# verify it landed as a link (not a copy) before moving on -- ls -l on a
+# symlink prints "raw -> /home/you/foreign-project/papers"
+ls -ld <program-root>/raw
+```
+
+**Windows — a directory junction (`mklink /J`), not a symlink.** A
+junction needs no admin privileges and no Developer Mode; a symlink
 (`mklink /D`, or PowerShell's `New-Item -ItemType SymbolicLink`) requires
 either an elevated shell or Developer Mode enabled — state this to the
-user explicitly if they ask why the command below isn't `/D`. Junctions
-only link DIRECTORIES (not individual files) and only work within the
-same local machine's NTFS volumes (not a UNC network share) — for a
-single file, prefer NOT bridging it at all (register it as a source
-instead, §3), since a hardlink (`mklink /H`) has none of a junction's
-transparency for tooling that stats the file and is easy to lose track of.
+user explicitly if they ask why the command isn't `/D`. Junctions only
+link DIRECTORIES and only work within the same local machine's NTFS
+volumes (not a UNC network share).
 
 ```cmd
-:: cmd.exe -- create <program-root>\raw as a junction pointing at the
-:: foreign tree's own document directory. Order matters: LINK path first,
-:: TARGET path second.
+:: cmd.exe -- order matters: LINK path first, TARGET path second.
 mklink /J "<program-root>\raw" "C:\path\to\foreign-project\papers"
 ```
 
 ```powershell
-# PowerShell equivalent
+# PowerShell equivalent, plus the same "did it land as a link" check
 New-Item -ItemType Junction -Path "<program-root>\raw" -Target "C:\path\to\foreign-project\papers"
-```
-
-Verify it landed as a junction (not a copy) before moving on:
-
-```powershell
 Get-Item "<program-root>\raw" | Select-Object LinkType, Target
 ```
 
-A junction to `raw` still needs nothing extra in `[paths].ingest_roots`
-(the default already includes `"raw"`) — `trialerror ingest add` reads through
-the junction transparently, exactly as if the foreign files lived there
-directly.
+For a SINGLE FILE on either platform, prefer NOT bridging it at all —
+register it as a source instead (§3). A Windows hardlink (`mklink /H`)
+has none of a junction's transparency for tooling that stats the file,
+and a one-off symlinked file is just as easy to lose track of later.
+
+**Either link shape works with the ingest fence, and for the same
+reason.** `resolve_ingest_roots` calls `.resolve()` on every configured
+root and `assert_in_tree` calls `.resolve()` on the candidate path, and
+`Path.resolve()` follows symlinks and junctions alike — so the link and
+its target compare as one real path rather than the bridged file being
+judged "outside every configured ingest root". A bridge at `raw`
+therefore needs nothing extra in `[paths].ingest_roots` (the default is
+already `("raw", "inbox")`), and `trialerror ingest add` reads through it
+transparently on both platforms, exactly as if the foreign files lived
+there directly.
 
 ## 5. Register sources against the bridged paths
+
+bash (a trailing `\` continues the line):
+
+```bash
+trialerror ingest add-source --kind <paper|book|web|rulebook|dataset|report|other> --title "<title>" \
+  --license-tier <open|academic_oa|user_owned_scan|commercial_restricted|unknown> \
+  --acquisition-route <author_posted|institutional|publisher_oa|user_scan|user_delivered|api|web> \
+  --launch-id <your launch_id> --content-file <path-into-the-foreign-tree>
+
+trialerror ingest add --source-id <SRC-id> --path <path-into-the-foreign-tree-or-link> --launch-id <your launch_id>
+```
+
+PowerShell (a trailing backtick continues the line):
 
 ```powershell
 trialerror ingest add-source --kind <paper|book|web|rulebook|dataset|report|other> --title "<title>" `
@@ -240,7 +311,7 @@ trialerror ingest add-source --kind <paper|book|web|rulebook|dataset|report|othe
   --acquisition-route <author_posted|institutional|publisher_oa|user_scan|user_delivered|api|web> `
   --launch-id <your launch_id> --content-file <path-into-the-foreign-tree>
 
-trialerror ingest add --source-id <SRC-id> --path <path-into-the-foreign-tree-or-junction> --launch-id <your launch_id>
+trialerror ingest add --source-id <SRC-id> --path <path-into-the-foreign-tree-or-link> --launch-id <your launch_id>
 ```
 
 Same pipeline as `/ingest` from here — a cost-estimate gate, then
@@ -250,13 +321,14 @@ exists and the first source registers cleanly."
 
 ## 6. Validate
 
-```powershell
+```console
 trialerror doctor --program-root <new-program-root>
 trialerror query search "<a phrase you know is in the bridged corpus>" --program-root <new-program-root>
 ```
 
-`doctor` catches a broken bridge early (a stale junction, a `[paths]`
-typo pointing at a directory that doesn't exist) before it becomes a
+`doctor` catches a broken bridge early (a dangling symlink or a stale
+junction, a `[paths]` typo pointing at a directory that doesn't exist)
+before it becomes a
 confusing ingest failure. The search smoke confirms the bridged content
 is actually reachable end-to-end, not just that a source row got created.
 If either fails, fix the bridge (§4) before registering more sources —
@@ -280,9 +352,9 @@ don't work around a doctor failure by ingesting anyway.
   before touching it.
 - **Large model/tool caches stay put.** Bridge them via
   `[ingest.ocr]`/`[ingest.embed]` config paths (§4a), never copy and
-  never junction — a junction over a 30GB+ cache buys nothing a config
-  path doesn't already give you, and doubles the ways the location can
-  drift.
+  never link — a symlink or junction over a 30GB+ cache buys nothing a
+  config path doesn't already give you, and doubles the ways the location
+  can drift.
 - **Don't guess the mapping.** If the interview (§2) didn't cover a
   directory in your inventory, ask before bridging it — an unbridged
   "stays external, unreferenced for now" is always a safe default; a
