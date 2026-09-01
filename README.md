@@ -89,9 +89,9 @@ and which are the actual product.
 
 `trialerror demo seed` builds a populated one in a few seconds:
 
-```powershell
+```console
 pip install -e .
-trialerror demo seed --dir .\demo-program
+trialerror demo seed --dir ./demo-program
 # then run the `dashboard serve` command it prints in nextActions
 ```
 

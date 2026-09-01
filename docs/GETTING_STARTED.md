@@ -5,8 +5,8 @@
 If you have not seen TrialError run yet, start with a populated demo program
 rather than an empty scaffold:
 
-```powershell
-trialerror demo seed --dir .\demo-program
+```console
+trialerror demo seed --dir ./demo-program
 ```
 
 That builds a small research program with a corpus, budget pools, a critique
