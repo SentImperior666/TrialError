@@ -80,6 +80,40 @@ corpus. It does not manage API keys for you beyond reading a path you
 configure. If you want a framework that owns the whole agent loop for you,
 use AutoGen, CrewAI, or a LangChain agent instead.
 
+## See it working first
+
+A scaffolded program starts empty, and an empty program makes the dashboard
+look broken rather than new: every panel renders its zero state, so there is
+no way to tell which surfaces are unimplemented, which are waiting on data,
+and which are the actual product.
+
+`trialerror demo seed` builds a populated one in a few seconds:
+
+```powershell
+pip install -e .
+trialerror demo seed --dir .\demo-program
+# then run the `dashboard serve` command it prints in nextActions
+```
+
+It seeds one small, coherent research program — two sessions (one closed, one
+open), a corpus across four license tiers with a genuine contradiction in it,
+budget pools with real spend and one abandoned booking, a critique gate
+holding a blocking edit, two deliberation rooms (one converging, one frozen
+and escalated), a knowledge-graph review queue with a pending merge proposal,
+and a course ladder part-way discharged. Every dashboard panel has something
+to show, and the DECIDE queue has real decisions in it.
+
+The data goes in through the same APIs the CLI uses — sessions are booted,
+launches booked and reconciled, documents ingested by a real worker draining
+the real job queue, gates driven through the real state machine — so what you
+see is what the system actually produces, not a mock. The corpus is entirely
+synthetic and labelled as such: every source title is prefixed `[DEMO]` and
+every document says so in its first line.
+
+The program is disposable. It keeps its own account and budget ledger inside
+`<program>/.platform`, so seeding never touches your real `~/.trialerror`;
+delete the directory and nothing of yours is affected.
+
 ## Quick start
 
 These commands were run against a fresh scaffold on both platforms to confirm
