@@ -15,9 +15,9 @@ before you touch real data).
    against it *without moving or restructuring anything*. Load the
    `import-existing-project` skill (`plugin/skills/import-existing-project/SKILL.md`):
    it walks inventory → interview → bridge (`trialerror.toml` `[paths]` +
-   `[paths].ingest_roots` pointed INTO your existing tree, or a Windows directory
-   junction when a true link is unavoidable — no data physically moves) → register →
-   validate.
+   `[paths].ingest_roots` pointed INTO your existing tree, or a true link — a directory
+   junction on Windows, a symlink on Linux/macOS — when one is unavoidable; no data
+   physically moves) → register → validate.
 3. **You want your existing project's own ledgers/logs to become real TrialError rows** —
    not just files TrialError can read alongside them, but data migrated into
    `ruling`/`artifact`/`event`/... tables. This is a deeper, per-project migration, not
@@ -33,16 +33,19 @@ A first, real session on TrialError (path 1 above): scaffold a program, boot a s
 ingest a document, search it with citations, citation-check a draft, then close with a
 rendered handoff.
 
-Every command below is copy-pasteable in Windows PowerShell and uses only commands and
-flags that exist in the shipped `trialerror/cli/*.py` code (verified against source, not the
-design doc — see the note at the end of `docs/OPERATOR_GUIDE.md` for the one place they
-disagree). Every `trialerror` command prints a JSON envelope
+Every command below is copy-pasteable on Linux, macOS, and Windows, and uses only commands
+and flags that exist in the shipped `trialerror/cli/*.py` code (verified against source, not
+the design doc — see the note at the end of `docs/OPERATOR_GUIDE.md` for the one place they
+disagree). A `console` fence is platform-neutral — type it exactly as written, in whatever
+shell you have; the few steps that genuinely differ between shells (line continuations,
+writing a file, the shape of an absolute path) are given twice, bash first and PowerShell
+second, rather than making you translate. Every `trialerror` command prints a JSON envelope
 (`{ok, command, result|error, nextActions, meta}`); the walkthrough calls out the fields
 worth reading, but the full payload is always there if you want more than that.
 
 ## 0. Install
 
-```powershell
+```console
 cd research-harness
 pip install -e .
 trialerror --version
@@ -50,11 +53,14 @@ trialerror --version
 
 ## 1. Scaffold a program
 
-```powershell
+```console
+# Linux / macOS
+trialerror program init demo --dir ~/research/demo-program
+# Windows PowerShell
 trialerror program init demo --dir C:\research\demo-program
 ```
 
-This creates `C:\research\demo-program\trialerror.toml` (a commented starter — program id,
+This creates a `trialerror.toml` in that directory (a commented starter — program id,
 model policy, license posture, ingest OCR/embed backend, litapi provider defaults, all
 optional except `[program].id`), the design's per-program layout (`raw/`, `archive/`,
 `memory/`, `law/`, `handoffs/`, `artifacts/`, `requests/`), and runs the initial
@@ -64,7 +70,10 @@ walking up from the current directory looking for `trialerror.toml`
 (`trialerror.util.config.find_program_root`), or via `--program-root` (see the placement
 note in "Gotchas" below).
 
-```powershell
+```console
+# Linux / macOS
+cd ~/research/demo-program
+# Windows PowerShell
 cd C:\research\demo-program
 ```
 
@@ -77,7 +86,7 @@ step (`trialerror session boot`) instead.
 TrialError tracks budget/spend per **account** (a Claude Code login), not per program. On a
 brand-new program there are no accounts yet, so the first boot bootstraps one:
 
-```powershell
+```console
 trialerror session boot --create-account "my-account"
 ```
 
@@ -90,7 +99,7 @@ Re-running `trialerror session boot` (no flags) while a session is already open 
 it returns the same open session's bundle rather than erroring. Use `--fresh` if you
 specifically want a "refuse if one is already open" boot instead.
 
-```powershell
+```console
 trialerror session status
 ```
 
@@ -104,6 +113,21 @@ agent spend, XID-validated against `platform.launch`. In a live Claude Code sess
 happens automatically (the orchestrator books, the `PreToolUse:Task` hook consumes the
 booking when it spawns a subagent — see `docs/OPERATOR_GUIDE.md`'s enforcement section).
 Working from a bare terminal, as in this walkthrough, book one yourself:
+
+bash (a trailing `\` continues the line):
+
+```bash
+trialerror budget book \
+  --session-id <SESS-id from step 2> \
+  --program-id demo \
+  --agent-kind orchestrator \
+  --model-class top \
+  --model claude-opus \
+  --purpose "getting-started walkthrough" \
+  --est-tokens 5000
+```
+
+PowerShell (a trailing backtick continues the line):
 
 ```powershell
 trialerror budget book `
@@ -122,7 +146,7 @@ pool yet, and that's fine: with no pool configured, `book` books unconditionally
 (`state="PROVISIONAL"`) — pools only start capping bookings once one exists. Create one
 when you want real cap enforcement:
 
-```powershell
+```console
 trialerror budget pools --create --account-id <ACC-id> --model-class top --period weekly --cap-tokens 1000000
 ```
 
@@ -141,22 +165,56 @@ ready to point at the real local models, add to `trialerror.toml`:
 ```toml
 [ingest.ocr]
 backend = "marker"
-marker_single_exe = "C:/path/to/marker_single.exe"   # never hardcoded — config-pathed
+marker_single_exe = "/home/you/tools/marker/venv/bin/marker_single"   # never hardcoded — config-pathed
 
 [ingest.embed]
 backend = "qwen3-4b"
-python_exe = "C:/path/to/embeddings_local/venv/Scripts/python.exe"
-module_dir = "C:/path/to/research/tools/embeddings_local"
+python_exe = "/home/you/research/tools/embeddings_local/venv/bin/python"
+module_dir = "/home/you/research/tools/embeddings_local"
+
+# Windows equivalents — same keys, drive-letter paths, and the venv's interpreter
+# lives under Scripts/ rather than bin/:
+#   marker_single_exe = "C:/path/to/marker_single.exe"
+#   python_exe = "C:/path/to/embeddings_local/venv/Scripts/python.exe"
+#   module_dir = "C:/path/to/research/tools/embeddings_local"
 ```
 
 The real backends shell out to your existing marker/Qwen3 tooling as subprocesses — see
 `docs/USER_SETUP.md` for what has to exist at those paths, and note this build has not
 yet been live-verified against a real GPU (flagged honestly in `trialerror accept`'s output).
 
+**An absolute config path must be absolute for the platform actually running it.**
+`pathlib` decides "is this absolute?" against the host, so a `C:/...` value read on Linux
+is not merely unusable — it has no drive on POSIX, reads as *relative*, and gets joined
+onto the program root, silently producing a real directory in the wrong place. Every
+`[paths]` key (`stores_dir`, `archive_dir`, `law_digest_path`, `handoffs_dir`,
+`requests_path`, `memory_dir`, `ingest_roots`) now raises a `ConfigError` naming the
+mismatch instead of resolving it wrongly; the `[ingest.*]` executable paths above are
+handed straight to the OS, so a wrong-platform value there surfaces as a job failure on a
+missing executable.
+
 ### Register a source, then a document
 
+bash — a quoted heredoc writes the bytes verbatim (UTF-8, no BOM, on any UTF-8 locale):
+
+```bash
+cat > raw/hello.md <<'EOF'
+# Hello TrialError
+
+Tabletop role-playing games use dice pools to resolve uncertain outcomes during play.
+EOF
+
+trialerror ingest add-source \
+  --kind web --title "Hello TrialError fixture" \
+  --license-tier open --acquisition-route web \
+  --launch-id <launch_id>
+```
+
+PowerShell — `-Encoding utf8` is stated explicitly because Windows PowerShell 5.1 defaults
+`Out-File` to UTF-16:
+
 ```powershell
-"# Hello TrialError`n`nTabletop role-playing games use dice pools to resolve uncertain outcomes during play." | Out-File -Encoding utf8 raw\hello.md
+"# Hello TrialError`n`nTabletop role-playing games use dice pools to resolve uncertain outcomes during play." | Out-File -Encoding utf8 raw/hello.md
 
 trialerror ingest add-source `
   --kind web --title "Hello TrialError fixture" `
@@ -166,8 +224,8 @@ trialerror ingest add-source `
 
 Copy `result.source.source_id` from the output, then:
 
-```powershell
-trialerror ingest add --source-id <source_id> --path raw\hello.md --launch-id <launch_id>
+```console
+trialerror ingest add --source-id <source_id> --path raw/hello.md --launch-id <launch_id>
 ```
 
 `result.job.job_id` is the first pipeline job (`normalize`, since `.md` is a directly
@@ -175,14 +233,14 @@ normalizable format — no OCR route needed for this fixture). Each stage enqueu
 next one on completion (normalize → chunk → embed → index), so one worker loop drains
 the whole pipeline:
 
-```powershell
+```console
 trialerror jobs start-worker --mode loop --foreground
 ```
 
 This runs inline in your terminal and exits once the queue has been idle for a few polls.
 Check progress any time with:
 
-```powershell
+```console
 trialerror ingest status --doc-id <doc_id>
 trialerror jobs list --state complete
 ```
@@ -192,7 +250,7 @@ threshold, default 50), it names the exact `--yes` command to re-run.
 
 ## 5. Search + citecheck
 
-```powershell
+```console
 trialerror query search "dice pools resolve uncertain outcomes"
 ```
 
@@ -203,6 +261,16 @@ To citation-check a draft against the corpus, write a file with a
 `[[cite:ANC-<id>]]` marker immediately after the sentence it supports (this exact marker
 syntax is `trialerror.verify.citecheck`'s mechanical-pass convention — the design doc doesn't
 pin one, so read this as the shipped code's contract):
+
+bash:
+
+```bash
+printf '%s\n' 'Tabletop role-playing games use dice pools to resolve uncertain outcomes during play. [[cite:ANC-<id>]]' > draft.md
+
+trialerror verify citecheck draft.md --by-launch <launch_id>
+```
+
+PowerShell:
 
 ```powershell
 "Tabletop role-playing games use dice pools to resolve uncertain outcomes during play. [[cite:ANC-<id>]]" | Out-File -Encoding utf8 draft.md
@@ -220,7 +288,7 @@ pairs would need one).
 Session close is a **refusing** tool by design — it fails on dangling (unreconciled)
 launches, an unread inbox, or a stale law-digest pin. Reconcile your booking first:
 
-```powershell
+```console
 trialerror budget reconcile --launch-id <launch_id> --actual-tokens 4200
 ```
 
@@ -230,12 +298,22 @@ also checks that at least one `hook_alive` event was recorded for the session �
 CLI directly rather than through a live Claude Code `SessionStart` hook, no such event
 exists, and close will refuse (`hooks_disabled`) unless you cite an override ruling:
 
-```powershell
+```console
 trialerror law append --summary "bare-terminal walkthrough session; hooks were never armed by design"
 ```
 
 Copy `result.ruling_id` from that, then close (`--course-check` is a required JSON blob —
 the design's course-adherence check from session lifecycle §9.3):
+
+bash:
+
+```bash
+trialerror session close \
+  --course-check '{"rungs":"n/a","build_vs_theory":"n/a","drift_flag":false}' \
+  --override-ruling-id <ruling_id>
+```
+
+PowerShell:
 
 ```powershell
 trialerror session close `

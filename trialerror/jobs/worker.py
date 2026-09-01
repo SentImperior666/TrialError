@@ -356,7 +356,12 @@ def spawn_worker(
     popen_kwargs: dict[str, Any] = {}
     if sys.platform == "win32":
         popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-    else:  # pragma: no cover - this design is Windows-first (Section 13); POSIX fallback only
+    else:
+        # POSIX equivalent of DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP:
+        # setsid() detaches from the controlling terminal so the child
+        # survives the parent shell and is not hit by its Ctrl-C. Exercised
+        # on every Linux run -- no `pragma: no cover` here, or coverage
+        # would hide the only branch that platform ever takes.
         popen_kwargs["start_new_session"] = True
 
     log_fh = open(log_path, "ab")

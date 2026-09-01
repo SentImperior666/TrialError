@@ -16,8 +16,9 @@ been doing while you were away. TrialError adds that layer on top of Claude Code
 without becoming a separate agent runtime itself: it is a CLI, two MCP
 servers, and a set of hooks that Claude Code drives.
 
-It targets a single operator working locally on Windows, with SQLite as the
-only storage engine and no required external services.
+It targets a single operator working locally on Windows or Linux, with SQLite
+as the only storage engine and no required external services. Both platforms
+run the full test suite in CI.
 
 ## Who it is for
 
@@ -81,8 +82,30 @@ use AutoGen, CrewAI, or a LangChain agent instead.
 
 ## Quick start
 
-These commands were run against a fresh scaffold to confirm they work as
-written. Windows PowerShell, from the repo root:
+These commands were run against a fresh scaffold on both platforms to confirm
+they work as written. Every `trialerror` invocation below is identical on
+Windows and Linux — only the `cd` target and the path separator differ.
+
+Linux / macOS (bash), from the repo root:
+
+```bash
+pip install -e .
+trialerror program init demo --dir ~/research/demo-program
+cd ~/research/demo-program
+
+trialerror session boot --create-account "my-account"
+# copy result.session_id from the output, then:
+trialerror budget book --session-id <SESS-id> --program-id demo --agent-kind orchestrator --model-class top --model claude-opus --purpose "first run" --est-tokens 5000
+# copy result.launch_id, then ingest a document:
+trialerror ingest add-source --kind web --title "example" --license-tier open --acquisition-route web --launch-id <launch_id>
+trialerror ingest add --source-id <source_id> --path raw/your-file.md --launch-id <launch_id>
+trialerror jobs start-worker --mode loop --foreground
+
+trialerror query search "your search terms here"
+trialerror dashboard serve
+```
+
+Windows PowerShell:
 
 ```powershell
 pip install -e .
@@ -101,6 +124,12 @@ trialerror query search "your search terms here"
 trialerror dashboard serve
 ```
 
+One caveat that is not cosmetic: a `[paths]` value in `trialerror.toml` must be
+absolute *for the platform you are running on*. `pathlib` judges
+absoluteness against the host, so a `C:/...` value on Linux is treated as
+*relative* and silently joined onto the program root. TrialError now refuses
+such a value with a clear error rather than resolving it to the wrong place.
+
 Each command prints a JSON envelope with the field you need for the next
 step (`result.session_id`, `result.launch_id`, and so on), plus a
 `nextActions` list naming the exact next command when one is expected.
@@ -116,8 +145,10 @@ reference and the enforcement model in full, read `docs/OPERATOR_GUIDE.md`.
 Everything below is implementation work, listed so you know what is real today and
 what is still coming. Nothing already shipped depends on any of it.
 
-- [ ] Linux support and a Linux CI lane. The suite has only ever run on Windows;
-      the CI badge is Windows-only on purpose.
+- [x] Linux support and a Linux CI lane. CI now runs the full suite on
+      `windows-latest` and `ubuntu-latest`; the plugin's Claude Code hooks go
+      through the `trialerror` console script rather than a bare `python`,
+      which does not exist on a stock Linux box.
 - [ ] Web-page ingestion pipeline. Fetched pages enter the corpus as saved markdown
       today; a hardened URL-to-corpus path is designed, not built.
 - [ ] Feed translation: side-by-side plain-language rendering of dense agent posts.

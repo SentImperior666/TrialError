@@ -12,6 +12,9 @@ new dependency for reading.
 
 from __future__ import annotations
 
+import os
+import platform
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +27,7 @@ __all__ = [
     "find_program_root",
     "resolve_configured_path",
     "configured_path_value",
+    "foreign_absolute_kind",
 ]
 
 CONFIG_FILENAME = "trialerror.toml"
@@ -107,11 +111,39 @@ def configured_path_value(config: Mapping[str, Any] | None, key: str, default: s
     program-root-relative), unresolved. Callers that need a value to STORE
     (e.g. a DB row's own ``rel_path``-style column, so a later read that
     joins it onto ``program_root`` stays correct even for an absolute
-    override -- pathlib's own ``Path.__truediv__`` already treats an
-    absolute right-hand operand as replacing the left, no branch needed at
-    the call site) want this raw string, not a pre-joined :func:`Path`."""
+    override -- pathlib's own ``Path.__truediv__`` treats an absolute
+    right-hand operand as replacing the left) want this raw string, not a
+    pre-joined :func:`Path`.
+
+    "Absolute", though, is decided by the *running* platform, which is the
+    subtlety :func:`resolve_configured_path` has to defend against -- see
+    its docstring."""
     paths_cfg = (config or {}).get("paths", {}) or {}
     return str(paths_cfg.get(key, default))
+
+
+#: A drive-letter path (``C:\\x``, ``C:/x``) or a UNC share (``\\\\host\\share``).
+_WINDOWS_ABSOLUTE_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+
+
+def foreign_absolute_kind(value: str) -> str | None:
+    """Name the platform a value is absolute *for* when that is not the
+    platform we are running on; ``None`` when the value is fine here.
+
+    This exists because :class:`pathlib.Path` resolves "is this absolute?"
+    against the host, so a path written for the other OS is not merely
+    unusable -- it is silently reclassified as *relative* and joined onto
+    the program root. There is no error, just a wrong path.
+    """
+    if os.name == "nt":
+        # A POSIX-absolute value on Windows: PureWindowsPath("/srv/x") has no
+        # drive, so .is_absolute() is False and the join silently proceeds.
+        if value.startswith("/") and not _WINDOWS_ABSOLUTE_RE.match(value):
+            return "POSIX"
+        return None
+    if _WINDOWS_ABSOLUTE_RE.match(value):
+        return "Windows"
+    return None
 
 
 def resolve_configured_path(
@@ -119,5 +151,23 @@ def resolve_configured_path(
 ) -> Path:
     """:func:`configured_path_value` joined onto ``program_root`` -- for a
     caller that just needs a concrete filesystem :class:`Path` (a directory
-    to write into, an env default), not a string to persist."""
-    return Path(program_root) / configured_path_value(config, key, default)
+    to write into, an env default), not a string to persist.
+
+    Refuses a value that is absolute for the *other* platform. Without this
+    check the failure is silent and confusing: on Linux,
+    ``Path("C:/research/corpus").is_absolute()`` is ``False``, so a config
+    copied from the Windows-era docs resolved to
+    ``<program_root>/C:/research/corpus`` -- a real directory, created
+    without complaint, in the wrong place. Raising names the problem at the
+    one point where it is still cheap to fix.
+    """
+    raw = configured_path_value(config, key, default)
+    foreign = foreign_absolute_kind(raw)
+    if foreign is not None:
+        raise ConfigError(
+            f"[paths].{key} = {raw!r} is an absolute {foreign} path, but this is "
+            f"{platform.system() or os.name}. Joining it onto the program root would "
+            f"silently produce a wrong path under {program_root}. Use a path that is "
+            f"absolute on this platform, or a program-root-relative one."
+        )
+    return Path(program_root) / raw

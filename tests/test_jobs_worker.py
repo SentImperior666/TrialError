@@ -133,7 +133,7 @@ def test_run_loop_respects_max_iterations(store):
     assert len(ledger.list_jobs(store, state="pending")) == 3
 
 
-def test_spawn_worker_uses_detached_creationflags_on_windows(store, program_root, platform_root, monkeypatch):
+def test_spawn_worker_detaches_the_child_on_every_platform(store, program_root, platform_root, monkeypatch):
     """Doesn't actually spawn a real process -- asserts the Popen call
     site requests DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP on Windows,
     the design's explicit M2 acceptance shape ("detached worker launcher
@@ -160,6 +160,13 @@ def test_spawn_worker_uses_detached_creationflags_on_windows(store, program_root
         assert captured["kwargs"]["creationflags"] == (
             subprocess_mod.DETACHED_PROCESS | subprocess_mod.CREATE_NEW_PROCESS_GROUP
         )
+    else:
+        # The POSIX arm used to be asserted by nothing, so on Linux this test
+        # proved only that argv was right -- a regression dropping detachment
+        # entirely would have passed. setsid() is what makes the worker
+        # outlive the launching shell.
+        assert captured["kwargs"]["start_new_session"] is True
+        assert "creationflags" not in captured["kwargs"]
     assert "--foreground" in captured["argv"]
     assert "--job-id" in captured["argv"]
     assert job["job_id"] in captured["argv"]
