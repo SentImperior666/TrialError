@@ -24,3 +24,9 @@ stores/*.db-wal
 stores/*.db-shm
 .trialerror_dashboard/
 dashboard_logs/
+
+# `trialerror demo seed` default output. The README and GETTING_STARTED both
+# tell you to run it as `--dir ./demo-program`, which from the repo root
+# leaves a whole scaffolded program (stores, its own .platform ledger, raw
+# fixtures) sitting untracked.
+demo-program/

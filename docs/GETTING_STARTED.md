@@ -1,5 +1,25 @@
 # Getting started
 
+## Before any of this: see it working
+
+If you have not seen TrialError run yet, start with a populated demo program
+rather than an empty scaffold:
+
+```console
+trialerror demo seed --dir ./demo-program
+```
+
+That builds a small research program with a corpus, budget pools, a critique
+gate mid-review, two deliberation rooms, and a part-discharged course ladder,
+then prints the `dashboard serve` command to open it. It is the fastest way to
+see what every panel is *for* before you have data of your own — a fresh
+scaffold renders every panel's zero state, which tells you nothing.
+
+The seeded program is disposable and self-contained (it keeps its own account
+ledger in `<program>/.platform`, so your real `~/.trialerror` is untouched),
+and its corpus is entirely synthetic — every source is prefixed `[DEMO]`.
+Delete the directory when you are done and read on.
+
 ## Three ways to start
 
 Pick the one that matches where you're coming from — none of them are mutually
