@@ -30,7 +30,7 @@ from trialerror.verify.verdicts import record_verdict
 
 from tests._verify_fixtures import bootstrap_launch, build_small_corpus
 
-_MATCHING_SENTENCE = "Tabletop role-playing games use dice pools to resolve uncertain outcomes during play."
+_MATCHING_SENTENCE = "Distributed schedulers use retry budgets to bound tail latency during failover."
 _MISMATCHED_SENTENCE = "Combat resolves through opposed rolls in this alternate system entirely."
 
 

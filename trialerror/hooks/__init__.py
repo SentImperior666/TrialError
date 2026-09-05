@@ -39,4 +39,16 @@ Each module exposes the same two callables it always did:
 
 from __future__ import annotations
 
-__all__ = ["post_task", "session_start", "spawn_gate", "stop_check"]
+__all__ = ["post_task", "session_start", "spawn_gate", "stop_check", "SUBAGENT_TOOL_NAMES"]
+
+# Claude Code 2.1.x renamed the subagent-spawning tool from "Task" to
+# "Agent" (found live on the sandbox host 2026-09-05, 03:34Z: a
+# `claude -p ... --plugin-dir .../plugin` session on Claude Code 2.1.261
+# spawned a subagent with NO spawn_gate refusal and NO post_task
+# accounting -- the transcript showed `TOOL_USE: Agent {...}` while
+# ``plugin/hooks/hooks.json``'s PreToolUse/PostToolUse matchers, and this
+# package's own tool_name comparisons, still only recognized "Task").
+# Both :mod:`trialerror.hooks.spawn_gate` and :mod:`trialerror.hooks.post_task`
+# gate on this tuple (instead of a bare ``== "Task"``) so the booking law
+# and its accounting keep firing under both the old and the new tool name.
+SUBAGENT_TOOL_NAMES = ("Task", "Agent")

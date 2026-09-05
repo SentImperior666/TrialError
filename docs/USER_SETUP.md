@@ -22,6 +22,35 @@ Nothing. v0 runs entirely on:
 Everything below this line is either (a) needed only once you switch to the real local
 models, (b) needed only for v1 acquisition features, or (c) optional observability.
 
+## 0a. Linux / container — what changes, what doesn't
+
+Everything in "v0" above runs unmodified on Linux or inside a container: the runtime has
+no Windows-only dependency beyond one detached-process launch technique
+(`DETACHED_PROCESS` on Windows, POSIX `setsid` — `start_new_session=True` — everywhere
+else), and that POSIX arm now has its own test coverage
+(`tests/test_posix_detach.py`) alongside the pre-existing Windows-only tests. Concretely:
+
+- **Program root / `[paths]` knobs** — `find_program_root`, `resolve_configured_path`,
+  and every knob this file's later sections mention (`stores_dir`, `ingest_roots`, …) are
+  built on `pathlib.Path`, not string-splitting — a Linux path works exactly like a
+  Windows one everywhere in the CLI.
+- **Platform root** — still `TRIALERROR_PLATFORM_ROOT` if set, else `Path.home() /
+  ".trialerror"` (`trialerror/stores/paths.py::platform_root()`) — `Path.home()` resolves
+  to the container/Linux user's own home directory, same mechanism, no code change.
+- **`marker_single_exe` / `python_exe` / `module_dir` (§1 below) stay per-machine, GPU-
+  bound paths regardless of where the `trialerror` process itself runs** — these name a
+  local GPU install on whichever machine actually has one; a Linux/container host with no
+  GPU simply leaves `[ingest.ocr]`/`[ingest.embed]` unconfigured (falls back to the
+  deterministic `Fake*Backend`, same as any fresh program) rather than pointing them at
+  itself.
+- **Proven in a real container deployment, not just theoretically portable** — a checkout
+  bind-mounted into a Linux container (`pip install -e`'d at image build time), platform
+  root pointed at a dedicated directory via `TRIALERROR_PLATFORM_ROOT`, and the long-running
+  processes supervised as a detached, foregrounded loop (`dashboard serve --foreground` /
+  `jobs start-worker --foreground` in a supervisor's own restart loop — the `--foreground`
+  flags there are deliberate: a supervisor wants the CLI to block, not self-detach a second
+  time).
+
 ## 1. Local models — marker OCR + Qwen3-Embedding-4B
 
 The real backends are **config-pathed, never hardcoded** — TrialError shells out to your
@@ -341,7 +370,7 @@ raw vectors dominate the payload either way).
    walking away from it unattended for the first run.
 4. **Query it**:
    ```console
-   trialerror lit arxiv-semantic --q "formal semantics for tabletop game rules engines" --k 10
+   trialerror lit arxiv-semantic --q "retrieval-augmented generation evaluation metrics" --k 10
    ```
    Requires `[litapi.arxiv_index].api_key_path` pointed at a file holding your OpenAI API
    key (query-time embedding only — the corpus vectors are already precomputed, this never

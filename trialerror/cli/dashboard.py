@@ -17,19 +17,19 @@ Two subcommands:
   file and returns.
 
 TRIALERROR-DEV-NOTE (detached-by-default, a deliberate deviation from the
-mechspace reference): ``serve_mechspace.py`` (this build's named
-architecture reference) is a standalone script always run in the
-foreground -- ``python serve_mechspace.py``, Ctrl+C to stop, no detached
-mode at all. Every OTHER ``trialerror`` CLI command returns control to the
-shell immediately (design's own ``AgentEnvelope`` framing assumes a
-one-shot command, not a blocking one), and this codebase already has an
-established convention for a long-running local server needing to fit that
-shape: ``trialerror jobs start-worker`` spawns a DETACHED child by default and
-only blocks under an explicit ``--foreground`` (``trialerror.jobs.worker.
-spawn_worker``). ``trialerror dashboard serve`` follows THAT precedent rather
-than mechspace's always-foreground one, since an agent driving this CLI
-programmatically needs its shell back, and ``--foreground`` is exactly the
-one-line escape hatch (used by this build's own subprocess smoke test,
+origin project's earlier dashboard): that earlier dashboard's server script
+is a standalone script always run in the foreground -- invoked directly,
+Ctrl+C to stop, no detached mode at all. Every OTHER ``trialerror`` CLI
+command returns control to the shell immediately (design's own
+``AgentEnvelope`` framing assumes a one-shot command, not a blocking one),
+and this codebase already has an established convention for a long-running
+local server needing to fit that shape: ``trialerror jobs start-worker``
+spawns a DETACHED child by default and only blocks under an explicit
+``--foreground`` (``trialerror.jobs.worker.spawn_worker``). ``trialerror
+dashboard serve`` follows THAT precedent rather than the earlier dashboard's
+always-foreground one, since an agent driving this CLI programmatically
+needs its shell back, and ``--foreground`` is exactly the one-line escape
+hatch (used by this build's own subprocess smoke test,
 ``tests/test_dashboard_serve.py``) when blocking is what's wanted.
 """
 
@@ -152,7 +152,9 @@ def _cmd_serve(args: argparse.Namespace) -> dict[str, Any]:
         # setsid() detaches from the controlling terminal so the child
         # survives the parent shell and is not hit by its Ctrl-C. Exercised
         # on every Linux run -- no `pragma: no cover` here, or coverage
-        # would hide the only branch that platform ever takes.
+        # would hide the only branch that platform ever takes; the branch has
+        # its own direct coverage in tests/test_posix_detach.py (which skips
+        # cleanly on win32).
         popen_kwargs["start_new_session"] = True
 
     log_fh = open(log_path, "ab")

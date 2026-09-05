@@ -19,7 +19,7 @@ __all__ = ["bootstrap_launch", "build_small_corpus", "OVER_LENGTH_QUOTE", "restr
 #: fence-violation tests to build a summary body that must be refused for
 #: a subject citing ``build_small_corpus``'s restricted source.
 OVER_LENGTH_QUOTE = (
-    '"this exact combat resolution paragraph is being quoted verbatim word for word for '
+    '"this exact quorum reconfiguration paragraph is being quoted verbatim word for word for '
     'far more than twenty words on purpose so the D-COC-1 fence has something real to catch"'
 )
 

@@ -43,8 +43,8 @@ def test_live_cc_stop_hook_close_check():
     ...
 
 
-@pytest.mark.skip(reason=GPU_LIVE_CC_ITEMS["live_cc_task_matcher_wiring"])
-def test_live_cc_task_matcher_wiring():
+@pytest.mark.skip(reason=GPU_LIVE_CC_ITEMS["live_cc_task_or_agent_matcher_wiring"])
+def test_live_cc_task_or_agent_matcher_wiring():
     ...
 
 

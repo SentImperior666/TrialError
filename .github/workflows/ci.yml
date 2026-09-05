@@ -10,6 +10,21 @@ jobs:
     # TrialError was developed Windows-first; the Linux lane joined once the
     # suite had actually been proven there (see docs/GETTING_STARTED.md).
     # Both are required now -- neither platform is allowed to rot.
+    #
+    # ONE matrix job, not two: an earlier revision of this file kept a
+    # Windows-only `test` job and added a separate `test-linux` alongside it.
+    # The matrix is the better shape -- one definition, so the two lanes'
+    # install/test steps cannot drift apart -- so the extra job was folded in
+    # here. The Linux-only line-ending steps it carried survive below, gated
+    # on `runner.os == 'Linux'` because they are bash and the Windows leg of
+    # the matrix runs pwsh.
+    #
+    # What the ubuntu leg actually protects: the POSIX detachment branch in
+    # trialerror/jobs/worker.py, trialerror/cli/dashboard.py and
+    # trialerror/cli/obs.py (`start_new_session=True`, formerly
+    # `pragma: no cover`). It has direct coverage in
+    # tests/test_posix_detach.py, which SKIPS cleanly on win32, so the
+    # Windows leg is unaffected by it.
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -25,6 +40,52 @@ jobs:
         # Quoted: unquoted bracket extras are a glob, which works in bash by
         # accident (no match -> passed through literally) but errors under
         # zsh and under `set -f`.
+        #
+        # Deliberately NOT pinning tantivy here: nothing under
+        # testpaths=["tests"] imports it (the one import site,
+        # spikes/index_bakeoffs/bench_fts.py, is never collected by pytest,
+        # and the shipped search path is SQLite FTS5 -- see
+        # trialerror/ingest/normalizers.py's own "FTS5-over-tantivy"
+        # rationale). A deployment image that needs it pins it in its own
+        # Dockerfile, not in this test lane.
         run: pip install -e '.[dev]'
       - name: Test
         run: python -m pytest tests -q
+      - name: Check .gitattributes is tracked (CRLF-invariant precondition)
+        # The CRLF invariant below asserts that .gitattributes-driven
+        # renormalization has actually happened on this checkout. Until it
+        # has, the invariant is not yet in effect and must not hard-fail
+        # every push/PR in the meantime -- this step makes that sequencing
+        # explicit instead of shipping a step that is simply red until the
+        # renormalization commit lands.
+        if: runner.os == 'Linux'
+        id: gitattr
+        run: |
+          if git ls-files --error-unmatch .gitattributes > /dev/null 2>&1; then
+            echo "tracked=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tracked=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: CRLF normalization invariant
+        if: runner.os == 'Linux' && steps.gitattr.outputs.tracked == 'true'
+        run: |
+          crlf_count=$(git ls-files --eol | grep -c 'w/crlf' || true)
+          mixed_count=$(git ls-files --eol | grep -c 'w/mixed' || true)
+          cmd_bat_count=$(git ls-files | grep -Ei '\.(cmd|bat)$' | wc -l | tr -d ' ')
+          echo "w/crlf tracked files: $crlf_count -- w/mixed tracked files: $mixed_count -- *.cmd/*.bat tracked files: $cmd_bat_count"
+          if [ "$crlf_count" != "$cmd_bat_count" ]; then
+            echo "::error::git ls-files --eol reports $crlf_count CRLF working-tree file(s) but there are $cmd_bat_count *.cmd/*.bat file(s) -- the '* text=auto eol=lf' normalization is not (yet, or no longer) in effect on this checkout."
+            exit 1
+          fi
+          if [ "$mixed_count" != "0" ]; then
+            # w/crlf alone lets a mixed-line-ending file slip through
+            # uncounted on either side of the check -- a file with MIXED
+            # line endings violates '* text=auto eol=lf' just as much as a
+            # pure-CRLF one does.
+            echo "::error::git ls-files --eol reports $mixed_count file(s) with MIXED line endings (w/mixed) -- these violate the '* text=auto eol=lf' normalization just as much as a CRLF file does. Run 'git add --renormalize .' and recommit."
+            exit 1
+          fi
+      - name: .gitattributes not yet tracked -- CRLF invariant not enforced
+        if: runner.os == 'Linux' && steps.gitattr.outputs.tracked != 'true'
+        run: |
+          echo "::warning::.gitattributes is not tracked on this checkout yet -- the CRLF/mixed-line-ending invariant is not enforced until it is."

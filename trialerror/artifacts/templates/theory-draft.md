@@ -32,7 +32,7 @@ Iter-3 mandatory rules: semantic-fidelity kill condition; NO self-authored seeds
 <!-- How the object evolves; update rules stated precisely. -->
 
 ## Phenomena coverage
-<!-- Which tabletop phenomena the theory covers / excludes; be explicit about exclusions. -->
+<!-- Which phenomena the theory covers / excludes; be explicit about exclusions. -->
 
 ## Math-to-code
 <!-- Decidability, complexity, runtime objects, emission surface — the bridge from formalism to implementation. -->

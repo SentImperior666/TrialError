@@ -3,8 +3,8 @@ an :class:`~trialerror.dashboard.store_ro.RoStore` and returning a JSON-
 serializable ``dict``. These are the SAME functions both
 ``trialerror.dashboard.serve`` (live, per-request) and ``trialerror.dashboard.export``
 (one static snapshot) call -- the live and static paths can never
-independently drift on what a panel means, the same discipline
-``mechspace``'s data layer follows for its own single build path.
+independently drift on what a panel means, the same discipline the
+earlier dashboard's data layer follows for its own single build path.
 
 Scope (v1-honest, per the M1 build brief): an OPS COCKPIT over a TrialError
 program's operational state, not a research-content viz. Six panels

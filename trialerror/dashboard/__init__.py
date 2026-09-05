@@ -3,12 +3,11 @@ read-only web view over one TrialError program's stores.
 
 Ops cockpit, not a research-content viz (that distinction is deliberate --
 see the module docstrings under this package for the panel-by-panel scope).
-Modeled on the origin-project mechspace dashboard's proven serve+watch architecture
-(``research/tools/research_dashboard/mechspace/serve_mechspace.py`` in the
-sibling ``origin-project`` repo, read there as a READ-ONLY
-reference -- this package is TrialError's own build, not a copy): stdlib
-``http.server`` + a Server-Sent-Events endpoint fed by a polling mtime
-watcher, a static-snapshot export fallback, and localhost-only binding.
+Modeled on the proven serve+watch architecture of an earlier in-house
+research dashboard, read as a READ-ONLY reference -- this package is
+TrialError's own build, not a copy: stdlib ``http.server`` + a
+Server-Sent-Events endpoint fed by a polling mtime watcher, a
+static-snapshot export fallback, and localhost-only binding.
 
 Public surface, by submodule:
 

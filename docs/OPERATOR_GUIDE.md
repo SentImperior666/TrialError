@@ -138,7 +138,7 @@ real code (not policy text):
 
 | Surface | Refuses | Mechanism |
 |---|---|---|
-| **`PreToolUse:Task` hook** (`plugin/hooks/spawn_gate.py`) | A `Task` (subagent spawn) call whose prompt carries no valid `launch_id:` token, or one whose booking isn't `PROVISIONAL`/isn't the open session's/has an expired TTL, or whose model class violates `trialerror.toml`'s `[models]` policy for the stated purpose | Exit code 2 blocks the tool call; stderr carries the exact `trialerror budget book` command to fix it. The booking is consumed atomically on success (a conditional `PROVISIONAL→RUNNING` UPDATE) — the SAME `launch_id` token cannot ride a second spawn. Passes through (exit 0) for any non-`Task` tool call, or if it can't open the program's stores at all it fails **closed** (exit 2) since a `Task` call it can't verify is treated as unsafe. |
+| **`PreToolUse:Task/Agent` hook** (`plugin/hooks/spawn_gate.py`) | A subagent-spawn call — Claude Code 2.1.x invokes this as the `Agent` tool; `Task` is a legacy alias name the matcher and hook still accept (found live 2026-09-05, FU-11) — whose prompt carries no valid `launch_id:` token, or one whose booking isn't `PROVISIONAL`/isn't the open session's/has an expired TTL, or whose model class violates `trialerror.toml`'s `[models]` policy for the stated purpose | Exit code 2 blocks the tool call; stderr carries the exact `trialerror budget book` command to fix it. The booking is consumed atomically on success (a conditional `PROVISIONAL→RUNNING` UPDATE) — the SAME `launch_id` token cannot ride a second spawn. Passes through (exit 0) for any tool call whose name isn't `Task`/`Agent`, or if it can't open the program's stores at all it fails **closed** (exit 2) since a subagent-spawn call it can't verify is treated as unsafe. |
 | **`Stop` hook** (`plugin/hooks/stop_check.py`) | Stopping a session that still has dangling launches or a stale law pin | Blocks **once** with a checklist (exit 2); Claude Code's own `stop_hook_active` flag means the *second* stop attempt always passes — it can never trap the user in a loop. Fails **open** (allows the stop) on any internal error, unlike the spawn gate. |
 | **`trialerror session close`** | The same dangling-launch/stale-digest condition, plus an unread inbox, plus (unless `--override-ruling-id` cites an existing ruling) a session where hooks were never observed to fire at all (`hook_alive` event count = 0) | Returns a structured error naming the exact fix in `nextActions` — reconcile a launch, read the inbox, or `law diff-foreign`. |
 | **`trialerror gate` / `trialerror artifact register`** | Registering a `gated=1` artifact type whose gate isn't in `union_applied`; any gate-state transition that isn't a legal edge in the state machine; entering `union_applied` with an unverified blocking edit or a `reproduction_status=mismatch` | `IllegalTransitionError`/`GateEntryConditionError` → structured error; `gate advance` is the one mutation path and rejects every illegal edge (property-tested). |
@@ -224,9 +224,9 @@ below).
 
 Straight from this build's own `trialerror accept` enumeration:
 
-1. **Live Claude Code round trips** — `SessionStart` bundle injection, the `PreToolUse:Task`
+1. **Live Claude Code round trips** — `SessionStart` bundle injection, the `PreToolUse:Task/Agent`
    spawn-gate actually blocking a real spawn, the `Stop`-hook checklist, the `hooks.json`
-   Task-matcher actually scoping to `Task` calls, and both MCP servers' tool lists actually
+   matcher actually scoping to `Task`/`Agent` calls (and only those), and both MCP servers' tool lists actually
    being offered to a live agent — all proven only by real-subprocess tests, never inside
    an actual Claude Code session yet.
 2. **Real GPU backends** — `RealMarkerOcrBackend` has a `skipif`-gated smoke test (self-skips

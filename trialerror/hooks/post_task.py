@@ -20,6 +20,16 @@ detection mechanism.
 
 Always exits 0 — PostToolUse fires AFTER the tool already ran; this hook
 is pure observability and must never fail closed on a logging problem.
+
+TRIALERROR-DEV-NOTE (Task->Agent rename, found 2026-09-05): this hook used
+to gate on a bare ``tool_name != "Task"``. Live evidence on the sandbox
+host (03:34Z, the sandbox container) showed Claude Code 2.1.261 invoking
+the subagent tool as ``Agent``, not ``Task`` -- the old check silently
+skipped the ``subagent_return`` event (and the ``hook_alive{hook=post_task}``
+marker) for every real spawn. This now gates on
+:data:`trialerror.hooks.SUBAGENT_TOOL_NAMES` (``("Task", "Agent")``),
+matching :mod:`trialerror.hooks.spawn_gate`'s own fix and
+``plugin/hooks/hooks.json``'s ``^(Task|Agent)$`` matcher.
 """
 
 from __future__ import annotations
@@ -28,17 +38,26 @@ import json
 import sys
 from pathlib import Path
 
+from trialerror.hooks import SUBAGENT_TOOL_NAMES
+
 
 def _evaluate(payload: dict) -> str | None:
     """Returns a stderr diagnostic, or ``None`` on success/no-op. Kept
     separate from ``main()`` for direct testing, mirroring
     ``plugin/hooks/spawn_gate.py``'s ``_evaluate``."""
     tool_name = payload.get("tool_name")
-    if tool_name != "Task":
+    if tool_name not in SUBAGENT_TOOL_NAMES:
         return None
 
     tool_input = payload.get("tool_input") or {}
     prompt_text = tool_input.get("prompt") or tool_input.get("description") or ""
+    if not prompt_text and tool_input:
+        # TRIALERROR-DEV-NOTE (tool_input schema assumption, FU-11 verification
+        # finding FU11-V5): mirrors spawn_gate.py's own fallback -- if a
+        # future rename moves the prompt text under some other key, scan the
+        # WHOLE serialized tool_input for the `launch_id:` token rather than
+        # recording a subagent_return with a NULL launch_id.
+        prompt_text = json.dumps(tool_input, ensure_ascii=False)
     tool_response = payload.get("tool_response")
     cwd = payload.get("cwd") or "."
 

@@ -27,7 +27,7 @@ def corpus(store):
 
 
 def test_search_returns_a_non_null_citation_block_on_every_result(store, corpus):
-    r = engine.search(store, query="dice pools resolve uncertain outcomes")
+    r = engine.search(store, query="retry budgets bound tail latency")
     assert r["ok"] is True
     assert r["results"]
     for row in r["results"]:
@@ -43,25 +43,25 @@ def test_search_returns_a_non_null_citation_block_on_every_result(store, corpus)
 
 
 def test_search_query_id_is_a_qry_typed_id(store, corpus):
-    r = engine.search(store, query="dice pools")
+    r = engine.search(store, query="retry budgets")
     assert r["query_id"].startswith("QRY-")
 
 
 def test_search_mode_fts_only_uses_the_fts_tier(store, corpus):
-    r = engine.search(store, query="dice pools", mode="fts")
+    r = engine.search(store, query="retry budgets", mode="fts")
     assert r["tiers_used"] == ["fts"]
     assert r["stats"]["vector_scored"] == 0
 
 
 def test_search_mode_vector_only_uses_the_vector_tier(store, corpus):
-    r = engine.search(store, query="dice pools", mode="vector")
+    r = engine.search(store, query="retry budgets", mode="vector")
     assert r["tiers_used"] == ["vector"]
     assert r["stats"]["fts_candidates"] == 0
 
 
 def test_search_mode_auto_and_hybrid_use_both_tiers(store, corpus):
     for mode in ("auto", "hybrid"):
-        r = engine.search(store, query="dice pools resolve uncertain outcomes", mode=mode)
+        r = engine.search(store, query="retry budgets bound tail latency", mode=mode)
         assert r["tiers_used"] == ["fts", "vector"]
         assert r["results"][0]["fusion"]  # has per-tier rank entries
 
@@ -72,28 +72,28 @@ def test_search_invalid_mode_raises(store, corpus):
 
 
 def test_search_filters_by_license_tier(store, corpus):
-    r = engine.search(store, query="combat resolution", mode="fts", filters={"license_tier": ["commercial_restricted"]})
+    r = engine.search(store, query="quorum reconfiguration", mode="fts", filters={"license_tier": ["commercial_restricted"]})
     assert len(r["results"]) == 1
     assert r["results"][0]["source_id"] == corpus["restricted_source_id"]
 
-    r_wrong = engine.search(store, query="combat resolution", mode="fts", filters={"license_tier": ["open"]})
+    r_wrong = engine.search(store, query="quorum reconfiguration", mode="fts", filters={"license_tier": ["open"]})
     assert r_wrong["results"] == []
 
 
 def test_search_filters_by_source_ids(store, corpus):
-    r = engine.search(store, query="dice pools", mode="fts", filters={"source_ids": [corpus["open_source_id"]]})
+    r = engine.search(store, query="retry budgets", mode="fts", filters={"source_ids": [corpus["open_source_id"]]})
     assert all(row["source_id"] == corpus["open_source_id"] for row in r["results"])
 
 
 def test_search_filter_matching_nothing_returns_a_well_formed_empty_response(store, corpus):
-    r = engine.search(store, query="dice pools", filters={"source_ids": ["SRC-does-not-exist"]})
+    r = engine.search(store, query="retry budgets", filters={"source_ids": ["SRC-does-not-exist"]})
     assert r["ok"] is True
     assert r["results"] == []
     assert r["tiers_used"] == []
 
 
 def test_search_stats_carries_fts_candidates_vector_scored_and_elapsed_ms(store, corpus):
-    r = engine.search(store, query="dice pools resolve uncertain outcomes")
+    r = engine.search(store, query="retry budgets bound tail latency")
     assert isinstance(r["stats"]["fts_candidates"], int)
     assert isinstance(r["stats"]["vector_scored"], int)
     assert isinstance(r["stats"]["elapsed_ms"], float)
@@ -101,12 +101,12 @@ def test_search_stats_carries_fts_candidates_vector_scored_and_elapsed_ms(store,
 
 
 def test_search_k_limits_result_count(store, corpus):
-    r = engine.search(store, query="dice pools resolve uncertain outcomes", k=1)
+    r = engine.search(store, query="retry budgets bound tail latency", k=1)
     assert len(r["results"]) <= 1
 
 
 def test_search_results_are_ranked_1_based_and_score_descending(store, corpus):
-    r = engine.search(store, query="dice pools resolve uncertain outcomes")
+    r = engine.search(store, query="retry budgets bound tail latency")
     ranks = [row["rank"] for row in r["results"]]
     assert ranks == list(range(1, len(ranks) + 1))
     scores = [row["score"] for row in r["results"]]
@@ -119,7 +119,7 @@ def test_search_results_are_ranked_1_based_and_score_descending(store, corpus):
 
 
 def test_search_fences_commercial_restricted_results(store, corpus):
-    r = engine.search(store, query="combat resolution initiative order proprietary special ability", mode="fts")
+    r = engine.search(store, query="quorum reconfiguration lease fencing proprietary epoch counter", mode="fts")
     assert r["results"]
     row = r["results"][0]
     assert row["fenced"] is True
@@ -129,7 +129,7 @@ def test_search_fences_commercial_restricted_results(store, corpus):
 
 
 def test_search_does_not_fence_open_results(store, corpus):
-    r = engine.search(store, query="dice pools resolve uncertain outcomes", mode="fts")
+    r = engine.search(store, query="retry budgets bound tail latency", mode="fts")
     assert r["results"]
     row = r["results"][0]
     assert row["fenced"] is False
@@ -139,7 +139,7 @@ def test_search_does_not_fence_open_results(store, corpus):
 def test_search_text_field_is_untrusted_wrapped(store, corpus):
     from trialerror.retrieve.wrap import UNTRUSTED_CLOSE, UNTRUSTED_OPEN
 
-    r = engine.search(store, query="dice pools resolve uncertain outcomes", mode="fts")
+    r = engine.search(store, query="retry budgets bound tail latency", mode="fts")
     text = r["results"][0]["text"]
     assert text.startswith(UNTRUSTED_OPEN)
     assert text.endswith(UNTRUSTED_CLOSE)
@@ -147,7 +147,7 @@ def test_search_text_field_is_untrusted_wrapped(store, corpus):
 
 def test_search_unfenced_true_serves_raw_text_and_logs_one_event(store, corpus):
     r = engine.search(
-        store, query="combat resolution initiative order proprietary special ability", mode="fts",
+        store, query="quorum reconfiguration lease fencing proprietary epoch counter", mode="fts",
         unfenced=True, launch_id=corpus["launch_id"],
     )
     row = r["results"][0]
@@ -159,7 +159,7 @@ def test_search_unfenced_true_serves_raw_text_and_logs_one_event(store, corpus):
 
 
 def test_search_unfenced_false_never_logs_a_bypass_event(store, corpus):
-    engine.search(store, query="combat resolution initiative order proprietary special ability", mode="fts")
+    engine.search(store, query="quorum reconfiguration lease fencing proprietary epoch counter", mode="fts")
     events = list(store.ops.execute("SELECT * FROM event WHERE type = 'retrieval_unfenced_bypass'"))
     assert events == []
 
@@ -208,13 +208,13 @@ def test_get_source_not_found_raises(store):
 def test_get_document_outline_includes_title_elements(store, corpus):
     insert(
         store, "element",
-        {"element_id": new_id("ELM"), "doc_id": corpus["open_doc_id"], "seq": 99, "type": "Title", "text": "Chapter One: Dice and Fate", "page_number": 1},
+        {"element_id": new_id("ELM"), "doc_id": corpus["open_doc_id"], "seq": 99, "type": "Title", "text": "Chapter One: Systems Overview", "page_number": 1},
     )
     outline = engine.get_document_outline(store, corpus["open_doc_id"])
     assert outline["fenced"] is False
     titles = [o for o in outline["outline"] if o["type"] == "Title"]
     assert len(titles) == 1
-    assert titles[0]["text_preview"] == "Chapter One: Dice and Fate"
+    assert titles[0]["text_preview"] == "Chapter One: Systems Overview"
 
 
 def test_get_document_outline_fences_titles_for_restricted_sources(store, corpus):
@@ -252,7 +252,7 @@ def test_resolve_quote_exact_match_returns_page_and_span(store, corpus):
 
 
 def test_resolve_quote_substring_match_falls_back(store, corpus):
-    result = engine.resolve_quote(store, "dice pools to resolve uncertain outcomes")
+    result = engine.resolve_quote(store, "retry budgets to bound tail latency")
     assert result["found"] is True
     assert result["match_type"] == "substring"
 
@@ -273,7 +273,7 @@ def test_resolve_quote_fences_a_restricted_match(store, corpus):
 
 
 def test_resolve_quote_source_id_filter(store, corpus):
-    result = engine.resolve_quote(store, "dice pools to resolve uncertain outcomes", source_id=corpus["restricted_source_id"])
+    result = engine.resolve_quote(store, "retry budgets to bound tail latency", source_id=corpus["restricted_source_id"])
     assert result["found"] is False  # this text lives in the OPEN source, not the restricted one
 
 
@@ -314,14 +314,14 @@ def test_similar_not_found_raises(store):
 
 def test_graph_neighbors_returns_live_edges(store, corpus):
     e1, e2 = new_id("ENT"), new_id("ENT")
-    insert(store, "entity", {"entity_id": e1, "name": "Fireball", "entity_type": "spell", "resolution": "confirmed", "created_by_launch": corpus["launch_id"], "created_at": now()})
-    insert(store, "entity", {"entity_id": e2, "name": "Mage", "entity_type": "class", "resolution": "confirmed", "created_by_launch": corpus["launch_id"], "created_at": now()})
+    insert(store, "entity", {"entity_id": e1, "name": "Failover", "entity_type": "action", "resolution": "confirmed", "created_by_launch": corpus["launch_id"], "created_at": now()})
+    insert(store, "entity", {"entity_id": e2, "name": "Operator", "entity_type": "role", "resolution": "confirmed", "created_by_launch": corpus["launch_id"], "created_at": now()})
     anchor = dict(store.knowledge.execute("SELECT anchor_id FROM quote_anchor LIMIT 1").fetchone())
-    insert(store, "relation", {"rel_id": new_id("REL"), "src_entity": e1, "dst_entity": e2, "rel_type": "cast_by", "fact_text": "Fireball is cast by a Mage", "evidence_anchor": anchor["anchor_id"], "created_at": now()})
+    insert(store, "relation", {"rel_id": new_id("REL"), "src_entity": e1, "dst_entity": e2, "rel_type": "issued_by", "fact_text": "Failover is issued by an Operator", "evidence_anchor": anchor["anchor_id"], "created_at": now()})
 
     result = engine.graph_neighbors(store, e1)
     assert result["count"] == 1
-    assert result["edges"][0]["rel_type"] == "cast_by"
+    assert result["edges"][0]["rel_type"] == "issued_by"
 
     # symmetric: looking up the OTHER side of the edge finds it too
     result2 = engine.graph_neighbors(store, e2)
@@ -367,8 +367,8 @@ def test_graph_neighbors_fences_fact_text_for_commercial_restricted_source(store
     from trialerror.retrieve.wrap import UNTRUSTED_CLOSE, UNTRUSTED_OPEN
 
     e1, e2 = new_id("ENT"), new_id("ENT")
-    insert(store, "entity", {"entity_id": e1, "name": "Fireball", "entity_type": "spell", "resolution": "confirmed", "created_by_launch": corpus["launch_id"], "created_at": now()})
-    insert(store, "entity", {"entity_id": e2, "name": "Mage", "entity_type": "class", "resolution": "confirmed", "created_by_launch": corpus["launch_id"], "created_at": now()})
+    insert(store, "entity", {"entity_id": e1, "name": "Failover", "entity_type": "action", "resolution": "confirmed", "created_by_launch": corpus["launch_id"], "created_at": now()})
+    insert(store, "entity", {"entity_id": e2, "name": "Operator", "entity_type": "role", "resolution": "confirmed", "created_by_launch": corpus["launch_id"], "created_at": now()})
 
     restricted_anchor = dict(
         store.knowledge.execute(
@@ -383,7 +383,7 @@ def test_graph_neighbors_fences_fact_text_for_commercial_restricted_source(store
     insert(
         store, "relation",
         {
-            "rel_id": new_id("REL"), "src_entity": e1, "dst_entity": e2, "rel_type": "cast_by",
+            "rel_id": new_id("REL"), "src_entity": e1, "dst_entity": e2, "rel_type": "issued_by",
             "fact_text": verbatim_fact, "evidence_anchor": restricted_anchor["anchor_id"], "created_at": now(),
         },
     )
@@ -406,8 +406,8 @@ def test_graph_neighbors_does_not_fence_open_source_fact_text_but_still_wraps(st
     from trialerror.retrieve.wrap import UNTRUSTED_CLOSE, UNTRUSTED_OPEN
 
     e1, e2 = new_id("ENT"), new_id("ENT")
-    insert(store, "entity", {"entity_id": e1, "name": "Fireball", "entity_type": "spell", "resolution": "confirmed", "created_by_launch": corpus["launch_id"], "created_at": now()})
-    insert(store, "entity", {"entity_id": e2, "name": "Mage", "entity_type": "class", "resolution": "confirmed", "created_by_launch": corpus["launch_id"], "created_at": now()})
+    insert(store, "entity", {"entity_id": e1, "name": "Failover", "entity_type": "action", "resolution": "confirmed", "created_by_launch": corpus["launch_id"], "created_at": now()})
+    insert(store, "entity", {"entity_id": e2, "name": "Operator", "entity_type": "role", "resolution": "confirmed", "created_by_launch": corpus["launch_id"], "created_at": now()})
 
     open_anchor = dict(
         store.knowledge.execute(
@@ -417,8 +417,8 @@ def test_graph_neighbors_does_not_fence_open_source_fact_text_but_still_wraps(st
     insert(
         store, "relation",
         {
-            "rel_id": new_id("REL"), "src_entity": e1, "dst_entity": e2, "rel_type": "cast_by",
-            "fact_text": "Fireball is cast by a Mage", "evidence_anchor": open_anchor["anchor_id"], "created_at": now(),
+            "rel_id": new_id("REL"), "src_entity": e1, "dst_entity": e2, "rel_type": "issued_by",
+            "fact_text": "Failover is issued by an Operator", "evidence_anchor": open_anchor["anchor_id"], "created_at": now(),
         },
     )
 
@@ -427,7 +427,7 @@ def test_graph_neighbors_does_not_fence_open_source_fact_text_but_still_wraps(st
     assert edge["fenced"] is False
     assert edge["fact_text"].startswith(UNTRUSTED_OPEN)
     assert edge["fact_text"].endswith(UNTRUSTED_CLOSE)
-    assert "Fireball is cast by a Mage" in edge["fact_text"]  # short + open -> not capped away
+    assert "Failover is issued by an Operator" in edge["fact_text"]  # short + open -> not capped away
 
 
 def test_graph_neighbors_wraps_entity_summary(store, corpus):
@@ -437,7 +437,7 @@ def test_graph_neighbors_wraps_entity_summary(store, corpus):
     insert(
         store, "entity",
         {
-            "entity_id": e1, "name": "Fireball", "entity_type": "spell", "summary": "A powerful evocation spell.",
+            "entity_id": e1, "name": "Failover", "entity_type": "action", "summary": "A powerful failover routine.",
             "resolution": "confirmed", "created_by_launch": corpus["launch_id"], "created_at": now(),
         },
     )
@@ -445,9 +445,9 @@ def test_graph_neighbors_wraps_entity_summary(store, corpus):
     summary = result["entity"]["summary"]
     assert summary.startswith(UNTRUSTED_OPEN)
     assert summary.endswith(UNTRUSTED_CLOSE)
-    assert "A powerful evocation spell." in summary
+    assert "A powerful failover routine." in summary
     # entity.name is a short structured label, not a free-text body -- left unwrapped
-    assert result["entity"]["name"] == "Fireball"
+    assert result["entity"]["name"] == "Failover"
 
 
 def test_graph_neighbors_entity_without_summary_is_unaffected(store, corpus):

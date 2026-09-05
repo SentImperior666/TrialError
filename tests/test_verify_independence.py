@@ -250,7 +250,7 @@ def test_run_hypothesis_verification_result_carries_independence_stats(store):
 
     result = run_hypothesis_verification(
         store, hypothesis_text="rulebooks describe combat and dice mechanics",
-        query="game rules dice combat spell", judge=lambda env: "explicit agreement",
+        query="distributed systems retry coordinator lock", judge=lambda env: "explicit agreement",
         issued_by_launch=launch_id, mode="vector",
     )
 

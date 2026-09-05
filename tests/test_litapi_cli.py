@@ -57,7 +57,7 @@ def test_register_wires_lookup_citations_search_subcommands():
     assert args2.lit_cmd == "citations"
     assert args2.limit == 5
 
-    args3 = parser.parse_args(["lit", "search", "--query", "tabletop engines"])
+    args3 = parser.parse_args(["lit", "search", "--query", "distributed systems"])
     assert args3.lit_cmd == "search"
 
 
@@ -123,12 +123,12 @@ def test_cmd_citations_ok(monkeypatch):
 
 def test_cmd_search_ok(monkeypatch):
     monkeypatch.setattr(cli_lit, "_build_client", lambda args: _StubClient())
-    args = _Args(query="tabletop engines", limit=10)
+    args = _Args(query="distributed systems", limit=10)
 
     env = cli_lit._cmd_search(args)
 
     assert env["ok"] is True
-    assert env["result"]["records"][0]["title"] == "hit for tabletop engines"
+    assert env["result"]["records"][0]["title"] == "hit for distributed systems"
 
 
 def test_load_program_config_raw_returns_empty_when_no_program_root():

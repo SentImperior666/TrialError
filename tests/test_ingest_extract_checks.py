@@ -64,7 +64,7 @@ def test_entity_dupes_suspected_warns_on_a_draft_merge_proposal(store, program_r
     extract_api.accept_candidate(store, gm_record_id, by_launch=corpus["launch_id"])
 
     def judge_dup(envelope):
-        return {"entities": [{"name": "Game Master", "entity_type": "role"}], "relations": [], "claims": []}
+        return {"entities": [{"name": "Coordinator", "entity_type": "role"}], "relations": [], "claims": []}
 
     dup = extract_api.run_extract_chunk(store, _restricted_chunk_id(corpus), judge=judge_dup, created_by_launch=corpus["launch_id"])
     extract_api.accept_candidate(store, dup["record_ids"]["entities"][0], by_launch=corpus["launch_id"])

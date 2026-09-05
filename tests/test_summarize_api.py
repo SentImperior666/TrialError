@@ -45,7 +45,7 @@ def test_document_envelope_shape_and_content(store, corpus):
     assert envelope["source_doc_ids"] == [corpus["open_doc_id"]]
     assert envelope["word_cap"] == DEFAULT_WORD_CAP
     assert envelope["fenced"] is False
-    assert "dice pools" in envelope["context"].lower()
+    assert "retry budgets" in envelope["context"].lower()
     assert str(envelope["word_cap"]) in envelope["instruction"]
 
     doc = get(store, "document", pk_column="doc_id", pk_value=corpus["open_doc_id"])
@@ -140,7 +140,7 @@ def test_collection_envelope_aggregates_bottom_up_from_existing_document_summary
 
 def test_store_and_get_round_trip(store, corpus):
     envelope = build_summary_envelope(store, subject_kind="document", subject_id=corpus["open_doc_id"])
-    body = "Tabletop games use dice pools; a GM adjudicates disputes."
+    body = "These schedulers use retry budgets; a coordinator arbitrates disputes."
     row = store_summary(store, envelope=envelope, body=body, issued_by_launch=corpus["launch_id"])
 
     assert row["summary_id"].startswith("SUM-")

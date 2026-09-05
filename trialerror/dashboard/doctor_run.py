@@ -6,8 +6,9 @@ panel-refresh loop the SSE watcher drives -- ``trialerror doctor``'s checks can
 be non-trivial work (a full XID-dangling scan across every table, a
 vendored/-tree license scan) and are explicitly an OPERATOR-INITIATED
 action here, not something that fires on every file-save the way
-mechspace's rebuild used to have to guard against for embeddings
-(``MECHSPACE_NO_EMBED``). This module's ``run_doctor_and_persist`` is only
+the origin project's earlier dashboard's rebuild used to have to guard
+against for embeddings (a strict no-embed-on-rebuild contract it enforced).
+This module's ``run_doctor_and_persist`` is only
 ever called from a dedicated serve endpoint (``GET /dashboard/api/doctor/
 run``) or the CLI, never from the watcher thread.
 
@@ -15,9 +16,9 @@ The result is persisted to one JSON sidecar file under the program root
 (``<program_root>/.trialerror_dashboard/doctor_state.json``) -- a NEW file this
 dashboard layer owns, exactly the same "sidecar next to the thing it
 reports on, not one of the program's real stores" convention
-``serve_mechspace.py``'s own ``rebuild_state.json`` documents (see that
-file's README_LIVE.md, ``data/rebuild_state.json`` section, read as this
-build's reference architecture) -- so a human/agent inspecting the program
+that earlier dashboard's own ``rebuild_state.json`` documents (see its
+own docs, read as this build's reference architecture) -- so a human/agent
+inspecting the program
 root after a live dashboard session finds it in the obvious place, and a
 restarted dashboard server picks the last result back up without re-running
 doctor.
@@ -102,6 +103,6 @@ def run_doctor_and_persist(
         with tmp.open("w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=False)
             f.write("\n")
-        tmp.replace(path)  # atomic-ish swap, same convention serve_mechspace.write_json uses
+        tmp.replace(path)  # atomic-ish swap, same convention that earlier dashboard's write_json uses
 
     return state

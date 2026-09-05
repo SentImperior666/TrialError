@@ -41,15 +41,15 @@ def test_summary_mode_with_no_summaries_yet_returns_empty(store, corpus):
 
 
 def test_summary_mode_excluded_via_tiers_returns_nothing(store, corpus):
-    _store_doc_summary(store, corpus, "open_doc_id", "Dice pools resolve uncertain outcomes in play.")
-    r = engine.search(store, query="dice pools", mode="summary", tiers=["fts"])
+    _store_doc_summary(store, corpus, "open_doc_id", "Retry budgets resolve uncertain outcomes in play.")
+    r = engine.search(store, query="retry budgets", mode="summary", tiers=["fts"])
     assert r["tiers_used"] == []
     assert r["results"] == []
 
 
 def test_summary_mode_never_touches_fts_or_vector_stats(store, corpus):
-    _store_doc_summary(store, corpus, "open_doc_id", "An overview about dice pools.")
-    r = engine.search(store, query="dice pools", mode="summary")
+    _store_doc_summary(store, corpus, "open_doc_id", "An overview about retry budgets.")
+    r = engine.search(store, query="retry budgets", mode="summary")
     assert r["stats"]["fts_candidates"] == 0
     assert r["stats"]["vector_scored"] == 0
 
@@ -60,8 +60,8 @@ def test_summary_mode_never_touches_fts_or_vector_stats(store, corpus):
 
 
 def test_summary_result_row_carries_a_non_null_citation_block(store, corpus):
-    row = _store_doc_summary(store, corpus, "open_doc_id", "Dice pools resolve uncertain outcomes during play.")
-    r = engine.search(store, query="dice pools", mode="summary")
+    row = _store_doc_summary(store, corpus, "open_doc_id", "Retry budgets resolve uncertain outcomes during play.")
+    r = engine.search(store, query="retry budgets", mode="summary")
     assert len(r["results"]) == 1
     result = r["results"][0]
     assert result["kind"] == "summary"
@@ -82,12 +82,12 @@ def test_summary_result_row_carries_a_non_null_citation_block(store, corpus):
 
 
 def test_summary_text_is_untrusted_wrapped(store, corpus):
-    _store_doc_summary(store, corpus, "open_doc_id", "Dice pools resolve uncertain outcomes during play.")
-    r = engine.search(store, query="dice pools", mode="summary")
+    _store_doc_summary(store, corpus, "open_doc_id", "Retry budgets resolve uncertain outcomes during play.")
+    r = engine.search(store, query="retry budgets", mode="summary")
     text = r["results"][0]["text"]
     assert text.startswith(UNTRUSTED_OPEN)
     assert text.endswith(UNTRUSTED_CLOSE)
-    assert "Dice pools resolve uncertain outcomes during play." in text
+    assert "Retry budgets resolve uncertain outcomes during play." in text
 
 
 # ---------------------------------------------------------------------------
@@ -156,9 +156,9 @@ def test_blank_query_browses_every_current_summary_newest_first(store, corpus):
 
 
 def test_query_terms_filter_out_non_matching_summaries(store, corpus):
-    _store_doc_summary(store, corpus, "open_doc_id", "an overview about dice pools and outcomes")
-    _store_doc_summary(store, corpus, "restricted_doc_id", "an overview about spell components only")
-    r = engine.search(store, query="dice pools", mode="summary")
+    _store_doc_summary(store, corpus, "open_doc_id", "an overview about retry budgets and outcomes")
+    _store_doc_summary(store, corpus, "restricted_doc_id", "an overview about leader election only")
+    r = engine.search(store, query="retry budgets", mode="summary")
     assert len(r["results"]) == 1
     assert r["results"][0]["doc_id"] == corpus["open_doc_id"]
 
@@ -186,8 +186,8 @@ def test_filter_matching_zero_chunks_returns_empty_summary_results_too(store, co
 
 
 def test_result_rank_and_score_fields_present(store, corpus):
-    _store_doc_summary(store, corpus, "open_doc_id", "overview text about dice pools")
-    r = engine.search(store, query="dice pools", mode="summary")
+    _store_doc_summary(store, corpus, "open_doc_id", "overview text about retry budgets")
+    r = engine.search(store, query="retry budgets", mode="summary")
     row = r["results"][0]
     assert row["rank"] == 1
     assert isinstance(row["score"], float)

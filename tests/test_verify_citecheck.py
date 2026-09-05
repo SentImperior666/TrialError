@@ -18,9 +18,9 @@ from trialerror.verify.errors import CitecheckError
 from tests._verify_fixtures import anchor_for_chunk, bootstrap_launch, build_small_corpus
 
 # The fixture's open-source chunk text (see tests/_retrieve_fixtures.py::_add_document):
-#   "Tabletop role-playing games use dice pools to resolve uncertain outcomes during play.\n\n
-#    A game master adjudicates rules disputes and narrates the consequences of player actions."
-_MATCHING_SENTENCE = "Tabletop role-playing games use dice pools to resolve uncertain outcomes during play."
+#   "Distributed schedulers use retry budgets to bound tail latency during failover.\n\n
+#    A coordinator arbitrates lock conflicts and records the consequences of worker actions."
+_MATCHING_SENTENCE = "Distributed schedulers use retry budgets to bound tail latency during failover."
 _MISMATCHED_SENTENCE = "Combat resolves through opposed rolls in this alternate system entirely."
 
 

@@ -1,7 +1,7 @@
 {
   "doi": "10.1234/fixture.5678",
   "doi_url": "https://doi.org/10.1234/fixture.5678",
-  "title": "A Fixture Paper About Tabletop Engine Metadata Reconciliation",
+  "title": "A Fixture Paper About Distributed Systems Metadata Reconciliation",
   "genre": "journal-article",
   "is_paratext": false,
   "published_date": "2021-01-01",

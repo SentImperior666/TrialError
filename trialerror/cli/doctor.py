@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 
+from trialerror.util.config import find_program_root
 from trialerror.util.doctor import DoctorContext, discover_and_register_checks, run_checks
 from trialerror.util.envelope import error_envelope, next_action, ok_envelope
 
@@ -50,7 +51,11 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
         help="program scaffold root, so program-scoped checks (store schema version, "
         "XID-dangling scan, anchors_dangling, ...) can resolve the program's ops/knowledge/"
         "jobs DBs instead of skipping (design Section 12 M15 row / INTEGRATION_NOTES.md "
-        "item 5: 'program-scoped checks silently skip through the shared CLI' without this)",
+        "item 5: 'program-scoped checks silently skip through the shared CLI' without this). "
+        "Default when omitted everywhere: discovered by walking up from CWD looking for "
+        "trialerror.toml (find_program_root), same convention every other CLI group uses "
+        "(e.g. trialerror/cli/session.py's _resolve_program_root) -- LANE0_SANDBOX_RELOCATION_"
+        "DESIGN.md Sec 6 item 2 / INTEGRATION_NOTES.md item 5 follow-up.",
     )
     parser.add_argument(
         "--platform-root",
@@ -83,9 +88,19 @@ def run(args: argparse.Namespace) -> dict:
     if args.license_audit:
         only = ["license_audit"]
 
+    # LANE0_SANDBOX_RELOCATION_DESIGN.md Sec 6 item 2 (INTEGRATION_NOTES.md item 5
+    # follow-up): item 5 gave `trialerror doctor` a --program-root FLAG, but never
+    # gave it a DEFAULT -- run from inside a real program root with no flag at all,
+    # DoctorContext.program_root stayed None and every program-scoped check kept
+    # silently skipping. Every other CLI group falls back to find_program_root()
+    # (walk up from CWD for trialerror.toml) when the flag is omitted at every
+    # placement (e.g. trialerror/cli/session.py's _resolve_program_root) -- doctor
+    # now does the same.
+    program_root = Path(args.program_root) if args.program_root else find_program_root()
+
     ctx = DoctorContext(
         repo_root=Path(args.repo_root) if args.repo_root else Path.cwd(),
-        program_root=Path(args.program_root) if args.program_root else None,
+        program_root=program_root,
         platform_root=Path(args.platform_root) if args.platform_root else None,
         vendored_root=Path(args.vendored_root) if args.vendored_root else None,
     )

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom" xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/" xmlns:arxiv="http://arxiv.org/schemas/atom">
-  <link href="http://export.arxiv.org/api/query?search_query=all:tabletop%20engines&amp;start=0&amp;max_results=2" rel="self" type="application/atom+xml"/>
-  <title type="html">ArXiv Query: search_query=all:tabletop engines</title>
+  <link href="http://export.arxiv.org/api/query?search_query=all:distributed%20systems&amp;start=0&amp;max_results=2" rel="self" type="application/atom+xml"/>
+  <title type="html">ArXiv Query: search_query=all:distributed systems</title>
   <id>http://export.arxiv.org/api/QUERY_ID_FIXTURE</id>
   <updated>2026-08-29T00:00:00-05:00</updated>
   <opensearch:totalResults xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">2</opensearch:totalResults>
@@ -11,7 +11,7 @@
     <id>http://arxiv.org/abs/2301.00001v1</id>
     <updated>2023-01-01T00:00:00Z</updated>
     <published>2023-01-01T00:00:00Z</published>
-    <title>A Fixture Search Hit About Tabletop Engines, One</title>
+    <title>A Fixture Search Hit About Distributed Systems, One</title>
     <summary>First canned search-hit abstract.</summary>
     <author><name>Dee Search</name></author>
     <link href="http://arxiv.org/abs/2301.00001v1" rel="alternate" type="text/html"/>
@@ -21,7 +21,7 @@
     <id>http://arxiv.org/abs/2301.00002v1</id>
     <updated>2023-01-02T00:00:00Z</updated>
     <published>2023-01-02T00:00:00Z</published>
-    <title>A Fixture Search Hit About Tabletop Engines, Two</title>
+    <title>A Fixture Search Hit About Distributed Systems, Two</title>
     <summary>Second canned search-hit abstract.</summary>
     <author><name>Eli Search</name></author>
     <link href="http://arxiv.org/abs/2301.00002v1" rel="alternate" type="text/html"/>

@@ -228,6 +228,51 @@ def test_post_task_appends_subagent_return_event(roots):
     store.close()
 
 
+def test_post_task_appends_subagent_return_event_for_renamed_agent_tool(roots):
+    """Task->Agent rename (found 2026-09-05): Claude Code 2.1.x invokes the
+    subagent tool as ``Agent``. Before the fix, ``tool_name != "Task"``
+    made this hook a silent no-op for every real spawn -- no
+    ``subagent_return`` event, no accounting. Mirrors
+    ``test_post_task_appends_subagent_return_event`` above with
+    ``tool_name: "Agent"``."""
+    platform_root, program_root = roots
+    _seed_account(platform_root, program_root)
+    _run_hook(SESSION_START, {"hook_event_name": "SessionStart", "cwd": str(program_root)}, platform_root=platform_root)
+
+    store = open_store(program_root, platform_root=platform_root)
+    session_row = store.ops.execute("SELECT session_id FROM session WHERE status='open'").fetchone()
+    booked = book_launch(
+        store, session_id=session_row["session_id"], program_id="PROG-test", agent_kind="lens", model_class="mid",
+        model="sonnet", purpose="mechanical", est_tokens=10,
+    )
+    store.close()
+
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Agent",
+        "tool_input": {"prompt": f"do the thing. launch_id: {booked.launch_id}"},
+        "tool_response": {"result": "ok", "ids": ["X-1", "X-2"]},
+        "cwd": str(program_root),
+    }
+    proc = _run_hook(POST_TASK, payload, platform_root=platform_root)
+    assert proc.returncode == 0, proc.stderr
+
+    store = open_store(program_root, platform_root=platform_root)
+    rows = store.ops.execute("SELECT * FROM event WHERE type='subagent_return'").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["launch_id"] == booked.launch_id
+    payload_obj = json.loads(rows[0]["payload"])
+    assert payload_obj["response_size_bytes"] > 0
+    # FU-11 verification finding F3: the absent hook_alive{hook="post_task"}
+    # row was half the live incident's signature -- assert it explicitly for
+    # the Agent-named payload, not just transitively via the subagent_return
+    # row above.
+    hook_alive_rows = store.ops.execute("SELECT payload FROM event WHERE type='hook_alive'").fetchall()
+    hooks_seen = [json.loads(r["payload"])["hook"] for r in hook_alive_rows]
+    assert "post_task" in hooks_seen, f"no hook_alive{{hook='post_task'}} row, got {hooks_seen!r}"
+    store.close()
+
+
 def test_post_task_records_a_post_task_hook_alive_marker_distinct_from_session_start(roots):
     """FX-8 (C-0064 lens B EP-1 Bypass C): post_task.py must leave its own
     ``payload.hook == "post_task"`` liveness marker (distinct from

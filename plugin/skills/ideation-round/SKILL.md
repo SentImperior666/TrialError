@@ -56,7 +56,7 @@ some docs" pass.
 
    Book each lens's launch (`trialerror budget book ...` or the `book_launch`
    MCP tool), then spawn it with the `launch_id:` token in its prompt — the
-   spawn gate consumes the booking on Task invocation (see `/boot`'s note
+   spawn gate consumes the booking on subagent invocation (see `/boot`'s note
    on the PreToolUse hook). Each lens's own prompt should carry its
    assigned slice's doc_ids and its vantage/seat framing verbatim — do not
    let a lens improvise its own slice.
