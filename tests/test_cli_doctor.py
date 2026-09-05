@@ -118,11 +118,21 @@ def test_cli_doctor_program_root_flag_lets_program_scoped_checks_resolve(tmp_pat
     through the shared CLI, no matter how real the program scaffold was.
     Without the flag every present DB is unresolvable -> skip; with it,
     a real (migrated) program's 3 program-scoped DBs (platform is resolved
-    independently) are found and checked."""
+    independently) are found and checked.
+
+    ``monkeypatch.chdir(tmp_path)`` below is load-bearing, same convention as
+    ``tests/test_session_cli.py::test_session_program_root_not_found``: since
+    the Sec 6 item 2 fix, an omitted ``--program-root`` now falls back to
+    ``find_program_root()`` from CWD -- and the harness repo's own root
+    carries a real (untracked, gitignored) ``trialerror.toml`` for local dev.
+    Running this from the repo root unchanged would have the "before the
+    flag" half accidentally resolve THAT real program instead of proving
+    "no program root" behavior."""
     platform_root = tmp_path / "platform"
     program_root = tmp_path / "program"
     program_root.mkdir()
     monkeypatch.setenv("TRIALERROR_PLATFORM_ROOT", str(platform_root))
+    monkeypatch.chdir(tmp_path)
     store = open_store(program_root, platform_root=platform_root)
     store.close()
 
@@ -202,3 +212,48 @@ def test_cli_doctor_platform_root_flag_wins_over_a_mismatching_env_var(tmp_path,
     check2 = next(c for c in env2["result"]["checks"] if c["name"] == "xid_dangling")
     assert check2["status"] == "pass", check2
     assert check2["details"]["offenders"] == {}
+
+
+def test_cli_doctor_program_root_defaults_to_find_program_root_from_cwd(tmp_path, capsys, monkeypatch):
+    """LANE0_SANDBOX_RELOCATION_DESIGN.md Sec 6 item 2 (INTEGRATION_NOTES.md item 5
+    follow-up): item 5 gave `trialerror doctor` a ``--program-root`` FLAG but no
+    DEFAULT, so running the top-level command from inside a real, scaffolded
+    program root with NO flag at all still left ``DoctorContext.program_root=None``
+    and every program-scoped check silently skipped -- exactly as if no program
+    existed. Every other CLI group (e.g. ``trialerror session boot``, via
+    ``trialerror/cli/session.py``'s ``_resolve_program_root``) falls back to
+    ``find_program_root()`` (walk up from CWD for ``trialerror.toml``) when the
+    flag is omitted everywhere; doctor must do the same.
+
+    Runs `trialerror doctor` (via ``main()``, no ``--program-root``) with CWD set
+    to a nested subdirectory of a real, migrated program root -- proving both
+    that the default now resolves at all, and that it walks UP (not just checks
+    CWD itself) the same way ``find_program_root`` documents."""
+    platform_root = tmp_path / "platform"
+    program_root = tmp_path / "program"
+    program_root.mkdir()
+    # find_program_root() looks for the trialerror.toml FILE itself -- open_store()
+    # alone (below) never writes one, so without this write, the walk-up from
+    # nested_cwd would find no marker at all (or, run from an unisolated CWD,
+    # the wrong one -- see the sibling test's docstring above).
+    (program_root / "trialerror.toml").write_text('[program]\nid = "doctor-default-check"\n', encoding="utf-8")
+    nested_cwd = program_root / "raw" / "some" / "nested" / "dir"
+    nested_cwd.mkdir(parents=True)
+    monkeypatch.setenv("TRIALERROR_PLATFORM_ROOT", str(platform_root))
+    store = open_store(program_root, platform_root=platform_root)
+    store.close()
+
+    monkeypatch.chdir(nested_cwd)
+
+    rc = main(["doctor", "--only", "store_schema_version", "--vendored-root", str(tmp_path / "vendored")])
+    out = capsys.readouterr().out.strip()
+    env = json.loads(out)
+    assert rc == 0, env
+    check = next(c for c in env["result"]["checks"] if c["name"] == "store_schema_version")
+    # Before the fix these three were {"status": "skip", ...} (program_root stayed
+    # None) even though a real, migrated program sits right above CWD; a resolved
+    # DB reports {"current_version", "expected_version", "match"} instead (no
+    # "status" key at all -- trialerror/stores/checks.py:104 vs :113).
+    for db_kind in ("ops", "knowledge", "jobs"):
+        assert check["details"][db_kind].get("status") != "skip", check
+        assert check["details"][db_kind]["match"] is True, check

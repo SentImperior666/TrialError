@@ -62,7 +62,7 @@ def test_search_mode_vector_unfiltered_same_top_result_both_backends(program_roo
 
     fb_store = open_store(program_root, platform_root=platform_root)
     fb_corpus = build_small_corpus(fb_store)
-    fb_result = engine.search(fb_store, query="dice pools resolve uncertain outcomes", mode="vector")
+    fb_result = engine.search(fb_store, query="retry budgets bound tail latency", mode="vector")
     assert vec_backend_for(fb_store, fb_corpus["model_key"]) == VecBackend.FALLBACK
     fb_store.close()
 
@@ -75,7 +75,7 @@ def test_search_mode_vector_unfiltered_same_top_result_both_backends(program_roo
     try:
         sv_corpus = build_small_corpus(sv_store)
         assert vec_backend_for(sv_store, sv_corpus["model_key"]) == VecBackend.SQLITE_VEC
-        sv_result = engine.search(sv_store, query="dice pools resolve uncertain outcomes", mode="vector")
+        sv_result = engine.search(sv_store, query="retry budgets bound tail latency", mode="vector")
     finally:
         del os.environ["TRIALERROR_VEC_BACKEND"]
         sv_store.close()
@@ -95,7 +95,7 @@ def test_search_mode_vector_unfiltered_same_top_result_both_backends(program_roo
 
 
 def test_search_mode_vector_sqlite_vec_backend_stats_reported(store, sqlite_vec_corpus):
-    r = engine.search(store, query="dice pools resolve uncertain outcomes", mode="vector")
+    r = engine.search(store, query="retry budgets bound tail latency", mode="vector")
     assert r["ok"] is True
     assert r["tiers_used"] == ["vector"]
     assert r["stats"]["vector_scored"] > 0
@@ -110,7 +110,7 @@ def test_search_mode_vector_filtered_still_works_with_sqlite_vec_backend(store, 
     returns correctly-scoped, correct results even though the table is a
     real vec0 table."""
     r = engine.search(
-        store, query="dice pools resolve uncertain outcomes", mode="vector",
+        store, query="retry budgets bound tail latency", mode="vector",
         filters={"source_ids": [sqlite_vec_corpus["open_source_id"]]},
     )
     assert r["ok"] is True

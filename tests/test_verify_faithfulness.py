@@ -19,7 +19,7 @@ from trialerror.verify.verdicts import record_verdict
 
 from tests._verify_fixtures import anchor_for_chunk, bootstrap_launch, build_small_corpus
 
-_OPEN_SENTENCE = "Tabletop role-playing games use dice pools to resolve uncertain outcomes during play."
+_OPEN_SENTENCE = "Distributed schedulers use retry budgets to bound tail latency during failover."
 
 
 def _text_with_marker(anchor_id: str, sentence: str) -> str:
@@ -32,11 +32,11 @@ def _text_with_marker(anchor_id: str, sentence: str) -> str:
 
 
 def test_build_decomposition_envelope_carries_sentence_and_anchor():
-    pair = {"pair_id": "CPR-1", "sentence": "Dice pools resolve uncertainty.", "anchor_id": "ANC-x"}
+    pair = {"pair_id": "CPR-1", "sentence": "Retry budgets bound latency.", "anchor_id": "ANC-x"}
     envelope = build_decomposition_envelope(pair)
     assert envelope["kind"] == "faithfulness_decompose"
     assert envelope["pair_id"] == "CPR-1"
-    assert envelope["sentence"] == "Dice pools resolve uncertainty."
+    assert envelope["sentence"] == "Retry budgets bound latency."
     assert envelope["anchor_id"] == "ANC-x"
     assert "instruction" in envelope
 
@@ -50,7 +50,7 @@ def _decompose_into_two(_envelope):
     """A deterministic fake decomposer: every sentence splits into exactly
     two atomic claims -- one that will mechanically match the anchor's own
     quote (planted verbatim substring), one that plainly does not."""
-    return {"claims": [_OPEN_SENTENCE, "This is an entirely unrelated claim about goblin migration patterns."]}
+    return {"claims": [_OPEN_SENTENCE, "This is an entirely unrelated claim about coastal erosion patterns."]}
 
 
 def _verify_supported_only_first(envelope):
@@ -82,7 +82,7 @@ def test_run_faithfulness_round_trip_scores_planted_supported_and_unsupported_cl
     assert result["score"] == pytest.approx(0.5)
     statuses = {b["claim"]: b["status"] for b in result["breakdown"]}
     assert statuses[_OPEN_SENTENCE] == "mechanical_pass"
-    assert statuses["This is an entirely unrelated claim about goblin migration patterns."] == "llm_fail"
+    assert statuses["This is an entirely unrelated claim about coastal erosion patterns."] == "llm_fail"
 
     verdict = result["verdict"]
     assert verdict["subject_kind"] == "artifact"

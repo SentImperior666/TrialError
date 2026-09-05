@@ -14,6 +14,7 @@ directly.
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 
 __all__ = ["DEFAULT_BUSY_TIMEOUT_MS", "connect"]
@@ -59,8 +60,56 @@ def connect(
         conn = sqlite3.connect(str(p), timeout=busy_timeout_ms / 1000)
 
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode = WAL")
+    # busy_timeout goes on BEFORE the journal-mode switch below -- see the
+    # TRIALERROR-DEV-NOTE there for why setting it after does not help.
     conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms:d}")
+
+    if read_only:
+        # Unchanged from before: a read-only connection can't obtain the
+        # write access this pragma needs to actually flip a file that
+        # isn't already WAL, so on such a file SQLite treats this as a
+        # silent no-op (returns the file's existing mode rather than
+        # raising) instead of switching it. No retry, no verification --
+        # preserve that behaviour exactly rather than forcing a mode
+        # switch a read-only connection has no business making.
+        conn.execute("PRAGMA journal_mode = WAL")
+    else:
+        # TRIALERROR-DEV-NOTE: on the sandbox host (Ubuntu 24.04, SQLite
+        # 3.45.1) two writers racing connect() on a brand-new database file
+        # hit `sqlite3.OperationalError: database is locked` right here, 3/3
+        # runs, in well under a second -- see
+        # tests/test_stores_concurrency.py. Flipping journal_mode to WAL
+        # needs a brief EXCLUSIVE lock, and on 3.45.1 the collision with the
+        # other connection doing the same first-open switch surfaces as an
+        # immediate SQLITE_BUSY that bypasses SQLite's own busy-handler
+        # retry loop -- so the `timeout=`/busy_timeout we already set above
+        # never gets a chance to absorb it (SQLite 3.49.1 on Windows DEV
+        # does not reproduce this). Design lane-0 D14 (disaster containment)
+        # and the engram-F7 migration lock both lean on "first writer flips
+        # WAL, everyone else waits" holding on the sandbox host, not just on
+        # DEV, so we retry the pragma ourselves rather than trust the
+        # driver's internal handler for this one statement.
+        deadline = time.monotonic() + busy_timeout_ms / 1000
+        delay_s = 0.01  # ~10ms, doubled each retry, bounded by busy_timeout_ms
+        while True:
+            try:
+                mode = conn.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+                break
+            except sqlite3.OperationalError as exc:
+                message = str(exc).lower()
+                remaining = deadline - time.monotonic()
+                if ("locked" not in message and "busy" not in message) or remaining <= 0:
+                    raise
+                time.sleep(min(delay_s, remaining))
+                delay_s *= 2
+        # A fresh file another connection already switched returns "wal"
+        # immediately (no lock needed to read the current mode); anything
+        # else here means the switch silently didn't take.
+        if str(mode).lower() != "wal":
+            raise sqlite3.OperationalError(
+                f"PRAGMA journal_mode=WAL did not take effect (got {mode!r}) for {p}"
+            )
+
     if foreign_keys:
         conn.execute("PRAGMA foreign_keys = ON")
     return conn

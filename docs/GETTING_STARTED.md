@@ -63,6 +63,15 @@ second, rather than making you translate. Every `trialerror` command prints a JS
 (`{ok, command, result|error, nextActions, meta}`); the walkthrough calls out the fields
 worth reading, but the full payload is always there if you want more than that.
 
+**Linux / container.** The runtime has no Windows-only dependency: the one OS branch
+anywhere in `trialerror/` — `DETACHED_PROCESS` vs. POSIX `setsid` for a detached
+worker/dashboard/obs process — is exercised on both, has direct coverage in
+`tests/test_posix_detach.py` (which skips cleanly on win32), and CI runs the full suite
+on `windows-latest` and `ubuntu-latest`. Running inside a container changes nothing in
+this walkthrough beyond the shape of the paths you type; `docs/USER_SETUP.md` §0a lists
+what is and is not platform-dependent (program root, platform root, and the GPU-bound
+`[ingest.*]` tool paths).
+
 ## 0. Install
 
 ```console
@@ -85,10 +94,12 @@ model policy, license posture, ingest OCR/embed backend, litapi provider default
 optional except `[program].id`), the design's per-program layout (`raw/`, `archive/`,
 `memory/`, `law/`, `handoffs/`, `artifacts/`, `requests/`), and runs the initial
 migration over all four DBs (`stores/knowledge.db`, `stores/ops.db`, `stores/jobs.db`,
-plus the platform `~/.trialerror/platform.db`). Every command discovers its program root by
-walking up from the current directory looking for `trialerror.toml`
-(`trialerror.util.config.find_program_root`), or via `--program-root` (see the placement
-note in "Gotchas" below).
+plus the platform `~/.trialerror/platform.db` — on Linux this is still `~/.trialerror` under
+whatever `$HOME` the container/user resolves to, or wherever `TRIALERROR_PLATFORM_ROOT`
+points, same as Windows: `trialerror/stores/paths.py::platform_root()`). Every command
+discovers its program root by walking up from the current directory looking for
+`trialerror.toml` (`trialerror.util.config.find_program_root`), or via `--program-root`
+(see the placement note in "Gotchas" below).
 
 ```console
 # Linux / macOS
@@ -221,7 +232,7 @@ bash — a quoted heredoc writes the bytes verbatim (UTF-8, no BOM, on any UTF-8
 cat > raw/hello.md <<'EOF'
 # Hello TrialError
 
-Tabletop role-playing games use dice pools to resolve uncertain outcomes during play.
+Long-running research programs accumulate decisions faster than any one person can recall them.
 EOF
 
 trialerror ingest add-source \
@@ -234,7 +245,7 @@ PowerShell — `-Encoding utf8` is stated explicitly because Windows PowerShell 
 `Out-File` to UTF-16:
 
 ```powershell
-"# Hello TrialError`n`nTabletop role-playing games use dice pools to resolve uncertain outcomes during play." | Out-File -Encoding utf8 raw/hello.md
+"# Hello TrialError`n`nLong-running research programs accumulate decisions faster than any one person can recall them." | Out-File -Encoding utf8 raw/hello.md
 
 trialerror ingest add-source `
   --kind web --title "Hello TrialError fixture" `
@@ -271,7 +282,7 @@ threshold, default 50), it names the exact `--yes` command to re-run.
 ## 5. Search + citecheck
 
 ```console
-trialerror query search "dice pools resolve uncertain outcomes"
+trialerror query search "decisions faster than any one person can recall"
 ```
 
 Every result row carries a `citation.anchor.anchor_id` — copy one. This is the same
@@ -285,7 +296,7 @@ pin one, so read this as the shipped code's contract):
 bash:
 
 ```bash
-printf '%s\n' 'Tabletop role-playing games use dice pools to resolve uncertain outcomes during play. [[cite:ANC-<id>]]' > draft.md
+printf '%s\n' 'Long-running research programs accumulate decisions faster than any one person can recall them. [[cite:ANC-<id>]]' > draft.md
 
 trialerror verify citecheck draft.md --by-launch <launch_id>
 ```
@@ -293,7 +304,7 @@ trialerror verify citecheck draft.md --by-launch <launch_id>
 PowerShell:
 
 ```powershell
-"Tabletop role-playing games use dice pools to resolve uncertain outcomes during play. [[cite:ANC-<id>]]" | Out-File -Encoding utf8 draft.md
+"Long-running research programs accumulate decisions faster than any one person can recall them. [[cite:ANC-<id>]]" | Out-File -Encoding utf8 draft.md
 
 trialerror verify citecheck draft.md --by-launch <launch_id>
 ```

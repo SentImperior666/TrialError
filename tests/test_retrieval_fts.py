@@ -30,10 +30,10 @@ def test_fts_query_string_empty_input():
 
 
 def test_fts_search_finds_a_matching_chunk(store):
-    _insert_fts_row(store, "CHK-1", "dice pools resolve uncertain outcomes")
+    _insert_fts_row(store, "CHK-1", "retry budgets bound tail latency")
     _insert_fts_row(store, "CHK-2", "completely unrelated content about spaceships")
 
-    hits = fts_search(store, "dice pools")
+    hits = fts_search(store, "retry budgets")
     assert [h["chunk_id"] for h in hits] == ["CHK-1"]
 
 
@@ -42,19 +42,19 @@ def test_fts_search_no_match_returns_empty():
 
 
 def test_fts_search_respects_the_chunk_id_allowlist(store):
-    _insert_fts_row(store, "CHK-1", "dice pools resolve uncertain outcomes")
-    _insert_fts_row(store, "CHK-2", "dice pools appear twice in this document too")
+    _insert_fts_row(store, "CHK-1", "retry budgets bound tail latency")
+    _insert_fts_row(store, "CHK-2", "retry budgets appear twice in this document too")
 
-    hits_unfiltered = fts_search(store, "dice pools")
+    hits_unfiltered = fts_search(store, "retry budgets")
     assert {h["chunk_id"] for h in hits_unfiltered} == {"CHK-1", "CHK-2"}
 
-    hits_filtered = fts_search(store, "dice pools", chunk_id_allowlist=["CHK-2"])
+    hits_filtered = fts_search(store, "retry budgets", chunk_id_allowlist=["CHK-2"])
     assert [h["chunk_id"] for h in hits_filtered] == ["CHK-2"]
 
 
 def test_fts_search_empty_allowlist_short_circuits_to_no_candidates(store):
-    _insert_fts_row(store, "CHK-1", "dice pools resolve uncertain outcomes")
-    assert fts_search(store, "dice pools", chunk_id_allowlist=[]) == []
+    _insert_fts_row(store, "CHK-1", "retry budgets bound tail latency")
+    assert fts_search(store, "retry budgets", chunk_id_allowlist=[]) == []
 
 
 def test_fts_search_respects_the_limit(store):

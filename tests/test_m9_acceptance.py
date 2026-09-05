@@ -52,7 +52,7 @@ def test_fixture_artifact_with_one_broken_citation_is_caught_mechanically(store)
     corpus = build_small_corpus(store, launch_id=launch_id)
     good_anchor = anchor_for_chunk(store, corpus["open_chunk_ids"][0])
 
-    good_sentence = "Tabletop role-playing games use dice pools to resolve uncertain outcomes during play."
+    good_sentence = "Distributed schedulers use retry budgets to bound tail latency during failover."
     broken_sentence = "This claim cites a citation that was never actually anchored anywhere."
     text = (
         f"{good_sentence} [[cite:{good_anchor['anchor_id']}]] "
@@ -116,7 +116,7 @@ def test_hypothesis_fixture_with_planted_agreement_and_contradiction_yields_mixe
 
     result = run_hypothesis_verification(
         store, hypothesis_text="rulebooks universally describe combat and dice mechanics the same way",
-        query="game rules dice combat spell", judge=fixture_judge, issued_by_launch=launch_id, mode="vector",
+        query="distributed systems retry coordinator lock", judge=fixture_judge, issued_by_launch=launch_id, mode="vector",
         k_total=2, prereg=True,
     )
 

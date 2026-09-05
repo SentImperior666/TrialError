@@ -45,9 +45,9 @@ def test_register_wires_arxiv_semantic_subcommand():
     subparsers = parser.add_subparsers(dest="group")
     cli_lit.register(subparsers)
 
-    args = parser.parse_args(["lit", "arxiv-semantic", "--q", "tabletop engines", "--k", "5"])
+    args = parser.parse_args(["lit", "arxiv-semantic", "--q", "distributed systems", "--k", "5"])
     assert args.lit_cmd == "arxiv-semantic"
-    assert args.query == "tabletop engines"
+    assert args.query == "distributed systems"
     assert args.k == 5
 
 
@@ -112,7 +112,7 @@ def test_cmd_arxiv_index_build_same_zip_reuses_same_job_id(tmp_path):
 def test_cmd_arxiv_semantic_index_not_built_is_error_envelope(tmp_path):
     program_root = tmp_path / "program"
     program_root.mkdir()
-    args = _Args(program_root=str(program_root), query="tabletop engines", k=5)
+    args = _Args(program_root=str(program_root), query="distributed systems", k=5)
     env = cli_lit._cmd_arxiv_semantic(args)
     assert env["ok"] is False
     assert env["error"]["code"] == "index_not_built"
@@ -129,7 +129,7 @@ def test_cmd_arxiv_semantic_no_api_key_is_error_envelope(tmp_path):
     )
     cli_lit._cmd_arxiv_index_build(build_args)
 
-    args = _Args(program_root=str(program_root), query="tabletop engines", k=5)
+    args = _Args(program_root=str(program_root), query="distributed systems", k=5)
     env = cli_lit._cmd_arxiv_semantic(args)
     assert env["ok"] is False
     assert env["error"]["code"] == "no_api_key"

@@ -1,25 +1,22 @@
 """``trialerror dashboard serve`` -- the live serve+watch+SSE layer.
 
-Architecture modeled on the origin-project mechspace dashboard's proven
-serve_mechspace.py (``research/tools/research_dashboard/mechspace/
-serve_mechspace.py`` in the sibling ``origin-project`` repo,
-read there as a READ-ONLY reference -- this is TrialError's own build):
-stdlib ``http.server.ThreadingHTTPServer`` serving the static page, a
-watcher thread polling store-file mtimes (2-5s debounce, same window that
-module's own design cites), and a Server-Sent-Events endpoint broadcasting
-a ``changed`` notification to every open page when a watched file's mtime
-moves.
+Architecture modeled on the proven serve-and-watch design of an earlier
+in-house research dashboard, read as a READ-ONLY reference -- this is
+TrialError's own build: stdlib ``http.server.ThreadingHTTPServer``
+serving the static page, a watcher thread polling store-file mtimes
+(2-5s debounce, same window that earlier design cites), and a
+Server-Sent-Events endpoint broadcasting a ``changed`` notification to
+every open page when a watched file's mtime moves.
 
-Deliberate departure from mechspace's shape: there is no "rebuild" step
-here. mechspace watches markdown/jsonl SOURCE files and has to invoke two
-expensive subprocess builds (embeddings-capable, hence its whole
-``MECHSPACE_NO_EMBED`` contract) to turn them into a servable data bundle.
-This dashboard watches the program's SQLite store files directly and reads
-them fresh on every panel request -- the "rebuild" IS the next cheap SQL
-query (:mod:`trialerror.dashboard.data`), so there is nothing here that could
-ever reach an embeddings/LLM API, satisfying the same lesson
-(MECHSPACE_NO_EMBED) trivially rather than by a guard that has to be
-maintained.
+Deliberate departure from that earlier dashboard's shape: there is no
+"rebuild" step here. That earlier dashboard watched markdown/jsonl SOURCE
+files and had to invoke two expensive subprocess builds (embeddings-capable,
+hence its own strict no-embed-on-rebuild contract) to turn them into a
+servable data bundle. This dashboard watches the program's SQLite store
+files directly and reads them fresh on every panel request -- the "rebuild"
+IS the next cheap SQL query (:mod:`trialerror.dashboard.data`), so there is
+nothing here that could ever reach an embeddings/LLM API, satisfying the
+same lesson trivially rather than by a guard that has to be maintained.
 
 Endpoints:
 
@@ -136,7 +133,7 @@ class ServerConfig:
 
 
 # =============================================================================
-# SSE broadcaster (same fan-out shape as serve_mechspace.Broadcaster)
+# SSE broadcaster (same fan-out shape as that earlier dashboard's Broadcaster)
 # =============================================================================
 class Broadcaster:
     def __init__(self) -> None:

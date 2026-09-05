@@ -39,8 +39,8 @@ from tests._retrieve_fixtures import build_small_corpus
 # construction, not by luck).
 # ---------------------------------------------------------------------------
 
-_OPEN_SENTENCE_1 = "Tabletop role-playing games use dice pools to resolve uncertain outcomes during play."
-_OPEN_SENTENCE_2 = "A game master adjudicates rules disputes and narrates the consequences of player actions."
+_OPEN_SENTENCE_1 = "Distributed schedulers use retry budgets to bound tail latency during failover."
+_OPEN_SENTENCE_2 = "A coordinator arbitrates lock conflicts and records the consequences of worker actions."
 _RESTRICTED_LONG_PREFIX = (
     "This paragraph belongs to a commercial rulebook and is intentionally long so that fencing it "
     "down to twenty words is a meaningful, observable transformation rather than a no-op"
@@ -77,30 +77,30 @@ def _fake_judge(corpus, *, calls: list[str] | None = None):
         if chunk_id == open_id:
             return {
                 "entities": [
-                    {"name": "Game Master", "entity_type": "role", "confidence": 0.9},
-                    {"name": "Dice Pool", "entity_type": "mechanic", "confidence": 0.8},
+                    {"name": "Coordinator", "entity_type": "role", "confidence": 0.9},
+                    {"name": "Retry Budget", "entity_type": "mechanism", "confidence": 0.8},
                 ],
                 "relations": [
                     {
-                        "src": "Game Master", "dst": "Dice Pool", "rel_type": "uses",
-                        "fact_text": "A game master oversees dice pool resolution.",
+                        "src": "Coordinator", "dst": "Retry Budget", "rel_type": "uses",
+                        "fact_text": "A coordinator oversees retry budget resolution.",
                         "quote": _OPEN_SENTENCE_2, "confidence": 0.7,
                     }
                 ],
                 "claims": [
-                    {"text": "Dice pools resolve uncertain outcomes.", "kind": "mechanism", "quote": _OPEN_SENTENCE_1, "confidence": 0.6}
+                    {"text": "Retry budgets bound tail latency.", "kind": "mechanism", "quote": _OPEN_SENTENCE_1, "confidence": 0.6}
                 ],
             }
         if chunk_id == restricted_id:
             return {
                 "entities": [
-                    {"name": "Special Ability", "entity_type": "mechanic"},
-                    {"name": "Combat Resolution", "entity_type": "mechanic"},
+                    {"name": "Epoch Counter", "entity_type": "mechanism"},
+                    {"name": "Quorum Reconfiguration", "entity_type": "mechanism"},
                 ],
                 "relations": [
                     {
-                        "src": "Special Ability", "dst": "Combat Resolution", "rel_type": "part_of",
-                        "fact_text": "A special ability is invoked during combat resolution.",
+                        "src": "Epoch Counter", "dst": "Quorum Reconfiguration", "rel_type": "part_of",
+                        "fact_text": "An epoch counter is invoked during quorum reconfiguration.",
                         "quote": _RESTRICTED_LONG_PREFIX, "confidence": 0.5,
                     }
                 ],
@@ -283,14 +283,14 @@ def test_accept_entity_candidate_writes_confirmed_entity_no_dedup(store, corpus)
 
 def test_accept_entity_candidate_with_dedup_lands_draft_plus_merge_proposal(store, corpus):
     result = _queue_open_chunk(store, corpus)
-    gm_record_id = result["record_ids"]["entities"][0]  # "Game Master"
+    gm_record_id = result["record_ids"]["entities"][0]  # "Coordinator"
     first = extract_api.accept_candidate(store, gm_record_id, by_launch=corpus["launch_id"])
     assert first["resolution"] == "confirmed"
 
     # queue a SECOND extraction that proposes the same (name, entity_type)
     # again -- this time the dedup check should find the just-confirmed row.
     def judge_dup(envelope):
-        return {"entities": [{"name": "Game Master", "entity_type": "role"}], "relations": [], "claims": []}
+        return {"entities": [{"name": "Coordinator", "entity_type": "role"}], "relations": [], "claims": []}
 
     dup_result = extract_api.run_extract_chunk(store, _restricted_chunk_id(corpus), judge=judge_dup, created_by_launch=corpus["launch_id"])
     dup_record_id = dup_result["record_ids"]["entities"][0]
@@ -317,7 +317,7 @@ def test_accept_merge_proposal_confirms_member_entities(store, corpus):
     first = extract_api.accept_candidate(store, gm_record_id, by_launch=corpus["launch_id"])
 
     def judge_dup(envelope):
-        return {"entities": [{"name": "Game Master", "entity_type": "role"}], "relations": [], "claims": []}
+        return {"entities": [{"name": "Coordinator", "entity_type": "role"}], "relations": [], "claims": []}
 
     dup_result = extract_api.run_extract_chunk(store, _restricted_chunk_id(corpus), judge=judge_dup, created_by_launch=corpus["launch_id"])
     dup_record_id = dup_result["record_ids"]["entities"][0]
@@ -340,7 +340,7 @@ def test_reject_merge_proposal_confirms_member_as_distinct_no_merge_group(store,
     extract_api.accept_candidate(store, gm_record_id, by_launch=corpus["launch_id"])
 
     def judge_dup(envelope):
-        return {"entities": [{"name": "Game Master", "entity_type": "role"}], "relations": [], "claims": []}
+        return {"entities": [{"name": "Coordinator", "entity_type": "role"}], "relations": [], "claims": []}
 
     dup_result = extract_api.run_extract_chunk(store, _restricted_chunk_id(corpus), judge=judge_dup, created_by_launch=corpus["launch_id"])
     dup_record_id = dup_result["record_ids"]["entities"][0]
@@ -379,7 +379,7 @@ def test_reject_candidate_writes_nothing_and_is_not_reacceptable(store, corpus):
 
 def test_accept_reject_dispatch_by_id_prefix(store, corpus):
     result = _queue_open_chunk(store, corpus)
-    entity_record_id = result["record_ids"]["entities"][1]  # "Dice Pool" -- no dedup
+    entity_record_id = result["record_ids"]["entities"][1]  # "Retry Budget" -- no dedup
     out = extract_api.accept(store, entity_record_id, by_launch=corpus["launch_id"])
     assert out["kind"] == "entity"
 
@@ -417,7 +417,7 @@ def test_accept_relation_after_its_entities_succeeds_and_is_bitemporal(store, co
 
     row = store_get(store, "relation", pk_column="rel_id", pk_value=rel_id)
     assert row["src_entity"] is not None and row["dst_entity"] is not None
-    assert row["fact_text"] == "A game master oversees dice pool resolution."
+    assert row["fact_text"] == "A coordinator oversees retry budget resolution."
 
     # bi-temporal correctness (design Section 11 deliverable 1: "accepted
     # rows written bi-temporally (assert_fact) with anchors")

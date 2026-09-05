@@ -98,7 +98,7 @@ def test_tools_call_happy_path_search(seeded_server):
     [resp] = _run(
         server,
         {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-         "params": {"name": "search", "arguments": {"query": "dice pools resolve uncertain outcomes", "mode": "fts"}}},
+         "params": {"name": "search", "arguments": {"query": "retry budgets bound tail latency", "mode": "fts"}}},
     )
     result = resp["result"]
     assert result["isError"] is False
@@ -115,7 +115,7 @@ def test_tools_call_search_over_the_wire_fences_commercial_restricted_text(seede
         server,
         {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
          "params": {"name": "search",
-                    "arguments": {"query": "combat resolution initiative order proprietary special ability", "mode": "fts"}}},
+                    "arguments": {"query": "quorum reconfiguration lease fencing proprietary epoch counter", "mode": "fts"}}},
     )
     row = resp["result"]["structuredContent"]["result"]["results"][0]
     assert row["fenced"] is True
@@ -182,7 +182,7 @@ def test_full_search_then_resolve_quote_round_trip_over_the_wire(seeded_server):
     [search_resp] = _run(
         server,
         {"jsonrpc": "2.0", "id": 10, "method": "tools/call",
-         "params": {"name": "search", "arguments": {"query": "dice pools resolve uncertain outcomes", "mode": "fts"}}},
+         "params": {"name": "search", "arguments": {"query": "retry budgets bound tail latency", "mode": "fts"}}},
     )
     row = search_resp["result"]["structuredContent"]["result"]["results"][0]
     anchor_id = row["citation"]["anchor"]["anchor_id"]

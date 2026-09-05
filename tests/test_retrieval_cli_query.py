@@ -27,7 +27,7 @@ def test_query_search_happy_path(program_root, platform_root):
 
     parser = _build_parser()
     args = parser.parse_args([
-        "query", "search", "dice pools resolve uncertain outcomes", "--mode", "fts",
+        "query", "search", "retry budgets bound tail latency", "--mode", "fts",
         "--program-root", str(program_root), "--platform-root", str(platform_root),
     ])
     env = args.handler(args)
@@ -60,7 +60,7 @@ def test_query_search_unfenced_bypasses_the_fence_and_logs_an_event(program_root
 
     parser = _build_parser()
     args = parser.parse_args([
-        "query", "search", "combat resolution initiative order proprietary special ability", "--mode", "fts",
+        "query", "search", "quorum reconfiguration lease fencing proprietary epoch counter", "--mode", "fts",
         "--unfenced", "--launch-id", corpus["launch_id"],
         "--program-root", str(program_root), "--platform-root", str(platform_root),
     ])
@@ -83,7 +83,7 @@ def test_query_search_without_unfenced_still_fences(program_root, platform_root)
 
     parser = _build_parser()
     args = parser.parse_args([
-        "query", "search", "combat resolution initiative order proprietary special ability", "--mode", "fts",
+        "query", "search", "quorum reconfiguration lease fencing proprietary epoch counter", "--mode", "fts",
         "--program-root", str(program_root), "--platform-root", str(platform_root),
     ])
     env = args.handler(args)

@@ -26,7 +26,7 @@ from trialerror.verify.prereg import commit_prereg
 
 from tests._verify_fixtures import bootstrap_launch, build_small_corpus, seed_hypothesis
 
-_QUERY = "game rules dice combat spell"
+_QUERY = "distributed systems retry coordinator lock"
 
 
 # ---------------------------------------------------------------------------
@@ -59,9 +59,9 @@ def _build_three_chunk_fts_corpus(store, *, launch_id: str, query_term: str, dim
     )
 
     texts = [
-        " ".join([query_term] * 8 + ["tabletop", "filler", "alpha", "words", "padding"]) + ".",
-        " ".join([query_term] * 3 + ["tabletop", "filler", "bravo", "words", "more", "padding", "content"]) + ".",
-        " ".join([query_term] * 1 + ["tabletop", "filler", "charlie", "words", "padding", "content", "extra", "more"]) + ".",
+        " ".join([query_term] * 8 + ["umbrella", "filler", "alpha", "words", "padding"]) + ".",
+        " ".join([query_term] * 3 + ["umbrella", "filler", "bravo", "words", "more", "padding", "content"]) + ".",
+        " ".join([query_term] * 1 + ["umbrella", "filler", "charlie", "words", "padding", "content", "extra", "more"]) + ".",
     ]
 
     chunk_ids: list[str] = []
@@ -222,7 +222,7 @@ def test_stratified_retrieve_falls_back_to_rank_tercile_when_no_vectors_exist(st
     # the fallback is specifically about the ABSENT vectors, not an empty
     # candidate pool (which would short-circuit to "empty" before this
     # function ever reaches the vector-lookup step).
-    arms = stratified_retrieve(store, query="dice", mode="fts")
+    arms = stratified_retrieve(store, query="retry", mode="fts")
 
     assert arms["stratify_method"] == "rank_fallback"
     assert arms["all"], "fallback must still retrieve candidates via FTS"
@@ -242,9 +242,9 @@ def test_judgment_envelope_carries_the_prompt_hypothesis_and_fixed_labels(store)
     launch_id = bootstrap_launch(store)
     build_small_corpus(store, launch_id=launch_id)
     arms = stratified_retrieve(store, query=_QUERY, mode="vector")
-    envelope = build_hypothesis_judgment_envelope("dice pools produce uncertain outcomes", arms["all"][0])
-    assert envelope["hypothesis"] == "dice pools produce uncertain outcomes"
-    assert "dice pools produce uncertain outcomes" in envelope["prompt"]
+    envelope = build_hypothesis_judgment_envelope("retry budgets produce unpredictable outcomes", arms["all"][0])
+    assert envelope["hypothesis"] == "retry budgets produce unpredictable outcomes"
+    assert "retry budgets produce unpredictable outcomes" in envelope["prompt"]
     assert envelope["labels"][0] == "explicit contradiction"
     assert envelope["labels"][-1] == "explicit agreement"
     assert envelope["chunk_id"] == arms["all"][0]["chunk_id"]

@@ -55,7 +55,7 @@ def test_get_by_arxiv_hit():
 
     record = provider.get_by_arxiv("arXiv:2101.00001")
 
-    assert record.title == "A Fixture Paper About Tabletop Engine Metadata Reconciliation"
+    assert record.title == "A Fixture Paper About Distributed Systems Metadata Reconciliation"
     assert record.arxiv_id == "2101.00001"
     assert record.doi == "10.1234/fixture.5678"
     assert record.authors == ["Ada Fixture", "Bo Canned"]
@@ -130,25 +130,25 @@ def test_get_by_doi_non_arxiv_doi_raises_not_found_with_zero_network_calls():
 def test_search_returns_records_skipping_error_entries():
     transport = FakeTransport()
     transport.add_response(
-        _search_url("tabletop engines", max_results=2), _xml_response(load_text_fixture("arxiv_feed_search.xml"))
+        _search_url("distributed systems", max_results=2), _xml_response(load_text_fixture("arxiv_feed_search.xml"))
     )
     provider = ArxivProvider(transport, _arxiv_cfg())
 
-    records = provider.search("tabletop engines", limit=2)
+    records = provider.search("distributed systems", limit=2)
 
     assert len(records) == 2
-    assert records[0].title == "A Fixture Search Hit About Tabletop Engines, One"
+    assert records[0].title == "A Fixture Search Hit About Distributed Systems, One"
     assert records[1].arxiv_id == "2301.00002"
 
 
 def test_search_truncates_to_limit():
     transport = FakeTransport()
     transport.add_response(
-        _search_url("tabletop engines", max_results=1), _xml_response(load_text_fixture("arxiv_feed_search.xml"))
+        _search_url("distributed systems", max_results=1), _xml_response(load_text_fixture("arxiv_feed_search.xml"))
     )
     provider = ArxivProvider(transport, _arxiv_cfg())
 
-    records = provider.search("tabletop engines", limit=1)
+    records = provider.search("distributed systems", limit=1)
 
     assert len(records) == 1
 

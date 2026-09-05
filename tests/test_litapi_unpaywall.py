@@ -44,7 +44,7 @@ def test_get_by_doi_hit_with_publisher_oa_location():
 
     record = provider.get_by_doi("10.1234/fixture.5678")
 
-    assert record.title == "A Fixture Paper About Tabletop Engine Metadata Reconciliation"
+    assert record.title == "A Fixture Paper About Distributed Systems Metadata Reconciliation"
     assert record.doi == "10.1234/fixture.5678"
     assert record.authors == ["Ada Fixture", "Bo Canned"]
     assert record.year == 2021
@@ -167,7 +167,7 @@ def test_search_always_raises_unsupported():
     provider = UnpaywallProvider(transport, _unpaywall_cfg())
 
     with pytest.raises(ProviderUnsupportedOperationError):
-        provider.search("tabletop engines")
+        provider.search("distributed systems")
 
 
 def test_get_citations_always_raises_unsupported():

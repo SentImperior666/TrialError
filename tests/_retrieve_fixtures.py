@@ -151,8 +151,8 @@ def _add_document(
 _RESTRICTED_PARAGRAPH = (
     "This paragraph belongs to a commercial rulebook and is intentionally long so that fencing it "
     "down to twenty words is a meaningful, observable transformation rather than a no-op: it deals "
-    "with combat resolution, initiative order, and the precise wording of a proprietary special "
-    "ability that a licensed publisher would not want reproduced verbatim in any external system, "
+    "with quorum reconfiguration, lease fencing, and the precise wording of a proprietary epoch "
+    "counter that a licensed publisher would not want reproduced verbatim in any external system, "
     "database, or agent context window under any circumstances whatsoever."
 )
 
@@ -171,7 +171,7 @@ def build_small_corpus(store: Store, *, launch_id: str | None = None, dims: int 
     insert(
         store, "source",
         {
-            "source_id": open_source_id, "kind": "paper", "title": "An Open Paper About Tabletop Systems",
+            "source_id": open_source_id, "kind": "paper", "title": "An Open Paper About Distributed Systems",
             "license_tier": "open", "acquisition_route": "web", "request_state": "indexed",
             "registered_ts": now(), "registered_by_launch": launch_id,
         },
@@ -179,8 +179,8 @@ def build_small_corpus(store: Store, *, launch_id: str | None = None, dims: int 
     open_doc = _add_document(
         store, source_id=open_source_id, rel_path="archive/open.md",
         paragraphs=[
-            "Tabletop role-playing games use dice pools to resolve uncertain outcomes during play.",
-            "A game master adjudicates rules disputes and narrates the consequences of player actions.",
+            "Distributed schedulers use retry budgets to bound tail latency during failover.",
+            "A coordinator arbitrates lock conflicts and records the consequences of worker actions.",
         ],
         launch_id=launch_id, model_key=model_key, embed_backend=embed_backend, backend=backend,
     )
@@ -189,14 +189,14 @@ def build_small_corpus(store: Store, *, launch_id: str | None = None, dims: int 
     insert(
         store, "source",
         {
-            "source_id": restricted_source_id, "kind": "rulebook", "title": "Proprietary Combat Rulebook",
+            "source_id": restricted_source_id, "kind": "rulebook", "title": "Proprietary Technical Rulebook",
             "license_tier": "commercial_restricted", "acquisition_route": "user_scan", "request_state": "indexed",
             "registered_ts": now(), "registered_by_launch": launch_id,
         },
     )
     restricted_doc = _add_document(
         store, source_id=restricted_source_id, rel_path="archive/restricted.md",
-        paragraphs=[_RESTRICTED_PARAGRAPH, "A second, shorter paragraph about spell components and casting time."],
+        paragraphs=[_RESTRICTED_PARAGRAPH, "A second, shorter paragraph about leader election timeouts and heartbeat intervals."],
         launch_id=launch_id, model_key=model_key, embed_backend=embed_backend, backend=backend,
     )
 

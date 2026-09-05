@@ -142,7 +142,9 @@ def _cmd_start_phoenix(args: argparse.Namespace) -> dict:
         # setsid() detaches from the controlling terminal so the child
         # survives the parent shell and is not hit by its Ctrl-C. Exercised
         # on every Linux run -- no `pragma: no cover` here, or coverage
-        # would hide the only branch that platform ever takes.
+        # would hide the only branch that platform ever takes; the branch has
+        # its own direct coverage in tests/test_posix_detach.py (which skips
+        # cleanly on win32).
         popen_kwargs["start_new_session"] = True
 
     try:

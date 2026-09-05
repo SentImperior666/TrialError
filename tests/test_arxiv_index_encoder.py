@@ -60,7 +60,7 @@ def test_estimate_token_count_grows_with_length():
 
 
 def test_estimate_query_cost_usd_is_small_and_positive():
-    cost = estimate_query_cost_usd("a short search query about tabletop game engines")
+    cost = estimate_query_cost_usd("a short search query about distributed systems architecture")
     assert 0 < cost < 0.001
 
 
@@ -96,12 +96,12 @@ def test_openai_query_encoder_encode_query_success(monkeypatch):
     monkeypatch.setattr("trialerror.arxiv_index.encoder.urllib.request.urlopen", fake_urlopen)
 
     enc = OpenAIQueryEncoder(api_key="sk-test-key")
-    vector = enc.encode_query("tabletop game rules engine")
+    vector = enc.encode_query("distributed systems architecture")
 
     assert vector == [0.1, 0.2, 0.3]
     assert captured["url"] == "https://api.openai.com/v1/embeddings"
     assert captured["headers"]["Authorization"] == "Bearer sk-test-key"
-    assert captured["body"] == {"model": OPENAI_MODEL, "input": "tabletop game rules engine"}
+    assert captured["body"] == {"model": OPENAI_MODEL, "input": "distributed systems architecture"}
 
 
 def test_openai_query_encoder_never_logs_or_returns_the_key_itself(monkeypatch):

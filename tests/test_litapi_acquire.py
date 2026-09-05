@@ -78,7 +78,7 @@ def test_acquire_by_arxiv_id_downloads_and_registers(store, program_root):
 
     assert result.outcome == "acquired"
     assert result.oa_provider == "arxiv"
-    assert result.source["title"] == "A Fixture Paper About Tabletop Engine Metadata Reconciliation"
+    assert result.source["title"] == "A Fixture Paper About Distributed Systems Metadata Reconciliation"
     assert result.source["license_tier"] == "open"
     assert result.source["acquisition_route"] == "author_posted"
     assert result.source["arxiv_id"] == "2101.00001"

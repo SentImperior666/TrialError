@@ -287,7 +287,7 @@ def test_search_includes_graph_tier_when_kg_populated(store, corpus):
     e3 = _entity(store, corpus["launch_id"])
     _relation(store, e2, e3, anchor_id=restricted_anchor)
 
-    result = engine.search(store, query="dice pools resolve uncertain outcomes", mode="hybrid")
+    result = engine.search(store, query="retry budgets bound tail latency", mode="hybrid")
     assert "graph" in result["tiers_used"]
     assert result["stats"]["graph_candidates"] >= 1
     result_ids = {r["chunk_id"] for r in result["results"]}
@@ -295,11 +295,11 @@ def test_search_includes_graph_tier_when_kg_populated(store, corpus):
 
 
 def test_search_mode_fts_never_runs_graph_tier(store, corpus):
-    result = engine.search(store, query="dice pools", mode="fts")
+    result = engine.search(store, query="retry budgets", mode="fts")
     assert "graph" not in result["tiers_used"]
     assert "graph_candidates" not in result["stats"]
 
 
 def test_search_graph_tier_absent_when_kg_empty(store, corpus):
-    result = engine.search(store, query="dice pools resolve uncertain outcomes", mode="hybrid")
+    result = engine.search(store, query="retry budgets bound tail latency", mode="hybrid")
     assert "graph" not in result["tiers_used"]

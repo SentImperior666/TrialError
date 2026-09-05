@@ -63,9 +63,9 @@ def _assert_valid_search_response_row(row: dict) -> None:
 def test_every_result_row_schema_validates_with_a_non_null_citation(store):
     build_small_corpus(store)
     for query, mode in [
-        ("dice pools resolve uncertain outcomes", "hybrid"),
-        ("combat resolution initiative order proprietary special ability", "fts"),
-        ("game master adjudicates rules disputes", "vector"),
+        ("retry budgets bound tail latency", "hybrid"),
+        ("quorum reconfiguration lease fencing proprietary epoch counter", "fts"),
+        ("coordinator arbitrates lock conflicts", "vector"),
     ]:
         r = engine.search(store, query=query, mode=mode)
         assert r["ok"] is True
@@ -133,7 +133,7 @@ def test_fenced_corpus_search_and_get_chunk_never_serve_a_verbatim_run_over_20_w
     assert len(original_words) > 40, "fixture paragraph must be long enough for a >20-word violation to be possible"
 
     # --- search() ---
-    r = engine.search(store, query="combat resolution initiative order proprietary special ability", mode="fts")
+    r = engine.search(store, query="quorum reconfiguration lease fencing proprietary epoch counter", mode="fts")
     search_row = next(row for row in r["results"] if row["chunk_id"] == restricted_chunk_id)
     assert search_row["fenced"] is True
     served_words = search_row["text"].split()
@@ -162,7 +162,7 @@ def test_fenced_corpus_fixture_open_source_is_never_fenced_control_case(store):
     never fenced -- proves the fence is license-tier-driven, not a blanket
     truncation of every result."""
     corpus = build_small_corpus(store)
-    r = engine.search(store, query="dice pools resolve uncertain outcomes", mode="fts")
+    r = engine.search(store, query="retry budgets bound tail latency", mode="fts")
     row = next(x for x in r["results"] if x["chunk_id"] == corpus["open_chunk_ids"][0])
     assert row["fenced"] is False
     assert "license-fenced" not in row["text"]

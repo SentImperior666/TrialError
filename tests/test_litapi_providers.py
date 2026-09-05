@@ -82,7 +82,7 @@ def test_openalex_get_by_doi_hit():
 
     record = provider.get_by_doi("10.1234/fixture.5678")
 
-    assert record.title == "A Fixture Paper About Tabletop Engine Metadata Reconciliation"
+    assert record.title == "A Fixture Paper About Distributed Systems Metadata Reconciliation"
     assert record.doi == "10.1234/fixture.5678"
     assert record.authors == ["Ada Fixture", "Bo Canned"]
     assert record.year == 2021
@@ -138,7 +138,7 @@ def test_openalex_get_by_arxiv_resolves_via_synthesized_doi():
     record = provider.get_by_arxiv("arXiv:2101.00001")
 
     assert record.arxiv_id == "2101.00001"
-    assert record.title == "A Fixture Paper About Tabletop Engine Metadata Reconciliation"
+    assert record.title == "A Fixture Paper About Distributed Systems Metadata Reconciliation"
 
 
 def test_openalex_get_by_arxiv_not_found_raises():
@@ -156,12 +156,12 @@ def test_openalex_get_by_arxiv_not_found_raises():
 def test_openalex_search_returns_records_up_to_limit():
     transport = FakeTransport()
     transport.add_json(
-        _openalex_works_url({"filter": "title.search:tabletop engines", "per-page": "2"}),
+        _openalex_works_url({"filter": "title.search:distributed systems", "per-page": "2"}),
         json_body=load_fixture("openalex_citations_page.json"),
     )
     provider = OpenAlexProvider(transport, _openalex_cfg())
 
-    records = provider.search("tabletop engines", limit=2)
+    records = provider.search("distributed systems", limit=2)
 
     assert len(records) == 2
     assert records[0].title == "A Fixture Paper That Cites The Target Work"
@@ -287,10 +287,10 @@ def test_s2_search_returns_records():
         "total": 1, "offset": 0,
         "data": [{"paperId": "x", "title": "A Fixture Search Hit", "externalIds": {"DOI": "10.1/search"}, "authors": []}],
     }
-    transport.add_json(_s2_search_url("tabletop engines", 5), json_body=body)
+    transport.add_json(_s2_search_url("distributed systems", 5), json_body=body)
     provider = SemanticScholarProvider(transport, _s2_cfg())
 
-    records = provider.search("tabletop engines", limit=5)
+    records = provider.search("distributed systems", limit=5)
 
     assert len(records) == 1
     assert records[0].title == "A Fixture Search Hit"

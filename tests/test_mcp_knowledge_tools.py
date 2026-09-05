@@ -44,7 +44,7 @@ def test_tool_registry_has_exactly_the_11_named_tools(program_root, platform_roo
 
 def test_search_happy_path(program_root, platform_root):
     tools, corpus = _seeded_store_and_tools(program_root, platform_root)
-    env = tools["search"].handler({"query": "dice pools resolve uncertain outcomes", "mode": "fts"})
+    env = tools["search"].handler({"query": "retry budgets bound tail latency", "mode": "fts"})
     assert env["ok"] is True
     assert env["result"]["results"]
     assert env["result"]["results"][0]["fenced"] is False
@@ -56,7 +56,7 @@ def test_search_never_accepts_an_unfenced_bypass_even_if_the_arg_is_sent(program
     -- there is no argument name that turns the fence off."""
     tools, corpus = _seeded_store_and_tools(program_root, platform_root)
     env = tools["search"].handler({
-        "query": "combat resolution initiative order proprietary special ability", "mode": "fts",
+        "query": "quorum reconfiguration lease fencing proprietary epoch counter", "mode": "fts",
         "unfenced": True,  # not a real parameter of this tool -- must be silently ignored, not honored
     })
     assert env["ok"] is True

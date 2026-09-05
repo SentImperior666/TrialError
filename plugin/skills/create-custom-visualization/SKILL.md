@@ -335,8 +335,8 @@ if every extension panel you've declared is sound.
   bullet, the worked example's `awaiting_data` payload) instead of letting
   an empty table surface as a stack trace your users read as `ext_error`.
 - **Don't build the V2 visual redesign yourself.** If what you actually
-  want is the census-space MAP (points, colour, layout, pan/zoom) rather
-  than a JSON summary a generic table can render, that is
-  `design/dashboard-v2/Atlas.dc.html`'s job, not this skill's -- this
-  protocol gets your data TO the dashboard; it does not draw it for you
-  beyond the generic key/value and row-table renderer.
+  want is a bespoke MAP-style view (points, colour, layout, pan/zoom)
+  rather than a JSON summary a generic table can render, that's a
+  separate front-end build, not this skill's job -- this protocol gets
+  your data TO the dashboard; it does not draw it for you beyond the
+  generic key/value and row-table renderer.

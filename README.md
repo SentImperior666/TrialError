@@ -190,6 +190,10 @@ what is still coming. Nothing already shipped depends on any of it.
 - [ ] Dashboard: a backing route for the Evidence panel (per-claim neighborhood),
       and the write actions that ship disabled (pre-registration reveal,
       memory-conflict resolve, gate send-back, new feed threads).
+- [ ] Dashboard Console rendering: an idle-gap-compressed session timeline
+      (langfuse pattern) and a status-coloured jobs table with per-cell deltas
+      (k9s pattern), per the Console renderer brief. Until then the Console
+      uses a generic key/value renderer.
 - [ ] Full-text tier switch to tantivy. A measured bake-off found it 23-64x faster
       than FTS5 at every tested scale; the migration is scoped, not executed.
 - [ ] A dedicated term store for the lexicon, which is currently proxied from
@@ -225,14 +229,17 @@ where a specific piece of this codebase actually traces back to it:
   pattern behind faithfulness scoring.
 - **DeepEval** (Apache-2.0) — the pytest-native gate-acceptance-suite
   pattern (the pattern only — no dependency on the library itself).
-- **langfuse** (MIT, core) — idle-gap time compression, now how the
-  dashboard's Console timeline stays readable across long waits.
+- **langfuse** (MIT, core) — idle-gap time compression for long-running
+  timelines. Adopted in the dashboard's design contract for the Console
+  timeline; not yet shipped (the Console still uses a generic renderer).
 - **sigma.js** (MIT) — grid-cell label decimation and barycentre cluster
-  labels, now the dashboard's Atlas graph view.
+  labels. Adopted in the design contract for graph views inside per-program
+  extension panels; not yet shipped.
 - **k9s** (Apache-2.0) — the two-layer status colorer and per-cell delta
-  indicators, now the dashboard's Console jobs table.
-- **btop** (Apache-2.0) — the 101-step, three-stop gradient behind the
-  dashboard's meter rule.
+  indicators. Adopted in the design contract for the Console jobs table; not
+  yet shipped.
+- **btop** (Apache-2.0) — the 101-step, three-stop gradient for meters.
+  Read and considered; the shipped meters are deliberately flat, three-colour.
 - **arxiv-sanity-lite** (MIT) — the search-first page shell and explicit
   RANK BY control.
 - **taste-skill** and **ui-ux-pro-max-skill** — design-process skills (not
