@@ -43,16 +43,13 @@ else), and that POSIX arm now has its own test coverage
   GPU simply leaves `[ingest.ocr]`/`[ingest.embed]` unconfigured (falls back to the
   deterministic `Fake*Backend`, same as any fresh program) rather than pointing them at
   itself.
-- **The sandbox lane** (`LANE0_SANDBOX_RELOCATION_DESIGN.md`, Ubuntu container
-  `te-research`) is the concrete worked example: program root `/workspace/origin-project-program`,
-  harness bind-mounted (and already `pip install -e`'d at image build time) at
-  `/workspace/research-harness`, platform root defaulting to that container's own
-  `$HOME/.trialerror` unless `TRIALERROR_PLATFORM_ROOT` overrides it (the design's compose
-  profile sets it to `/workspace/platform`). See that design doc for the full container
-  profile, firewall allowlist, and detached-process supervision (`tmux` windows running
-  `dashboard serve --foreground` / `jobs start-worker --foreground` in a loop — the
-  `--foreground` flags there are deliberate: a supervised loop wants the CLI to block, not
-  self-detach a second time).
+- **Proven in a real container deployment, not just theoretically portable** — a checkout
+  bind-mounted into a Linux container (`pip install -e`'d at image build time), platform
+  root pointed at a dedicated directory via `TRIALERROR_PLATFORM_ROOT`, and the long-running
+  processes supervised as a detached, foregrounded loop (`dashboard serve --foreground` /
+  `jobs start-worker --foreground` in a supervisor's own restart loop — the `--foreground`
+  flags there are deliberate: a supervisor wants the CLI to block, not self-detach a second
+  time).
 
 ## 1. Local models — marker OCR + Qwen3-Embedding-4B
 
