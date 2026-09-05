@@ -86,6 +86,91 @@ def test_hook_passes_through_non_task_tools(roots):
     assert proc.returncode == 0
 
 
+# ---------------------------------------------------------------------------
+# Task->Agent rename (found 2026-09-05, C-0064-era live evidence): Claude
+# Code 2.1.x invokes the subagent tool as "Agent", not "Task". The gate
+# must treat both names identically -- these mirror the "Task" tests above
+# with ``tool_name: "Agent"`` substituted in, one per booking-lifecycle
+# state so the fix is proven at each of the same points the rename broke.
+# ---------------------------------------------------------------------------
+
+
+def test_hook_refuses_agent_with_no_launch_id_token(roots):
+    platform_root, program_root = roots
+    store = open_store(program_root, platform_root=platform_root)
+    account_id = new_id("ACC")
+    insert(store, "account", {"account_id": account_id, "label": "t", "created_ts": now()})
+    insert(
+        store, "session",
+        {"session_id": new_id("SESS"), "account_id": account_id, "opened_ts": now(), "status": "open"},
+    )
+    store.close()
+
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Agent",
+        "tool_input": {"prompt": "go do research, no ids anywhere"},
+        "cwd": str(program_root),
+    }
+    proc = _run_hook(payload, platform_root=platform_root)
+    assert proc.returncode == 2
+    assert "SPAWN REFUSED" in proc.stderr
+    assert "no_launch_id_token" in proc.stderr
+
+
+def test_hook_allows_booked_agent_and_consumes_the_token(roots, booked):
+    """The exact live-evidence shape: a subagent spawn issued as the
+    renamed ``Agent`` tool with a booked launch_id must be gated (and
+    consumed) exactly like ``Task`` was -- this is the case that regressed
+    silently (spawn went through with no booking check at all)."""
+    platform_root, program_root = roots
+    launch_id = booked
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Agent",
+        "tool_input": {"prompt": f"you are a lens. launch_id: {launch_id}"},
+        "cwd": str(program_root),
+    }
+    proc = _run_hook(payload, platform_root=platform_root)
+    assert proc.returncode == 0, proc.stderr
+
+    store = open_store(program_root, platform_root=platform_root)
+    from trialerror.stores import get
+
+    row = get(store, "launch", pk_column="launch_id", pk_value=launch_id)
+    # FU-11 verification findings F3/FU11-V6: the absent hook_alive{hook=
+    # "spawn_gate"} row was HALF the live incident's own signature (the
+    # other half being the missing booking check proven above) -- assert it
+    # explicitly for the Agent-named payload, not just transitively via the
+    # exit code/launch-state assertions.
+    hook_alive_rows = store.ops.execute(
+        "SELECT payload FROM event WHERE type='hook_alive'"
+    ).fetchall()
+    store.close()
+    hooks_seen = [json.loads(r["payload"])["hook"] for r in hook_alive_rows]
+    assert "spawn_gate" in hooks_seen, f"no hook_alive{{hook='spawn_gate'}} row, got {hooks_seen!r}"
+    assert row["state"] == "RUNNING"
+
+
+def test_hook_refuses_the_same_token_reused_on_a_second_agent_spawn(roots, booked):
+    platform_root, program_root = roots
+    launch_id = booked
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Agent",
+        "tool_input": {"prompt": f"you are a lens. launch_id: {launch_id}"},
+        "cwd": str(program_root),
+    }
+
+    first = _run_hook(payload, platform_root=platform_root)
+    assert first.returncode == 0, first.stderr
+
+    second = _run_hook(payload, platform_root=platform_root)
+    assert second.returncode == 2
+    assert "SPAWN REFUSED" in second.stderr
+    assert "token_not_provisional" in second.stderr
+
+
 def test_hook_refuses_task_with_no_launch_id_token(roots):
     platform_root, program_root = roots
     # An open session must exist first -- otherwise the gate refuses on
@@ -207,6 +292,66 @@ def test_hook_records_a_spawn_gate_hook_alive_marker_distinct_from_session_start
     store.close()
     hooks_seen = [json.loads(r["payload"])["hook"] for r in rows]
     assert hooks_seen == ["spawn_gate"], f"expected still exactly one marker (de-duped), got {hooks_seen!r}"
+
+
+# ---------------------------------------------------------------------------
+# FU-11 verification finding FU11-V5: the tool_name rename (Task -> Agent)
+# proved an assumption about Claude Code's tool surface can go stale
+# unnoticed; the sibling assumption -- that the launch_id-bearing prompt
+# text lives under tool_input["prompt"]/["description"] -- was never
+# checked. These prove the cheap fallback (scan the whole serialized
+# tool_input) actually finds a launch_id token stashed under some other
+# key, rather than only asserting it by reading the source.
+# ---------------------------------------------------------------------------
+
+
+def test_hook_finds_launch_id_token_under_an_unexpected_tool_input_key(roots, booked):
+    """If a future Claude Code tool-input schema change moves the prompt
+    text off ``prompt``/``description`` (unverified sibling assumption to
+    the Task->Agent rename), the gate must still find a `launch_id:` token
+    embedded in the tool_input rather than refusing every real spawn."""
+    platform_root, program_root = roots
+    launch_id = booked
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Agent",
+        "tool_input": {"instructions": f"you are a lens. launch_id: {launch_id}"},
+        "cwd": str(program_root),
+    }
+    proc = _run_hook(payload, platform_root=platform_root)
+    assert proc.returncode == 0, proc.stderr
+
+    store = open_store(program_root, platform_root=platform_root)
+    from trialerror.stores import get
+
+    row = get(store, "launch", pk_column="launch_id", pk_value=launch_id)
+    store.close()
+    assert row["state"] == "RUNNING"
+
+
+def test_hook_refuses_agent_when_tool_input_has_no_token_anywhere(roots):
+    """The fallback must not manufacture a false match: an ``Agent`` call
+    whose tool_input carries fields but no `launch_id:` token anywhere
+    still refuses as ``no_launch_id_token``."""
+    platform_root, program_root = roots
+    store = open_store(program_root, platform_root=platform_root)
+    account_id = new_id("ACC")
+    insert(store, "account", {"account_id": account_id, "label": "t", "created_ts": now()})
+    insert(
+        store, "session",
+        {"session_id": new_id("SESS"), "account_id": account_id, "opened_ts": now(), "status": "open"},
+    )
+    store.close()
+
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Agent",
+        "tool_input": {"instructions": "go do research, no ids anywhere"},
+        "cwd": str(program_root),
+    }
+    proc = _run_hook(payload, platform_root=platform_root)
+    assert proc.returncode == 2
+    assert "no_launch_id_token" in proc.stderr
 
 
 def test_hook_unparseable_stdin_passes_through(roots):

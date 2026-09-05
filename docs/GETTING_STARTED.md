@@ -141,8 +141,9 @@ is the read-only way to re-check the same bundle later without re-booting.
 Every write that TrialError attributes to "who did this" (`registered_by_launch`,
 `created_by_launch`, artifact/gate actors, …) needs a `launch_id` — a booked unit of
 agent spend, XID-validated against `platform.launch`. In a live Claude Code session this
-happens automatically (the orchestrator books, the `PreToolUse:Task` hook consumes the
-booking when it spawns a subagent — see `docs/OPERATOR_GUIDE.md`'s enforcement section).
+happens automatically (the orchestrator books, the `PreToolUse:Task/Agent` hook consumes the
+booking when it spawns a subagent — `Agent` is the tool name Claude Code 2.1.x actually uses,
+`Task` a legacy alias the hook still accepts; see `docs/OPERATOR_GUIDE.md`'s enforcement section).
 Working from a bare terminal, as in this walkthrough, book one yourself:
 
 bash (a trailing `\` continues the line):

@@ -27,14 +27,26 @@ stdin, resolve the program/platform roots, call the gate, translate the
 verdict to an exit code.
 
 TRIALERROR-DEV-NOTE (matcher wiring): this hook assumes it is only invoked for
-``tool_name == "Task"``. ``plugin/hooks/hooks.json`` now enforces that with
-a ``Task``-only ``PreToolUse`` matcher, so the assumption holds under the
-shipped manifest. Belt and braces, THIS module still defends itself: any
-``tool_name`` other than ``"Task"`` (or a payload it can't parse at all)
+``tool_name in SUBAGENT_TOOL_NAMES`` (see :mod:`trialerror.hooks`).
+``plugin/hooks/hooks.json`` now enforces that with a ``^(Task|Agent)$``
+``PreToolUse`` matcher, so the assumption holds under the shipped
+manifest. Belt and braces, THIS module still defends itself: any
+``tool_name`` outside that set (or a payload it can't parse at all)
 passes through (exit 0) rather than guessing - see ``_evaluate`` below.
 Confirming that Claude Code actually applies the matcher, rather than
 merely that the fast path works, remains a live-session item (see
 ``tests/acceptance/test_gpu_and_live_cc_journeys.py``).
+
+TRIALERROR-DEV-NOTE (Task->Agent rename, found 2026-09-05): this docstring
+used to say the matcher, and this module's own comparison, were
+``"Task"``-only. Live evidence on the sandbox host (03:34Z, the sandbox container
+container) showed Claude Code 2.1.261 invoking the subagent tool as
+``Agent`` rather than ``Task`` -- the old ``tool_name != "Task"`` check
+silently let every real spawn through unbooked (no refusal, no
+``hook_alive{hook=spawn_gate}`` row). Both the manifest matcher above and
+the comparison below now gate on ``SUBAGENT_TOOL_NAMES = ("Task", "Agent")``
+(:mod:`trialerror.hooks`) so a future rename of either name is a one-line
+fix in one place instead of a repeat of this incident.
 
 TRIALERROR-DEV-NOTE (cwd assumption): ``trialerror.util.config.find_program_root``
 walks up from the hook payload's ``cwd`` looking for ``trialerror.toml``. This
@@ -49,21 +61,34 @@ import json
 import sys
 from pathlib import Path
 
+from trialerror.hooks import SUBAGENT_TOOL_NAMES
+
 
 def _evaluate(payload: dict) -> tuple[int, str | None]:
     """Returns ``(exit_code, stderr_message)``. Kept separate from
     ``main()`` so a test can call it directly with a crafted payload dict
     instead of piping JSON through a real stdin/subprocess."""
     tool_name = payload.get("tool_name")
-    if tool_name != "Task":
+    if tool_name not in SUBAGENT_TOOL_NAMES:
         return 0, None
 
     tool_input = payload.get("tool_input") or {}
     prompt_text = tool_input.get("prompt") or tool_input.get("description") or ""
+    if not prompt_text and tool_input:
+        # TRIALERROR-DEV-NOTE (tool_input schema assumption, FU-11 verification
+        # finding FU11-V5): the Task->Agent rename above proved the tool NAME
+        # is not stable across Claude Code versions; the shape of tool_input
+        # (that a subagent call carries "prompt" or "description") is an
+        # equally unverified assumption. If a future rename moves the prompt
+        # text under some other key, fall back to scanning the WHOLE
+        # serialized tool_input for the `launch_id:` token rather than
+        # treating the call as promptless -- cheap hardening, not a full fix
+        # (a live Claude Code session must still confirm the real key name).
+        prompt_text = json.dumps(tool_input, ensure_ascii=False)
     cwd = payload.get("cwd") or "."
 
     # Deferred imports: keep import cost off the (much more common)
-    # not-a-Task-call fast path above.
+    # not-a-subagent-call fast path above.
     from trialerror.budget.gate import evaluate_spawn_for_open_session, resolve_open_session
     from trialerror.events.api import record_hook_alive_once
     from trialerror.stores.store import open_store
@@ -80,7 +105,7 @@ def _evaluate(payload: dict) -> tuple[int, str | None]:
 
     try:
         store = open_store(program_root)
-    except Exception as exc:  # noqa: BLE001 - this IS a Task call; cannot verify -> fail CLOSED
+    except Exception as exc:  # noqa: BLE001 - this IS a subagent spawn call; cannot verify -> fail CLOSED
         return 2, f"spawn gate: could not open program stores at {program_root}: {exc}"
 
     try:
@@ -113,7 +138,7 @@ def main() -> int:
         payload = json.loads(raw) if raw.strip() else {}
     except Exception:
         # Can't even parse the hook payload -> can't tell if this is a
-        # Task call -> pass through rather than blocking every tool.
+        # subagent spawn call -> pass through rather than blocking every tool.
         return 0
 
     try:

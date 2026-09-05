@@ -209,13 +209,18 @@ def run_clean_checkout_smoke(program_root: Path, platform_root: Path, *, repo_ro
 
         # ------------------------------------------------------------
         # 4. spawn-gate refusal/consumption round trip -- via the REAL
-        #    PreToolUse:Task hook subprocess (plugin/hooks/spawn_gate.py):
+        #    PreToolUse hook subprocess (plugin/hooks/spawn_gate.py):
         #    (a) a Task prompt with no launch_id token -> exit 2 refused;
-        #    (b) the SAME booked launch_id -> exit 0, consumes the booking
-        #        (PROVISIONAL -> RUNNING);
-        #    (c) replaying the identical token again -> exit 2 refused
-        #        (design Section 12 M3 row: "same launch_id token on a
-        #        second spawn refused").
+        #    (b) the SAME booked launch_id, spawned as the tool name Claude
+        #        Code 2.1.x actually emits ("Agent" -- FU-11, 2026-09-05) ->
+        #        exit 0, consumes the booking (PROVISIONAL -> RUNNING);
+        #    (c) replaying the identical token again (as the legacy "Task"
+        #        alias, still accepted) -> exit 2 refused (design Section
+        #        12 M3 row: "same launch_id token on a second spawn
+        #        refused"). Using both names across (a)/(b)/(c) means this
+        #        shipped, run-in-the-field smoke journey exercises the live
+        #        tool name Claude Code emits, not only the dead "Task"
+        #        alias (FU-11 verification finding F2).
         # ------------------------------------------------------------
         with _step(steps, "spawn_gate_refusal_no_token"):
             no_token = _run_hook_script(
@@ -232,7 +237,7 @@ def run_clean_checkout_smoke(program_root: Path, platform_root: Path, *, repo_ro
         with _step(steps, "spawn_gate_consumption"):
             consumed = _run_hook_script(
                 _SPAWN_GATE_HOOK,
-                {"hook_event_name": "PreToolUse", "tool_name": "Task",
+                {"hook_event_name": "PreToolUse", "tool_name": "Agent",
                  "tool_input": {"prompt": f"launch_id: {launch_id}\ndo the acceptance-smoke work"},
                  "cwd": str(program_root)},
                 platform_root=platform_root,
@@ -548,14 +553,22 @@ GPU_LIVE_CC_ITEMS: dict[str, str] = {
         "tests/test_m6_acceptance.py::test_session_start_injects_bundle_orchestrator_executed_note."
     ),
     "live_cc_spawn_gate_pretooluse_task": (
-        "LIVE PreToolUse:Task spawn-gate firing on a REAL subagent spawn (design Section 5.4 "
-        "PreToolUse:Task row; M3/F18): from a live Claude Code session with the plugin's hooks "
-        "wired, invoke the Task tool without a booked `launch_id:` token and confirm Claude "
-        "Code itself surfaces the exit-2 refusal message to the agent (not just that the "
-        "script would exit 2 under a synthetic stdin payload). Offline proxy already covered: "
-        "tests/test_spawn_gate_hook.py (real subprocess, real stdin, real exit code) + this "
-        "build's own run_clean_checkout_smoke (spawn_gate_refusal_no_token/"
-        "spawn_gate_consumption/spawn_gate_replay_refused steps)."
+        "LIVE PreToolUse spawn-gate firing on a REAL subagent spawn (design Section 5.4 "
+        "PreToolUse:Task row; M3/F18; tool name updated per FU-11, 2026-09-05): from a live "
+        "Claude Code session with the plugin's hooks wired, get the agent to spawn a subagent "
+        "-- Claude Code 2.1.x invokes this as the `Agent` tool (`Task` is only a legacy alias "
+        "name that `hooks.json`'s matcher and `trialerror.hooks.SUBAGENT_TOOL_NAMES` still "
+        "accept, not something current Claude Code emits) -- without a booked `launch_id:` "
+        "token, and confirm Claude Code itself surfaces the exit-2 refusal message to the "
+        "agent (not just that the script would exit 2 under a synthetic stdin payload). Then, "
+        "in the SAME session, confirm a `hook_alive` row with `payload.hook == \"spawn_gate\"` "
+        "was actually written for that call (`trialerror events tail`/a store query) -- the "
+        "spawn's outcome alone does not distinguish the manifest matcher firing-and-allowing "
+        "from the matcher never firing at all (FU-11 verification finding FU11-V4). Offline "
+        "proxy already covered: tests/test_spawn_gate_hook.py (real subprocess, real stdin, "
+        "real exit code, `Agent`-tool-name cases included) + this build's own "
+        "run_clean_checkout_smoke (spawn_gate_refusal_no_token/spawn_gate_consumption/"
+        "spawn_gate_replay_refused steps, the middle one now spawned as `Agent`)."
     ),
     "live_cc_stop_hook_close_check": (
         "LIVE Stop-hook close check (design Section 5.4 Stop row; M6/F18): in a real Claude "
@@ -564,14 +577,21 @@ GPU_LIVE_CC_ITEMS: dict[str, str] = {
         "once with the checklist message (and allows a second stop, never trapping the user) -- "
         "this is Claude Code UI behavior a synthetic stdin payload cannot exercise."
     ),
-    "live_cc_task_matcher_wiring": (
-        "Task-matcher wiring verification in plugin/hooks/hooks.json (design Section 12 M6 "
-        "row): confirm, in a real Claude Code session, that the PreToolUse hook fires ONLY for "
-        "`tool_name==\"Task\"` calls and never for e.g. Bash/Read -- i.e. that the plugin "
-        "manifest's own matcher config is what Claude Code is actually applying, not merely "
-        "that spawn_gate.py's own internal `tool_name != \"Task\"` fast-path defends itself "
-        "(which tests/test_spawn_gate_hook.py::test_hook_passes_through_non_task_tools already "
-        "proves at the script level)."
+    "live_cc_task_or_agent_matcher_wiring": (
+        "PreToolUse/PostToolUse matcher wiring verification in plugin/hooks/hooks.json (design "
+        "Section 12 M6 row; corrected per FU-11, 2026-09-05 -- see FU11-V1): confirm, in a real "
+        "Claude Code session, that the hook fires for `tool_name` in `{Task, Agent}` -- Claude "
+        "Code 2.1.x's real subagent-spawn tool name is `Agent`; `Task` is a legacy alias -- and "
+        "never for e.g. Bash/Read. This item used to say the matcher should fire ONLY for "
+        "`tool_name==\"Task\"`; that criterion was itself wrong (a correctly-fixed matcher fires "
+        "on `Agent`, which the old wording would have read as a wiring FAILURE) and is fixed "
+        "here. i.e. confirm the plugin manifest's own `^(Task|Agent)$` matcher config is what "
+        "Claude Code is actually applying, not merely that spawn_gate.py's/post_task.py's own "
+        "internal `tool_name not in SUBAGENT_TOOL_NAMES` fast-path defends itself (which "
+        "tests/test_spawn_gate_hook.py::test_hook_passes_through_non_task_tools and "
+        "tests/test_cli_hook.py::test_hooks_json_pretooluse_posttooluse_matchers_cover_task_and_agent_only "
+        "already prove at the script/manifest level, but cannot observe whether Claude Code's "
+        "own regex engine fullmatches or searches)."
     ),
     "live_cc_mcp_smoke_knowledge_server": (
         "MCP smoke via Claude Code for trialerror-knowledge (design Section 12 M8 row: \"MCP smoke "
@@ -584,8 +604,16 @@ GPU_LIVE_CC_ITEMS: dict[str, str] = {
     "live_cc_mcp_smoke_ops_server_book_spawn_reconcile": (
         "MCP smoke via Claude Code for trialerror-ops, specifically the book->spawn->reconcile round "
         "trip (design Section 12 M14 row): register `trialerror mcp ops` in a real Claude Code "
-        "session, call `book_launch` via the MCP tool, spawn a REAL Task with the returned "
-        "launch_id (exercising the live PreToolUse hook above), then `reconcile_launch`. "
+        "session, call `book_launch` via the MCP tool, spawn a REAL subagent with the returned "
+        "launch_id -- Claude Code 2.1.x does this as the `Agent` tool, not the legacy `Task` "
+        "alias (FU-11, 2026-09-05); exercises the live PreToolUse hook above -- then "
+        "`reconcile_launch`. While here, capture the full `tool_input` object of that real "
+        "`Agent` spawn from the session transcript and confirm it still carries a `prompt` (or "
+        "`description`) field: spawn_gate.py/post_task.py's launch_id extraction assumed that "
+        "shape, unverified, the same way the tool NAME was assumed to stay `Task` -- if the "
+        "field ever moves, the gate now falls back to scanning the whole serialized "
+        "`tool_input` for the `launch_id:` token (FU-11 verification finding FU11-V5) rather "
+        "than failing closed on every spawn, but that fallback itself is unverified live. "
         "Offline proxy already covered: tests/test_mcp_ops_protocol.py::"
         "test_full_book_spawn_reconcile_round_trip_over_the_wire + "
         "test_stdio_smoke_real_subprocess_initialize_and_tools_list."

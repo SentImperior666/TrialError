@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -114,6 +115,20 @@ def test_spawn_gate_refusal_writes_nothing_to_stdout(open_session):
     assert proc.stdout == "", f"stdout must stay empty, got {proc.stdout!r}"
 
 
+def test_spawn_gate_refuses_unbooked_agent_spawn_with_exit_2(open_session):
+    """Task->Agent rename (found 2026-09-05): the CLI envelope path must
+    gate ``tool_name: "Agent"`` exactly like ``"Task"`` -- mirrors
+    ``test_spawn_gate_refuses_unbooked_spawn_with_exit_2`` above."""
+    platform_root, program_root, _ = open_session
+    proc = _run(
+        "spawn-gate",
+        {"tool_name": "Agent", "tool_input": {"prompt": "go do research"}, "cwd": str(program_root)},
+        platform_root=platform_root,
+    )
+    assert proc.returncode == 2, f"expected BLOCK, got {proc.returncode}: {proc.stderr}"
+    assert "SPAWN REFUSED" in proc.stderr
+
+
 def test_spawn_gate_passes_through_non_task_tools(open_session):
     platform_root, program_root, _ = open_session
     proc = _run(
@@ -192,6 +207,51 @@ def test_post_task_never_blocks(open_session):
     assert proc.returncode == 0
 
 
+def test_post_task_never_blocks_for_renamed_agent_tool(open_session):
+    """Task->Agent rename (found 2026-09-05): mirrors
+    ``test_post_task_never_blocks`` above with ``tool_name: "Agent"`` --
+    strengthened per FU-11 verification finding FU11-V3: asserts the
+    observable effect (a ``subagent_return`` row keyed to the booked
+    launch_id), not merely the exit code. Exit 0 alone does not
+    distinguish a correctly-recorded return from the pre-fix silent
+    no-op: mutation-tested by shrinking SUBAGENT_TOOL_NAMES back to
+    ``("Task",)`` at runtime -- the exit-code-only version of this test
+    still passed (the old code silently no-ops and returns 0 for
+    "Agent"), while the assertion below fails, exactly the case FU-11
+    exists to catch."""
+    platform_root, program_root, session_id = open_session
+    store = open_store(program_root, platform_root=platform_root)
+    booked = book_launch(
+        store,
+        session_id=session_id,
+        program_id="PROG-test",
+        agent_kind="lens",
+        model_class="mid",
+        model="sonnet",
+        purpose="mechanical",
+        est_tokens=10,
+    )
+    store.close()
+
+    proc = _run(
+        "post-task",
+        {
+            "tool_name": "Agent",
+            "tool_input": {"prompt": f"do the thing. launch_id: {booked.launch_id}"},
+            "tool_response": {"content": "done"},
+            "cwd": str(program_root),
+        },
+        platform_root=platform_root,
+    )
+    assert proc.returncode == 0
+
+    store = open_store(program_root, platform_root=platform_root)
+    rows = store.ops.execute("SELECT * FROM event WHERE type='subagent_return'").fetchall()
+    store.close()
+    assert len(rows) == 1, f"expected one subagent_return row, got {rows!r}"
+    assert rows[0]["launch_id"] == booked.launch_id
+
+
 # ---------------------------------------------------------------------------
 # unparseable stdin must never take the session down
 # ---------------------------------------------------------------------------
@@ -242,3 +302,29 @@ def test_hooks_json_manifest_uses_the_console_script_not_a_bare_interpreter():
     for command in commands:
         assert command.startswith("trialerror hook "), command
         assert "python" not in command, f"{command!r} names an interpreter again"
+
+
+def test_hooks_json_pretooluse_posttooluse_matchers_cover_task_and_agent_only():
+    """Regression guard for the Task->Agent rename (found 2026-09-05):
+    Claude Code 2.1.x invokes the subagent tool as ``Agent``, not ``Task``.
+    ``PreToolUse``/``PostToolUse`` matchers must catch both exact names --
+    and, per how Claude Code documents matcher regexes ("Edit|Write" style
+    alternation), must NOT also catch superstrings like ``TaskList`` or
+    ``Agents`` that happen to contain one of the two names. We can only
+    prove this against ``re.fullmatch`` here (Claude Code applies the
+    regex itself; whether its engine fullmatches or searches is not
+    something a local test can observe) -- the manifest is anchored
+    (``^(Task|Agent)$``) so the two interpretations agree regardless."""
+    manifest_path = Path(__file__).resolve().parents[1] / "plugin" / "hooks" / "hooks.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    for event_name in ("PreToolUse", "PostToolUse"):
+        matchers = [entry["matcher"] for entry in manifest["hooks"][event_name]]
+        assert len(matchers) == 1, f"{event_name}: expected exactly one matcher entry, got {matchers!r}"
+        pattern = matchers[0]
+        for name in ("Task", "Agent"):
+            assert re.fullmatch(pattern, name), f"{event_name} matcher {pattern!r} must fullmatch {name!r}"
+        for not_a_subagent_name in ("TaskList", "Agents", "SubAgent", "Bash", ""):
+            assert not re.fullmatch(pattern, not_a_subagent_name), (
+                f"{event_name} matcher {pattern!r} must NOT fullmatch {not_a_subagent_name!r}"
+            )
