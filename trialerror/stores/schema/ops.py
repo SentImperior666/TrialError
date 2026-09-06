@@ -32,6 +32,7 @@ TABLES = (
     "lens_roster",
     "lens_assignment",
     "memory_item",
+    "memory_relation",
     "room",
     "room_turn",
     "room_score",
@@ -588,6 +589,94 @@ _V6 = (
     "CREATE INDEX idx_feed_post_translation_gate ON feed_post_translation(gate_status)",
 )
 
+# ---- v7 (mining adoptions engram-F4 / engram-F5) -----------------------
+#
+# TRIALERROR-DEV-NOTE (why v7 -- the third number this migration has worn):
+# authored as v6 against a branch point where ops stopped at v5, then
+# renumbered to v8 on the lane branch once master landed lane b's
+# ``ops_v6_feed_post_translation_gate_verdict`` and orchestrator ruling L-C1
+# (``docs/reviews/LANE_C_DASHBOARD_COMPLETION_SPEC.md``) allocated v7 to lane
+# C. It lands as **v7** because the merge order went the other way: this lane
+# merged into master BEFORE lane c, so v7 was free at merge time and L-C1 was
+# amended to give lane c v8. The rule L-C1 actually encodes is "never reuse a
+# number, and rename the constant with the number" -- which is about
+# collision, not about a fixed integer per lane; whoever merges first takes
+# the next free number and the later lane moves up.
+#
+# The rename matters as much as the integer, for the reason lane b's B1 note
+# spells out: two branches binding the same module-level name to different
+# statement blocks is a footgun Python will not report -- after a careless
+# merge that keeps both blocks, the name binds to whichever assignment comes
+# last and the wrong DDL runs under the surviving migration, silently.
+# Distinct names leave nothing to shadow, and the MIGRATIONS tuple stays a
+# visible three-way conflict rather than a silent one. That is exactly what
+# happened here: master's ``_V6`` and this lane's block conflicted loudly on
+# both the constant and the tuple, and both survived the resolution intact.
+#
+# MIGRATIONS is contiguous 1..7 again after this merge (the lane branch's
+# deliberate 1,2,3,4,5,8 gap closed by landing at 7 instead of 8).
+# ``apply_migrations`` compares version numbers and never requires
+# contiguity, so the gap was safe while it existed -- but one hazard outlived
+# it and belongs to anyone carrying a dev store across this merge: an ops.db
+# migrated to ``user_version=8`` ON THE PRE-MERGE LANE BRANCH will now SKIP
+# every migration <= 8, this v7 and lane b's v6 included, and will keep a
+# stale ``user_version`` no later migration can walk back. That affects a dev
+# store only, never a freshly created one -- recreate such a store.
+#
+# ``memory_relation`` is engram-F4's save-time conflict surface
+# (``docs/mining/G25-operator-2026-09__engram.md`` finding 3; orchestrator
+# verdict "adopt-now:memory WITH CONSTRAINT - advisory candidates only,
+# never auto-applied verdicts"). Two deliberate schema decisions carried
+# over from the source, both load-bearing:
+#
+# - **No ``UNIQUE(source_id, target_id)``.** The source's own schema
+#   comment says "multi-actor disagreement allowed": two judges may record
+#   opposite verdicts about the same pair and the row model must hold both
+#   rather than collapse to one answer. A unique constraint here would
+#   silently make the second judge overwrite the first.
+# - **``relation`` is NULLABLE, ``judgment_status`` is not.** A row born
+#   from the BM25 scan is a *candidate* -- ``judgment_status='pending'``
+#   with no verb yet. The locked six-verb vocabulary only applies once a
+#   human or agent judges it. This is what keeps section 5.3's constraint
+#   structural instead of merely conventional: there is no "system wrote a
+#   verdict" state the schema can even represent as judged-by-default,
+#   and ``trialerror.memory.conflicts.judge`` refuses ``marked_by_kind=
+#   'system'`` outright.
+#
+# ``memory_item.reviewed_ts`` is engram-F5's other half (finding 4;
+# verdict "adopt-now:memory as a DOCTOR CHECK ... never mutates a pin or a
+# ruling"). It is written ONLY by an explicit "I looked at this" act
+# (``trialerror memory reviewed <id>``) -- never by a timer, never by the
+# doctor check, never by decay. The staleness computation itself is pure:
+# it reads ``max(reviewed_ts, updated_ts)`` and reports, per section 5.7's
+# "must surface it ... and must never expire, unpin, or downgrade a law on
+# a timer."
+_V7 = (
+    """
+    CREATE TABLE memory_relation (
+        relation_id                 TEXT PRIMARY KEY,
+        source_id                   TEXT NOT NULL REFERENCES memory_item(memory_item_id),
+        target_id                     TEXT NOT NULL REFERENCES memory_item(memory_item_id),
+        relation                        TEXT CHECK (relation IN
+                                          ('related','compatible','scoped','conflicts_with','supersedes','not_conflict')),
+        judgment_status                   TEXT NOT NULL CHECK (judgment_status IN ('pending','judged','superseded')),
+        score                               REAL,
+        reason                                TEXT,
+        evidence                                TEXT,
+        confidence                                REAL,
+        marked_by_actor                             TEXT,
+        marked_by_kind                                TEXT CHECK (marked_by_kind IN ('human','agent','system')),
+        marked_by_model                                 TEXT,
+        created_ts                                        TEXT NOT NULL,
+        judged_ts                                           TEXT,
+        superseded_by_relation_id                             TEXT REFERENCES memory_relation(relation_id)
+    )
+    """,
+    "CREATE INDEX idx_memory_relation_source ON memory_relation(source_id, judgment_status)",
+    "CREATE INDEX idx_memory_relation_status ON memory_relation(judgment_status, created_ts)",
+    "ALTER TABLE memory_item ADD COLUMN reviewed_ts TEXT",
+)
+
 MIGRATIONS = (
     Migration(version=1, name="ops_v1_initial_schema", statements=_V1),
     Migration(version=2, name="ops_v2_memory_item_account_id_nullable_and_thread_status_refs", statements=_V2),
@@ -595,4 +684,5 @@ MIGRATIONS = (
     Migration(version=4, name="ops_v4_criterion_and_feed_post_translation", statements=_V4),
     Migration(version=5, name="ops_v5_meta_kv", statements=_V5),
     Migration(version=6, name="ops_v6_feed_post_translation_gate_verdict", statements=_V6),
+    Migration(version=7, name="ops_v7_memory_relation_and_reviewed_ts", statements=_V7),
 )

@@ -213,3 +213,152 @@ def test_memory_merge_requires_group_and_keep_together(program_root, platform_ro
     rc, env = _call(["memory", "merge", "--program-root", str(program_root), "--group", "x"], capsys)
     assert rc == 1
     assert env["error"]["code"] == "incomplete_resolution"
+
+
+# ---------------------------------------------------------------------------
+# mining adoptions engram-F4 (candidates/judge) and engram-F5 (stale/reviewed)
+# ---------------------------------------------------------------------------
+def _put(program_root, platform_root, capsys, account_id, key, body, extra=()):
+    return _call(
+        [
+            "memory", "put", "--program-root", str(program_root),
+            "--key", key, "--tier", "L0", "--kind", "rule", "--body", body, "--account", account_id, *extra,
+        ],
+        capsys,
+    )
+
+
+def test_memory_put_reports_conflict_candidates_without_blocking(program_root, platform_root, capsys):
+    account_id = _seed_account(program_root, platform_root)
+    body = "Every agent run is booked in the spend ledger before spawn."
+    _put(program_root, platform_root, capsys, account_id, "spawn-booking-rule", body)
+    rc, env = _put(program_root, platform_root, capsys, account_id, "spawn-booking-restated", body)
+    assert rc == 0
+    assert env["ok"] is True  # the save succeeded; the advisory is additive
+    assert env["result"]["conflict_candidates"]
+    assert "ADVISORY (unjudged)" in env["result"]["conflict_note"]
+
+
+def test_memory_put_no_conflict_scan_skips_the_advisory(program_root, platform_root, capsys):
+    account_id = _seed_account(program_root, platform_root)
+    body = "Every agent run is booked in the spend ledger before spawn."
+    _put(program_root, platform_root, capsys, account_id, "spawn-booking-rule", body)
+    rc, env = _put(
+        program_root, platform_root, capsys, account_id, "spawn-booking-restated", body, extra=("--no-conflict-scan",)
+    )
+    assert rc == 0
+    assert env["result"]["conflict_candidates"] == []
+
+
+def test_memory_put_feed_thread_failure_never_fails_the_put(program_root, platform_root, capsys):
+    """A thread id that does not exist must be reported, not raised: the
+    row is already written by the time the note is posted."""
+    account_id = _seed_account(program_root, platform_root)
+    body = "Every agent run is booked in the spend ledger before spawn."
+    _put(program_root, platform_root, capsys, account_id, "spawn-booking-rule", body)
+    rc, env = _put(
+        program_root, platform_root, capsys, account_id, "spawn-booking-restated", body,
+        extra=("--feed-thread", "THR-does-not-exist"),
+    )
+    assert rc == 0
+    assert env["ok"] is True
+    assert env["result"]["feed_note"]["posted"] is False
+    assert env["result"]["feed_note"]["error"]
+
+
+def test_memory_candidates_lists_pending_and_judge_settles_one(program_root, platform_root, capsys):
+    account_id = _seed_account(program_root, platform_root)
+    body = "Every agent run is booked in the spend ledger before spawn."
+    _put(program_root, platform_root, capsys, account_id, "spawn-booking-rule", body)
+    _put(program_root, platform_root, capsys, account_id, "spawn-booking-restated", body)
+
+    rc, env = _call(
+        ["memory", "candidates", "--program-root", str(program_root)], capsys
+    )
+    assert rc == 0
+    assert env["result"]["count"] >= 1
+    assert env["result"]["verbs"] == [
+        "related", "compatible", "scoped", "conflicts_with", "supersedes", "not_conflict",
+    ]
+    relation_id = env["result"]["candidates"][0]["relation_id"]
+
+    rc, env = _call(
+        [
+            "memory", "judge", "--program-root", str(program_root),
+            "--relation", relation_id, "--verb", "supersedes", "--actor", "operator",
+        ],
+        capsys,
+    )
+    assert rc == 0
+    assert env["result"]["relation"]["judgment_status"] == "judged"
+    assert env["result"]["relation"]["marked_by_kind"] == "human"
+
+
+def test_memory_judge_does_not_offer_a_system_actor_kind(program_root, platform_root, capsys):
+    """argparse itself refuses it -- review section 5.3 is enforced at the
+    CLI surface as well as in the API."""
+    import pytest
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "memory", "judge", "--program-root", str(program_root),
+                "--relation", "MREL-x", "--verb", "related", "--actor", "bot", "--actor-kind", "system",
+            ]
+        )
+
+
+def test_memory_judge_refuses_an_unknown_relation(program_root, platform_root, capsys):
+    rc, env = _call(
+        [
+            "memory", "judge", "--program-root", str(program_root),
+            "--relation", "MREL-nope", "--verb", "related", "--actor", "operator",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert env["error"]["code"] == "judge_refused"
+
+
+def test_memory_stale_and_reviewed_round_trip(program_root, platform_root, capsys):
+    from datetime import timedelta
+
+    from trialerror.util.timeutil import now_dt
+
+    old = now_dt() - timedelta(days=2000)
+    old_ts = old.strftime("%Y-%m-%dT%H:%M:%S.") + f"{old.microsecond // 1000:03d}Z"
+
+    account_id = _seed_account(program_root, platform_root)
+    rc, env = _put(
+        program_root, platform_root, capsys, account_id, "ancient-rule", "an old standing rule",
+        extra=("--ts", old_ts),
+    )
+    item_id = env["result"]["item"]["memory_item_id"]
+
+    rc, env = _call(
+        ["memory", "stale", "--program-root", str(program_root)], capsys
+    )
+    assert rc == 0
+    assert env["result"]["count"] == 1
+    assert env["result"]["by_kind"] == {"rule": 1}
+
+    rc, env = _call(
+        ["memory", "reviewed", item_id, "--program-root", str(program_root)],
+        capsys,
+    )
+    assert rc == 0
+    assert env["result"]["item"]["reviewed_ts"]
+
+    rc, env = _call(
+        ["memory", "stale", "--program-root", str(program_root)], capsys
+    )
+    assert env["result"]["count"] == 0
+
+
+def test_memory_reviewed_refuses_an_unknown_id(program_root, platform_root, capsys):
+    rc, env = _call(
+        ["memory", "reviewed", "MEM-nope", "--program-root", str(program_root)],
+        capsys,
+    )
+    assert rc == 1
+    assert env["error"]["code"] == "review_refused"

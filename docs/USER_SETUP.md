@@ -203,6 +203,11 @@ What you get:
 - `trialerror budget quota` reads it anywhere (freshness-checked, 15-min bar);
   `--ingest --account-id ACC-...` records it as a `quota_snapshot(source=api)` row
 - the dashboard's budget panel carries a `plan_quota` block automatically
+- inside the research sandbox nothing to paste: `deploy/sandbox/te-boot.sh` writes this
+  `statusLine` key into the container user's settings on first boot (idempotent) and the
+  image already sets `TRIALERROR_QUOTA_DIR`; note the feed exists only in interactive
+  terminal sessions -- the Claude desktop app's Code tab never runs the statusLine
+  command, so a desktop-driven session stays on screenshots
 
 Rules of precedence are unchanged: your screenshot ingests
 (`source=screenshot`) still override everything on conflict; this feed is the

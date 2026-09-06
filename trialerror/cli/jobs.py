@@ -6,6 +6,13 @@ Registration rule (design Section 5.2 / lane safety): this module lives at
 ``trialerror/cli/jobs.py`` and is auto-discovered by
 ``trialerror.cli.discover_groups`` -- adding it never touched
 ``trialerror/cli/__init__.py``.
+
+``kick`` is the seventh verb, added by mining adoption rowboat-F8: it
+writes the wake token :func:`trialerror.jobs.worker.run_loop` naps on, so
+"a job was just enqueued, stop waiting" costs one command instead of a
+poll interval. It is deliberately NOT a spawn -- it wakes workers that
+already exist and does nothing at all when none are running (which is why
+it needs no launch booking).
 """
 
 from __future__ import annotations
@@ -18,13 +25,13 @@ from pathlib import Path
 from trialerror.jobs import ledger
 from trialerror.jobs.errors import JobError
 from trialerror.jobs.registry import discover_and_register_handlers
-from trialerror.jobs.worker import run_loop, run_one, spawn_worker
+from trialerror.jobs.worker import DEFAULT_JITTER_FRACTION, kick, run_loop, run_one, spawn_worker
 from trialerror.stores.store import Store, open_store
 from trialerror.util.config import find_program_root
 from trialerror.util.envelope import error_envelope, next_action, ok_envelope
 
 GROUP_NAME = "jobs"
-HELP = "Durable execution ledger: list/claim/pause/resume jobs; launch detached workers."
+HELP = "Durable execution ledger: list/claim/pause/resume/kick jobs; launch detached workers."
 
 
 def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
@@ -59,6 +66,19 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     p_start.add_argument("--max-idle-polls", type=int, default=3)
     p_start.add_argument("--max-iterations", type=int, default=None)
     p_start.add_argument(
+        "--jitter-frac",
+        type=float,
+        default=None,
+        dest="jitter_frac",
+        help=f"poll-window jitter as a +/- fraction of --poll-interval-s (default {DEFAULT_JITTER_FRACTION}; 0 disables)",
+    )
+    p_start.add_argument(
+        "--no-wake-signal",
+        action="store_true",
+        dest="no_wake_signal",
+        help="ignore the wake-signal file ('trialerror jobs kick' will not shorten this worker's naps)",
+    )
+    p_start.add_argument(
         "--handler-module", action="append", default=None, help="extra module to import before running (repeatable)"
     )
     p_start.add_argument(
@@ -72,6 +92,12 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     p_tick = sub.add_parser("tick", help="reclaim jobs whose lease has expired (crashed-worker recovery)")
     _common(p_tick)
     p_tick.set_defaults(handler=_cmd_tick)
+
+    p_kick = sub.add_parser(
+        "kick", help="wake any napping worker immediately (writes the wake-signal token; does not spawn)"
+    )
+    _common(p_kick)
+    p_kick.set_defaults(handler=_cmd_kick)
 
     p_pause = sub.add_parser("pause", help="cooperatively pause a job (its worker stops at its next heartbeat)")
     _common(p_pause)
@@ -140,6 +166,32 @@ def _cmd_tick(args: argparse.Namespace) -> dict:
         store.close()
 
 
+def _cmd_kick(args: argparse.Namespace) -> dict:
+    """rowboat-F8's immediate-trigger escape hatch. Opens no store: the
+    wake signal is a file next to ``jobs.db``, and a kick must stay usable
+    (and cheap) even while a worker holds the DB busy -- which is exactly
+    when someone reaches for it."""
+    program_root = _resolve_program_root(args)
+    if program_root is None:
+        return error_envelope(
+            "jobs.kick", "no_program_root", "no --program-root given and no trialerror.toml found walking up from CWD"
+        )
+    try:
+        result = kick(program_root)
+    except OSError as exc:
+        return error_envelope("jobs.kick", "wake_signal_unwritable", f"{type(exc).__name__}: {exc}")
+    return ok_envelope(
+        "jobs.kick",
+        result=result,
+        next_actions=[
+            next_action(
+                ["trialerror", "jobs", "start-worker", "--mode", "loop"],
+                "no worker is napping? a kick wakes existing workers only -- launch one",
+            )
+        ],
+    )
+
+
 def _cmd_pause(args: argparse.Namespace) -> dict:
     store, err = _open(args)
     if err is not None:
@@ -202,12 +254,15 @@ def _cmd_start_worker(args: argparse.Namespace) -> dict:
             if args.mode == "once":
                 result = run_one(store, job_id=args.job_id, kind=args.kind, payload=payload, kinds=kinds, **lease_kwargs)
                 return ok_envelope("jobs.start-worker", result=result)
+            jitter_kwargs = {"jitter_frac": args.jitter_frac} if args.jitter_frac is not None else {}
             results = run_loop(
                 store,
                 kinds=kinds,
                 poll_interval_s=args.poll_interval_s,
                 max_idle_polls=args.max_idle_polls,
                 max_iterations=args.max_iterations,
+                wake_signal=not args.no_wake_signal,
+                **jitter_kwargs,
                 **lease_kwargs,
             )
             return ok_envelope("jobs.start-worker", result={"results": results, "count": len(results)})
@@ -233,6 +288,8 @@ def _cmd_start_worker(args: argparse.Namespace) -> dict:
         poll_interval_s=args.poll_interval_s,
         max_idle_polls=args.max_idle_polls,
         max_iterations=args.max_iterations,
+        jitter_frac=args.jitter_frac,
+        wake_signal=not args.no_wake_signal,
         extra_handler_modules=args.handler_module,
     )
     return ok_envelope(

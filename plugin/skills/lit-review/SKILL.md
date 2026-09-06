@@ -62,3 +62,45 @@ snippet you cannot cite back to an anchor.
    + deterministic-sampled LLM escalation) before it's trusted upstream —
    see the verify CLI group; `/verify-hypothesis` is the dedicated loop
    when the question IS a hypothesis, not just a question.
+
+## Review plan for anything larger than one question (HoH-F4)
+
+A one-off question needs no plan. A survey, a keystone-feeding review, or any
+answer you expect to take more than one search/gather cycle gets a plan on
+this template before step 1, posted to the review's feed thread or written at
+the top of the draft:
+
+> **Objective (bounded but locally complete).** One paragraph: the question
+> this review answers, stated so that anyone can tell when it is answered.
+> **Sub-questions (at most three)**, each already answerable from what the
+> corpus holds (`corpus_stats` first) — a sub-question that needs a source not
+> yet ingested is an `/ingest` request, not a priority.
+> Order: gaps and contradictions in the program's standing claims first,
+> extensions second.
+> **Explicitly excluded:** the adjacent topics that would be interesting but
+> are not this question. Name them.
+> **Preservation gate** — what must NOT regress: previously verified claims
+> are not silently softened to fit new evidence; every existing marker keeps
+> resolving; fenced sources stay fenced.
+> **Acceptance gate** — the smallest end-to-end check: every claim sentence
+> carries a resolving marker, quote-check is clean, and any gap is stated as
+> a gap rather than filled from general knowledge.
+> Do not reuse the previous review's plan. Re-derive this one from the
+> question and the latest corpus state.
+
+Source: Harness-of-Harness §3.4.1 and Appendix A.2 (arXiv:2609.01481,
+CC BY 4.0) — at most three achievable priorities, an exclusion list, a
+Preservation Gate and an Acceptance Gate, blockers before extensions, never
+inherit the previous plan. Adapted to a literature review; not a verbatim copy.
+
+## When NOT to apply
+
+- The question IS a hypothesis being adjudicated — `/verify-hypothesis` is
+  the only sanctioned path to a verdict row; a lit-review answer must not
+  stand in for it.
+- The source that would answer it is not in the corpus — `/ingest` first;
+  do not answer from general knowledge and cite nothing.
+- The user wants the raw text of a `commercial_restricted` source — the fence
+  is structural; this skill never reaches for `--unfenced`.
+- You would cite "close enough" — a marker bound to an anchor that does not
+  support the sentence is worse than an honest gap.

@@ -340,3 +340,18 @@ if every extension panel you've declared is sound.
   separate front-end build, not this skill's job -- this protocol gets
   your data TO the dashboard; it does not draw it for you beyond the
   generic key/value and row-table renderer.
+
+## When NOT to apply
+
+- One of the six built-in panels (session / budget / jobs / gates / corpus /
+  doctor) already shows it — file a note against the built-in instead of
+  duplicating it per program.
+- The panel would need to WRITE to the store. Panels are read-only over the
+  store by construction; a write path is a CLI verb or an API change, not a
+  panel.
+- You are about to add the panel inside TrialError's own repository. A panel
+  lives under the program root (`trialerror_ext/panels/`), registered nowhere
+  in TrialError.
+- The "panel" is really program-specific logic that belongs in the program's
+  own code — the dashboard renders data, it does not compute research
+  results.

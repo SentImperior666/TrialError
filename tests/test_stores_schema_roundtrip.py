@@ -22,14 +22,17 @@ from tests._store_fixtures import populate_one_of_everything
 # about has exactly one declared home," not a frozen historical count.
 # FU-14's ops_v5 "meta" kv table (the origin-project import watermark's home) makes it
 # 22 for ops -- same reasoning: an additive seam, not a design revision.
-EXPECTED_TABLE_COUNT_BY_DB = {"platform": 5, "ops": 22, "knowledge": 17, "jobs": 2}
+# The mining adoptions' ops_v7 "memory_relation" (engram-F4's save-time
+# conflict surface) makes it 23 for ops -- same reasoning again: an
+# additive seam, not a design revision.
+EXPECTED_TABLE_COUNT_BY_DB = {"platform": 5, "ops": 23, "knowledge": 17, "jobs": 2}
 
 
 def test_table_counts_match_design_section_4():
     for db_kind, expected in EXPECTED_TABLE_COUNT_BY_DB.items():
         actual = len(SCHEMA_MODULES[db_kind].TABLES)
         assert actual == expected, f"{db_kind}: expected {expected} tables, schema module declares {actual}"
-    assert len(TABLE_DB) == sum(EXPECTED_TABLE_COUNT_BY_DB.values()) == 46
+    assert len(TABLE_DB) == sum(EXPECTED_TABLE_COUNT_BY_DB.values()) == 47
 
 
 def test_round_trip_one_row_per_table(store):

@@ -932,14 +932,89 @@ def _memory_conflict_items(rostore: RoStore) -> list[dict[str, Any]]:
     ]
 
 
+def _memory_stale_items(rostore: RoStore) -> list[dict[str, Any]]:
+    """MINING ADOPTION engram-F5: memory items whose type-keyed review
+    clock has run out. Non-blocking, and the ``consequence`` says plainly
+    that reviewing changes nothing but the clock -- the panel must not
+    read as "this item is about to expire", because nothing here expires
+    on a timer (review section 5.7).
+
+    Tolerant of a store predating ops v7 exactly as its engram-F4 sibling
+    :func:`_memory_conflict_candidate_items` is (no
+    ``memory_item.reviewed_ts`` column -> no items). The guard matters more
+    here than there: this panel only ever holds a READ-ONLY connection
+    (``open_store_ro`` never migrates), so an un-migrated program cannot
+    heal itself on this path, and :func:`build_all_panels` has no
+    per-panel ``try``/``except`` -- one missing column would take down the
+    ENTIRE dashboard payload rather than this one list."""
+    import sqlite3 as _sqlite3
+
+    from trialerror.memory.staleness import stale_items as _stale
+
+    try:
+        stale = _stale(rostore.ops)
+    except _sqlite3.OperationalError:
+        return []
+    return [
+        {
+            "kind": "memory_stale",
+            "id": s["memory_item_id"],
+            "key": s["key"],
+            "item_kind": s["kind"],
+            "overdue_days": s["overdue_days"],
+            "half_life_days": s["half_life_days"],
+            "blocking": False,
+            "consequence": (
+                f"Reviewing {s['key']!r} resets its review clock and changes nothing else "
+                "-- decay never expires, unpins, or downgrades anything."
+            ),
+        }
+        for s in stale
+    ]
+
+
+def _memory_conflict_candidate_items(rostore: RoStore) -> list[dict[str, Any]]:
+    """MINING ADOPTION engram-F4: save-time conflict candidates nobody has
+    judged yet. Tolerant of a store predating ops v7 (no table -> no
+    items), so an un-migrated program still renders the panel instead of
+    erroring on it."""
+    import sqlite3 as _sqlite3
+
+    from trialerror.memory.conflicts import list_candidates as _list_candidates
+
+    try:
+        rows = _list_candidates(rostore.ops, status="pending")
+    except _sqlite3.OperationalError:
+        return []
+    return [
+        {
+            "kind": "memory_conflict_candidate",
+            "id": r["relation_id"],
+            "key": r["source_key"],
+            "target_key": r["target_key"],
+            "score": r["score"],
+            "blocking": False,
+            "consequence": (
+                f"Judging records one verb about {r['source_key']!r} vs {r['target_key']!r} with your name on it; "
+                "nothing about either item changes."
+            ),
+        }
+        for r in rows
+    ]
+
+
 def build_determinations_panel(rostore: RoStore) -> dict[str, Any]:
     """The one determination queue -- REDESIGN S20 (``build_review_panel``
     unioning three existing reads, no new tables) plus S21 (a
     ``consequence`` field per item, "what happens if you verify") and S26
-    (memory-merge conflicts, "queue kind, not drawn"). Six kinds today:
+    (memory-merge conflicts, "queue kind, not drawn"). Eight kinds today:
     gate edits awaiting verification, KG merge proposals, acquisition
     requests, pre-registration reveals, room freeze-and-escalate events,
-    and memory-sync conflicts."""
+    memory-sync conflicts, and -- from the 2026-09 mining adoptions --
+    unjudged save-time memory conflict candidates (engram-F4) and memory
+    items past their type-keyed review half-life (engram-F5). Both new
+    kinds are non-blocking by construction: they are prompts to LOOK at
+    something, never gates on anything."""
     if not rostore.is_available("ops"):
         return {"status": "not_initialized", "message": "ops.db not found"}
 
@@ -951,6 +1026,8 @@ def build_determinations_panel(rostore: RoStore) -> dict[str, Any]:
     items.extend(_prereg_reveal_items(conn))
     items.extend(_room_escalation_items(rostore, conn))
     items.extend(_memory_conflict_items(rostore))
+    items.extend(_memory_conflict_candidate_items(rostore))
+    items.extend(_memory_stale_items(rostore))
 
     counts_by_kind: dict[str, int] = {}
     for item in items:
