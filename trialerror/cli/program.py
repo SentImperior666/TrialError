@@ -133,6 +133,24 @@ id = "{program_id}"
 # dims = 2048
 # timeout_s = 1800
 
+# Plain-English Feed translator (trialerror.feed_translate, `trialerror feed
+# translate`). Absent table -> backend = "pending": a translation job builds
+# the envelope and parks it, costing nothing and calling nothing, for an
+# agent to fill with `trialerror feed translate --post-id ... --body "..."`.
+#   backend = "pending"  park envelopes (default; zero cost, zero network)
+#   backend = "fake"     deterministic offline rewrite, for demos and tests
+#   backend = "model"    model-backed; refuses to run without a booked launch,
+#                        and has no generation driver in this build (see
+#                        docs/reviews/AISPEAK_TRANSLATOR_DESIGN.md Section 3)
+# The faithfulness gate always runs its deterministic fidelity tier; the two
+# knobs below only widen what else withholds a translation.
+# [feed.translator]
+# backend = "pending"
+# model = "claude-sonnet-5"
+# faithfulness_min_score = 0.8
+# strict_style = false                # also withhold on register-level style breaks
+# require_faithfulness_score = false  # also withhold anything never judged
+
 # Literature-metadata API clients (trialerror.litapi.config, `trialerror lit ...`).
 # Every field defaults conservatively when this section is absent -- see
 # trialerror/litapi/config.py's own module docstring for the exact numbers and

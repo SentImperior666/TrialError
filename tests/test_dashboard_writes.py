@@ -60,11 +60,19 @@ def test_dispatch_no_program_root_refuses_every_action(platform_root):
     assert result["status"] == "no_program_root"
 
 
-@pytest.mark.parametrize("action", sorted(writes.WRITABLE_ACTIONS))
+@pytest.mark.parametrize(
+    "action", sorted(a for a in writes.WRITABLE_ACTIONS if writes.REQUIRED_FIELDS.get(a))
+)
 def test_dispatch_missing_required_fields_never_opens_a_store(program_root, platform_root, action, monkeypatch):
     """A missing required field is refused BEFORE ``open_store`` is ever
     called (design: no write connection should be opened for a client
-    bug) -- proven by monkeypatching ``open_store`` to explode if reached."""
+    bug) -- proven by monkeypatching ``open_store`` to explode if reached.
+
+    Actions with an EMPTY ``REQUIRED_FIELDS`` entry are excluded: they have
+    no field this table can pre-check (``feed-translate`` takes exactly one
+    of two alternatives), so they validate inside the handler and their
+    refusal is a ``ValueError``-shaped one -- covered by
+    ``tests/test_dashboard_feed_translation.py`` instead."""
 
     def _boom(*_a, **_k):
         raise AssertionError(f"open_store must not be called for a missing-field refusal on {action!r}")

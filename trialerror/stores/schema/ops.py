@@ -520,10 +520,79 @@ _V5 = (
     """,
 )
 
+# ---- schema-v6 (lane-b-translator): the translator's fail-closed GATE
+# VERDICT -- the one thing ops_v4's table seam left out.
+#
+# TRIALERROR-DEV-NOTE (why v6, not v5 -- B1, fix pass): this migration was
+# authored as "ops_v5" against the branch point (95789bc), but master
+# independently landed its OWN ops v5 first (FU-14, "ops_v5_meta_kv", a
+# ``meta`` key/value side table -- an unrelated seam that happened to claim
+# the same next integer). Renumbered to v6 here, in THIS lane's own branch,
+# specifically so the eventual merge is a visible three-way conflict on
+# ``ops.py``'s ``MIGRATIONS`` tuple rather than a SILENT one: the trap a
+# same-numbered ``Migration(version=5, ...)`` on both sides would set is
+# that a careless resolution keeps both statement blocks but renumbers only
+# the ``Migration(...)`` line -- and if both blocks were still bound to the
+# SAME module-level name (``_V5``), Python would happily bind ``_V5`` to
+# whichever assignment comes last with no error at all, silently running
+# the wrong statements under the surviving migration. Renaming the
+# constant itself to ``_V6`` (not just the version number) removes that
+# footgun: after the merge, master's ``_V5``/meta-kv and this lane's
+# ``_V6``/gate-verdict are two distinct names, so there is nothing left to
+# shadow. The orchestrator still has to resolve the real merge conflict
+# (this migration's version number needs to land as 6 in the merged file,
+# ordered after master's own v5) -- this renumbering does not do that
+# merge, it makes the merge FAIL LOUDLY instead of failing silently.
+#
+# ops_v4 shipped ``faithfulness_score`` (a number) and
+# ``faithfulness_verdict_id`` (an XID to knowledge.verdict): enough to
+# record that a score was computed, not enough to answer the question the
+# dashboard must answer on every render -- "may this translation be
+# SHOWN?" A score alone cannot answer it, because the guard
+# (``trialerror.feed_translate.gate``) is two-tier: a DETERMINISTIC fidelity
+# tier that always runs (every id/number/date preserved verbatim, no
+# invented number, no hedge promoted to a fact) plus an OPTIONAL judged
+# tier that produces the score. A translation can fail the first tier
+# without ever reaching the second, so ``faithfulness_score IS NULL`` is
+# ambiguous between "not scored", "not gated at all", and "failed before
+# scoring" -- three states the UI has to tell apart (AISPEAK design
+# Section 4.4's three right-column states).
+#
+# Two additive columns, no table rebuild: SQLite's ALTER TABLE ADD COLUMN
+# accepts a CHECK constraint, and accepts NOT NULL as long as a non-NULL
+# DEFAULT is given -- which is also what backfills every pre-v6 row.
+#
+# 1. ``gate_status`` -- 'pass' | 'fail' | 'ungated'. Rows written before
+#    this migration (and any row hand-inserted straight through
+#    ``trialerror.stores.insert`` rather than
+#    ``trialerror.feed_translate.api.store_translation``) default to
+#    'ungated': honest about never having been checked, and deliberately
+#    NOT collapsed into 'fail', so a legacy row is not retroactively
+#    accused of a fidelity break it was never tested for. The dashboard
+#    withholds 'fail' and serves 'ungated' with an explicit "not gated"
+#    flag (``trialerror.dashboard.data.build_feed_panel``).
+# 2. ``gate_reasons`` -- JSON: ``{"violations": [{rule, severity, detail},
+#    ...], "score": ..., "threshold": ..., "hedges_lost": [...]}``. A
+#    verdict with no readable reason is not an auditable verdict; this
+#    codebase's own bar for a failure is that it "names exactly what's
+#    wrong, never just a bare boolean" (design Section 8.1's "surgical
+#    patching", applied to a translation).
+#
+# The index is on ``gate_status`` for the ``feed_translation_failures``
+# doctor check (``trialerror/feed_translate/checks.py``), which counts rows
+# in exactly that one state.
+_V6 = (
+    "ALTER TABLE feed_post_translation ADD COLUMN gate_status TEXT NOT NULL DEFAULT 'ungated' "
+    "CHECK (gate_status IN ('pass','fail','ungated'))",
+    "ALTER TABLE feed_post_translation ADD COLUMN gate_reasons TEXT",
+    "CREATE INDEX idx_feed_post_translation_gate ON feed_post_translation(gate_status)",
+)
+
 MIGRATIONS = (
     Migration(version=1, name="ops_v1_initial_schema", statements=_V1),
     Migration(version=2, name="ops_v2_memory_item_account_id_nullable_and_thread_status_refs", statements=_V2),
     Migration(version=3, name="ops_v3_rooms_created_ts_scored_link_deliverable", statements=_V3),
     Migration(version=4, name="ops_v4_criterion_and_feed_post_translation", statements=_V4),
     Migration(version=5, name="ops_v5_meta_kv", statements=_V5),
+    Migration(version=6, name="ops_v6_feed_post_translation_gate_verdict", statements=_V6),
 )

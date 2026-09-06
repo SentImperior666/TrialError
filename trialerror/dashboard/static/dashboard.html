@@ -294,6 +294,9 @@
               <span class="note-strip" style="letter-spacing:0.1em;">READING ORDER</span>
               <span class="chip chip--live" style="cursor:pointer;" data-role="feed-order-arrived">AS IT ARRIVED</span>
               <span class="chip chip--neutral" style="cursor:not-allowed;" title="needs goal-grouping logic this API stage does not provide" aria-disabled="true">GROUPED BY GOAL</span>
+              <span class="note-strip" style="letter-spacing:0.1em; margin-top:8px;">PLAIN ENGLISH</span>
+              <span class="chip chip--live" style="cursor:pointer;" data-role="feed-translation-toggle" title="show the stored plain-English translation beside each post">SIDE BY SIDE</span>
+              <span class="note-strip" data-role="feed-translation-note"></span>
             </div>
             <div class="note-strip" style="margin-top:auto; padding:11px 12px;">POSTS ARE APPEND-ONLY.<br>AUTHORSHIP IS SERVER-DERIVED.</div>
           </div>
@@ -380,6 +383,7 @@
     loadedOnce: {},            // panel name -> true once fetched at least once
     // per-surface selection state
     feedThreadId: null,
+    feedSideBySide: true,      // PLAIN ENGLISH column on/off (AISPEAK design 4.4)
     roomsRoomId: null,
     roomsSelectedDp: null,
     dossierArtifactId: null,
@@ -1285,6 +1289,10 @@
     transmitBtn.disabled = !(writesEnabled() && p.active_thread_id);
     transmitBtn.title = writesEnabled() ? "" : "live mode + a write token are required (static snapshots are read-only)";
     unreadCount.textContent = (p.unread_directives || []).length + " UNREAD DIRECTIVES";
+    var withheld = p.translation_withheld_count || 0;
+    qs('[data-role="feed-translation-note"]').textContent = withheld
+      ? withheld + " WITHHELD BY THE FAITHFULNESS GATE"
+      : "GATED; WITHHELD TRANSLATIONS ARE NEVER SHOWN";
     (p.threads || []).forEach(function (t) {
       var row = el("div", { "class": "thread-row" + (t.thread_id === p.active_thread_id ? " is-active" : "") }, [
         el("span", { "class": "name", text: t.title })
@@ -1323,25 +1331,90 @@
         el("span", { text: fmtHM(post.ts) + " UTC" })
       ]);
       card.appendChild(head);
-      if (post.translation) {
-        var split = el("div", { "class": "post-body-split" });
-        var origCol = el("div", { "class": "post-body-col original" }, [el("div", { "class": "label", text: "AS POSTED" }), el("div", { "class": "text", text: post.body })]);
-        var faith = post.translation.faithfulness_score;
-        var trLabel = "PLAIN ENGLISH · v" + post.translation.translator_version + (faith !== null && faith !== undefined ? " · faithfulness " + faith : "");
-        var trCol = el("div", { "class": "post-body-col translation" }, [el("div", { "class": "label", text: trLabel }), el("div", { "class": "text", text: post.translation.body })]);
-        split.appendChild(origCol); split.appendChild(trCol);
-        card.appendChild(split);
-      } else {
-        var single = el("div", { "class": "post-body-single" }, [
-          el("div", { "class": "text", text: post.body }),
-          el("div", { "class": "note-strip", "style": "margin-top:8px;", text: p.translator_table_available ? "PLAIN ENGLISH — not yet translated" : "PLAIN ENGLISH — unavailable, this program predates schema v4" })
-        ]);
-        card.appendChild(single);
-      }
+      card.appendChild(buildPostBody(post, p));
       posts.appendChild(card);
     });
   }
+
+  /* Right-hand column, per AISPEAK_TRANSLATOR_DESIGN.md 4.4. Five
+     translation_state values come off the API (see
+     trialerror.dashboard.data._translation_slot); none of them ever renders
+     a body the gate withheld -- the server does not even send that text,
+     so the check below is belt-and-braces, not the only guard. */
+  function translationLabel(t) {
+    var bits = ["PLAIN ENGLISH"];
+    if (t && t.translator_version) bits.push("v" + t.translator_version);
+    if (t && t.faithfulness_score !== null && t.faithfulness_score !== undefined) bits.push("faithfulness " + t.faithfulness_score);
+    if (t && t.created_ts) bits.push(fmtDate(t.created_ts));
+    return bits.join(" · ");
+  }
+
+  function gateReasonLines(t) {
+    var reasons = (t && t.gate_reasons && t.gate_reasons.reasons) || [];
+    return reasons.length ? reasons : ["no reason recorded"];
+  }
+
+  function translateButton(post, label) {
+    var btn = el("button", { type: "button", "class": "btn", text: label });
+    var msg = el("div", { "class": "note-strip", "style": "margin-top:6px;" });
+    btn.disabled = !writesEnabled();
+    btn.title = writesEnabled() ? "enqueue a translation job for this post" : "live mode + a write token are required (static snapshots are read-only)";
+    wireWriteAction(btn, msg, "feed-translate",
+      function () { return { post_id: post.post_id }; },
+      ["post_id"], {},
+      function () { loadFeed(); });
+    return el("div", {}, [btn, msg]);
+  }
+
+  function buildPostBody(post, panel) {
+    var st = post.translation_state || (post.translation ? "translated" : "absent");
+    var t = post.translation;
+    var showColumn = state.feedSideBySide;
+
+    if (showColumn && (st === "translated" || st === "ungated") && t && t.body) {
+      var split = el("div", { "class": "post-body-split" });
+      split.appendChild(el("div", { "class": "post-body-col original" }, [
+        el("div", { "class": "label", text: "AS POSTED" }),
+        el("div", { "class": "text", text: post.body })
+      ]));
+      var col = [
+        el("div", { "class": "label", text: translationLabel(t) }),
+        el("div", { "class": "text", text: t.body })
+      ];
+      if (st === "ungated") {
+        col.push(el("div", { "class": "note-strip", text: "NOT GATED — stored before the faithfulness guard existed, or written outside it" }));
+      }
+      split.appendChild(el("div", { "class": "post-body-col translation" }, col));
+      return split;
+    }
+
+    var notes = [el("div", { "class": "text", text: post.body })];
+    if (!panel.translator_table_available) {
+      notes.push(el("div", { "class": "note-strip", "style": "margin-top:8px;", text: "PLAIN ENGLISH — unavailable, this program predates schema v4" }));
+    } else if (!showColumn) {
+      notes.push(el("div", { "class": "note-strip", "style": "margin-top:8px;", text: "PLAIN ENGLISH — column hidden (SIDE BY SIDE is off)" }));
+    } else if (st === "withheld") {
+      notes.push(el("div", { "class": "note-strip", "style": "margin-top:8px; color:var(--crit-text);", text: "PLAIN ENGLISH — translation withheld, faithfulness check failed" }));
+      gateReasonLines(t).forEach(function (r) {
+        notes.push(el("div", { "class": "note-strip", "style": "margin-top:2px;", text: "· " + r }));
+      });
+      notes.push(translateButton(post, "RE-TRANSLATE"));
+    } else if (st === "pending") {
+      notes.push(el("div", { "class": "note-strip", "style": "margin-top:8px;", text: "PLAIN ENGLISH — translation pending, a job is queued for this post" }));
+    } else {
+      notes.push(el("div", { "class": "note-strip", "style": "margin-top:8px;", text: "PLAIN ENGLISH — not yet translated" }));
+      notes.push(translateButton(post, "TRANSLATE ▾"));
+    }
+    return el("div", { "class": "post-body-single" }, notes);
+  }
+
   qs('[data-role="feed-order-arrived"]').addEventListener("click", function () {});
+  qs('[data-role="feed-translation-toggle"]').addEventListener("click", function () {
+    state.feedSideBySide = !state.feedSideBySide;
+    this.className = "chip " + (state.feedSideBySide ? "chip--live" : "chip--neutral");
+    this.textContent = state.feedSideBySide ? "SIDE BY SIDE" : "ORIGINAL ONLY";
+    loadFeed();
+  });
 
   wireWriteAction(
     qs('[data-role="feed-transmit-btn"]'),

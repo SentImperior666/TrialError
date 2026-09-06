@@ -98,13 +98,18 @@ Every OTHER field described below is only present when `status == "ok"`.
       "body": "test post body",
       "in_reply_to": null,
       "kind": "launch",
+      "translation_state": "translated",
       "translation": {
         "translation_id": "XLAT-01M178QK2S946RDDWD4F8NSJA8",
         "body": "test translation body",
         "style_mode": "flavored",
         "translator_version": "1",
         "faithfulness_score": null,
-        "created_ts": "2026-08-29T17:22:59.801Z"
+        "created_ts": "2026-08-29T17:22:59.801Z",
+        "gate_status": "pass",
+        "gate_reasons": {"passed": true, "reasons": [], "score": null, "threshold": 0.8,
+                          "judged": false, "style": {"style_mode": "flavored", "violations": [],
+                                                     "hedges_lost": []}}
       }
     }
   ],
@@ -118,7 +123,8 @@ Every OTHER field described below is only present when `status == "ok"`.
       "read_by_session": null
     }
   ],
-  "translator_table_available": true
+  "translator_table_available": true,
+  "translation_withheld_count": 0
 }
 ```
 
@@ -128,9 +134,16 @@ Notes:
 - `active_thread_id` — the resolved selection: the `thread_id` you passed, or (default) the thread with the most recently-posted message, or (if no thread has any posts yet) the newest-created thread, or `null` if there are zero threads at all.
 - `posts` — full-text posts in `active_thread_id`, oldest first (append order). `author` is server-derived and NEVER caller-settable (`trialerror.events.api._derive_author`) — always `"<agent_kind>:<launch_id>"` or `"orchestrator:<session_id>"`.
 - `kind` — the text before the first `:` in `author`. Use this to badge a post (`orchestrator`, `lens`, `critic`, whatever `agent_kind` a launch actually used — this is real data, not a fixed enum, so render an unknown value neutrally rather than assuming a closed set).
-- `translation` — **`null` if this post has never been translated, or if the `feed_post_translation` table doesn't exist yet on this program** (see `translator_table_available`). This build creates only the TABLE seam (internal design notes, not in this export) — no job handler, no CLI verb, no translator exists yet, so **every real program's posts will show `translation: null` until that future feature ships and a translation job actually runs.** When present, it is always the one `status='current'` row for that post — `faithfulness_score` is `null` until a faithfulness gate has actually scored it (§4.3 of that design doc; not built in this stage either).
+- `translation_state` — **read this, not `translation != null`.** One of five values (`trialerror.dashboard.data._translation_slot`), matching the internal translator design notes' §4.4 right-column states (not in this export):
+  - `"translated"` — a gated, PASSING translation. `translation.body` is the plain-English text.
+  - `"ungated"` — a translation stored with no gate verdict (a row written before schema v6, or one hand-inserted outside `trialerror.feed_translate`). Served, but render the "not gated" note: it was never checked.
+  - `"withheld"` — the faithfulness gate FAILED it. **`translation.body` is `null` — the withheld text is not in the payload at all**, deliberately (a body the UI must not render has no business crossing the wire). `translation.gate_reasons.reasons` carries the human-readable failure list; show that plus the original.
+  - `"pending"` — a `feed_translate` job for this post is queued/claimed/running on the ledger. Render "translation pending".
+  - `"absent"` — nothing has been asked for. Render the `TRANSLATE ▾` affordance (which posts `write/feed-translate`, §12.10).
+- `translation` — `null` for `pending`/`absent`; otherwise the one `status='current'` row for that post, with `gate_status` (`pass`/`fail`/`ungated`), `gate_reasons` (a parsed JSON object, or `null`), and `faithfulness_score` (`null` unless the optional judged tier ran — the always-on deterministic tier produces no score).
 - `unread_directives` — **NOT scoped to `active_thread_id`.** `inbox_item` (the operator directive channel) carries no `thread_id` column in the real schema — it is a program-wide channel. Render it as its own "operator inbox" surface, not inline in the thread's post stream (the `Feed.dc.html` mockup shows an inline "OPERATOR ... DIRECTIVE" card; that shape isn't backed by real per-thread data — build the directive UI as a separate list instead). Reading this list is a plain `SELECT ... WHERE read_ts IS NULL` — it does **not** mark anything read (`mark_read=False` is always passed).
-- `translator_table_available` — `true`/`false`. Useful to grey out or hide the "Translate ▾" affordance entirely on a program whose `ops.db` predates schema v4.
+- `translator_table_available` — `true`/`false`. Grey out or hide the `TRANSLATE ▾` affordance entirely on a program whose `ops.db` predates schema v4.
+- `translation_withheld_count` — how many posts in this thread the gate withheld. Surface it near the panel chrome: a withheld translation is invisible by design, so without this number a systematically broken translator looks exactly like one nobody ran. `trialerror doctor` reports the program-wide figure as `feed_translation_failures`.
 
 ## 3. Rooms — `GET /dashboard/api/rooms[?room_id=ROOM-...]`
 
@@ -435,7 +448,14 @@ Notes:
 - No dedicated "corpus stats for the empty state" field is added here — reuse the pre-existing `corpus` panel (`GET /dashboard/api/corpus`) for the `Search.dc.html` empty-state counts strip; fetching it alongside `search` on page load is cheap and keeps this route's contract narrow.
 - Facet filters (`source_ids`/`kind`/`license_tier`/`year`) map straight onto `SearchRequest.filters`; an over-narrow filter (matches zero chunks) is a well-formed empty result, never an error.
 
-## 10. Schema migration summary (ops_v4)
+## 10. Schema migration summary (ops_v4, plus ops_v6)
+
+Note (B1, fix pass): this migration was authored as "ops_v5" against this
+lane's branch point, but master independently landed its own, unrelated
+ops v5 first (FU-14's `ops_v5_meta_kv`, a small key/value side table).
+Renumbered to v6 here so the two migrations merge as a visible conflict
+rather than a silently-shadowed Python constant — see
+`trialerror/stores/schema/ops.py`'s TRIALERROR-DEV-NOTE at `_V6`.
 
 `trialerror/stores/schema/ops.py`'s `Migration(version=4, name="ops_v4_criterion_and_feed_post_translation", ...)` — purely additive, two new tables, zero column changes to any existing table:
 
@@ -468,7 +488,22 @@ CREATE TABLE feed_post_translation (
 CREATE INDEX idx_feed_post_translation_post ON feed_post_translation(post_id, translator_version, status);
 ```
 
-`feed_post_translation`'s shape is verbatim from the internal translator design notes (not in this export; this build creates the TABLE seam only — no job handler, no CLI verb, no translator logic). `created_by_launch` (→ `platform.launch`) and `faithfulness_verdict_id` (→ `knowledge.verdict`) are registered as cross-store XIDs in `trialerror/stores/xid.py`; `post_id` is a same-file FK (both tables live in `ops.db`), not an XID.
+**ops_v6 (lane-b-translator)** then adds the gate's verdict to that same
+table — two additive columns, no rebuild:
+
+```sql
+ALTER TABLE feed_post_translation ADD COLUMN gate_status TEXT NOT NULL DEFAULT 'ungated'
+    CHECK (gate_status IN ('pass','fail','ungated'));
+ALTER TABLE feed_post_translation ADD COLUMN gate_reasons TEXT;
+CREATE INDEX idx_feed_post_translation_gate ON feed_post_translation(gate_status);
+```
+
+Pre-v6 rows backfill to `'ungated'`, never to `'fail'`: a translation
+stored before the guard existed was not CHECKED, and reporting it as
+FAILED would both withhold it from the panel and count it against the
+translator in doctor.
+
+`feed_post_translation`'s shape is verbatim from the internal translator design notes §4.2 (not in this export). `created_by_launch` (→ `platform.launch`) and `faithfulness_verdict_id` (→ `knowledge.verdict`) are registered as cross-store XIDs in `trialerror/stores/xid.py`; `post_id` is a same-file FK (both tables live in `ops.db`), not an XID.
 
 Both tables are picked up automatically the next time anything opens the store for writing (`trialerror.stores.store.open_store`, which every CLI command already calls); **`trialerror dashboard` itself never migrates anything — it is read-only by construction** (`trialerror/dashboard/store_ro.py`'s own module docstring). This is exactly why `course` has its own `awaiting_migration` status (§7) and why `feed`'s `translator_table_available` flag exists (§2): a dashboard pointed at a not-yet-migrated program must degrade visibly, not silently show stale/wrong data or crash.
 
@@ -650,7 +685,33 @@ Body: `{"thread_id", "body"}` required; `"session_id"`/`"in_reply_to"`
 optional. Success `result`: `{"post_id", "thread_id", "author", "ts"}` —
 `author` always starts `"orchestrator:"`.
 
-### 12.10 `POST /dashboard/api/doctor/run`
+### 12.10 `POST /dashboard/api/write/feed-translate`
+
+Added by lane-b-translator. ENQUEUES a `feed_translate` job on the M2
+ledger (`trialerror.jobs.ledger.enqueue`, `kind="custom"`,
+`payload["handler"] = "feed_translate"`) and returns immediately — **it
+never translates inline and never calls a model from the HTTP process.**
+That is the design's own option C (internal translator design notes §4.1, not in
+this export); its rejected option B was "book a
+launch per VIEW", which this route exists to avoid.
+
+Body: exactly ONE of `"post_id"` / `"thread_id"`; `"style_mode"`
+(`flavored` default, or `strict`) optional. Giving both, or neither,
+refuses cleanly. Success `result`: `{"job_id", "state", "kind", "target"}`.
+
+`created_by_launch` is always `null`: a dashboard operator has no launch
+identity (the same reason `feed-post` always passes `launch_id=None`), so
+the resulting translation is stored under the orchestrator's no-launch
+identity. A program configured with a budget-spending translator backend
+(`[feed.translator] backend = "model"`) therefore REFUSES such a job at
+the worker rather than running unbooked — book a launch and use
+`trialerror feed translate --by-launch ...` for that case.
+
+After a successful enqueue the affected post's `translation_state` reads
+`"pending"` on the next `GET /dashboard/api/feed` until a worker lands a
+row; re-fetch the panel rather than optimistically rendering anything.
+
+### 12.11 `POST /dashboard/api/doctor/run`
 
 Was `GET` before this build (`trialerror.dashboard.doctor_run.run_doctor_and_persist`
 WRITES a sidecar state file — `<program_root>/.trialerror_dashboard/doctor_state.json`
@@ -661,7 +722,7 @@ before — the doctor panel's own `{"status": "ok", "last_run": {...}}`
 (§ the `doctor` panel; not itself one of the seven Stage-1/2 panels, but
 present in every `/dashboard/api/all` response).
 
-### 12.11 What stays disabled, and why
+### 12.12 What stays disabled, and why
 
 Every button the V2 design drew that this build does NOT wire stays
 disabled in the UI with a `title` naming the reason, per action kind:
@@ -680,7 +741,7 @@ Registration of artifacts stays orchestrator-only by law (C-0006) — no
 register button was ever drawn as enabled-pending in the V1/V2 design, and
 none is wired here.
 
-### 12.12 Eventing (verified per action)
+### 12.13 Eventing (verified per action)
 
 Every write action's underlying module already writes its own
 audit trail; none of the routes above add a second one:
@@ -694,4 +755,5 @@ audit trail; none of the routes above add a second one:
 | `room-score` | `room_dp_scored` (same). |
 | `room-freeze` | `room_frozen` (same). |
 | `feed-post` | None dedicated — `feed_post` itself IS the durable, queryable row (same posture as `verify-edit`: the mutation is its own record; nothing else in this codebase treats "a row was inserted" as needing a second event mirror). |
+| `feed-translate` | None dedicated — the enqueued `job` row and its `job_event` trail (`trialerror.jobs.ledger.enqueue` writes an `enqueued` job event) ARE the record; the translation row it eventually produces carries its own `gate_status`/`gate_reasons` audit. |
 | `doctor/run` | None — writes only its own sidecar state file (`trialerror.dashboard.doctor_run`), never the program's real stores. |
