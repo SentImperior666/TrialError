@@ -189,8 +189,10 @@ what is still coming. Nothing already shipped depends on any of it.
       `windows-latest` and `ubuntu-latest`; the plugin's Claude Code hooks go
       through the `trialerror` console script rather than a bare `python`,
       which does not exist on a stock Linux box.
-- [ ] Web-page ingestion pipeline. Fetched pages enter the corpus as saved markdown
-      today; a hardened URL-to-corpus path is designed, not built.
+- [x] Web-page ingestion pipeline: `trialerror webfetch` queues URLs for a fetch-only
+      sidecar (host allowlist, robots overrides, per-fetch audit), extracts the pages into
+      the corpus as documents with anchors, and records bounded acknowledgements of
+      attribution findings (`webfetch ack`).
 - [x] Feed translation: `trialerror feed translate` enqueues a job behind a fail-closed gate (ids, numbers, and hedges are always checked; meaning is verified only when judgments are supplied) and the dashboard shows the plain-English rendering side-by-side with the original — the text itself comes from `--body`/`--judgments-file` today, since no generative model backend ships in this release.
 - [x] Dashboard: a backing route for the Evidence panel (per-claim neighborhood),
       and the write actions that ship disabled (pre-registration reveal,

@@ -58,7 +58,7 @@ from __future__ import annotations
 import sqlite3
 
 from trialerror.artifacts.state_machine import is_legal_transition
-from the (excluded) tenant-migration module import at_or_before, import_ts_from_conn
+from trialerror.stores.watermark import at_or_before, import_ts_from_conn
 from trialerror.stores import paths
 from trialerror.stores.connection import connect
 from trialerror.util.doctor import CheckResult, DoctorContext, register_check
