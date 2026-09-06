@@ -22,6 +22,7 @@ install, is not a doctor failure).
 from __future__ import annotations
 
 import sqlite3
+import tomllib
 from pathlib import Path
 
 from trialerror.stores import paths
@@ -125,14 +126,48 @@ def check_store_schema_version(ctx: DoctorContext) -> CheckResult:
     )
 
 
-def _xid_dangling_count(source_conn: sqlite3.Connection, table: str, col: str, target_path: Path, target) -> int:
+def _program_id(ctx: DoctorContext) -> str | None:
+    """The program's own id from ``trialerror.toml`` (``[program] id``), or None when
+    the root has no readable toml. Used to scope PLATFORM-sourced XID references: a
+    platform.db is shared by every program under one account, so a ``launch`` row that
+    belongs to another program legitimately points at a session in THAT program's
+    ops.db, not this one's."""
+    if ctx.program_root is None:
+        return None
+    toml_path = Path(ctx.program_root) / "trialerror.toml"
+    try:
+        with open(toml_path, "rb") as fh:
+            cfg = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    pid = (cfg.get("program") or {}).get("id") if isinstance(cfg, dict) else None
+    return str(pid) if pid else None
+
+
+def _has_column(conn: sqlite3.Connection, table: str, col: str) -> bool:
+    return any(row[1] == col for row in conn.execute(f"PRAGMA table_info({table})").fetchall())
+
+
+def _xid_dangling_count(
+    source_conn: sqlite3.Connection,
+    table: str,
+    col: str,
+    target_path: Path,
+    target,
+    scope: tuple[str, str] | None = None,
+) -> int:
     source_conn.execute("ATTACH DATABASE ? AS xid_target_db", (str(target_path),))
     try:
-        row = source_conn.execute(
+        sql = (
             f"SELECT COUNT(*) FROM {table} t "
             f"LEFT JOIN xid_target_db.{target.table} tgt ON t.{col} = tgt.{target.pk_column} "
             f"WHERE t.{col} IS NOT NULL AND tgt.{target.pk_column} IS NULL"
-        ).fetchone()
+        )
+        params: tuple = ()
+        if scope is not None:
+            sql += f" AND t.{scope[0]} = ?"
+            params = (scope[1],)
+        row = source_conn.execute(sql, params).fetchone()
         return int(row[0])
     finally:
         source_conn.execute("DETACH DATABASE xid_target_db")
@@ -163,6 +198,8 @@ def check_xid_dangling(ctx: DoctorContext) -> CheckResult:
     offenders: dict[str, int] = {}
     total = 0
     open_conns: dict[str, sqlite3.Connection] = {}
+    program_id = _program_id(ctx)
+    scoped_columns: list[str] = []
     try:
         for (table, col), target in XID_REGISTRY.items():
             source_kind = TABLE_DB.get(table)
@@ -170,8 +207,22 @@ def check_xid_dangling(ctx: DoctorContext) -> CheckResult:
                 continue  # defensive; every registry table is a real table
             if source_kind not in open_conns:
                 open_conns[source_kind] = connect(paths_by_kind[source_kind])
+            # A platform table is shared across the account's programs; a reference
+            # from it INTO a per-program store is only checkable for rows that belong
+            # to THIS program (first seen live in the e2e, whose smoke and corpus
+            # programs share one scratch platform: the smoke program's launch pointed
+            # at the smoke program's session and read as dangling here).
+            scope: tuple[str, str] | None = None
+            if (
+                source_kind == "platform"
+                and target.db != "platform"
+                and program_id is not None
+                and _has_column(open_conns[source_kind], table, "program_id")
+            ):
+                scope = ("program_id", program_id)
+                scoped_columns.append(f"{table}.{col}")
             count = _xid_dangling_count(
-                open_conns[source_kind], table, col, paths_by_kind[target.db], target
+                open_conns[source_kind], table, col, paths_by_kind[target.db], target, scope=scope
             )
             if count:
                 offenders[f"{table}.{col} -> {target.db}.{target.table}"] = count
@@ -187,7 +238,11 @@ def check_xid_dangling(ctx: DoctorContext) -> CheckResult:
         else "no dangling XID references"
     )
     return CheckResult(
-        name="xid_dangling", category="stores", status=status, message=message, details={"offenders": offenders}
+        name="xid_dangling",
+        category="stores",
+        status=status,
+        message=message,
+        details={"offenders": offenders, "scoped_to_program": program_id, "scoped_columns": scoped_columns},
     )
 
 
