@@ -747,6 +747,11 @@ trialerror accept
    backend="qwen3-4b"`, ingest a real document, confirm embeddings are produced and
    indexed correctly (matryoshka 2048, instruction-aware).
 
+Items 1-4 above are exactly what the deployment handover gate's live-session phase
+discharges when you run it in a container: `trialerror accept --suite e2e` enumerates
+those human steps beside the automated ones, each with the exact command and the
+criterion it is judged against.
+
 None of these eight block using TrialError today — v0's fake backends and the offline
 subprocess test suite cover everything else. They're the honest remainder between
 "tested" and "verified live," and they're the reason `trialerror accept`'s summary always

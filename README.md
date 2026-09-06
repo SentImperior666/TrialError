@@ -168,6 +168,12 @@ Each command prints a JSON envelope with the field you need for the next
 step (`result.session_id`, `result.launch_id`, and so on), plus a
 `nextActions` list naming the exact next command when one is expected.
 
+`trialerror accept` runs the acceptance harness end to end against a throwaway
+program — `--suite smoke` for the clean-checkout journey, `--suite e2e` for the
+deployment handover gate (corpus, dashboard, ops and GPU-offload journeys, each
+recording its own evidence row) — and always lists the items that still need a
+real machine rather than quietly omitting them.
+
 For the full walkthrough, including citation-checking a draft and closing a
 session with a rendered handoff, read `docs/GETTING_STARTED.md`. For
 account setup, local model configuration, and the optional literature-API
