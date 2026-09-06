@@ -11,8 +11,11 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
 from trialerror.stores import paths
 from trialerror.stores.store import open_store
+from trialerror.util.config import ConfigError
 
 
 # ---------------------------------------------------------------------------
@@ -127,10 +130,32 @@ def test_open_store_explicit_config_wins_over_auto_load(tmp_path, platform_root)
         store.close()
 
 
-def test_open_store_malformed_trialerror_toml_falls_back_to_default(tmp_path, platform_root):
+def test_open_store_malformed_trialerror_toml_raises(tmp_path, platform_root):
+    """Lane L0-C / design D13 ("unparseable ``trialerror.toml`` always
+    raises") REPLACES this test's former assertion that a broken config
+    silently fell back to the default ``stores/`` location.
+
+    The old behaviour was worse than it looked: a program whose
+    ``[paths].stores_dir`` points somewhere else would, on one stray
+    character, quietly open a SECOND empty set of databases beside the real
+    ones and report nothing -- the same silent-fallback class of bug that
+    made a config typo route the record through the fake OCR/embed
+    backends. A config that exists and cannot be read is now a stop
+    condition."""
     program_root = tmp_path / "program"
     program_root.mkdir()
     (program_root / "trialerror.toml").write_text("[program\nbroken toml", encoding="utf-8")
+    with pytest.raises(ConfigError, match="invalid TOML"):
+        open_store(program_root, platform_root=platform_root)
+    assert not (program_root / "stores").exists(), "nothing is created behind a refused config"
+
+
+def test_open_store_absent_trialerror_toml_still_uses_the_defaults(tmp_path, platform_root):
+    """The other half of the same rule: ABSENT is not the same as broken.
+    A bare scratch program (what most of this suite opens) must keep
+    working exactly as before."""
+    program_root = tmp_path / "program"
+    program_root.mkdir()
     store = open_store(program_root, platform_root=platform_root)
     try:
         assert (program_root / "stores" / "ops.db").is_file()

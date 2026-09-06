@@ -219,7 +219,7 @@ the `atomic` scheduler pattern).
 
 ## Doctor checks catalog
 
-`trialerror doctor` runs every check registered by every subsystem (**53 checks across 21
+`trialerror doctor` runs every check registered by every subsystem (**57 checks across 22
 categories**); each subsystem owns its own `checks.py`, auto-discovered — adding a new one
 never touches a shared file. That figure had drifted twice before anyone noticed, precisely
 because nothing enforced it, so it is now pinned by a test against the live registry
@@ -230,8 +230,9 @@ not the full registry — `trialerror doctor --json` is authoritative.
 | Category | Checks |
 |---|---|
 | `stores` | `store_schema_version`, `xid_dangling` (cross-store reference scan), `anchors_dangling` (doc_sha256 half) |
-| `ingest` | `chunker_missing`, `chunker_outdated`, `embedding_missing`, `embedding_stale`, `anchor_spot_resolve` (quote_sha256 half) |
+| `ingest` | `chunker_missing`, `chunker_outdated`, `embedding_missing`, `embedding_stale`, `anchor_spot_resolve` (quote_sha256 half), `fake_backend_rows` (fake-backend rows in a program that declared it will not accept them) |
 | `jobs` | `stale_lease`, `heartbeat_age` |
+| `offload` | `offload_backlog` (documents waiting for the remote GPU worker), `offload_stale_claims`, `offload_failed` |
 | `law` | `law_digest_lockstep`, `law_chain_integrity`, `law_pin_format` |
 | `budget` | `budget_dangling_launches`, `budget_pool_overspend` |
 | `events` | `event_secret_leak`, `feed_author_integrity` |
