@@ -171,18 +171,24 @@ def _watched_paths(config: ServerConfig) -> list[Path]:
     file) for every store this server can see. Re-derived on every poll
     (not cached once at startup) so a program that gets initialized AFTER
     the server starts (a fresh ``trialerror program init`` while the dashboard
-    is already open) is picked up automatically."""
+    is already open) is picked up automatically.
+
+    Fail-closed on an unparseable config (lane L0-C, design D13:
+    "unparseable ``trialerror.toml`` always raises"). Swallowing the parse
+    error here meant the watcher silently fell back to the DEFAULT
+    ``stores/`` location for a program whose ``[paths].stores_dir`` points
+    elsewhere -- so the dashboard would watch three files that never
+    change and report a live program as frozen. The caller
+    (:func:`watcher_loop`) is what decides how loud that is; this function
+    no longer pretends it read a config it could not read."""
     bases: list[Path] = [store_paths.platform_db_path(root=config.platform_root)]
     if config.program_root is not None:
         cfg_path = config.program_root / "trialerror.toml"
         cfg = None
         if cfg_path.is_file():
-            try:
-                from trialerror.util.config import load_config
+            from trialerror.util.config import load_config
 
-                cfg = load_config(cfg_path).raw
-            except Exception:
-                cfg = None
+            cfg = load_config(cfg_path).raw
         bases.append(store_paths.ops_db_path(config.program_root, cfg))
         bases.append(store_paths.knowledge_db_path(config.program_root, cfg))
         bases.append(store_paths.jobs_db_path(config.program_root, cfg))

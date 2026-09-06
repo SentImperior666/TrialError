@@ -107,6 +107,135 @@ harness and needs to happen first, on its own terms.
 `RealQwenEmbedBackend` has no execution coverage beyond argument-construction. The first
 real ingest you run with these configured *is* the live verification.
 
+## 1a. Two-machine split — the program on one box, the GPU on another
+
+Skip this section entirely if the machine running your program is the machine with the GPU.
+
+It exists for the other shape: the program lives somewhere always-on and CPU-only, and the GPU
+is in a laptop that is off most of the time. Section 1's config cannot express that — the
+paths there are per-machine, and neither machine can call the other on demand. `backend =
+"offload"` is the answer: the CPU box queues the work, the GPU box drains the queue whenever it
+happens to be on.
+
+### What each side's config says
+
+**The program's box** (call it the *queue side*) — its `trialerror.toml`:
+
+```toml
+[ingest]
+require_real_backends = true      # see "Fail-closed" below
+
+[ingest.ocr]
+backend = "offload"
+expect_backend = "marker"         # optional: pin what the worker must report back
+
+[ingest.embed]
+backend = "offload"
+model_key = "qwen3-4b"            # REQUIRED - emb rows are keyed by it, so it is never defaulted
+dims = 2048
+```
+
+**The GPU box** keeps a program root of its own whose `trialerror.toml` is an ordinary section-1
+config naming the real local installs (`marker_single_exe`, `python_exe`, `module_dir`). That
+program root is not a second copy of your research — it is only how the worker learns where your
+models are. Nothing is written into it.
+
+### The restricted key (you generate it; no agent ever handles key material)
+
+On the GPU box:
+
+```powershell
+ssh-keygen -t ed25519 -f ~/.ssh/te_offload -N ""
+```
+
+On the queue box, copy `deploy/sandbox/offload-shell.sh` next to the program (edit its
+`TE_OFFLOAD_ROOT` if the program root is not the default), `chmod 700` it, and append ONE line to
+`~/.ssh/authorized_keys`:
+
+```
+restrict,command="/home/<you>/offload-shell.sh" <contents of te_offload.pub>
+```
+
+That wrapper is the security of the key. It accepts only
+`list | claim | pull | push | publish | return | heartbeat`, validates the job id against
+`[A-Za-z0-9._-]+` (refusing `.` and `..`), reads a pushed archive's member list BEFORE extracting
+anything and refuses any member that is not a flat regular file, caps one transfer at 2 GB in each
+direction (`TE_OFFLOAD_MAX_PUSH_BYTES` / `TE_OFFLOAD_MAX_PULL_BYTES` — over the cap the verb fails
+rather than truncating), and confines every path to the queue directory. `restrict` removes
+forwarding, PTY allocation and `~/.ssh/rc` on top.
+
+**Do not let the GPU box choose the wrapper's environment.** `TE_OFFLOAD_ROOT` decides which
+directory the key can reach at all, so it must come from the queue box and never from the client:
+keep every `TE_OFFLOAD_*` name out of `sshd_config`'s `AcceptEnv`, leave `PermitUserEnvironment`
+off, and write no `~/.ssh/environment` for that account. If you do not control that SSH server's
+configuration, hard-code the paths as literals in your copy of the script instead of leaving the
+`${TE_OFFLOAD_*:-...}` defaults in place.
+
+Verify both halves before you rely on it:
+
+```powershell
+ssh te-offload list      # exit 0, empty on an empty queue
+ssh te-offload bash      # must fail: "offload-shell: unknown verb 'bash'"
+```
+
+Finally, on the GPU box, `~/.ssh/config`:
+
+```
+Host te-offload
+    HostName <queue box>
+    User <you>
+    IdentityFile ~/.ssh/te_offload
+    IdentitiesOnly yes
+```
+
+### Running it
+
+```powershell
+trialerror offload worker --remote te-offload --program-root C:/path/to/dev-program
+```
+
+It claims each queued job, pulls the inputs, runs marker/Qwen3 locally, pushes the outputs,
+publishes, and exits with **"Queue empty - safe to switch DEV off"**. Add `--stay` to keep
+polling. A second copy refuses immediately (a single-instance lock — two workers would fight over
+the GPU). Ctrl+C returns the current claim; closing the lid cannot, which is why the queue side
+returns any claim whose heartbeat has been silent for 60 minutes (`trialerror offload reclaim`).
+
+On the queue side, two commands belong in whatever loop already runs `trialerror jobs tick`:
+
+```bash
+trialerror offload reclaim   # return claims from a worker that went away
+trialerror offload kick      # un-delay a parked job whose result has landed; sweep finished ones
+```
+
+`trialerror offload status` prints the counts. The dashboard's HOME "what needs a human" panel
+carries the same line: *"N documents wait for the DEV GPU"*.
+
+### What waiting costs (nothing) and what failing costs (a bounded amount)
+
+A parked stage fails *environmentally*, so its retry budget is never consumed: three weeks with
+the GPU box switched off leaves every job at `attempts = 0`. A GPU failure is different — it is
+counted in the marker as `offload_attempts`, and after three of them the job lands in
+`offload/failed/<job_id>/` with an `error.json` and the ledger row settles `abandoned`. That
+split is deliberate: an absent machine is not a failure, and a document that crashes marker every
+single time must stop consuming GPU minutes.
+
+### Fail-closed (why `require_real_backends = true` is worth setting)
+
+The failure this guards against is silent. A one-character typo in a table name
+(`[ingest.embeded]`) leaves a program that looks configured, runs without error, and writes
+hash-derived 16-dimensional stand-in vectors into a knowledge store whose whole purpose is
+retrieval — and nobody notices until search quality is quietly wrong, months of ingest later. So:
+
+- an unparseable `trialerror.toml` now raises instead of falling back to the defaults;
+- with `require_real_backends = true`, an absent or `backend = "fake"` `[ingest.ocr]`/
+  `[ingest.embed]` table is refused at load time;
+- the worker refuses to start against a program root configured for fake (or offload) backends;
+- a published result that reports a fake backend, the wrong model key, the wrong dimensionality,
+  a mismatched chunk list, a different config hash, or a payload whose sha256 does not match is
+  quarantined in `offload/failed/` instead of being folded into the record;
+- `trialerror doctor --only fake_backend_rows` finds fake rows already in a program that declared
+  it would not accept them.
+
 ## 2. Optional: local Phoenix trace sink
 
 Entirely optional observability — every span emission no-ops silently if this isn't

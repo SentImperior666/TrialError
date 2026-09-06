@@ -50,6 +50,7 @@ from trialerror.ingest.sanitizer import SANITIZER_VERSION, sanitize
 from trialerror.ingest.stream import stream_v1
 from trialerror.jobs import ledger
 from trialerror.jobs.registry import register_handler
+from trialerror.offload.marker import is_offload_config
 from trialerror.retrieve import lexical
 from trialerror.stores.store import Store
 from trialerror.stores.vecindex import VecBackend, ensure_vec_table, serialize_vector_fallback, vec_table_name
@@ -81,15 +82,29 @@ def _enqueue_next_stage(store: Store, *, stage: str, payload: dict[str, Any], jo
 
 
 def _load_config(store: Store) -> dict[str, Any]:
+    """The program's ``trialerror.toml``, or ``{}`` when there is none.
+
+    **Fail-closed (design D13, lane L0-C).** This used to swallow every
+    exception and return ``{}`` -- which meant a single mistyped character
+    in ``trialerror.toml`` silently reverted a GPU-configured program to
+    the fake OCR/embed backends and wrote hash-derived stand-ins into the
+    record. An ABSENT config still means "a scratch program, use the
+    defaults" (that is what most of the test suite runs on); a PRESENT but
+    unparseable one now raises, because the operator's stated intent
+    exists and could not be read.
+
+    :func:`~trialerror.ingest.backends.assert_real_backends_if_required`
+    then enforces the program's own ``[ingest] require_real_backends``
+    posture at the same single load point."""
+    from trialerror.ingest.backends import assert_real_backends_if_required
     from trialerror.util.config import CONFIG_FILENAME, load_config
 
     cfg_path = store.program_root / CONFIG_FILENAME
     if not cfg_path.is_file():
         return {}
-    try:
-        return load_config(cfg_path).raw
-    except Exception:
-        return {}
+    raw = load_config(cfg_path).raw
+    assert_real_backends_if_required(raw)
+    return raw
 
 
 def _resolve_raw_path(store: Store, doc: dict[str, Any]) -> Path:
@@ -201,10 +216,21 @@ def run_ocr(ctx) -> None:
         raise RuntimeError(f"ocr: no such document {doc_id!r}")
     raw_path = _resolve_raw_path(store, doc)
     config = _load_config(store)
-    backend = load_ocr_backend(config.get("ingest", {}).get("ocr", {}))
+    ocr_cfg = config.get("ingest", {}).get("ocr", {})
 
-    work_dir = store.program_root / "jobs_work" / doc_id / "ocr"
-    result = backend.run(input_path=raw_path, work_dir=work_dir)
+    if is_offload_config(ocr_cfg):
+        # Lane L0-C (design D5): this box has no GPU. Resolve the pages
+        # from a result the DEV worker already published, or park the job
+        # (EnvironmentalFailure, attempt NOT consumed) until it does.
+        # Everything below this branch is unchanged -- the offload path
+        # feeds the SAME tail the real backends feed.
+        from trialerror.offload.stage import offload_ocr_result
+
+        result = offload_ocr_result(ctx, doc=doc, raw_path=raw_path, ocr_cfg=ocr_cfg)
+    else:
+        backend = load_ocr_backend(ocr_cfg)
+        work_dir = store.program_root / "jobs_work" / doc_id / "ocr"
+        result = backend.run(input_path=raw_path, work_dir=work_dir)
     ctx.set_checkpoint({"ocr_pages": len(result.pages)})
 
     drafts = [
@@ -213,7 +239,12 @@ def run_ocr(ctx) -> None:
             "type": "NarrativeText",
             "text": page.text,
             "page_number": page.page_number,
-            "detection_origin": f"ocr:{backend.name}",
+            # ``result.ocr_backend`` rather than ``backend.name``: identical
+            # for every local backend (both are "fake"/"marker"), and the
+            # only correct answer for an offloaded stage, where the backend
+            # object here is a marker and the real name came back with the
+            # published result.
+            "detection_origin": f"ocr:{result.ocr_backend}",
         }
         for i, page in enumerate(result.pages)
     ]
@@ -326,26 +357,65 @@ def run_embed(ctx) -> None:
         )
 
     pending = [c for c in chunks if not _is_cached(c["sha256"])]
-    done = 0
-    for i in range(0, len(pending), batch_size):
-        batch = pending[i : i + batch_size]
-        vectors = backend.embed_batch([c["text"] for c in batch], kind="document")
-        for c, vector in zip(batch, vectors):
-            if _is_cached(c["sha256"]):  # a resumed attempt may have already committed this one
-                continue
-            insert(
-                store,
-                "emb",
-                {
-                    "chunk_sha256": c["sha256"],
-                    "model_key": model_key,
-                    "dims": dims,
-                    "vector": serialize_vector_fallback(list(vector)),
-                    "created_ts": now(),
-                },
+
+    if is_offload_config(embed_cfg):
+        # Lane L0-C (design D5 / v3 delta N2): the whole document's chunk
+        # list travels to the DEV GPU as one payload -- batching is the
+        # worker's business, since the backend there embeds in batches of
+        # eight and this side has no model at all. Nothing to offload when
+        # every chunk is already cached (a resumed run), which is why this
+        # is guarded rather than unconditional.
+        if pending:
+            from trialerror.offload.stage import offload_embed_vectors
+
+            vectors_by_chunk = offload_embed_vectors(
+                ctx,
+                doc_id=doc_id,
+                chunks=chunks,
+                embed_cfg=embed_cfg,
+                model_key=model_key,
+                dims=dims,
             )
-        done += len(batch)
-        ctx.set_checkpoint({"embedded": done, "total_pending": len(pending), "model_key": model_key})
+            done = 0
+            for c in chunks:
+                if _is_cached(c["sha256"]):
+                    continue
+                insert(
+                    store,
+                    "emb",
+                    {
+                        "chunk_sha256": c["sha256"],
+                        "model_key": model_key,
+                        "dims": dims,
+                        "vector": serialize_vector_fallback(list(vectors_by_chunk[c["chunk_id"]])),
+                        "created_ts": now(),
+                    },
+                )
+                done += 1
+                ctx.set_checkpoint(
+                    {"embedded": done, "total_pending": len(pending), "model_key": model_key}
+                )
+    else:
+        done = 0
+        for i in range(0, len(pending), batch_size):
+            batch = pending[i : i + batch_size]
+            vectors = backend.embed_batch([c["text"] for c in batch], kind="document")
+            for c, vector in zip(batch, vectors):
+                if _is_cached(c["sha256"]):  # a resumed attempt may have already committed this one
+                    continue
+                insert(
+                    store,
+                    "emb",
+                    {
+                        "chunk_sha256": c["sha256"],
+                        "model_key": model_key,
+                        "dims": dims,
+                        "vector": serialize_vector_fallback(list(vector)),
+                        "created_ts": now(),
+                    },
+                )
+            done += len(batch)
+            ctx.set_checkpoint({"embedded": done, "total_pending": len(pending), "model_key": model_key})
 
     update(store, "document", pk_column="doc_id", pk_value=doc_id, changes={"status": "embedded"})
     _enqueue_next_stage(

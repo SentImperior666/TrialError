@@ -44,6 +44,12 @@ from typing import Any, Protocol, Sequence
 # trialerror.ingest.
 from trialerror.jobs.worker import EnvironmentalFailure
 
+# Lane L0-C (design D5/D13): the third backend value, ``"offload"``, is not
+# a model at all -- it routes the stage to the DEV GPU worker through the
+# handler-level seam. ``trialerror.offload.marker`` is deliberately
+# dependency-free so this import can sit at module level without a cycle.
+from trialerror.offload.marker import OFFLOAD_BACKEND_NAME, OffloadMarker
+
 __all__ = [
     "OcrPage",
     "OcrResult",
@@ -58,7 +64,57 @@ __all__ = [
     "load_embed_backend",
     "DEFAULT_FAKE_EMBED_DIMS",
     "DEFAULT_EMBED_TIMEOUT_S",
+    "RealBackendRequiredError",
+    "assert_real_backends_if_required",
 ]
+
+
+class RealBackendRequiredError(ValueError):
+    """Raised at config-load time by :func:`assert_real_backends_if_required`
+    when a program that declared ``[ingest] require_real_backends = true``
+    would nonetheless route a stage through the fake backend.
+
+    A ``ValueError`` subclass so every existing caller that already catches
+    the loaders' ``ValueError`` for a malformed backend table keeps
+    behaving the same way."""
+
+
+def assert_real_backends_if_required(raw_config: dict[str, Any] | None) -> None:
+    """Design D13: "the origin-project program's toml sets ``[ingest]
+    require_real_backends = true`` (fake or absent backend tables refused);
+    ... default remains permissive so the test suite and scratch programs
+    keep working".
+
+    ``raw_config`` is the WHOLE ``trialerror.toml`` dict (not one
+    ``[ingest.*]`` table) because the flag and the tables it governs live
+    at different depths, and because "the table is absent entirely" is one
+    of the two conditions being refused -- a check that only ever sees the
+    table cannot detect its absence.
+
+    Why this is worth a hard refusal rather than a doctor warning: the
+    failure it prevents is silent. A one-character typo in a table name
+    (``[ingest.embeded]``) leaves a program that looks configured, runs
+    without error, and writes hash-derived 16-dimensional vectors into a
+    knowledge store whose whole purpose is retrieval. Nobody notices until
+    search quality is quietly wrong, months of ingest later."""
+    ingest = (raw_config or {}).get("ingest") or {}
+    if not ingest.get("require_real_backends", False):
+        return
+    for stage in ("ocr", "embed"):
+        table = ingest.get(stage)
+        if not isinstance(table, dict) or not table:
+            raise RealBackendRequiredError(
+                f"[ingest] require_real_backends = true, but [ingest.{stage}] is absent from "
+                "trialerror.toml -- an absent table means the fake backend, which this program "
+                f"has declared it will not accept. Set [ingest.{stage}] backend = "
+                f"'{OFFLOAD_BACKEND_NAME}' (GPU on another machine) or a real local backend."
+            )
+        backend_name = table.get("backend", "fake")
+        if backend_name == "fake":
+            raise RealBackendRequiredError(
+                f"[ingest] require_real_backends = true, but [ingest.{stage}] backend = 'fake' "
+                "-- refusing to route the record through a deterministic stand-in."
+            )
 
 
 # --------------------------------------------------------------------------
@@ -260,6 +316,11 @@ def load_ocr_backend(config: dict[str, Any]) -> OcrBackend:
     backend_name = config.get("backend", "fake")
     if backend_name == "fake":
         return FakeOcrBackend()
+    if backend_name == OFFLOAD_BACKEND_NAME:
+        # Lane L0-C / design v3 delta N2: the OCR model runs on DEV. This
+        # marker carries the identity the handler's offload branch needs
+        # and raises if anything tries to compute through it.
+        return OffloadMarker("ocr", config)
     if backend_name == "marker":
         marker_single_exe = config.get("marker_single_exe")
         if not marker_single_exe:
@@ -270,7 +331,10 @@ def load_ocr_backend(config: dict[str, Any]) -> OcrBackend:
             extra_args=config.get("marker_extra_args", []),
             timeout_s=config.get("timeout_s", DEFAULT_OCR_TIMEOUT_S),
         )
-    raise ValueError(f"unknown ingest.ocr.backend {backend_name!r} (choices: 'fake', 'marker')")
+    raise ValueError(
+        f"unknown ingest.ocr.backend {backend_name!r} (choices: 'fake', 'marker', "
+        f"'{OFFLOAD_BACKEND_NAME}')"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -445,6 +509,13 @@ def load_embed_backend(config: dict[str, Any]) -> EmbedBackend:
             dims=config.get("dims", DEFAULT_FAKE_EMBED_DIMS),
             delay_s=config.get("delay_s", 0.0),  # test-only seam -- see FakeEmbedBackend's docstring
         )
+    if backend_name == OFFLOAD_BACKEND_NAME:
+        # Lane L0-C: the embedding model runs on DEV. ``model_key``/``dims``
+        # still have to be known HERE -- ``emb`` rows and the
+        # ``vec_chunks__<model_key>`` table are keyed by them, and
+        # ``run_index`` reads them off this object -- so the marker demands
+        # them from the config rather than defaulting them.
+        return OffloadMarker("embed", config)
     python_exe = config.get("python_exe")
     module_dir = config.get("module_dir")
     if not python_exe or not module_dir:

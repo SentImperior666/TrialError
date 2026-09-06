@@ -133,6 +133,32 @@ id = "{program_id}"
 # dims = 2048
 # timeout_s = 1800
 
+# GPU offload (trialerror.offload) -- for the shape where this program runs on
+# an always-on CPU-only box while the GPU lives in another machine that is off
+# most of the time. `backend = "offload"` makes the stage queue its work under
+# <program_root>/offload/ and park its job ENVIRONMENTALLY, so the retry budget
+# is untouched however long the GPU box stays away; a worker over there runs
+# the real model and publishes the result back, which this side verifies
+# (payload sha, model key, dimensionality, chunk list, config hash) before a
+# single row is written. Full setup: docs/USER_SETUP.md "Two-machine split".
+# [ingest.ocr]
+# backend = "offload"
+# expect_backend = "marker"     # optional: pin what the worker must report back
+# [ingest.embed]
+# backend = "offload"
+# model_key = "qwen3-4b"        # REQUIRED for offload -- emb rows are keyed by it
+# dims = 2048
+
+# Fail-closed backends. With this true, an absent or `backend = "fake"`
+# [ingest.ocr]/[ingest.embed] table is REFUSED at load time instead of quietly
+# routing the record through the deterministic stand-ins (the failure it
+# prevents is silent: a mistyped table name looks configured, runs without
+# error, and writes hash-derived vectors into a retrieval store). Off by
+# default so a fresh scaffold works with no setup at all; turn it on for any
+# program whose record you intend to keep.
+# [ingest]
+# require_real_backends = true
+
 # Plain-English Feed translator (trialerror.feed_translate, `trialerror feed
 # translate`). Absent table -> backend = "pending": a translation job builds
 # the envelope and parks it, costing nothing and calling nothing, for an

@@ -91,20 +91,27 @@ def _auto_load_paths_config(program_root: Path) -> dict | None:
     every one of those ~20 call sites to be individually taught to load
     and thread a config dict through -- the same "ambient, no caller
     opt-in needed" spirit ``TRIALERROR_PLATFORM_ROOT`` already has for the
-    platform root. Missing/invalid ``trialerror.toml`` -> ``None`` (same
-    "read generically, tolerate absence" convention
-    ``trialerror.cli.budget._load_policy`` already documents) -- most tests open
-    a bare ``tmp_path`` with no ``trialerror.toml`` at all, and must see
-    byte-identical behavior to before this knob existed."""
+    platform root.
+
+    ABSENT ``trialerror.toml`` -> ``None`` (same "read generically,
+    tolerate absence" convention ``trialerror.cli.budget._load_policy``
+    already documents) -- most tests open a bare ``tmp_path`` with no
+    ``trialerror.toml`` at all, and must see byte-identical behavior to
+    before this knob existed.
+
+    PRESENT but unparseable -> **raises** ``ConfigError`` (lane L0-C,
+    design D13: "unparseable ``trialerror.toml`` always raises"). This used
+    to fall back to ``None``, which quietly relocated every store back to
+    the default ``<program_root>/stores`` for a program whose config said
+    otherwise -- opening a SECOND, empty set of databases beside the real
+    ones and reporting nothing. A config that exists and cannot be read is
+    a stop condition, not a default."""
     cfg_path = program_root / "trialerror.toml"
     if not cfg_path.is_file():
         return None
-    try:
-        from trialerror.util.config import load_config
+    from trialerror.util.config import load_config
 
-        return load_config(cfg_path).raw
-    except Exception:
-        return None
+    return load_config(cfg_path).raw
 
 
 def open_store(

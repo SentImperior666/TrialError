@@ -74,6 +74,7 @@ __all__ = [
     "fail",
     "pause",
     "resume",
+    "kick",
     "sweep_expired_leases",
     "backoff_seconds",
 ]
@@ -521,6 +522,41 @@ def resume(store: Store, job_id: str) -> dict[str, Any]:
     if current is None:
         raise JobNotFoundError(f"no such job: {job_id!r}")
     raise InvalidTransitionError(f"job {job_id!r} is in state {current['state']!r}, not 'paused'; cannot resume")
+
+
+def kick(store: Store, job_id: str) -> dict[str, Any] | None:
+    """Clear a deferred job's ``next_attempt_ts`` so it becomes claimable
+    NOW. Returns the updated row, or ``None`` if there was nothing to clear
+    (already claimable, terminal, paused, or no such job) -- like
+    :func:`claim_specific`, "nothing happened" is an ordinary outcome here,
+    not an error.
+
+    Added for lane L0-C (design section 4: "``trialerror offload kick``:
+    resets ``next_attempt_ts`` (new ``ledger.kick``) for pending jobs whose
+    ``done/`` landed"). The offload branch parks a stage with an
+    ``EnvironmentalFailure`` carrying a 30-minute retry delay, because the
+    DEV GPU may be off for weeks and polling it faster would be pure
+    noise. But once the result actually lands, that same delay is the only
+    thing standing between the document and its finished ingest -- and the
+    landing is observable (a directory appeared), so the sandbox can simply
+    say "now" instead of waiting out a timer that was sized for absence.
+
+    Deliberately narrower than :func:`resume`: it never changes ``state``,
+    never touches ``attempts``, and refuses to act on anything that is not
+    already ``pending``/``failed``-with-budget. Un-delaying is not the same
+    power as un-pausing, and this is called by an unattended loop."""
+    sql = """
+        UPDATE job SET next_attempt_ts = NULL
+        WHERE job_id = :job_id AND next_attempt_ts IS NOT NULL
+          AND (state = 'pending' OR (state = 'failed' AND attempts < max_attempts))
+        RETURNING *
+    """
+    with store.jobs:
+        row = store.jobs.execute(sql, {"job_id": job_id}).fetchone()
+    if row is None:
+        return None
+    _log_event(store, job_id, "kicked", {"reason": "offload result published"})
+    return dict(row)
 
 
 def sweep_expired_leases(store: Store) -> list[dict[str, Any]]:
