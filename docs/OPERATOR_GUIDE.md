@@ -245,7 +245,7 @@ not the full registry — `trialerror doctor --json` is authoritative.
 | `verify` | `verdict_evidence_anchors`, `prereg_escrow_integrity` |
 | `obs` | `obs_exporter_reachable`, `obs_span_drop_counter` |
 | `util` | `license_audit` (vendored/ header + manifest scan) |
-| `webfetch` | `webfetch_sidecar_alive` (the fetch process's heartbeat), `webfetch_backlog`, `webfetch_refused_24h` (warns on the SSRF/exfil refusal class), `webfetch_unattributed` (a fetch no booked launch asked for), `webfetch_orphans`, `webfetch_queue_disk`, `webfetch_thin_backlog` (info), `webfetch_refetch_due` (info) |
+| `webfetch` | `webfetch_sidecar_alive` (the fetch process's heartbeat), `webfetch_backlog`, `webfetch_refused_24h` (warns on the SSRF/exfil refusal class), `webfetch_unattributed` (a fetch no booked launch asked for — the audit trail it reads is append-only, so an intentional one, such as the deliberate forged-attribution test, is retired with `trialerror webfetch ack --fetch-id … --launch-id … --note …` and its host twin `te-webfetch.sh ack`; the line is never deleted, the acknowledged offender is still reported with its note, and the acknowledgement is bounded to what was on record when it was made, so a later fetch fails the check again whether it carries a new id or reuses the acknowledged one), `webfetch_orphans`, `webfetch_queue_disk`, `webfetch_thin_backlog` (info), `webfetch_refetch_due` (info) |
 
 `--only <name>` runs one (repeatable for several); `--license-audit` is shorthand for
 `--only license_audit`; program-scoped checks (everything except `license_audit`) need

@@ -385,6 +385,309 @@ class TestUnattributed:
         assert "platform.db" in result.message
 
 
+class TestUnattributedAcknowledgements:
+    """The acceptance runbook's H-attrib item asks the operator to forge a
+    manifest and prove both surfaces go red. The audit copy is append-only,
+    so without this path the check stays red for the life of the program and
+    the operator learns to ignore the category.
+
+    What is being tested is that the escape hatch does not become a mute
+    button: the audit line survives, the acknowledged offender is still
+    reported (with the note that excused it), and one new offender turns the
+    verdict red again regardless of how many acknowledgements exist — a new
+    id or a REUSED one, which is the whole difference between a boundary and
+    an allowlist entry.
+    """
+
+    def forge(self, queue_dir, *, fetch_id, job_id=None, launch_id="LNCH-bogus", ts=None):
+        record = dict(
+            job_id=job_id or f"JOB-webfetch-{fetch_id}",
+            fetch_id=fetch_id,
+            launch_id=launch_id,
+            outcome="fetched",
+        )
+        if ts is not None:
+            record["ts"] = ts
+        write_audit(queue_dir, **record)
+
+    def later(self, seconds: float = 3600.0) -> str:
+        """An audit timestamp in the future, i.e. after any acknowledgement
+        this test makes. ``write_audit`` stamps 10 s ago by default, which is
+        the ordinary case of a line that predates its acknowledgement."""
+        return _ts(-seconds)
+
+    def ack(
+        self,
+        store,
+        launch_id,
+        *,
+        fetch_ids=(),
+        job_ids=(),
+        note="H-attrib runbook forgery",
+        ts=None,
+    ):
+        from trialerror.webfetch.acks import acknowledge
+
+        return acknowledge(
+            store,
+            fetch_ids=fetch_ids,
+            job_ids=job_ids,
+            launch_id=launch_id,
+            note=note,
+            ts=ts,
+        )
+
+    def test_the_forgery_fails_until_it_is_acknowledged(
+        self, store, program_root, queue_dir, launch_id, ctx
+    ):
+        enqueue_fetch(store, url=URL, launch_id=launch_id)
+        self.forge(queue_dir, fetch_id="WF-forged")
+        assert check_webfetch_unattributed(ctx).status == "fail"
+
+        self.ack(store, launch_id, fetch_ids=["WF-forged"])
+        result = check_webfetch_unattributed(ctx)
+        assert result.status == "pass"
+        assert "1 acknowledged id(s) holding 1 record(s) aside" in result.message
+        assert "WF-forged" in result.message
+        # Never "forgery test": the check cannot know what an acknowledged
+        # offender was, and saying so turns a report into a reassurance.
+        assert "forgery" not in result.message
+
+    def test_the_audit_line_is_never_removed(
+        self, store, program_root, queue_dir, launch_id, ctx
+    ):
+        enqueue_fetch(store, url=URL, launch_id=launch_id)
+        self.forge(queue_dir, fetch_id="WF-forged")
+        before = (queue_dir / "audit.jsonl").read_bytes()
+        self.ack(store, launch_id, fetch_ids=["WF-forged"])
+        check_webfetch_unattributed(ctx)
+        assert (queue_dir / "audit.jsonl").read_bytes() == before
+
+    def test_the_acknowledged_offender_is_still_reported_with_its_note(
+        self, store, program_root, queue_dir, launch_id, ctx
+    ):
+        enqueue_fetch(store, url=URL, launch_id=launch_id)
+        self.forge(queue_dir, fetch_id="WF-forged")
+        self.ack(store, launch_id, fetch_ids=["WF-forged"], note="deliberate, runbook H-attrib")
+
+        details = check_webfetch_unattributed(ctx).details
+        assert details["offender_count"] == 0
+        assert details["offenders"] == []
+        assert details["acknowledged_count"] == 1
+        assert details["acknowledgement_count"] == 1
+        assert details["acknowledged_ids"] == ["WF-forged"]
+        entry = details["acknowledged"][0]
+        assert entry["fetch_id"] == "WF-forged"
+        assert entry["ack"]["note"] == "deliberate, runbook H-attrib"
+        assert entry["ack"]["launch_id"] == launch_id
+
+    def test_a_job_id_acknowledgement_covers_the_same_line(
+        self, store, program_root, queue_dir, launch_id, ctx
+    ):
+        """Whichever id the operator was shown is the one they will paste.
+        The host's audit dump prints the job id; the doctor details print
+        both."""
+        enqueue_fetch(store, url=URL, launch_id=launch_id)
+        self.forge(queue_dir, fetch_id="WF-forged", job_id="JOB-webfetch-WF-forged")
+        self.ack(store, launch_id, job_ids=["JOB-webfetch-WF-forged"])
+
+        result = check_webfetch_unattributed(ctx)
+        assert result.status == "pass"
+        assert result.details["acknowledged_ids"] == ["JOB-webfetch-WF-forged"]
+
+    def test_a_new_offender_beside_an_acknowledged_one_still_fails(
+        self, store, program_root, queue_dir, launch_id, ctx
+    ):
+        enqueue_fetch(store, url=URL, launch_id=launch_id)
+        self.forge(queue_dir, fetch_id="WF-forged")
+        self.ack(store, launch_id, fetch_ids=["WF-forged"])
+        assert check_webfetch_unattributed(ctx).status == "pass"
+
+        self.forge(queue_dir, fetch_id="WF-new")
+        result = check_webfetch_unattributed(ctx)
+        assert result.status == "fail"
+        assert result.details["offender_count"] == 1
+        assert result.details["offenders"][0]["fetch_id"] == "WF-new"
+        assert result.details["acknowledged_count"] == 1
+        assert "1 other offender(s) are acknowledged" in result.message
+
+    def test_acknowledging_an_id_nobody_forged_changes_no_verdict(
+        self, store, program_root, queue_dir, launch_id, ctx
+    ):
+        """An acknowledgement is keyed on an id, not on a wildcard: one for
+        an id that never appears cannot silence the one that does."""
+        enqueue_fetch(store, url=URL, launch_id=launch_id)
+        self.forge(queue_dir, fetch_id="WF-forged")
+        self.ack(store, launch_id, fetch_ids=["WF-something-else"])
+        result = check_webfetch_unattributed(ctx)
+        assert result.status == "fail"
+        assert result.details["acknowledged_count"] == 0
+
+    def test_a_clean_program_says_nothing_about_acknowledgements(
+        self, store, program_root, queue_dir, launch_id, ctx
+    ):
+        enqueue_fetch(store, url=URL, launch_id=launch_id)
+        result = check_webfetch_unattributed(ctx)
+        assert result.status == "pass"
+        assert result.message == "every fetch on record names a booked launch"
+        assert result.details["acknowledged_count"] == 0
+
+    # -- the boundary -----------------------------------------------------
+    #
+    # The one property everything else in this class rests on: an
+    # acknowledgement covers what existed when it was written, and nothing
+    # after. Without it the id is a permanent allowlist token — and it is a
+    # PUBLISHED one, since the passing message and `webfetch acks` both name
+    # the acknowledged ids, so anything that can read a doctor run learns
+    # which id is exempt forever.
+
+    def test_a_new_line_reusing_an_acknowledged_id_still_fails(
+        self, store, program_root, queue_dir, launch_id, ctx
+    ):
+        enqueue_fetch(store, url=URL, launch_id=launch_id)
+        self.forge(queue_dir, fetch_id="WF-forged")
+        self.ack(store, launch_id, fetch_ids=["WF-forged"])
+        assert check_webfetch_unattributed(ctx).status == "pass"
+
+        # The same id, a fresh line, a different bogus launch — the shape a
+        # real forgery takes once it knows which id is acknowledged.
+        self.forge(
+            queue_dir, fetch_id="WF-forged", launch_id="LNCH-also-bogus", ts=self.later()
+        )
+        result = check_webfetch_unattributed(ctx)
+        assert result.status == "fail"
+        assert result.details["offender_count"] == 1
+        assert result.details["acknowledged_stale_count"] == 1
+        assert result.details["acknowledged_stale"][0]["launch_id"] == "LNCH-also-bogus"
+        assert "arrived AFTER the acknowledgement" in result.message
+
+    def test_re_acknowledging_moves_the_boundary_forward(
+        self, store, program_root, queue_dir, launch_id, ctx
+    ):
+        """Widening is possible, but only as a second deliberate, attributed,
+        event-logged act — not as something the first ack granted in advance."""
+        enqueue_fetch(store, url=URL, launch_id=launch_id)
+        self.forge(queue_dir, fetch_id="WF-forged")
+        self.ack(store, launch_id, fetch_ids=["WF-forged"])
+        self.forge(queue_dir, fetch_id="WF-forged", ts=self.later(3600))
+        assert check_webfetch_unattributed(ctx).status == "fail"
+
+        self.ack(
+            store,
+            launch_id,
+            fetch_ids=["WF-forged"],
+            note="second line, also mine",
+            ts=self.later(7200),
+        )
+        result = check_webfetch_unattributed(ctx)
+        assert result.status == "pass"
+        assert result.details["acknowledged_count"] == 2
+        assert result.details["acknowledgement_count"] == 1
+
+    def test_an_audit_line_with_no_timestamp_is_never_covered(
+        self, store, program_root, queue_dir, launch_id, ctx
+    ):
+        """A record whose own clock cannot be read is not proof of anything,
+        so it stays an offender — the same safe direction the corpus-import
+        grandfathering takes."""
+        enqueue_fetch(store, url=URL, launch_id=launch_id)
+        (queue_dir / "audit.jsonl").write_text(
+            json.dumps(
+                {
+                    "job_id": "JOB-webfetch-WF-forged",
+                    "fetch_id": "WF-forged",
+                    "launch_id": "LNCH-bogus",
+                    "outcome": "fetched",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.ack(store, launch_id, fetch_ids=["WF-forged"])
+        result = check_webfetch_unattributed(ctx)
+        assert result.status == "fail"
+        assert result.details["acknowledged_stale_count"] == 1
+
+    # -- what the message says --------------------------------------------
+
+    def test_the_message_counts_acknowledgements_not_audit_lines(
+        self, store, program_root, queue_dir, launch_id, ctx
+    ):
+        """One operator judgment covering eight lines is ONE judgment. The
+        old wording inflated it into eight and repeated the id five times."""
+        enqueue_fetch(store, url=URL, launch_id=launch_id)
+        for _ in range(8):
+            self.forge(queue_dir, fetch_id="WF-forged")
+        self.ack(store, launch_id, fetch_ids=["WF-forged"])
+
+        result = check_webfetch_unattributed(ctx)
+        assert result.status == "pass"
+        assert result.details["acknowledged_count"] == 8
+        assert result.details["acknowledgement_count"] == 1
+        assert result.details["acknowledged_ids"] == ["WF-forged"]
+        assert result.message.count("WF-forged") == 1
+        assert "1 acknowledged id(s) holding 8 record(s) aside" in result.message
+
+    # -- what an acknowledgement may not do -------------------------------
+
+    def test_a_job_kind_acknowledgement_does_not_cover_a_fetch_id(
+        self, store, program_root, queue_dir, launch_id, ctx
+    ):
+        """The recorded kind is a constraint, not decoration: acknowledging
+        --job-id X must not cover an offender whose FETCH id is X and then
+        report `kind: job` against a fetch-field match."""
+        enqueue_fetch(store, url=URL, launch_id=launch_id)
+        self.forge(queue_dir, fetch_id="AMBIG-1", job_id="JOB-webfetch-other")
+        self.ack(store, launch_id, job_ids=["AMBIG-1"])
+        result = check_webfetch_unattributed(ctx)
+        assert result.status == "fail"
+        assert result.details["acknowledged_count"] == 0
+
+    def test_an_ack_row_with_no_launch_or_note_cannot_excuse_anything(
+        self, store, program_root, queue_dir, launch_id, ctx
+    ):
+        """A row that the verb would have refused to write must not get the
+        authority the verb spends two validations establishing. It stays
+        listed, under its own key, so the operator sees a BROKEN
+        acknowledgement rather than a silent one."""
+        from trialerror.webfetch.acks import ack_key
+
+        enqueue_fetch(store, url=URL, launch_id=launch_id)
+        self.forge(queue_dir, fetch_id="WF-forged")
+        with store.ops:
+            store.ops.execute(
+                "INSERT INTO meta (key, value, updated_ts) VALUES (?, ?, ?)",
+                (ack_key("WF-forged"), "not json at all", "2026-01-01T00:00:00.000Z"),
+            )
+        result = check_webfetch_unattributed(ctx)
+        assert result.status == "fail"
+        assert result.details["acknowledged_count"] == 0
+        assert result.details["acknowledged_invalid_count"] == 1
+        assert "no launch or no note" in result.message
+
+    def test_a_corrupt_ops_db_does_not_turn_the_verdict_into_an_error(
+        self, store, program_root, queue_dir, launch_id, ctx
+    ):
+        """The docstring promises a bad ops.db is never a reason to fail a
+        health check. connect() runs a PRAGMA on the way in, so a non-sqlite
+        file raises there rather than at the query."""
+        from trialerror.stores import paths as store_paths
+
+        enqueue_fetch(store, url=URL, launch_id=launch_id)
+        self.forge(queue_dir, fetch_id="WF-forged")
+        ops_db = store_paths.ops_db_path(program_root)
+        store.close()
+        for suffix in ("-wal", "-shm"):
+            sidecar = ops_db.with_name(ops_db.name + suffix)
+            if sidecar.exists():
+                sidecar.unlink()
+        ops_db.write_bytes(b"not a database, not even close")
+
+        result = check_webfetch_unattributed(ctx)
+        assert result.status == "fail"
+        assert result.details["acknowledged_count"] == 0
+
+
 # ---------------------------------------------------------------------------
 # webfetch_orphans / webfetch_queue_disk
 # ---------------------------------------------------------------------------

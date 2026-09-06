@@ -22,7 +22,14 @@ Severity, and why each one is what it is:
     ``webfetch_sidecar_alive`` (nothing is being fetched at all and nobody
     told you) and ``webfetch_unattributed`` (a fetch exists that no booked
     launch asked for — the T7 signal, and the only thing here that means
-    "someone may be using this channel").
+    "someone may be using this channel"). The second one has the project's
+    only *acknowledgement* path (:mod:`trialerror.webfetch.acks`): the audit
+    copy is append-only, so the forgery the acceptance runbook prescribes
+    can only be retired by a separate attributed record, never by editing
+    the trail. Acknowledged ids are reported in their own list and stop
+    counting toward the verdict; the record is bounded by its own timestamp,
+    so one new offender still turns it red — including one that reuses an
+    acknowledged id.
 
 ``warn``
     a backlog older than an hour, refusals from the SSRF/exfil class, an
@@ -50,7 +57,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 from trialerror.stores import paths
 from trialerror.stores.connection import connect
@@ -124,6 +131,7 @@ class _Ctx:
     queue: Queue
     knowledge_db: Path
     jobs_db: Path
+    ops_db: Path
 
 
 def _skip(name: str, message: str) -> CheckResult:
@@ -172,6 +180,7 @@ def _resolve(ctx: DoctorContext) -> tuple[_Ctx | None, str]:
             queue=Queue(queue_root),
             knowledge_db=paths.knowledge_db_path(program_root, raw),
             jobs_db=paths.jobs_db_path(program_root, raw),
+            ops_db=paths.ops_db_path(program_root, raw),
         ),
         "",
     )
@@ -222,6 +231,188 @@ def _audit_records(resolved: _Ctx) -> Iterator[dict[str, Any]]:
             continue
         if isinstance(record, dict):
             yield record
+
+
+def _acknowledged_ids(resolved: _Ctx) -> dict[str, dict[str, Any]]:
+    """``{id: ack record}`` from ``ops.meta`` (:mod:`trialerror.webfetch.acks`).
+
+    Read-only and best-effort in both directions: no ops.db yet, an ops.db
+    predating the ``meta`` table, or an ops.db that is not a database at all
+    simply means nothing has been acknowledged — which is the same answer as
+    a program that has made no acknowledgements, and never a reason to fail a
+    health check.
+
+    Both sqlite errors and OS errors are caught, and both around the
+    ``connect`` as well as the read: :func:`trialerror.stores.connection.
+    connect` runs ``PRAGMA journal_mode = WAL`` on the way in, so a file that
+    has been scribbled over raises ``sqlite3.DatabaseError`` *there* rather
+    than at the query. Catching only ``OSError`` left an in-container process
+    that corrupts ops.db able to turn this check's FAIL into an error row —
+    which is the wrong direction for the one check in this file that means
+    "someone may be using this channel".
+    """
+    from trialerror.webfetch.acks import load_acknowledged
+
+    if not resolved.ops_db.exists():
+        return {}
+    try:
+        conn = connect(resolved.ops_db, read_only=True)
+    except (OSError, sqlite3.Error):  # vanished mid-run, or not a database
+        return {}
+    try:
+        return load_acknowledged(conn)
+    except sqlite3.Error:  # pragma: no cover - load_acknowledged guards its own query
+        return {}
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:  # pragma: no cover - defensive
+            pass
+
+
+#: Which acknowledgement ``kind`` may cover which offender field. The kind is
+#: recorded by the write path from the flag the operator used, and matching it
+#: here is what keeps it a constraint rather than decoration — an ack made
+#: with ``--job-id X`` should not cover an offender whose *fetch* id is X and
+#: then report ``kind: job`` against a fetch-field match. ``unknown`` (a row
+#: whose JSON did not parse) is accepted on either side rather than neither,
+#: so a corrupt row stays visible instead of silently un-acknowledging an id.
+_ACK_FIELD_KINDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("fetch_id", ("fetch", "unknown")),
+    ("job_id", ("job", "unknown")),
+)
+
+
+def _parse_boundary_ts(raw: object) -> datetime | None:
+    """One timestamp → an aware UTC ``datetime``, or ``None`` if it will not
+    read. Naive stamps are taken as UTC, which is what every writer on both
+    sides of this boundary emits."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        stamp = parse_ts(raw.strip())
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp
+
+
+def _at_or_before(row_ts: object, boundary_ts: object) -> bool:
+    """``True`` iff ``row_ts`` is a real timestamp at or before
+    ``boundary_ts`` — the comparison that makes an exemption a boundary
+    rather than a switch.
+
+    ``False`` (never exempt) when either side is missing or unparseable: an
+    exemption must be provable, and a record whose own timestamp cannot be
+    read is not proof of anything. This is deliberately the same rule the
+    corpus-import grandfathering applies, spelled out here rather than
+    imported because that package is not part of every build of this one;
+    both parse rather than compare as text, since ``…+00:00`` and ``…Z``
+    stamps sort differently as strings than as instants.
+    """
+    a = _parse_boundary_ts(row_ts)
+    b = _parse_boundary_ts(boundary_ts)
+    if a is None or b is None:
+        return False
+    return a <= b
+
+
+def _ack_is_attributed(record: Mapping[str, Any]) -> bool:
+    """Whether an acknowledgement record carries the two things the write
+    path spends its validation establishing: a launch and a note.
+
+    The read path has to check this itself. ``acks.acknowledge`` refuses an
+    empty note and an unbooked launch, so a stored row missing either was not
+    written by the verb — and granting it the verb's authority would let a
+    row inserted straight into ``ops.meta`` suppress an offender with
+    ``launch_id: None`` and an empty note, which the passing message would
+    then report as an accounted-for id. Defence in depth rather than a
+    boundary (anything that can write ops.meta could also insert a
+    ``platform.launch`` row and acknowledge legitimately), but the failure
+    direction matters: a broken acknowledgement should be visible, not silent.
+    """
+    launch_id = record.get("launch_id")
+    note = record.get("note")
+    return bool(
+        isinstance(launch_id, str)
+        and launch_id.strip()
+        and isinstance(note, str)
+        and note.strip()
+    )
+
+
+def _ack_for(
+    offender: dict[str, Any], acknowledged: dict[str, dict[str, Any]]
+) -> tuple[dict[str, Any] | None, str | None, dict[str, Any] | None]:
+    """``(covering ack, rejection reason, rejected ack)`` for this offender.
+
+    An acknowledgement is a **boundary, not a switch** — the property
+    :func:`_at_or_before` exists to state, and the one this module's storage
+    precedent names as what makes an exemption honest: "a row written one
+    second later is not exempt, so the exemption can never silently
+    widen". Matching on id membership alone
+    made an acknowledged id a permanent, unbounded allowlist token, and the
+    feature *publishes* its own tokens — the passing message names the
+    acknowledged ids and ``webfetch acks`` lists them — so anything that can
+    read ``trialerror doctor`` would learn which id is exempt forever and
+    could reuse it for a real forgery. So: an offender is covered only when
+    its own timestamp parses AND is at or before the acknowledgement's. A
+    record with a missing or unreadable timestamp is never covered, the same
+    safe direction that rule takes everywhere else. The offender's timestamp is the one
+    the *other* side of the boundary wrote (``Queue.append_audit`` stamps it
+    from the sidecar's clock; a ``web_fetch`` row's is its own
+    ``fetched_ts``/``created_ts``), not anything the acknowledging session
+    supplies.
+
+    Either id counts, but only against its own kind. A forged manifest names
+    both a ``fetch_id`` and a ``job_id``, and the operator acknowledging it
+    has whichever one the surface they were reading put in front of them —
+    the host's audit dump prints the job id, the doctor's own details print
+    both.
+
+    The rejection reason is ``"stale"`` (the id IS acknowledged, but this
+    record arrived after the acknowledgement or carries no readable
+    timestamp) or ``"invalid"`` (the acknowledgement row names no launch or
+    no note). Both leave the offender counting toward the verdict; both are
+    reported, because "an acknowledged id turned up on a new line" is the
+    single most interesting thing this check can say.
+    """
+    if not acknowledged:
+        return None, None, None
+    offender_ts = offender.get("ts")
+    if not isinstance(offender_ts, str):
+        offender_ts = None
+    reason: str | None = None
+    rejected: dict[str, Any] | None = None
+    for field, kinds in _ACK_FIELD_KINDS:
+        value = offender.get(field)
+        if not isinstance(value, str) or value not in acknowledged:
+            continue
+        record = acknowledged[value]
+        if record.get("kind") not in kinds:
+            continue
+        if not _ack_is_attributed(record):
+            if reason is None:
+                reason, rejected = "invalid", record
+            continue
+        if not _at_or_before(offender_ts, record.get("ts")):
+            if reason is None or reason == "invalid":
+                reason, rejected = "stale", record
+            continue
+        return record, None, None
+    return None, reason, rejected
+
+
+def _id_list(ids: list[str], limit: int = 5) -> str:
+    """Ids for a one-line message: all of them when there are few, and a
+    named remainder when there are many — never a bare count, because the
+    operator reading a green line has to be able to check it."""
+    if not ids:
+        return "none"
+    if len(ids) <= limit:
+        return ", ".join(ids)
+    return ", ".join(ids[:limit]) + f", +{len(ids) - limit} more"
 
 
 def _age_s(value: object) -> float | None:
@@ -489,6 +680,28 @@ def check_webfetch_unattributed(ctx: DoctorContext) -> CheckResult:
     healthy program. Requiring the fetch record to be missing too keeps the
     signal — a hand-written manifest has neither — and drops the false
     positive.
+
+    **Acknowledgements** (:mod:`trialerror.webfetch.acks`). The audit copy is
+    append-only, so the one forgery the acceptance runbook prescribes (item
+    H-attrib) would otherwise hold this check at FAIL for the life of the
+    program — and a check that cannot go green after a test the runbook
+    itself asks for is a check the operator learns to ignore. An operator
+    records, per id and against a booked launch of their own, that an
+    offender is accounted for; an offender whose ``fetch_id`` OR ``job_id``
+    carries such a record moves to ``details["acknowledged"]`` WITH the
+    record (launch, note, timestamp) attached, and stops counting toward the
+    verdict. Nothing is deleted, nothing is rewritten, and the count and the
+    ids are named in the passing message so a green line still says out loud
+    what it is standing on.
+
+    An acknowledgement is **bounded in time**: it covers the records that
+    existed when it was written and nothing after (:func:`_ack_for`). So a
+    new offender still FAILs whether it arrives with a fresh id or reuses an
+    acknowledged one — the second case is called out by name in the FAIL
+    message and in ``details["acknowledged_stale"]``, because an id that was
+    signed for turning up on a newer line is the thing an operator most
+    needs to be told. Without the bound the acknowledged id would be a
+    permanent allowlist token, and this check publishes its own tokens.
     """
     resolved, reason = _resolve(ctx)
     if resolved is None:
@@ -518,7 +731,8 @@ def check_webfetch_unattributed(ctx: DoctorContext) -> CheckResult:
     if conn_knowledge is not None:
         try:
             for row in conn_knowledge.execute(
-                "SELECT fetch_id, job_id, launch_id, url_norm FROM web_fetch"
+                "SELECT fetch_id, job_id, launch_id, url_norm, fetched_ts, created_ts "
+                "FROM web_fetch"
             ).fetchall():
                 known_fetch_ids.add(str(row["fetch_id"]))
                 if str(row["launch_id"]) not in booked:
@@ -528,6 +742,11 @@ def check_webfetch_unattributed(ctx: DoctorContext) -> CheckResult:
                             "fetch_id": row["fetch_id"],
                             "job_id": row["job_id"],
                             "launch_id": row["launch_id"],
+                            # The row's own clock, for the acknowledgement
+                            # boundary: when it was fetched, or failing that
+                            # when the row was created (NOT NULL in the
+                            # schema, so there is always something to compare).
+                            "ts": row["fetched_ts"] or row["created_ts"],
                         }
                     )
         finally:
@@ -561,20 +780,77 @@ def check_webfetch_unattributed(ctx: DoctorContext) -> CheckResult:
                     "fetch_id": fetch_id,
                     "job_id": job_id,
                     "launch_id": launch_id,
+                    # Stamped by ``Queue.append_audit`` from the sidecar's
+                    # clock on the other side of the boundary — the input to
+                    # the acknowledgement boundary in ``_ack_for``.
+                    "ts": record.get("ts"),
                     "unbooked_launch": unbooked_launch,
                     "unknown_job": unknown_job,
                 }
             )
 
-    offenders = row_offenders + audit_offenders
+    acknowledged_records = _acknowledged_ids(resolved)
+    offenders: list[dict[str, Any]] = []
+    acknowledged: list[dict[str, Any]] = []
+    stale: list[dict[str, Any]] = []
+    invalid: list[dict[str, Any]] = []
+    for offender in row_offenders + audit_offenders:
+        record, why, rejected = _ack_for(offender, acknowledged_records)
+        if record is not None:
+            acknowledged.append({**offender, "ack": record})
+            continue
+        offenders.append(offender)
+        if rejected is not None:
+            entry = {**offender, "ack": rejected, "why": why}
+            (stale if why == "stale" else invalid).append(entry)
+
+    # Two different numbers, because they answer two different questions and
+    # conflating them inflated one operator judgment into one-per-audit-line:
+    # how many records are being held aside, and how many acknowledgements are
+    # doing the holding. The id list is deduped for the same reason — a
+    # message that repeats one id five times reads as five decisions.
+    acknowledged_ids = sorted({str(entry["ack"]["id"]) for entry in acknowledged})
     details = {
         "offenders": offenders[:50],
         "offender_count": len(offenders),
+        "acknowledged": acknowledged[:50],
+        # records held aside …
+        "acknowledged_count": len(acknowledged),
+        # … and distinct acknowledgements doing it
+        "acknowledgement_count": len(acknowledged_ids),
+        "acknowledged_ids": acknowledged_ids[:50],
+        # An acknowledged id that turned up on a record NEWER than its
+        # acknowledgement: still an offender, and the most interesting thing
+        # this check can report, because it is what a reused id looks like.
+        "acknowledged_stale": stale[:50],
+        "acknowledged_stale_count": len(stale),
+        # An acknowledgement row with no launch or no note — not written by
+        # the verb, and not allowed to excuse anything.
+        "acknowledged_invalid": invalid[:50],
+        "acknowledged_invalid_count": len(invalid),
         "booked_launches": len(booked),
         "note": "the host-side check on the fetch process's own audit mount is the "
         "authoritative one; this is its in-container twin (design §3.4)",
     }
     if offenders:
+        also = ""
+        if acknowledged:
+            also += (
+                f" ({len(acknowledged)} other offender(s) are acknowledged by "
+                f"{len(acknowledged_ids)} acknowledgement(s) and not counted here)"
+            )
+        if stale:
+            also += (
+                f"; {len(stale)} of the offenders name an id that IS acknowledged but "
+                "arrived AFTER the acknowledgement was written — an acknowledgement "
+                "covers what existed when it was made, so this is a new record reusing "
+                "a known id"
+            )
+        if invalid:
+            also += (
+                f"; {len(invalid)} name an acknowledgement row carrying no launch or no "
+                "note, which cannot excuse anything"
+            )
         return CheckResult(
             name="webfetch_unattributed",
             category=_CATEGORY,
@@ -583,7 +859,20 @@ def check_webfetch_unattributed(ctx: DoctorContext) -> CheckResult:
                 f"{len(offenders)} fetch record(s)/audit line(s) carry a launch or job nobody "
                 "booked — read the audit before doing anything else; a fetch with no booked "
                 "launch is the one signal that this channel is being used by something other "
-                "than the harness"
+                f"than the harness{also}"
+            ),
+            details=details,
+        )
+    if acknowledged:
+        return CheckResult(
+            name="webfetch_unattributed",
+            category=_CATEGORY,
+            status="pass",
+            message=(
+                "every unacknowledged fetch on record names a booked launch — "
+                f"{len(acknowledged_ids)} acknowledged id(s) holding {len(acknowledged)} "
+                f"record(s) aside ({_id_list(acknowledged_ids)}); the audit lines are "
+                "still there, 'trialerror webfetch acks' says who signed for them and why"
             ),
             details=details,
         )
