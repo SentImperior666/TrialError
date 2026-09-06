@@ -88,20 +88,29 @@ def _insert_relation(conn: sqlite3.Connection, relation_id: str, **overrides: ob
 # ---------------------------------------------------------------------------
 
 
-def test_ops_migrations_are_contiguous_one_through_seven():
+def test_ops_migrations_are_contiguous_from_one():
     """A renumber (v6 -> v8 -> v7) is exactly the edit that leaves a hole or
-    a duplicate behind."""
+    a duplicate behind. Lane c then landed v8 on top of this one, so what has
+    to hold is CONTIGUITY and distinct names -- pinning a fixed last version
+    would turn every later lane's migration into a failure in this file."""
     versions = [m.version for m in ops.MIGRATIONS]
     assert versions == list(range(1, len(versions) + 1))
-    assert versions[-1] == 7
     assert len({m.name for m in ops.MIGRATIONS}) == len(ops.MIGRATIONS)
+    for m in ops.MIGRATIONS:
+        assert m.name.startswith(f"ops_v{m.version}_"), \
+            f"{m.name!r} does not carry its own number (lane b's B1 rule)"
 
 
 def test_v7_is_the_memory_relation_migration_under_its_ruled_name():
     v7 = next(m for m in ops.MIGRATIONS if m.version == 7)
     assert v7.name == "ops_v7_memory_relation_and_reviewed_ts"
     assert v7.statements is ops._V7
-    assert not hasattr(ops, "_V8")
+    # ``_V8`` exists now: it is lane c's thread migration, not a second
+    # binding of this one's statements. The hazard B1 names is two branches
+    # binding the same NAME to different DDL, so what this guards is that the
+    # constants stay distinct objects under distinct, numbered names.
+    assert ops._V8 is not ops._V7
+    assert next(m for m in ops.MIGRATIONS if m.version == 8).statements is ops._V8
 
 
 # ---------------------------------------------------------------------------

@@ -613,15 +613,28 @@ _V6 = (
 # happened here: master's ``_V6`` and this lane's block conflicted loudly on
 # both the constant and the tuple, and both survived the resolution intact.
 #
-# MIGRATIONS is contiguous 1..7 again after this merge (the lane branch's
-# deliberate 1,2,3,4,5,8 gap closed by landing at 7 instead of 8).
+# MIGRATIONS was contiguous 1..7 after this merge (the lane branch's
+# deliberate 1,2,3,4,5,8 gap closed by landing at 7 instead of 8), and is
+# contiguous 1..8 now that lane c's ``_V8`` has landed on top.
 # ``apply_migrations`` compares version numbers and never requires
 # contiguity, so the gap was safe while it existed -- but one hazard outlived
 # it and belongs to anyone carrying a dev store across this merge: an ops.db
 # migrated to ``user_version=8`` ON THE PRE-MERGE LANE BRANCH will now SKIP
-# every migration <= 8, this v7 and lane b's v6 included, and will keep a
-# stale ``user_version`` no later migration can walk back. That affects a dev
-# store only, never a freshly created one -- recreate such a store.
+# every migration <= 8 -- this v7, lane b's v6, AND lane c's v8, which is a
+# different migration that happens to share the number -- and will keep a
+# stale ``user_version`` no later migration can walk back.
+#
+# The v8 skip is the one that bites in a way the message does not explain.
+# Such a store never gets the ``thread`` rebuild, so ``thread.created_by``
+# does not exist, and the first ``trialerror feed post --new-thread`` (or the
+# dashboard's + NEW THREAD) refuses with::
+#
+#     ValidationError: thread: unknown column(s) ['created_by']
+#
+# -- a clean refusal naming a SYMPTOM, not the cause. The cause is always the
+# same one: this store's ``user_version`` was stamped by a branch, not by
+# these migrations. It affects a dev store only, never a freshly created one.
+# Recreate such a store; there is no supported repair.
 #
 # ``memory_relation`` is engram-F4's save-time conflict surface
 # (``docs/mining/G25-operator-2026-09__engram.md`` finding 3; orchestrator
@@ -677,6 +690,75 @@ _V7 = (
     "ALTER TABLE memory_item ADD COLUMN reviewed_ts TEXT",
 )
 
+# ---- v8 (lane C, step C7): a thread an operator can open ---------------
+#
+# ``thread.created_by_launch`` was NOT NULL, and that one word is the whole
+# reason the dashboard could post into a thread but never START one:
+# ``events.api.post_feed`` has an explicit ``launch_id=None ->
+# orchestrator:<open session>`` identity and ``create_thread`` had none, so
+# the operator -- who has a session and no launch -- was the one caller of
+# this subsystem who could not open a room to talk in. The walkthrough
+# complaint ("no threads to act on") runs straight through it.
+# ``trialerror.events.api.create_thread``'s own docstring flagged this as a
+# schema constraint that lane had no licence to relax; ruling L-C1 grants the
+# licence.
+#
+# Two columns move:
+#
+# - ``created_by_launch`` becomes NULLABLE. Its XID_REGISTRY entry
+#   (("thread","created_by_launch") -> platform.launch) is UNCHANGED and stays
+#   enforced for every non-null value: ``trialerror.stores.writer``'s
+#   ``_validate_xids`` already skips a NULL column, so "null allowed, non-null
+#   still validated" falls out of the existing write API with no further
+#   change -- the same reasoning ops_v2 recorded for ``memory_item.account_id``.
+# - ``created_by`` is NEW and nullable: the derived author string, exactly the
+#   shape ``feed_post.author`` carries (``<agent_kind>:<launch_id>`` for an
+#   agent, ``orchestrator:<session_id>`` for the operator). It is written by
+#   ``create_thread`` going forward and is NULL for every pre-v8 row, because
+#   the only way to derive one is a ``platform.launch`` lookup and platform is
+#   a DIFFERENT FILE -- a migration on ops.db cannot reach it. The column is
+#   WRITE-ONLY as of this migration: nothing reads it yet, and the feed's
+#   thread rail shows no thread author, so a pre-v8 row loses nothing by
+#   having none. (This note used to say "readers fall back to
+#   ``created_by_launch``"; no reader does -- lane C, finding F9. The first
+#   one that wants an author should read ``COALESCE(created_by,
+#   created_by_launch)``, and that is where the fallback belongs.)
+#
+# Table rebuild rather than ALTER, because dropping a NOT NULL is not an
+# ALTER SQLite has. ``feed_post.thread_id`` is a same-file FK child with rows
+# in it, so the bare DROP would be refused under enforcement -- which is
+# precisely what ``stores/migrate.py``'s OFF/ON bracketing around the whole
+# migration transaction exists for (its own TRIALERROR-DEV-NOTE says so, and
+# names jobs.db's job/job_event pair as the first case). v2's ``status``/
+# ``refs`` columns and their CHECK are carried through verbatim; ``thread``
+# carries no indexes of its own, so none are recreated.
+#
+# Numbering: v7 is the mining-adoptions lane's ``memory_relation`` migration,
+# which merged first. L-C1 as amended gives lane c **v8**, and the constant is
+# renamed with the number (lane b's B1 rule -- two branches binding the same
+# name to different DDL is a footgun Python will not report). MIGRATIONS stays
+# contiguous 1..8.
+_V8 = (
+    """
+    CREATE TABLE thread__v8new (
+        thread_id           TEXT PRIMARY KEY,
+        title               TEXT NOT NULL,
+        created_ts          TEXT NOT NULL,
+        created_by_launch   TEXT,
+        created_by          TEXT,
+        status              TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','archived')),
+        refs                TEXT
+    )
+    """,
+    """
+    INSERT INTO thread__v8new (thread_id, title, created_ts, created_by_launch, created_by, status, refs)
+    SELECT thread_id, title, created_ts, created_by_launch, NULL, status, refs
+    FROM thread
+    """,
+    "DROP TABLE thread",
+    "ALTER TABLE thread__v8new RENAME TO thread",
+)
+
 MIGRATIONS = (
     Migration(version=1, name="ops_v1_initial_schema", statements=_V1),
     Migration(version=2, name="ops_v2_memory_item_account_id_nullable_and_thread_status_refs", statements=_V2),
@@ -685,4 +767,5 @@ MIGRATIONS = (
     Migration(version=5, name="ops_v5_meta_kv", statements=_V5),
     Migration(version=6, name="ops_v6_feed_post_translation_gate_verdict", statements=_V6),
     Migration(version=7, name="ops_v7_memory_relation_and_reviewed_ts", statements=_V7),
+    Migration(version=8, name="ops_v8_thread_created_by_nullable_and_author", statements=_V8),
 )

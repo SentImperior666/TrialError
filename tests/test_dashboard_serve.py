@@ -39,6 +39,7 @@ from trialerror.dashboard.doctor_run import doctor_state_path
 from trialerror.dashboard.store_ro import open_store_ro
 from trialerror.events.api import post_feed
 from trialerror.stores.store import open_store
+from tests._ports import free_port
 from tests._store_fixtures import populate_one_of_everything
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -46,15 +47,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 _TOKEN_META_RE = re.compile(r'<meta name="dashboard-write-token" content="([0-9a-f]+)">')
 
 
-def _free_port() -> int:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+def _wait_for_server(
+    host: str, port: int, *, timeout_s: float = 15.0, proc: "subprocess.Popen | None" = None
+) -> None:
+    """Poll ``GET /`` until the server answers.
 
-
-def _wait_for_server(host: str, port: int, *, timeout_s: float = 15.0) -> None:
+    ``proc`` is the server's own process (lane C, finding F7). A server that
+    lost the race for its port is already gone -- since M-LU-4 it asks for
+    ``SO_EXCLUSIVEADDRUSE``, so it dies rather than sharing -- and waiting the
+    full fifteen seconds to report that it "never came up" hides the cause.
+    If it has exited, say so, and say with what, at once."""
     deadline = time.time() + timeout_s
     last_exc: Exception | None = None
     while time.time() < deadline:
@@ -64,6 +66,12 @@ def _wait_for_server(host: str, port: int, *, timeout_s: float = 15.0) -> None:
                     return
         except (urllib.error.URLError, ConnectionError, OSError) as exc:
             last_exc = exc
+            if proc is not None and proc.poll() is not None:
+                raise AssertionError(
+                    f"the dashboard server exited with code {proc.returncode} before it answered on "
+                    f"{host}:{port} -- it never bound the port (the server log this test wrote says "
+                    f"why). Last client error: {last_exc}"
+                ) from exc
             time.sleep(0.2)
     raise AssertionError(f"dashboard server never came up on {host}:{port}: {last_exc}")
 
@@ -131,7 +139,7 @@ def seeded_program(tmp_path):
 def test_dashboard_serve_subprocess_smoke(seeded_program):
     program_root, platform_root, ids = seeded_program
     host = "127.0.0.1"
-    port = _free_port()
+    port = free_port()
 
     argv = [
         sys.executable, "-m", "trialerror.cli", "dashboard", "serve", "--foreground",
@@ -146,7 +154,7 @@ def test_dashboard_serve_subprocess_smoke(seeded_program):
     log_fh = open(log_path, "wb")
     proc = subprocess.Popen(argv, cwd=str(REPO_ROOT), stdout=log_fh, stderr=subprocess.STDOUT)
     try:
-        _wait_for_server(host, port)
+        _wait_for_server(host, port, proc=proc)
 
         # GET / -- the dashboard page itself. HALIDE shell: a persistent
         # rail (data-role="rail") with one data-panel button per surface,
@@ -190,16 +198,21 @@ def test_dashboard_serve_subprocess_smoke(seeded_program):
             "rooms-list", "rooms-turns",                                 # rooms
             "determ-list", "determ-detail",                              # determinations
             "dossier-registry-list", "dossier-detail",                   # dossier
+            "evidence-index", "evidence-detail", "evidence-filter",      # evidence (C6)
+            "evidence-count",
             "lexicon-index-list", "lexicon-detail",                      # lexicon
             "course-body",                                               # course
-            # console: one container per TEConsole.CARD_ORDER entry, plus the
-            # subbar's two readings. LEDGER and TIMELINE ship hidden until a
-            # renderer for them exists -- the HOOK is here either way, which is
-            # this page's rule: every container a renderer writes into is real
-            # markup, findable without executing a line of JS.
+            # console: TWO containers per TEConsole.CARD_ORDER entry -- the
+            # body, and the head slot where that card's own status reading
+            # goes -- plus the subbar's two readings. This page's rule: every
+            # container a renderer writes into is real markup, findable
+            # without executing a line of JS.
             "console-body-session", "console-body-pools", "console-body-ledger",
             "console-body-timeline", "console-body-jobs", "console-body-gates",
             "console-body-corpus", "console-body-doctor",
+            "console-head-session", "console-head-pools", "console-head-ledger",
+            "console-head-timeline", "console-head-jobs", "console-head-gates",
+            "console-head-corpus", "console-head-doctor",
             "console-asof", "console-health-tally",
         ):
             assert f'data-role="{role}"' in body, f"missing DOM hook data-role={role!r}"
@@ -210,13 +223,19 @@ def test_dashboard_serve_subprocess_smoke(seeded_program):
         # the renderer split (spec section 0): the page LOADS console_render.js
         # instead of carrying its renderers inline.
         assert '<script src="console_render.js"></script>' in body
+        assert '<script src="evidence_render.js"></script>' in body
 
-        # ...and the server serves that file, from the same static root as the
-        # stylesheet. A 404 here is a page whose Console never renders.
-        with urllib.request.urlopen(f"http://{host}:{port}/console_render.js", timeout=5) as resp:
-            assert resp.status == 200
-            js_body = resp.read().decode("utf-8")
-        assert "TEConsole" in js_body
+        assert '<script src="feed_render.js"></script>' in body
+
+        # ...and the server serves those files, from the same static root as
+        # the stylesheet. A 404 here is a page whose Console never renders, or
+        # a Feed that silently falls back to a flat list -- neither of which
+        # reports anything to the operator looking at it.
+        for name, global_name in (("console_render.js", "TEConsole"), ("feed_render.js", "TEFeed")):
+            with urllib.request.urlopen(f"http://{host}:{port}/{name}", timeout=5) as resp:
+                assert resp.status == 200, name
+                js_body = resp.read().decode("utf-8")
+            assert global_name in js_body, name
 
         # GET a static asset (the external stylesheet) -- proves the
         # document-root static serving works, not just the "/" rewrite --
@@ -240,7 +259,8 @@ def test_dashboard_serve_subprocess_smoke(seeded_program):
             all_payload = json.loads(resp.read().decode("utf-8"))
         assert set(all_payload["panels"]) == {
             "session", "budget", "jobs", "gates", "corpus", "doctor",
-            "feed", "rooms", "determinations", "dossier", "lexicon", "course", "since_you_left",
+            "feed", "rooms", "determinations", "dossier", "evidence", "lexicon", "course",
+            "since_you_left",
         }
         assert all_payload["meta"]["program_root"] == str(program_root)
 
@@ -257,6 +277,40 @@ def test_dashboard_serve_subprocess_smoke(seeded_program):
         ) as resp:
             feed_scoped = json.loads(resp.read().decode("utf-8"))
         assert feed_scoped["active_thread_id"] == ids["thread"]
+
+        # C6 -- the Evidence route, and the selectors it resolves.
+        with urllib.request.urlopen(f"http://{host}:{port}/dashboard/api/evidence", timeout=5) as resp:
+            assert resp.status == 200
+            evidence_panel = json.loads(resp.read().decode("utf-8"))
+        assert evidence_panel["status"] == "ok"
+        assert evidence_panel["active_claim_id"] == ids["claim"]
+
+        # the TRACE entry point from a search-result row: an anchor id and
+        # nothing else, which is all `citation.anchor` carries.
+        with urllib.request.urlopen(
+            f"http://{host}:{port}/dashboard/api/evidence?anchor_id={ids['quote_anchor']}", timeout=5
+        ) as resp:
+            assert resp.status == 200
+            traced_panel = json.loads(resp.read().decode("utf-8"))
+        assert traced_panel["active_claim_id"] == ids["claim"]
+
+        # an id that resolves to nothing is 200 with a READING, never a 404 --
+        # a young corpus has anchors nobody has made a claim on yet.
+        with urllib.request.urlopen(
+            f"http://{host}:{port}/dashboard/api/evidence?claim_id=CLM-nope", timeout=5
+        ) as resp:
+            assert resp.status == 200
+            missing_panel = json.loads(resp.read().decode("utf-8"))
+        assert missing_panel["status"] == "ok"
+        assert missing_panel["active_claim_id"] is None
+        assert missing_panel["not_found"] == {"kind": "claim_id", "id": "CLM-nope"}
+        assert missing_panel["index"], "the rail still renders -- only the selection failed"
+
+        # and the renderer that panel needs is served, exactly like console_render.js
+        with urllib.request.urlopen(f"http://{host}:{port}/evidence_render.js", timeout=5) as resp:
+            assert resp.status == 200
+            ev_js = resp.read().decode("utf-8")
+        assert "TEEvidence" in ev_js
 
         # the search endpoint: empty query -> a well-formed, empty result,
         # never an error.
@@ -400,7 +454,7 @@ def seeded_program_with_ext_panel(tmp_path):
 def test_dashboard_serve_ext_panel_subprocess_smoke(seeded_program_with_ext_panel):
     program_root, platform_root, ids = seeded_program_with_ext_panel
     host = "127.0.0.1"
-    port = _free_port()
+    port = free_port()
 
     argv = [
         sys.executable, "-m", "trialerror.cli", "dashboard", "serve", "--foreground",
@@ -412,7 +466,7 @@ def test_dashboard_serve_ext_panel_subprocess_smoke(seeded_program_with_ext_pane
     log_fh = open(log_path, "wb")
     proc = subprocess.Popen(argv, cwd=str(REPO_ROOT), stdout=log_fh, stderr=subprocess.STDOUT)
     try:
-        _wait_for_server(host, port)
+        _wait_for_server(host, port, proc=proc)
 
         # the listing: both fixture panels, sorted by order, error-free at
         # the manifest stage (the broken one only fails once build_panel
@@ -451,7 +505,8 @@ def test_dashboard_serve_ext_panel_subprocess_smoke(seeded_program_with_ext_pane
             all_payload = json.loads(resp.read().decode("utf-8"))
         assert set(all_payload["panels"]) == {
             "session", "budget", "jobs", "gates", "corpus", "doctor",
-            "feed", "rooms", "determinations", "dossier", "lexicon", "course", "since_you_left", "ext",
+            "feed", "rooms", "determinations", "dossier", "evidence", "lexicon", "course",
+            "since_you_left", "ext",
         }
         assert all_payload["panels"]["ext"]["job_count"] == {"status": "ok", "job_count": 1}
         assert all_payload["panels"]["ext"]["broken"]["status"] == "ext_error"
@@ -497,15 +552,52 @@ def seeded_program_with_gate_edit(tmp_path):
     )
     gate = open_gate(store, artifact_id=artifact["artifact_id"])
     submit_gate(store, gate_id=gate["gate_id"], by_launch=ids["launch"])
+    # TWO blocking edits (C7): the loop verifies one and sends the other
+    # BACK, and neither round trip may depend on the other having run.
     verdict = record_verdict(
         store, gate_id=gate["gate_id"], verdict="PASS_WITH_EDITS", critic_launch=ids["launch"],
-        edits=[{"text": "fix the tally", "blocking": True}],
+        edits=[{"text": "fix the tally", "blocking": True}, {"text": "the caption is wrong", "blocking": True}],
     )
-    edit_id = json.loads(verdict["edits"])[0]["edit_id"]
+    decoded_edits = json.loads(verdict["edits"])
+    edit_id = decoded_edits[0]["edit_id"]
+
+    # C7: a real committed pre-registration, escrow file and all --
+    # populate_one_of_everything inserts the ROW only, and a reveal of that
+    # would refuse (unreadable escrow) rather than exercise the success path.
+    from trialerror.verify.prereg import commit_prereg
+
+    prereg = commit_prereg(
+        store, title="the e2e sealed thing", procedure="run it twice and compare", params={"n": 2}
+    )
     store.close()
+
+    # C7: one open memory-conflict group, built the way the real harness makes
+    # one -- two accounts reconciled through the markdown export/import
+    # boundary, never a shared ops.db.
+    from trialerror.memory.api import put_item
+    from trialerror.memory.render import export_memory, import_memory
+    from tests._memory_fixtures import make_account
+
+    other_root = tmp_path / "other_program"
+    other_root.mkdir()
+    other = open_store(other_root, platform_root=platform_root)
+    mine = open_store(program_root, platform_root=platform_root)
+    try:
+        put_item(other, key="e2e-topic", tier="L0", kind="rule", body="THEIR body",
+                 account_id=make_account(other, label="other account"))
+        put_item(mine, key="e2e-topic", tier="L0", kind="rule", body="MY body",
+                 account_id=make_account(mine, label="my account"))
+        export_dir = tmp_path / "memory_export"
+        export_memory(other, out_dir=export_dir)
+        ids["memory_group"] = import_memory(mine, in_dir=export_dir).conflicts[0]["group_id"]
+    finally:
+        other.close()
+        mine.close()
 
     ids["edit_gate_id"] = gate["gate_id"]
     ids["edit_id"] = edit_id
+    ids["send_back_edit_id"] = decoded_edits[1]["edit_id"]
+    ids["committed_prereg"] = prereg["prereg_id"]
     ids["edit_artifact_id"] = artifact["artifact_id"]
     return program_root, platform_root, ids
 
@@ -520,7 +612,7 @@ def test_dashboard_write_actions_full_loop_subprocess(seeded_program_with_gate_e
     path)."""
     program_root, platform_root, ids = seeded_program_with_gate_edit
     host = "127.0.0.1"
-    port = _free_port()
+    port = free_port()
 
     argv = [
         sys.executable, "-m", "trialerror.cli", "dashboard", "serve", "--foreground",
@@ -532,7 +624,7 @@ def test_dashboard_write_actions_full_loop_subprocess(seeded_program_with_gate_e
     log_fh = open(log_path, "wb")
     proc = subprocess.Popen(argv, cwd=str(REPO_ROOT), stdout=log_fh, stderr=subprocess.STDOUT)
     try:
-        _wait_for_server(host, port)
+        _wait_for_server(host, port, proc=proc)
         write_token = _get_write_token(host, port)
 
         # ---- 1) post directive -> appears in the feed panel ---------------
@@ -554,6 +646,35 @@ def test_dashboard_write_actions_full_loop_subprocess(seeded_program_with_gate_e
         # authorship is server-derived").
         assert posted_row["author"].startswith("orchestrator:")
         assert posted_row["author"] == posted["result"]["author"]
+
+        # ---- 1b) REPLY IN THREAD -> the reply lands UNDER its parent -------
+        # The whole of lane C item B on the wire: one extra field on the same
+        # write action, and the panel comes back with the structure derived.
+        reply_body = "operator reply: the tally is short by one"
+        status, replied = _post_json(
+            host, port, "/dashboard/api/write/feed-post",
+            {"thread_id": ids["thread"], "body": reply_body, "in_reply_to": posted["result"]["post_id"]},
+            token=write_token,
+        )
+        assert status == 200
+        assert replied["ok"] is True
+
+        with urllib.request.urlopen(f"http://{host}:{port}/dashboard/api/feed?thread_id={ids['thread']}", timeout=5) as resp:
+            threaded_panel = json.loads(resp.read().decode("utf-8"))
+        by_id = {p["post_id"]: p for p in threaded_panel["posts"]}
+        parent = by_id[posted["result"]["post_id"]]
+        child = by_id[replied["result"]["post_id"]]
+        assert parent["reply_count"] == 1
+        assert child["reply_to"] == parent["post_id"]
+        assert child["depth"] == parent["depth"] + 1
+        assert child["root_post_id"] == parent["root_post_id"]
+        assert child["reply_to_missing"] is False
+        # the reading order puts it directly after its parent, and the rail's
+        # own count sees it too.
+        seq = threaded_panel["order_threaded"]
+        assert seq.index(child["post_id"]) == seq.index(parent["post_id"]) + 1
+        thread_row = next(t for t in threaded_panel["threads"] if t["thread_id"] == ids["thread"])
+        assert thread_row["thread_reply_count"] == 1
 
         # sanity: BEFORE verifying, the edit is a live, blocking
         # determination item.
@@ -581,7 +702,10 @@ def test_dashboard_write_actions_full_loop_subprocess(seeded_program_with_gate_e
         # sweep §3.10 item 3 (spec §5.1): `edits` arrives DECODED -- no
         # client-side JSON.parse of a value the server just serialized.
         assert isinstance(pending_row["edits"], list)
-        assert pending_row["unverified_count"] == 0
+        # One of the gate's TWO blocking edits is verified; the other is the
+        # one step 3 sends back. The count is per-gate, so it is 1, not 0 --
+        # and that is the reading an operator needs: this gate is not clear.
+        assert pending_row["unverified_count"] == 1
         edit_row = next(e for e in pending_row["edits"] if e["edit_id"] == ids["edit_id"])
         assert edit_row["verified"] is True
         assert edit_row["applied"] is True
@@ -595,6 +719,102 @@ def test_dashboard_write_actions_full_loop_subprocess(seeded_program_with_gate_e
             determ_after = json.loads(resp.read().decode("utf-8"))
         gate_edit_ids_after = {i["id"] for i in determ_after["items"] if i["kind"] == "gate_edit"}
         assert f"{ids['edit_gate_id']}::{ids['edit_id']}" not in gate_edit_ids_after
+
+        # ---- 3) C7: send the OTHER edit back ------------------------------
+        send_back_item_id = f"{ids['edit_gate_id']}::{ids['send_back_edit_id']}"
+        status, sent_back = _post_json(
+            host, port, "/dashboard/api/write/gate-send-back",
+            {
+                "gate_id": ids["edit_gate_id"], "edit_id": ids["send_back_edit_id"],
+                "by_launch": ids["launch"], "note": "the caption names the wrong figure",
+            },
+            token=write_token,
+        )
+        assert status == 200
+        assert sent_back["ok"] is True, sent_back
+
+        with urllib.request.urlopen(f"http://{host}:{port}/dashboard/api/determinations", timeout=5) as resp:
+            determ_sent_back = json.loads(resp.read().decode("utf-8"))
+        row = next(i for i in determ_sent_back["items"] if i["id"] == send_back_item_id)
+        # It STAYS in the queue -- a sent-back edit is an unverified one, and
+        # the union is still refused. What changed is that the objection is
+        # now on the item for the next operator to read.
+        assert row["sent_back"] is True
+        assert row["sent_back_note"] == "the caption names the wrong figure"
+        assert row["sent_back_by_launch"] == ids["launch"]
+
+        # ---- 4) C7: resolve a memory conflict -----------------------------
+        with urllib.request.urlopen(f"http://{host}:{port}/dashboard/api/determinations", timeout=5) as resp:
+            determ_mem = json.loads(resp.read().decode("utf-8"))
+        mem_item = next(i for i in determ_mem["items"] if i["kind"] == "memory_conflict")
+        assert mem_item["id"] == ids["memory_group"]
+        # both sides arrive with their BODIES -- the choice is not decidable
+        # from a version count (C7 enrichment).
+        assert {v["side"] for v in mem_item["versions"]} == {"left", "right"}
+        assert {v["body"] for v in mem_item["versions"]} == {"MY body", "THEIR body"}
+
+        status, resolved = _post_json(
+            host, port, "/dashboard/api/write/memory-resolve",
+            {"group_id": ids["memory_group"], "keep": "left"}, token=write_token,
+        )
+        assert status == 200
+        assert resolved["ok"] is True, resolved
+        assert resolved["result"]["keep"] == "left"
+
+        with urllib.request.urlopen(f"http://{host}:{port}/dashboard/api/determinations", timeout=5) as resp:
+            determ_resolved = json.loads(resp.read().decode("utf-8"))
+        assert not [i for i in determ_resolved["items"] if i["kind"] == "memory_conflict"], \
+            "a resolved group leaves the queue"
+
+        # ---- 5) C7: reveal a pre-registration -----------------------------
+        prereg_item = next(
+            i for i in determ_resolved["items"]
+            if i["kind"] == "prereg_reveal" and i["id"] == ids["committed_prereg"]
+        )
+        # hashes only, before the reveal (REDESIGN 5.4)
+        assert prereg_item["procedure_sha256"] and prereg_item["params_sha256"]
+        assert prereg_item["escrow_present"] is True
+        assert "procedure" not in prereg_item and "params" not in prereg_item
+
+        status, revealed = _post_json(
+            host, port, "/dashboard/api/write/prereg-reveal",
+            {"prereg_id": ids["committed_prereg"]}, token=write_token,
+        )
+        assert status == 200
+        assert revealed["ok"] is True, revealed
+        assert revealed["result"]["procedure"] == "run it twice and compare"
+        assert revealed["result"]["params"] == {"n": 2}
+        # dest_dir is the SERVER's choice, never the browser's
+        assert Path(revealed["result"]["revealed_path"]).parent == program_root / "prereg" / "revealed"
+
+        with urllib.request.urlopen(f"http://{host}:{port}/dashboard/api/determinations", timeout=5) as resp:
+            determ_revealed = json.loads(resp.read().decode("utf-8"))
+        assert ids["committed_prereg"] not in {
+            i["id"] for i in determ_revealed["items"] if i["kind"] == "prereg_reveal"
+        }, "a revealed pre-registration leaves the queue"
+
+        # ---- 6) C7 (ops v8): open a thread and post the first message -----
+        status, thread = _post_json(
+            host, port, "/dashboard/api/write/thread-create",
+            {"title": "opened from the dashboard", "body": "the first thing said in it"},
+            token=write_token,
+        )
+        assert status == 200
+        assert thread["ok"] is True, thread
+        assert thread["result"]["author"] == f"orchestrator:{ids['session']}"
+
+        with urllib.request.urlopen(
+            f"http://{host}:{port}/dashboard/api/feed?thread_id={thread['result']['thread_id']}", timeout=5
+        ) as resp:
+            new_thread_panel = json.loads(resp.read().decode("utf-8"))
+        assert new_thread_panel["active_thread_id"] == thread["result"]["thread_id"]
+        assert [p["body"] for p in new_thread_panel["posts"]] == ["the first thing said in it"]
+        opened = next(
+            t for t in new_thread_panel["threads"] if t["thread_id"] == thread["result"]["thread_id"]
+        )
+        assert opened["title"] == "opened from the dashboard"
+        assert opened["created_by_launch"] is None
+        assert opened["created_by"] == thread["result"]["author"]
     finally:
         proc.terminate()
         try:
@@ -856,7 +1076,7 @@ def test_all_route_is_200_with_platform_db_absent(seeded_program_without_platfor
     every other panel is intact."""
     program_root, platform_root, _ids = seeded_program_without_platform_db
     host = "127.0.0.1"
-    port = _free_port()
+    port = free_port()
 
     argv = [
         sys.executable, "-m", "trialerror.cli", "dashboard", "serve", "--foreground",
@@ -868,7 +1088,7 @@ def test_all_route_is_200_with_platform_db_absent(seeded_program_without_platfor
     log_fh = open(log_path, "wb")
     proc = subprocess.Popen(argv, cwd=str(REPO_ROOT), stdout=log_fh, stderr=subprocess.STDOUT)
     try:
-        _wait_for_server(host, port)
+        _wait_for_server(host, port, proc=proc)
 
         with urllib.request.urlopen(f"http://{host}:{port}/dashboard/api/all", timeout=10) as resp:
             assert resp.status == 200
@@ -914,7 +1134,7 @@ def test_read_only_gets_produce_zero_changed_events(seeded_program):
     attributed to ``ops`` -- proving the watcher is quiet, not deaf."""
     program_root, platform_root, ids = seeded_program
     host = "127.0.0.1"
-    port = _free_port()
+    port = free_port()
     poll, debounce = 0.2, 0.3
 
     argv = [
@@ -928,7 +1148,7 @@ def test_read_only_gets_produce_zero_changed_events(seeded_program):
     proc = subprocess.Popen(argv, cwd=str(REPO_ROOT), stdout=log_fh, stderr=subprocess.STDOUT)
     sse = None
     try:
-        _wait_for_server(host, port)
+        _wait_for_server(host, port, proc=proc)
         sse = _SseClient(host, port)
         sse.read_for(0.5)  # the hello frame
         assert b"event: hello" in sse.buf

@@ -16,6 +16,7 @@ from pathlib import Path
 
 from trialerror.cli import main
 from trialerror.stores.store import open_store
+from tests._ports import free_port
 from tests._store_fixtures import populate_one_of_everything
 
 
@@ -27,14 +28,6 @@ def _run(argv, capsys):
 
 def _common_args(program_root, platform_root):
     return ["--program-root", str(program_root), "--platform-root", str(platform_root)]
-
-
-def _free_port() -> int:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 def test_dashboard_export_cli_round_trip(program_root, platform_root, tmp_path, capsys):
@@ -85,7 +78,7 @@ def test_dashboard_serve_detached_spawn_returns_pid_and_url(program_root, platfo
     populate_one_of_everything(store)
     store.close()
 
-    port = _free_port()
+    port = free_port()
     log_dir = tmp_path / "logs"
     pid = None
     try:

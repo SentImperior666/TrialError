@@ -398,6 +398,11 @@ PANEL_QUERY_PARAMS: dict[str, tuple[tuple[str, str], ...]] = {
     "rooms": (("room_id", "room_id"),),
     "dossier": (("artifact_id", "artifact_id"),),
     "since_you_left": (("since", "since"),),
+    # C6, and the entry the tuple shape was widened FOR: a TRACE from a
+    # search-result row sends `anchor_id` and nothing else, so the route
+    # cannot choose between the three -- it hands over whichever are present
+    # and build_evidence_panel applies spec section 1.2's order.
+    "evidence": (("claim_id", "claim_id"), ("anchor_id", "anchor_id"), ("chunk_id", "chunk_id")),
 }
 
 

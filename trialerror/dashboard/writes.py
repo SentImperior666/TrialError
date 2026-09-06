@@ -47,12 +47,18 @@ below therefore REQUIRES the caller to name a real launch, the same as the
 always calls ``trialerror.events.api.post_feed`` with ``launch_id=None`` -- it
 NEVER accepts a caller-supplied author, and always posts as
 ``orchestrator:<open session>`` (:func:`trialerror.events.api._derive_author`'s
-own fallback). Opening a NEW thread is deliberately not offered here:
-``trialerror.events.api.create_thread`` requires a real ``launch_id``
-(``thread.created_by_launch NOT NULL`` -- that module's own docstring notes
-this is a schema constraint this lane has no license to relax), which an
-orchestrator-identity post has none of; posting into an EXISTING thread is
-the one legitimate no-launch write this subsystem supports.
+own fallback).
+
+**Opening a NEW thread is now offered too** (``thread-create``, lane C step
+C7). It was not, and the reason stood in this docstring: ``create_thread``
+required a real ``launch_id`` because ``thread.created_by_launch`` was NOT
+NULL, which an orchestrator identity has none of -- a schema constraint the
+lane that wrote that line had no licence to relax. **ops v8**
+(``ops_v8_thread_created_by_nullable_and_author``) relaxes it and gives
+``thread`` the same derived ``created_by`` a post carries; ruling L-C1 is the
+licence. Authorship is still server-derived and never caller-settable, so the
+guarantee that used to be enforced by "you cannot do this at all" is now
+enforced the same way ``feed-post``'s always was.
 
 Every function below returns a plain, JSON-serializable ``dict`` -- never an
 :mod:`trialerror.util.envelope` ``AgentEnvelope`` (that shape is CLI/argv
@@ -204,6 +210,131 @@ def _do_feed_post(store: Store, body: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Lane C (C7): the four actions the Determinations queue drew disabled.
+# Spec section 4; rulings L-C2 (identity), L-C3 (reveal), L-C6 (no REJECT).
+# ---------------------------------------------------------------------------
+
+
+def _do_prereg_reveal(store: Store, body: dict[str, Any]) -> dict[str, Any]:
+    """Un-blind one pre-registration (ruling L-C3).
+
+    The most consequential button on this dashboard: a reveal ends the blind
+    and cannot be undone. Three guards, and none of them is the browser's to
+    relax.
+
+    **``dest_dir`` is never read from the body.** The module takes an optional
+    destination and this function does not pass one, so a reveal always lands
+    under ``program_root / "prereg" / "revealed"``. An HTTP caller naming a
+    write path is a path-traversal primitive, not a feature -- the same reason
+    EXPORT TRANSCRIPT stays disabled (12.12).
+
+    **The audit row belongs to the module, not to this layer.**
+    ``reveal_prereg`` emits ``prereg_revealed`` itself (carrying the two
+    COMMITTED HASHES, never the revealed content), so a CLI reveal and a
+    browser reveal leave the identical record. All this adds is ``session_id``
+    -- the dashboard's own session, so the log says which sitting broke the
+    blind.
+
+    **A tampered escrow is a FINDING, not a server fault.**
+    ``PreregTamperedError`` voids the row as a side effect and surfaces here as
+    a clean ``{"ok": false}`` with the module's own message; ``VerifyError`` is
+    in :data:`_EXPECTED_ERRORS` precisely so it can never reach the HTTP layer
+    as a 500.
+
+    The two-click confirm is the CLIENT's guard and is deliberately not
+    duplicated here. A confirm token on the wire would be one more thing to
+    forge; this endpoint's real protection is the write token, and the
+    irreversibility being stated before the first click."""
+    from trialerror.verify.prereg import reveal_prereg
+
+    return reveal_prereg(store, prereg_id=body["prereg_id"], session_id=_clean(body.get("session_id")))
+
+
+def _do_memory_resolve(store: Store, body: dict[str, Any]) -> dict[str, Any]:
+    """Resolve one memory-sync conflict group: KEEP LEFT / KEEP RIGHT /
+    KEEP BOTH.
+
+    ``keep`` is validated by ``resolve_conflict`` itself -- a ``ValueError``
+    naming the three legal values -- not here: this layer would only be a
+    second copy of a rule that already exists, and two copies drift. The same
+    call refuses a group that is already resolved, so a double-click cannot
+    quietly re-answer it differently."""
+    from trialerror.memory.merge import resolve_conflict
+
+    return resolve_conflict(store, group_id=body["group_id"], keep=body["keep"])
+
+
+def _do_gate_send_back(store: Store, body: dict[str, Any]) -> dict[str, Any]:
+    """Object to a critic's edit and send it back -- the non-destructive
+    counterpart to ``verify-edit``.
+
+    All four fields are required, ``note`` included: a send-back with no stated
+    objection is the freeze-without-reason case, and whoever has to redo the
+    work needs to know what was wrong with it.
+
+    ``by_launch`` is still free text on the wire (interim rule L-C2), and
+    ``send_back_edit`` refuses an id with no ``platform.launch`` row --
+    ``XidTargetMissingError``, surfaced verbatim. It never falls back to some
+    other identity: an unattributable objection is worse than a refused one.
+    A platform-level operator identity is a separate lane.
+
+    REJECT (``gated -> failed``) is deliberately NOT offered (ruling L-C6): a
+    destructive verb driven by a free-text identity is not auditable, so it
+    stays a CLI verdict path until L-C2 lands properly."""
+    return gates_api.send_back_edit(
+        store,
+        gate_id=body["gate_id"],
+        edit_id=body["edit_id"],
+        by_launch=body["by_launch"],
+        note=body["note"],
+    )
+
+
+def _do_thread_create(store: Store, body: dict[str, Any]) -> dict[str, Any]:
+    """Open a new feed thread AND post the first message into it.
+
+    The module docstring above used to explain why this action could not
+    exist: ``thread.created_by_launch`` was NOT NULL and an orchestrator
+    identity has no launch. **ops v8** made the column nullable and gave
+    ``thread`` the same derived ``created_by`` a post already carries, so the
+    operator can now OPEN a thread exactly as they could always post into one.
+    Authorship stays server-derived and is never caller-settable
+    (``launch_id=None``, like :func:`_do_feed_post`).
+
+    A first post is REQUIRED. An empty thread is a room with nobody in it, and
+    both the feed rail and anything reading ``list_threads`` would show it as
+    something to act on.
+
+    **Two auto-commits, not one transaction -- and that is the safer choice
+    here.** ``create_thread`` commits, then ``post_feed`` commits. A crash
+    between them leaves a VISIBLE EMPTY THREAD: recoverable, obvious in the
+    rail, and strictly better than the alternative failure (a post with no
+    thread) that ordering the other way round would produce. Making it atomic
+    would need transaction-scoped variants of two functions several other
+    callers already use, to buy protection against the milder of the two
+    outcomes."""
+    thread = events_api.create_thread(
+        store,
+        title=body["title"],
+        launch_id=None,
+        session_id=_clean(body.get("session_id")),
+    )
+    post = events_api.post_feed(
+        store,
+        thread_id=thread["thread_id"],
+        body=body["body"],
+        launch_id=None,
+        session_id=_clean(body.get("session_id")),
+    )
+    return {
+        "thread_id": thread["thread_id"],
+        "post_id": post["post_id"],
+        "author": thread["created_by"],
+        "ts": thread["created_ts"],
+    }
+
+
 def _do_feed_translate(store: Store, body: dict[str, Any]) -> dict[str, Any]:
     """ENQUEUE a plain-English translation job for one post or one thread.
     Never translates inline: the operator's click books work on the M2
@@ -261,6 +392,11 @@ WRITABLE_ACTIONS: dict[str, Callable[[Store, dict[str, Any]], dict[str, Any]]] =
     "room-freeze": _do_room_freeze,
     "feed-post": _do_feed_post,
     "feed-translate": _do_feed_translate,
+    # lane C (C7): the four the Determinations queue used to draw disabled.
+    "prereg-reveal": _do_prereg_reveal,
+    "memory-resolve": _do_memory_resolve,
+    "gate-send-back": _do_gate_send_back,
+    "thread-create": _do_thread_create,
 }
 
 REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
@@ -277,6 +413,14 @@ REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     # validated inside the handler instead, where a ValueError becomes the
     # same clean {"ok": false, "message": ...} refusal (_EXPECTED_ERRORS).
     "feed-translate": (),
+    # lane C (C7).
+    "prereg-reveal": ("prereg_id",),
+    "memory-resolve": ("group_id", "keep"),
+    # note is required on purpose: a send-back with no stated objection is
+    # the freeze-without-reason case (spec section 4).
+    "gate-send-back": ("gate_id", "edit_id", "by_launch", "note"),
+    # body is required: an empty thread is a room with nobody in it.
+    "thread-create": ("title", "body"),
 }
 
 

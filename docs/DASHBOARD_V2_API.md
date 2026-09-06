@@ -145,6 +145,58 @@ Notes:
 - `translator_table_available` — `true`/`false`. Grey out or hide the `TRANSLATE ▾` affordance entirely on a program whose `ops.db` predates schema v4.
 - `translation_withheld_count` — how many posts in this thread the gate withheld. Surface it near the panel chrome: a withheld translation is invisible by design, so without this number a systematically broken translator looks exactly like one nobody ran. `trialerror doctor` reports the program-wide figure as `feed_translation_failures`.
 
+### 2.1 Threading (lane C item B)
+
+Added by lane C, step C8, on the operator's walkthrough complaint: *"messages
+are not structured by their relationships"*. `feed_post.in_reply_to` was on
+every row and in no payload. **No migration** — the column, its self-FK and
+`post_feed`'s `in_reply_to=` parameter all predate this; only the reading is
+new.
+
+Per post, beside the fields above:
+
+```json
+{
+  "reply_to": "POST-01M178QK2BB04BVB746XJXZ28C",
+  "reply_to_missing": false,
+  "depth": 1,
+  "root_post_id": "POST-01M178QK2BB04BVB746XJXZ28C",
+  "reply_count": 2
+}
+```
+
+Per panel:
+
+```json
+{ "order_threaded": ["POST-...root", "POST-...reply", "POST-...deeper", "POST-...root2"] }
+```
+
+and, on every entry of `threads[]`, `"thread_reply_count": 3`.
+
+- `posts` is **unchanged**: still arrival order (`ts ASC, rowid ASC`), still the append-only truth. Threading is a second reading of the same list, never a reshuffle of it — which is what makes the AS IT ARRIVED view a render of `posts` verbatim rather than a second server query.
+- `order_threaded` — DFS pre-order: roots by `(ts, rowid)`, each post's children by `(ts, rowid)`. Every post in `posts` appears exactly once. `[]` for a thread with no posts. Render the threaded view by walking this list and indenting each card by its own `depth`; you never need to build the tree client-side.
+- `reply_to` — the parent id, an alias of the raw `in_reply_to` column (which is still there). Read `reply_to`.
+- `depth` — 0 for a root, +1 per parent **that is present in this thread**. A client that indents should cap the visual indent (the shipped renderer caps at 4 rails) while still reporting the true depth.
+- `root_post_id` — the top of this post's chain; its own id for a root. This is the key a collapse control toggles on: hiding a root's subtree is `depth > 0 && collapsed[root_post_id]`.
+- `reply_count` — **direct children only**, inside this thread. Not the subtree. A card's own head says how many posts answer *it*; a collapse control that hides a whole subtree must count the subtree itself (the shipped renderer derives that client-side from `root_post_id`, where the visible set is known).
+- `reply_to_missing` — `true` when `reply_to` is set but that post is **not in this thread**. Two causes, reported identically because the client's answer is the same for both:
+  - a **cross-thread parent** — `feed_post.in_reply_to` is a plain self-FK with no same-thread constraint, so this row is entirely legal;
+  - a **cycle** — SQLite enforces that the parent EXISTS, never that the graph is acyclic, so a hand-written row or a restore that renumbered ids can close a loop. Every post in (or leading into) a cycle is cut loose and reported this way, which is what makes the traversal terminate by construction rather than by a depth cap.
+
+  Such a post gets `depth: 0` and is its own `root_post_id`, and **it is in `order_threaded`**. Ruling L-C4 is explicit: render it at root level with the flag visible, **never drop it**. `reply_to` still carries the id it pointed at — the flag explains, it does not erase.
+- `thread_reply_count` (on each `threads[]` entry) — posts in that thread with a non-null `in_reply_to`, from one `GROUP BY` over the whole table rather than a query per rail row. Counts the RAW column, so a cross-thread or cycle parent still counts here even though the active thread reports it as `reply_to_missing`: the honest reading of a thread nobody has opened is "posts written as answers".
+
+**Client contract (`static/feed_render.js`, `window.TEFeed`).** The reading
+order is a per-viewer browser preference in `localStorage`
+(`trialerror.dashboard.feed.order`), **THREADED by default** (L-C4) — never
+server state, and never a query parameter. `GET /dashboard/api/feed` has no
+`order` parameter and will not get one: both orders are the same payload read
+two ways.
+
+A bundle exported before this build has `posts` and no `order_threaded`; the
+renderer degrades to arrival order rather than to an empty page, and reads
+`in_reply_to` when `reply_to` is absent. Do the same in any other client.
+
 ## 3. Rooms — `GET /dashboard/api/rooms[?room_id=ROOM-...]`
 
 ```json
@@ -448,7 +500,13 @@ Notes:
 - No dedicated "corpus stats for the empty state" field is added here — reuse the pre-existing `corpus` panel (`GET /dashboard/api/corpus`) for the `Search.dc.html` empty-state counts strip; fetching it alongside `search` on page load is cheap and keeps this route's contract narrow.
 - Facet filters (`source_ids`/`kind`/`license_tier`/`year`) map straight onto `SearchRequest.filters`; an over-narrow filter (matches zero chunks) is a well-formed empty result, never an error.
 
-## 10. Schema migration summary (ops_v4, plus ops_v6)
+## 10. Schema migration summary (ops_v4, plus ops_v6 — and §15.4 for ops_v8)
+
+**This section is not the whole migration history.** It covers the two this
+build authored. Since then ops.db has taken **v7** (the mining-adoptions
+lane's `memory_relation` / `reviewed_ts` table) and **v8** (lane C's
+`thread` rebuild — nullable `created_by_launch`, new `created_by`), which is
+documented at §15.4 with its ruling and its dev-store hazard. Read both.
 
 Note (B1, fix pass): this migration was authored as "ops_v5" against this
 lane's branch point, but master independently landed its own, unrelated
@@ -685,6 +743,14 @@ Body: `{"thread_id", "body"}` required; `"session_id"`/`"in_reply_to"`
 optional. Success `result`: `{"post_id", "thread_id", "author", "ts"}` —
 `author` always starts `"orchestrator:"`.
 
+`in_reply_to` is REPLY IN THREAD's entire effect on the wire (§2.1, lane C
+C8): pass the parent's `post_id` to land the new post under it, or `null` /
+omit it for a plain thread post. It is stored verbatim; the reply structure
+every reader sees is derived from it at read time, so nothing here needs to
+know about `depth` or `order_threaded`. The value is not validated against the
+target thread — a cross-thread parent is legal, and the feed panel reports it
+as `reply_to_missing` rather than refusing the write.
+
 ### 12.10 `POST /dashboard/api/write/feed-translate`
 
 Added by lane-b-translator. ENQUEUES a `feed_translate` job on the M2
@@ -724,6 +790,14 @@ present in every `/dashboard/api/all` response).
 
 ### 12.12 What stays disabled, and why
 
+> **Four of the rows below are superseded by section 15 (lane C, C7).** SEND
+> BACK on a gate edit, both buttons on a `prereg_reveal`, both on a
+> `memory_conflict`, and "opening a NEW thread" are all wired now — the last
+> of them by **ops v8**, which removed the `NOT NULL` this table cites as the
+> reason. The rows are kept rather than deleted, so the reasoning that held
+> until C7 stays readable; section 15 is the current contract. REJECT
+> specifically was NOT wired (ruling L-C6) and is drawn nowhere.
+
 Every button the V2 design drew that this build does NOT wire stays
 disabled in the UI with a `title` naming the reason, per action kind:
 
@@ -757,3 +831,501 @@ audit trail; none of the routes above add a second one:
 | `feed-post` | None dedicated — `feed_post` itself IS the durable, queryable row (same posture as `verify-edit`: the mutation is its own record; nothing else in this codebase treats "a row was inserted" as needing a second event mirror). |
 | `feed-translate` | None dedicated — the enqueued `job` row and its `job_event` trail (`trialerror.jobs.ledger.enqueue` writes an `enqueued` job event) ARE the record; the translation row it eventually produces carries its own `gate_status`/`gate_reasons` audit. |
 | `doctor/run` | None — writes only its own sidecar state file (`trialerror.dashboard.doctor_run`), never the program's real stores. |
+
+---
+
+## 13. Console panel additions (lane C step C5 / bug-sweep batch K4)
+
+Everything in this section is **additive**. No field named anywhere above
+changed shape or meaning, and every existing per-field test kept passing
+without an edit — which is the property that lets the Console be rewritten
+without a flag day.
+
+The rule these fields exist to satisfy: **every card is a pure function of
+the `/dashboard/api/all` bundle.** A reading the page computes from rows the
+bundle does not carry is a reading the static export cannot draw, so
+anything the Console needs is a field, not a client convention.
+
+### 13.1 `jobs` panel — decoded columns, subject, duration, offload
+
+`recent_jobs[]` gains four things (`build_jobs_panel`, `data.py`):
+
+| field | shape | notes |
+|---|---|---|
+| `payload` | object (was a JSON **string**) | `_decode_json_text`: unparseable text stays a string, so a column holding a plain note survives untouched. |
+| `checkpoint` | object (was a JSON **string**) | same rule. The ingest checkpoint (`rows_ingested`, `current_member`, …) used to reach a table cell as one long JSON string — the single least readable thing on the page (console-3). |
+| `subject` | string \| null | `_job_subject(payload)`: `handler` → `doc_id` → `source_id` → the basename of `zip_path`/`path`/`file` → `"N field(s)"`. `kind` alone says `custom` for every handler-dispatched job. |
+| `duration_s` | number \| null | `settled_ts - created_ts`, **settled rows only**. A settled job has no live lease; how long it took is the reading that belongs in that column instead. |
+
+Panel-level, new:
+
+```
+offload: {available: bool,
+          counts: {pending, claimed, done, failed},
+          awaiting: n,
+          jobs: {<job_id>: {state: "pending"|"claimed"|"done"|"failed",
+                            worker_id: str|null, heartbeat_ts: iso|null,
+                            offload_attempts: int|null}}}
+```
+
+Read from two independent sources and unioned by job id:
+
+- the queue directory `<program_root>/offload/{pending,claimed/<worker_id>,done,failed}`
+  (`trialerror.offload.protocol`) — `available: false` when the directory is
+  absent, which is every program that has never parked work;
+- the ledger rows themselves: a job whose `last_error` starts with
+  `awaiting DEV GPU` (the prefix `trialerror.offload.stage` raises with) is
+  parked, and says so from the moment it is parked.
+
+`awaiting` is the size of the union, so the count is right both before the
+queue directory exists and after. `counts` is the directory alone.
+
+### 13.2 `session` panel — decoded queue, and the timeline
+
+`open_session.boot_bundle_stats.queue` is decoded (it was a JSON string;
+M-CON-3). The SESSION card prints its length.
+
+`open_session.timeline` is new, and is `null` when no session is open:
+
+```
+timeline: {
+  window: {start_ts, end_ts|null},          // opened_ts -> closed_ts, or null = still open
+  spans: [{id, kind: "launch"|"job"|"room", lane, label,
+           start_ts, end_ts|null,
+           status: "running"|"complete"|"retried"|"booked"|"failed"|"abandoned"|"frozen",
+           ref: {launch_id|job_id|room_id: "..."}}],
+  instants: [{ts, kind: "hook_alive"|"room_dp_scored"|"gate_transition",
+              lane, label, ref}],
+  truncated: {spans_dropped, instants_dropped, events_scan_limited}
+}
+```
+
+A pure derivation over rows that already exist — no new table, no new
+writer:
+
+- **launches**: `platform.launch WHERE session_id = ?`; start `booked_ts`,
+  end `reconciled_ts`; `PROVISIONAL → booked`, `RUNNING → running`,
+  `RECONCILED → complete`, `ABANDONED`/`REFUSED`/`DEFERRED → abandoned` (all
+  three are bookings that will never run, and the bar says so rather than
+  implying work in flight); lane = `agent_kind`, label = `purpose`.
+- **jobs**: `jobs.job` rows created inside the window; start = the first
+  `job_event` of type `claimed` (one `GROUP BY`), else `created_ts`; end =
+  `settled_ts`; `retried` when `attempts > 1` or a `reclaimed` job_event
+  exists; lane = `kind · subject`.
+- **rooms**: `ops.event WHERE session_id = ?` — `room_created` opens a span
+  per `payload.room_id`, `room_frozen`/`room_converged` closes it as
+  `frozen`/`complete`; a room still open has `end_ts: null`.
+- **instants**: `hook_alive` and `room_dp_scored` from the same scan;
+  `ops.gate_transition` rows inside the window.
+
+Caps: 200 spans and 200 instants, newest kept, with the dropped counts in
+`truncated` (the house rule: truncation reports itself). The event scan is
+bounded at 5,000 rows and says so via `truncated.events_scan_limited`.
+
+Timestamps are compared as strings, not parsed per row: every stamp in the
+harness is written by `trialerror.util.timeutil.now()` in one fixed format,
+so a lexicographic compare IS a chronological compare.
+
+### 13.3 `gates` panel — decoded edits (landed in C1/C3, documented here)
+
+`pending_edits[].edits` is a decoded array, and each entry carries
+`unverified_count` — the number the Console's GATES card and the rail badge
+both want, computed once, server-side.
+
+### 13.4 What the client does with all of it
+
+`static/console_render.js` (`window.TEConsole`) holds every Console
+renderer. It never touches the page's global node factory: nodes come from
+an element helper the caller injects (`h`, and `hs` for the SVG namespace),
+which is what lets the same shipped file run under Node against
+`tests/_dom_shim.js`. The pure decisions — `computeHealth`,
+`compressIdleGaps`, `timelineX`, `jobsSnapshotOf`, every formatter — are
+data-in/data-out and are exported on the module for reuse and for testing.
+
+Two client behaviours are worth knowing about from the server side:
+
+- **the one-second tick.** Every rendered stamp carries `data-ts`; while
+  Console is the active panel an interval re-reads them, and re-lays the
+  timeline when a span has no `end_ts`. It is cleared on the way out of the
+  panel. Nothing refetches: the tick re-reads what the page already holds.
+- **`jobsSnapshot`.** The JOBS card diffs against its own previous render to
+  draw `↑` / `Δ` / `↓`. It is in-memory, per page life, and a render with no
+  previous snapshot shows no markers — a page that flags every row as new on
+  load says nothing.
+
+### 13.5 Console DOM hooks
+
+Each of the eight cards has **two** `data-role` hooks: `console-body-<name>`
+and `console-head-<name>`, where `<name>` is the card's own name except
+`diagnostics`, whose hooks are `console-*-doctor` (the card is named for what
+it reports, the hook for the panel that feeds it). The head slot carries that
+card's one-glance status reading. `RUN THE CHECK SWEEP` is drawn by the
+DIAGNOSTICS card, not by the subbar; in a static snapshot it is drawn
+disabled with its reason, per §12.12's convention.
+
+---
+
+<!-- builder: lane C (dashboard completion), step C6, launch LNCH-01M1R8J31R24P6781WT1G05PZC
+     spec of record: docs/reviews/LANE_C_DASHBOARD_COMPLETION_SPEC.md section 1 + ruling L-C5.
+     Sections 13, 14 and 15 are lane C's additions (13 is C5's Console); every
+     section above is lane b's and earlier, unchanged.
+     trialerror/dashboard/data.py::build_evidence_panel +
+     tests/test_dashboard_evidence.py + tests/test_dashboard_evidence_render.py
+     are the source of truth if this document and the code disagree. -->
+
+## 14. Evidence — `GET /dashboard/api/evidence[?claim_id=CLM-…|?anchor_id=ANC-…|?chunk_id=CHK-…]`
+
+The claim-trace surface. Until lane C this tab carried a `gap-notice` saying it
+had no backing route; this is that route.
+
+### 14.1 Selecting a claim
+
+Three selectors, resolved **in this order** by the builder (never by the route
+— see 14.2):
+
+| param | what it means | who sends it |
+|---|---|---|
+| `claim_id` | this exact claim | the rail, a co-anchored row, a page refresh |
+| `anchor_id` | the newest live claim standing on that anchor, primary **or** extra | `TRACE ▸` on a search-result row (`results[].citation.anchor.anchor_id`) |
+| `chunk_id` | the same trace one level coarser: any anchor on that chunk | a future chunk-level entry point |
+| *(none)* | the newest live claim | first load |
+
+An id that resolves to nothing is **200 with a reading**, never a 404:
+
+```json
+{"status": "ok", "active_claim_id": null, "claim": null,
+ "not_found": {"kind": "anchor_id", "id": "ANC-…"},
+ "index": ["… the rail still renders …"]}
+```
+
+A young corpus has anchors nobody has made a claim on yet, and a TRACE onto one
+of them is an ordinary event, not an error.
+
+A claim named **explicitly** by `claim_id` is returned even when it is expired
+or invalidated — its own `expired_at`/`invalid_at` say so on the row. The rail
+(`index`) is always the LIVE view.
+
+### 14.2 `PANEL_QUERY_PARAMS` is a tuple of pairs
+
+`serve.PANEL_QUERY_PARAMS["evidence"]` is
+`(("claim_id","claim_id"), ("anchor_id","anchor_id"), ("chunk_id","chunk_id"))`.
+`build_one_panel` passes through **every** param that is present and non-blank;
+the builder owns the precedence between them. A blank value is treated as
+absent, so a builder never has to tell "not asked" from "asked for nothing".
+
+### 14.3 Payload
+
+```
+{status: "ok",
+ index: [{claim_id, kind, text_short, confidence, created_at,
+          source_id, source_title, anchor_count, superseded}],   <=100, newest first
+ index_total, index_truncated,
+ active_claim_id,
+ not_found: {kind, id}                                           only when a selector missed
+ claim: {claim_id, kind, text, fenced, confidence, created_at, valid_at,
+         expired_at, invalid_at, superseded_by, created_by_launch},
+ anchors: [{anchor_id, role: "primary"|"extra", doc_id, chunk_id, source_id,
+            source_title, license_tier, page, char_start, char_end, quote,
+            fenced, doc_sha_matches, quote_sha_matches, missing}],
+ argues: {contradicts: [prov_edge...], supports: [prov_edge...],
+          verdicts: [{verdict_id, procedure, procedure_version, label, ts,
+                      issued_by_launch, prereg_compliant}],
+          note},
+ co_anchored_claims: [{claim_id, kind, text_short, shared: "anchor"|"chunk"|"document"}],
+ neighbourhood: {seed_entities: [{entity_id, name, entity_type, via_anchor}],
+                 nodes: [{id, kind: "claim"|"entity", label}],
+                 edges: [{rel_id, src, dst, rel_type, fact_text, fenced, evidence_anchor}],
+                 max_hops, hops_reached, hop_limit, truncated,
+                 node_count, edge_count, edges_listed, seeds_dropped},
+ lineage: {superseded_by, supersedes: [claim_id...]},
+ term_conflicts_omitted: {reason: "awaiting_migration", message}}   see 14.7
+```
+
+### 14.4 Fencing and the untrusted wrapper — which fields, and why
+
+Four different treatments, and the differences are deliberate:
+
+| field | treatment |
+|---|---|
+| `claim.text` | `citation_quote(text, fenced=<primary anchor's source tier>)` **then** `untrusted_wrap`. It is a free-text body; the client strips the wrapper and renders a text node. |
+| `neighbourhood.edges[].fact_text` | already fenced **and** wrapped by the engine (`retrieve.engine._fence_relation_edges`). This builder does not redo it. |
+| `anchors[].quote` | `citation_quote` only, **not** wrapped — the same treatment `get_chunk`/`resolve_quote` give their own per-anchor `quote` field. |
+| `index[].text_short` | fence-capped, then truncated to 140 chars, **not** wrapped. Truncating a wrapped string can cut its closing delimiter off, which is exactly the forged-close hazard `untrusted_wrap` exists to prevent. |
+
+`fenced: true` means the source is `commercial_restricted`, and the quote is
+then capped at 20 words (D-COC-1) by the engine's own `citation_quote` — this
+module calls that function rather than re-implementing the cap.
+
+### 14.5 The two hash chips
+
+They answer different questions and are reported separately:
+
+- `doc_sha_matches` — `quote_anchor.doc_sha256` against `document.sha256`.
+  `false` means the document was re-ingested after this anchor was cut, so its
+  character offsets may now point at different bytes. (The same predicate the
+  corpus panel's stale-anchor count uses.)
+- `quote_sha_matches` — the stored `quote_text` re-hashed against
+  `quote_sha256`. **`null`, not `false`**, when no `quote_text` was stored:
+  "not re-checkable here" is a third reading, and collapsing it into `false`
+  would accuse an anchor that is merely terse.
+
+`missing: true` marks an anchor id a claim names that has no `quote_anchor` row
+— a broken FK, reported on the row rather than dropped.
+
+### 14.6 Bounds, all reported
+
+| field | bound | what the client shows |
+|---|---|---|
+| `index` | 100 live claims | `index_truncated` → the rail says how many it is not showing, and that the filter searches only these |
+| `neighbourhood.seed_entities` | 5 | `seeds_dropped` → a header chip |
+| `neighbourhood.edges` | 100 | `edges_listed` vs `edge_count` → "N OF M EDGES NOT LISTED" |
+| `neighbourhood` traversal | the engine's own `max_hops` / `hop_limit` | `truncated` → "RESULT TRUNCATED AT n EDGES" |
+| `co_anchored_claims` candidates | 200 scanned | *(not surfaced; a stated bound in the builder's docstring)* |
+
+The inline SVG is drawn only when `node_count <= 100`
+(`TEEvidence.SVG_NODE_CEILING`); past that the edges table stands alone and the
+card says `N NODES, DRAWN AS A TABLE ONLY`. The table is present either way.
+
+### 14.7 What is NOT here
+
+- **`prov_edge` is read, and reported empty.** The table has zero writers
+  anywhere in this codebase; `argues.note` says so. `verdict(subject_kind=
+  'claim', procedure='contracrow')` is the live contradiction signal.
+- **Term-sense conflicts are omitted, with the reason stated** (ruling L-C5).
+  Lane e (E4) adds `lexicon.api.conflicts_for_claim` and this builder picks it
+  up behind an import guard. Until then the payload carries
+  `term_conflicts_omitted: {reason: "awaiting_migration", message}` and the
+  renderer prints that message — never an empty box that reads "no conflicts".
+  When lane e lands, the key becomes `term_conflicts: {status, conflicts}`.
+- **SEND TO DETERMINATIONS / OPEN A ROOM ON IT are drawn disabled**, with their
+  reasons in `title` (section 12.11's convention): no callable exists for
+  either verb.
+
+### 14.8 Renderer
+
+`static/evidence_render.js` → `window.TEEvidence`. Same contract as
+`console_render.js`: no `document`, every node from an injected `h`. It takes a
+**second** injected helper, `svg`, because an SVG child needs `createElementNS`
+in a browser; with no `svg` given it falls back to `h`, which is what the Node
+harness uses.
+
+It is a hard dependency on `console_render.js` (the shared `h2` / `rowButton`
+primitives) and refuses at `create()` time if that file did not load — there is
+no local half-copy. Both are listed in `export.py::_INLINE_SCRIPTS`, in load
+order, and the template loads them in that order too.
+
+---
+
+<!-- builder: lane C (dashboard completion), step C7.
+     spec of record: docs/reviews/LANE_C_DASHBOARD_COMPLETION_SPEC.md section 4 +
+     rulings L-C1 (ops v8), L-C2 (identity), L-C3 (reveal), L-C6 (no REJECT).
+     trialerror/dashboard/writes.py + tests/test_dashboard_writes.py +
+     test_dashboard_serve.py's full-loop assertions are the source of truth if
+     this document and the code disagree. -->
+
+## 15. Writes, part two — the four actions lane C wired (C7)
+
+Section 12's contract is unchanged: same route shape, same token header, same
+`{ok, result}` / `{ok, status, message}` envelope, same
+`_validate_fields` type table. Four actions join the nine already there
+(thirteen live), and four of section 12.12's "what stays disabled, and why"
+rows are superseded — see the note at the head of that section.
+
+| action | body | module called | refusals (verbatim from the module) | audit |
+|---|---|---|---|---|
+| `prereg-reveal` | `{prereg_id}` + optional `session_id` | `verify.prereg.reveal_prereg` | `PreregNotFoundError`, `PreregVoidedError`, `PreregTamperedError` (voids the row as a side effect), `ValidationError` (unknown `session_id`) | `prereg_revealed`, written by the module |
+| `memory-resolve` | `{group_id, keep}` — `keep ∈ left/right/both` | `memory.merge.resolve_conflict` | `ValueError` (unknown group, already resolved, bad `keep`) | `memory_conflict_resolved`, written by the module |
+| `gate-send-back` | `{gate_id, edit_id, by_launch, note}` — all four required | `artifacts.gates.send_back_edit` | `ValueError` (state, unknown edit, already verified, empty note), `XidTargetMissingError` (unknown launch) | `gate_edit_sent_back`, in the same transaction as the mutation |
+| `thread-create` | `{title, body}` + optional `session_id` | `events.api.create_thread` then `post_feed` | `ValidationError` (no open session) | the `thread` + `feed_post` rows |
+
+### 15.1 `prereg-reveal` — the irreversible one
+
+Three guards, and none of them is the browser's to relax.
+
+- **`dest_dir` is never read from the body.** The reveal always lands under
+  `program_root/prereg/revealed/`. An HTTP caller naming a write path is a
+  path-traversal primitive, not a feature — the same reason EXPORT TRANSCRIPT
+  stays disabled (12.12).
+- **Hashes only, until revealed.** The determinations item carries
+  `procedure_sha256`, `params_sha256` and `escrow_present`, and never the
+  sealed content (REDESIGN 5.4). `escrow_present: false` means a reveal will
+  refuse *and void the commitment*, and the item's `consequence` says so — the
+  operator should not learn that by pressing the button.
+- **Two clicks in the browser** (ruling L-C3). The button becomes
+  `CONFIRM REVEAL — IRREVERSIBLE` for 5 seconds, then disarms. This is a
+  CLIENT guard and is deliberately not duplicated on the wire: a confirm token
+  would be one more thing to forge, and the endpoint's real protection is the
+  write token.
+
+The `prereg_revealed` event is written by `reveal_prereg` itself, not by this
+layer, so a CLI reveal and a browser reveal leave the identical record. Its
+payload is `{prereg_id, revealed_path, procedure_sha256, params_sha256}` — the
+committed hashes, never the revealed content, because an event log is not the
+place to un-blind a procedure a second time. `session_id` names the sitting
+that broke the blind; it must be a real `ops.session` row (`event.session_id`
+is a same-file FK) and is **checked before anything is written**, so an
+attribution mistake refuses instead of leaving a broken blind with no audit
+row. Omitted, it resolves to the newest open session, or `null` when nothing
+is open.
+
+A tampered escrow is a **finding**, not a server fault: `VerifyError` is in
+`_EXPECTED_ERRORS`, so it reaches the client as a clean `ok: false` with the
+module's own message, and never as a 500.
+
+**A fourth refusal, added in the C9 fix pass (finding F2): a revealed
+pre-registration cannot be revealed again.** `PreregAlreadyRevealedError` (a
+`VerifyError`, so also a clean `ok: false`) names the id and the first
+reveal's timestamp. A reveal is the one irreversible act here and happens
+exactly once; the second call used to succeed, re-copying the escrow,
+overwriting `revealed_ts` with the later time and appending a second
+`prereg_revealed` event — so the moment the blind actually broke survived
+only in the log. The Determinations queue drops the item after the first
+reveal, so only a direct CLI or HTTP call reaches this.
+
+### 15.2 `memory-resolve`
+
+`keep` is validated by `resolve_conflict`, not by this layer — one copy of the
+rule. Resolution is **one-shot per group**: a second call with a different
+answer is refused, so a double-click cannot quietly change the outcome.
+
+The determinations item now carries `versions: [{side, memory_item_id, tier,
+kind, account_id, updated_ts, l0_abstract, body}]`. `version_count` alone made
+this the one queue kind an operator could not decide from the page — "2
+versions of X disagree" is not something you can choose between.
+
+### 15.3 `gate-send-back`
+
+The non-destructive counterpart to `verify-edit`, and **not** a state
+transition: it mutates one entry of the `edits` JSON array and writes no
+`gate_transition` row (12.12's posture for `verify_edit`, unchanged). The
+entry becomes `applied=False, verified=False, sent_back=True` plus
+`sent_back_note` / `sent_back_by_launch` / `sent_back_ts`.
+
+A sent-back edit is an **unverified** edit, so it still blocks
+`union_applied`, with the same `unverified_blocking` refusal, and it **stays
+in the determinations queue** — with the objection visible on it, so the next
+operator does not verify it blind. Sending back is a request for work, not a
+way around the gate.
+
+`note` is required. A send-back with no stated objection is the
+freeze-without-reason case.
+
+Unlike a verification — whose record is the JSON entry itself — this emits
+`gate_edit_sent_back`, in the same transaction as the mutation: an objection
+has to reach whoever must now do the work, and nothing else in the schema
+would carry it.
+
+**Identity (interim rule L-C2).** `by_launch` stays free text on the wire, and
+an id with no `platform.launch` row **fails with `XidTargetMissingError`**. It
+never falls back to another identity — an unattributable objection is worse
+than a refused one. The same rule binds `verify-edit`. A platform-level
+operator identity is a separate lane after the handover.
+
+**No REJECT** (ruling L-C6). `gated → failed` is legal in the state machine
+and is not wired here; it stays a CLI verdict path (`gate verdict`) until the
+identity ruling lands, because a destructive verb driven by a free-text
+identity is not auditable. No control anywhere on Decide carries the word.
+
+### 15.4 `thread-create` — and ops v8
+
+Opens a thread AND posts the first message into it. A first post is required:
+an empty thread is a room with nobody in it.
+
+Authorship is server-derived and never caller-settable (`launch_id=None`, like
+`feed-post`), so the result's `author` is `orchestrator:<open session>` and
+`thread.created_by_launch` is NULL.
+
+Section 12's own text used to explain why this action could not exist:
+`thread.created_by_launch` was `NOT NULL` and an orchestrator identity has no
+launch. **ops v8** (`ops_v8_thread_created_by_nullable_and_author`, ruling
+L-C1) changes two things on `thread`:
+
+- `created_by_launch` becomes **nullable**. Its XID registry entry is
+  unchanged and still enforced for every non-null value — `_validate_xids`
+  already skips a NULL, so "null allowed, non-null still validated" needed no
+  new code.
+- `created_by` is **new and nullable**: the derived author string, the same
+  shape `feed_post.author` carries. Pre-v8 rows have `NULL` here, because
+  deriving one needs a `platform.launch` lookup and platform is a different
+  file — readers fall back to `created_by_launch` for those, which is what
+  they had before.
+
+It is a table rebuild (dropping a NOT NULL is not an ALTER SQLite has), and
+`feed_post.thread_id` is a same-file FK child with rows in it — which is
+exactly what `stores/migrate.py`'s `PRAGMA foreign_keys` OFF/ON bracketing
+exists for. v2's `status`/`refs` columns and their CHECK are carried through.
+
+`trialerror feed post --new-thread` no longer requires `--launch-id`; the
+refusal moved to `create_thread`, which raises when there is no launch *and*
+no open session.
+
+**Numbering.** v7 is the mining-adoptions lane's `memory_relation` migration,
+which merged first; lane c takes v8. `MIGRATIONS` is contiguous 1..8, and each
+constant is named with its own number (`_V8`) — two branches binding one name
+to different DDL is a footgun Python will not report.
+
+### 15.5 Determinations item enrichments (C7)
+
+| kind | new fields |
+|---|---|
+| `prereg_reveal` | `procedure_sha256`, `params_sha256`, `escrow_present` |
+| `memory_conflict` | `versions: [{side, memory_item_id, tier, kind, account_id, updated_ts, l0_abstract, body}]` |
+| `gate_edit` | `sent_back`, `sent_back_note`, `sent_back_by_launch`, `sent_back_ts` |
+
+The Decide detail no longer calls the generic object renderer for
+`prereg_reveal` or `memory_conflict` — those two are the last call sites
+outside the ext panels. The rest of the kinds keep it; their shapes read
+perfectly well as a key/value table.
+
+### 15.6 What section 12.12 still says
+
+`room_escalation`, `memory_conflict_candidate` and `memory_stale` stay
+unwired, each with its own reason in the control's `title`. The generic
+disabled arm now draws ONE control labelled `NO ACTION WIRED HERE` rather than
+two named after verbs those kinds do not have — a disabled button naming a
+verb the subsystem cannot perform is a promise the page cannot keep.
+## 16. The C9 fix pass — two contract changes worth knowing about
+
+The adversarial verification of stage 2 closed twelve findings. Ten were
+tests, comments or internals; these two change what a caller sees.
+
+### 16.1 A write refuses BEFORE it mutates, not after (finding F1)
+
+Every write action that carries a launch id now validates it against
+`platform.launch` **before** it touches any state. Three did not:
+`merge-accept`, `merge-reject` and `acquisition-delivered` mutated first and
+wrote their audit `event` row second, and since `event.launch_id` is an XID
+column, an unknown launch was refused by the audit insert — after the
+proposal had already moved to `confirmed`/`rejected`, or the source to
+`delivered`. The client saw `{"ok": false}`, the store disagreed, no audit
+row explained it, and the retry hit "is not draft" with no way back.
+
+What changed for a caller: nothing about the message (the refusal is the same
+`XidTargetMissingError` text, `status: "XidTargetMissingError"`), and
+everything about the state afterwards — **a refused write has written
+nothing, and the same call with a real launch id then succeeds.** That was
+already true of `verify-edit`, `gate-send-back`, `room-turn`, `room-score`
+and `room-freeze`; it is now true of all of them. Ruling L-C2's letter — a
+named error, never an identity fallback — is unchanged.
+
+The same guard covers `extract.accept()` / `reject()`'s candidate arm
+(`RCD-` ids), which shares the dispatch surface `merge-accept` calls.
+
+### 16.2 Keyboard: V and B on the Decide gate arm (finding F6)
+
+Spec section 4 asked for them and C7 shipped only the buttons. `V` presses
+VERIFY EDIT, `B` presses SEND BACK, both scoped to the selected item's
+detail pane, both no-ops when the control is disabled, and both inert while
+focus is in an input, a textarea or a select (so typing a note that contains
+"b" cannot send an edit back). Alt/Ctrl/Meta combinations are left to the
+browser.
+
+**No keyboard path reaches an irreversible verb.** The handler refuses any
+control carrying `data-confirm-label` — the attribute `requireTwoClicks`
+stamps on a destructive button (today only REVEAL). That is a structural
+guard, not a safe-list: a future arm that arms a destructive button gets no
+key binding to it for free, and ruling L-C3's "two clicks, from the one
+listener that submits" keeps holding. The synthetic click is dispatched on
+the button so the submit runs through `wireWriteAction` — required-field
+check, disabled state, message strip and the WA-2 reload included — and it
+is the page's only synthetic click, which a test pins.

@@ -9,7 +9,13 @@ from pathlib import Path
 import pytest
 
 from trialerror.stores.writer import get, update
-from trialerror.verify.errors import InvalidProcedureError, PreregNotFoundError, PreregTamperedError, PreregVoidedError
+from trialerror.verify.errors import (
+    InvalidProcedureError,
+    PreregAlreadyRevealedError,
+    PreregNotFoundError,
+    PreregTamperedError,
+    PreregVoidedError,
+)
 from trialerror.verify.prereg import canonical_json, check_prereg_compliance, commit_prereg, prereg_status, reveal_prereg, sha256_hex
 
 
@@ -100,6 +106,29 @@ def test_reveal_prereg_already_voided_is_refused(store):
     update(store, "prereg", pk_column="prereg_id", pk_value=committed["prereg_id"], changes={"status": "voided"})
     with pytest.raises(PreregVoidedError):
         reveal_prereg(store, prereg_id=committed["prereg_id"])
+
+
+def test_reveal_prereg_twice_is_refused_and_keeps_the_first_reveals_record(store):
+    """A reveal ends the blind, which happens exactly once (lane C, finding
+    F2). The second call used to succeed: it re-copied the escrow, OVERWROTE
+    `revealed_ts` with the later time and appended a second `prereg_revealed`
+    event -- so the moment the blind was actually broken survived only in the
+    log, and only if you knew to read past the last row."""
+    committed = commit_prereg(store, title="t", procedure="proc", params={"k": 1})
+    first = reveal_prereg(store, prereg_id=committed["prereg_id"])
+
+    with pytest.raises(PreregAlreadyRevealedError) as exc:
+        reveal_prereg(store, prereg_id=committed["prereg_id"])
+    assert committed["prereg_id"] in str(exc.value)
+    assert first["revealed_ts"] in str(exc.value)
+
+    db_row = get(store, "prereg", pk_column="prereg_id", pk_value=committed["prereg_id"])
+    assert db_row["status"] == "revealed"
+    assert db_row["revealed_ts"] == first["revealed_ts"], "the first reveal's timestamp must survive"
+    events = store.ops.execute(
+        "SELECT * FROM event WHERE type = 'prereg_revealed' ORDER BY ts, rowid"
+    ).fetchall()
+    assert len(events) == 1, "one reveal, one event"
 
 
 def test_check_prereg_compliance_true_when_executed_matches_committed(store):

@@ -23,7 +23,10 @@
 
    Two markers inside the arguments stand in for things JSON cannot carry:
    {"__targets": [names]} becomes a map of fresh container elements (reported
-   back under "targets"), and {"__fn": "name"} becomes a callback.
+   back under "targets"), and {"__fn": "name"} becomes a callback -- one that
+   returns undefined, unless it also carries {"__node": {tag, class, text}}, in
+   which case it returns that node (for a renderer that is handed another
+   renderer and has to pass its output through).
 
    OUTPUT (one JSON object on stdout)
      {"kind": "node",  "tree": {...}}                a DOM node came back
@@ -51,6 +54,18 @@ const MODULE_GLOBALS = {
   "console_render.js": "TEConsole",
   "evidence_render.js": "TEEvidence",
   "feed_render.js": "TEFeed"
+};
+
+/** Files that must already be in the context when a module is evaluated.
+ *  console_render.js owns the two SHARED primitives (h2, rowButton); the other
+ *  render files call them off the global rather than copying them, which is
+ *  the coupling the browser gets from the ORDER of the script tags in
+ *  dashboard.html. The harness reproduces that order rather than pretending a
+ *  render file is standalone -- without it a test would exercise the local
+ *  fallbacks and never the primitives the page actually runs. */
+const MODULE_DEPS = {
+  "evidence_render.js": ["console_render.js"],
+  "feed_render.js": ["console_render.js"]
 };
 
 function parseArgv(argv) {
@@ -84,10 +99,13 @@ function parseArgv(argv) {
  *  attaches to `window` in a real page -- which is the point: the harness
  *  exercises the SHIPPED file, byte for byte, not a copy. */
 function loadRenderModule(fileName, doc) {
-  const src = fs.readFileSync(path.join(STATIC_DIR, fileName), "utf8");
   const sandbox = { console, document: doc, JSON, Math, Date, Object, Array, String, Number };
   sandbox.window = sandbox;
   vm.createContext(sandbox);
+  for (const dep of MODULE_DEPS[fileName] || []) {
+    vm.runInContext(fs.readFileSync(path.join(STATIC_DIR, dep), "utf8"), sandbox, { filename: dep });
+  }
+  const src = fs.readFileSync(path.join(STATIC_DIR, fileName), "utf8");
   vm.runInContext(src, sandbox, { filename: fileName });
   const globalName = MODULE_GLOBALS[fileName];
   const api = sandbox[globalName];
@@ -135,7 +153,16 @@ function main() {
       return targetNodes;
     }
     if (Object.prototype.hasOwnProperty.call(value, "__fn")) {
-      const fn = function () { fn.calls += 1; };
+      // `__node: {tag, class, text}` makes the stub RETURN a node instead of
+      // undefined -- needed wherever a renderer is handed another renderer and
+      // has to pass its output through untouched (the Feed calls lane b's
+      // buildPostBody for every card and must not rebuild what comes back).
+      const spec = value.__node || null;
+      const fn = function () {
+        fn.calls += 1;
+        if (!spec) return undefined;
+        return h(spec.tag || "div", { "class": spec.class || "", text: spec.text || "" });
+      };
       fn.calls = 0;
       return fn;
     }

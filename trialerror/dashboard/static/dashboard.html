@@ -211,24 +211,31 @@
         </div>
       </section>
 
-      <!-- ============================== EVIDENCE (documented API gap) ============================== -->
+      <!-- ============================== EVIDENCE ==============================
+           C6 (spec section 1). The gap-notice this replaced said the surface had
+           no backing route; GET /dashboard/api/evidence is that route, and
+           evidence_render.js draws it. Markup here is CONTAINERS ONLY -- every
+           node inside them comes from the renderer, so the two can be worked on
+           independently and the renderer can be tested without a browser.
+           ====================================================================== -->
       <section class="panel" id="panel-evidence" data-panel="evidence">
-        <div class="subbar"><span class="t">EVIDENCE</span><span class="m">claim-trace neighbourhood graph</span></div>
-        <div class="gap-notice">
-          <div class="head">&#9650; THIS SURFACE HAS NO BACKING ROUTE YET</div>
-          <div class="body">
-            Evidence.dc.html's claim-trace view (a single claim's grounding anchors,
-            contradictions, and its 2-hop knowledge-graph neighbourhood) needs a
-            per-claim detail route this build's API does not expose &mdash;
-            <code>docs/DASHBOARD_V2_API.md</code> ships <code>feed</code>,
-            <code>rooms</code>, <code>determinations</code>, <code>dossier</code>,
-            <code>lexicon</code>, <code>course</code>, <code>since_you_left</code> and
-            <code>search</code> only. <code>search</code>'s own results carry a
-            citation (anchor, page, quote) but not a claim id, contradiction edges,
-            or a neighbourhood adjacency list. Rather than fabricate a graph from
-            data that isn't there, this tab says so in place, per Tokens.dc.html's
-            own honesty rule 12. See the build report's API-gap list.
+        <div class="subbar">
+          <span class="t">EVIDENCE</span>
+          <span class="m">one claim, traced to what it stands on</span>
+          <span class="fill"></span>
+          <span class="m" data-role="evidence-count"></span>
+        </div>
+        <div class="lexicon-layout">
+          <div class="lexicon-index">
+            <div class="term-filter-row">
+              <div class="term-search">
+                <span class="prompt" style="font-size:13px;">&gt;</span>
+                <input type="text" data-role="evidence-filter" placeholder="filter claims, source ids, titles">
+              </div>
+            </div>
+            <div data-role="evidence-index"><div class="panel-loading">loading&hellip;</div></div>
           </div>
+          <div class="lexicon-detail" data-role="evidence-detail"><div class="panel-loading">loading&hellip;</div></div>
         </div>
       </section>
 
@@ -298,10 +305,31 @@
         <div class="feed-layout">
           <div class="feed-threads">
             <div class="subbar" style="padding:0 12px;"><span class="t">THREADS</span><span class="fill"></span><span class="m" data-role="feed-unread-count"></span></div>
+            <!-- C7 (ops v8): the operator can open a thread now, not just post
+                 into one. Collapsed until asked for -- a composer permanently
+                 open above the list is a form nobody wanted. -->
+            <div class="new-thread-box">
+              <button type="button" class="btn btn--secondary btn--tiny" disabled title="live mode required" data-role="feed-new-thread-toggle">+ NEW THREAD</button>
+              <div class="write-form is-hidden" data-role="feed-new-thread-form">
+                <input type="text" class="write-input" data-role="feed-new-thread-title" placeholder="thread title">
+                <textarea class="write-textarea" data-role="feed-new-thread-body" placeholder="the first post — full text, never a summary"></textarea>
+                <div class="btn-row">
+                  <button type="button" class="btn btn--primary" disabled title="live mode required" data-role="feed-new-thread-btn">OPEN THREAD</button>
+                  <button type="button" class="btn btn--secondary" data-role="feed-new-thread-cancel">CANCEL</button>
+                </div>
+                <div class="write-form-msg" data-role="feed-new-thread-msg"></div>
+                <div class="note-strip">AUTHORED AS orchestrator:&lt;YOUR OPEN SESSION&gt;. A THREAD NEEDS ITS FIRST POST.</div>
+              </div>
+            </div>
             <div data-role="feed-thread-list"><div class="panel-loading">loading&hellip;</div></div>
             <div style="padding:12px; border-top:1px solid var(--hairline-soft); margin-top:12px; display:flex; flex-direction:column; gap:8px;">
               <span class="note-strip" style="letter-spacing:0.1em;">READING ORDER</span>
-              <span class="chip chip--live" style="cursor:pointer;" data-role="feed-order-arrived">AS IT ARRIVED</span>
+              <!-- L-C4: THREADED is the default -- the operator's walkthrough
+                   complaint was exactly the missing structure. The choice is
+                   persisted per viewer in localStorage, never on the server:
+                   it is a reading preference, not program state. -->
+              <span class="chip chip--live" style="cursor:pointer;" data-role="feed-order-threaded" title="replies nested under the post they answer">THREADED</span>
+              <span class="chip chip--neutral" style="cursor:pointer;" data-role="feed-order-arrived" title="append order -- the raw, unstructured truth">AS IT ARRIVED</span>
               <span class="chip chip--neutral" style="cursor:not-allowed;" title="needs goal-grouping logic this API stage does not provide" aria-disabled="true">GROUPED BY GOAL</span>
               <span class="note-strip" style="letter-spacing:0.1em; margin-top:8px;">PLAIN ENGLISH</span>
               <span class="chip chip--live" style="cursor:pointer;" data-role="feed-translation-toggle" title="show the stored plain-English translation beside each post">SIDE BY SIDE</span>
@@ -312,6 +340,11 @@
           <div class="feed-main">
             <div class="subbar" data-role="feed-thread-header"></div>
             <div class="feed-posts" data-role="feed-post-list"><div class="panel-loading">loading&hellip;</div></div>
+            <!-- REPLY IN THREAD's target, shown only while one is chosen: a
+                 composer that will post a REPLY must not look like one that
+                 will post a new root. Cleared on success, on a thread switch,
+                 and by its own dismiss control. -->
+            <div class="feed-reply-target is-hidden" data-role="feed-reply-target"></div>
             <div class="write-form-bar" style="display:flex; align-items:center; gap:11px; padding:10px 14px;">
               <span class="prompt" style="font-size:12px; color:var(--live); font-family:var(--font-mono);">&gt;</span>
               <input type="text" class="write-input" data-role="feed-compose-input" style="flex-grow:1;" maxlength="4000" placeholder="transmit a directive to this thread (posts as orchestrator -- authorship is server-derived)">
@@ -343,30 +376,28 @@
           <span class="console-health-tally" data-role="console-health-tally" data-health="ok">&mdash;</span>
           <span class="console-asof" data-role="console-asof">&mdash;</span>
           <span class="m">LOOPBACK ONLY, NO AUTHENTICATION</span>
-          <button type="button" class="btn btn--secondary is-hidden" data-role="doctor-run-btn">RUN THE CHECK SWEEP</button>
         </div>
         <!--
-          The eight card containers of TEConsole.CARD_ORDER (console_render.js).
-          A card whose renderer is registered there is painted by it; the rest
-          keep the generic renderer, which is what makes the Console renderer
-          landable one card at a time instead of in one 2,000-line commit.
+          The eight cards of TEConsole.CARD_ORDER (console_render.js). Each has
+          TWO hooks: the body, and a head slot the renderer fills with that
+          card's own status reading (ONE OPEN / n RUNNING / N CHECKS, K
+          CATEGORIES). The title stays in the markup as a real <h2> (M-VA-1) so
+          the card is named before any script runs -- and so a card whose
+          renderer somehow never loads still says what it was going to be.
 
-          LAUNCH LEDGER and THIS SESSION, END TO END have no generic form at
-          all -- they are new readings, not a re-draw of an existing panel --
-          so their cards stay `is-hidden` until a renderer for them exists and
-          renderConsoleFromBundle unhides them. The hooks are in the served
-          markup either way, which is this page's rule: every container a
-          renderer writes into is real HTML a string test can find.
+          RUN THE CHECK SWEEP moved out of this subbar and into the DIAGNOSTICS
+          card head, beside the reading it refreshes: a panel-wide button for
+          one card's verb was a leftover from the generic renderer.
         -->
         <div class="console-grid" data-role="console-grid">
-          <div class="card" id="console-card-session"><div class="card-header"><span class="title">SESSION</span></div><div class="card-body" data-role="console-body-session"><div class="panel-loading">loading&hellip;</div></div></div>
-          <div class="card" id="console-card-pools"><div class="card-header"><span class="title">BUDGET / POOLS</span></div><div class="card-body" data-role="console-body-pools"><div class="panel-loading">loading&hellip;</div></div></div>
-          <div class="card is-hidden" id="console-card-ledger"><div class="card-header"><span class="title">LAUNCH LEDGER</span></div><div class="card-body" data-role="console-body-ledger"></div></div>
-          <div class="card is-hidden" id="console-card-timeline"><div class="card-header"><span class="title">THIS SESSION, END TO END</span></div><div class="card-body" data-role="console-body-timeline"></div></div>
-          <div class="card" id="console-card-jobs"><div class="card-header"><span class="title">JOBS</span></div><div class="card-body" data-role="console-body-jobs"><div class="panel-loading">loading&hellip;</div></div></div>
-          <div class="card" id="console-card-gates"><div class="card-header"><span class="title">GATES</span></div><div class="card-body" data-role="console-body-gates"><div class="panel-loading">loading&hellip;</div></div></div>
-          <div class="card" id="console-card-corpus"><div class="card-header"><span class="title">CORPUS / DIAGNOSTICS</span></div><div class="card-body" data-role="console-body-corpus"><div class="panel-loading">loading&hellip;</div></div></div>
-          <div class="card" id="console-card-doctor"><div class="card-header"><span class="title">DOCTOR</span></div><div class="card-body" data-role="console-body-doctor"><div class="panel-loading">loading&hellip;</div></div></div>
+          <div class="card" id="console-card-session"><div class="card-header"><h2 class="title">SESSION</h2><span class="fill"></span><span class="card-head" data-role="console-head-session"></span></div><div class="card-body" data-role="console-body-session"><div class="panel-loading">loading&hellip;</div></div></div>
+          <div class="card" id="console-card-pools"><div class="card-header"><h2 class="title">POOLS</h2><span class="fill"></span><span class="card-head" data-role="console-head-pools"></span></div><div class="card-body" data-role="console-body-pools"><div class="panel-loading">loading&hellip;</div></div></div>
+          <div class="card" id="console-card-ledger"><div class="card-header"><h2 class="title">LAUNCH LEDGER</h2><span class="fill"></span><span class="card-head" data-role="console-head-ledger"></span></div><div class="card-body" data-role="console-body-ledger"><div class="panel-loading">loading&hellip;</div></div></div>
+          <div class="card" id="console-card-timeline"><div class="card-header"><h2 class="title">THIS SESSION, END TO END</h2><span class="fill"></span><span class="card-head" data-role="console-head-timeline"></span></div><div class="card-body" data-role="console-body-timeline"><div class="panel-loading">loading&hellip;</div></div></div>
+          <div class="card" id="console-card-jobs"><div class="card-header"><h2 class="title">JOBS</h2><span class="fill"></span><span class="card-head" data-role="console-head-jobs"></span></div><div class="card-body" data-role="console-body-jobs"><div class="panel-loading">loading&hellip;</div></div></div>
+          <div class="card" id="console-card-gates"><div class="card-header"><h2 class="title">GATES</h2><span class="fill"></span><span class="card-head" data-role="console-head-gates"></span></div><div class="card-body" data-role="console-body-gates"><div class="panel-loading">loading&hellip;</div></div></div>
+          <div class="card" id="console-card-corpus"><div class="card-header"><h2 class="title">CORPUS</h2><span class="fill"></span><span class="card-head" data-role="console-head-corpus"></span></div><div class="card-body" data-role="console-body-corpus"><div class="panel-loading">loading&hellip;</div></div></div>
+          <div class="card" id="console-card-doctor"><div class="card-header"><h2 class="title">DIAGNOSTICS</h2><span class="fill"></span><span class="card-head" data-role="console-head-doctor"></span></div><div class="card-body" data-role="console-body-doctor"><div class="panel-loading">loading&hellip;</div></div></div>
         </div>
       </section>
 
@@ -387,8 +418,14 @@
   `trialerror dashboard export` inlines each of these into the snapshot
   (export.py's _INLINE_SCRIPTS): a single portable file has no siblings to
   fetch, and the exported page must render identically over file://.
+
+  ORDER MATTERS between them, not just against the inline script:
+  console_render.js owns the two shared primitives (h2, rowButton) that
+  evidence_render.js calls off the global, so it comes first.
 -->
 <script src="console_render.js"></script>
+<script src="evidence_render.js"></script>
+<script src="feed_render.js"></script>
 
 <script>
 (function () {
@@ -432,13 +469,30 @@
     // per-surface selection state
     feedThreadId: null,
     feedSideBySide: true,      // PLAIN ENGLISH column on/off (AISPEAK design 4.4)
+    // ---- threading (lane C item B; ruling L-C4) ----
+    feedOrder: null,           // "threaded" | "arrived" -- read from localStorage at boot
+    feedCollapsed: {},         // root_post_id -> true; in-memory, per spec §2.2
+    feedReplyTo: null,         // {post_id, author, ts} the composer is answering
     roomsRoomId: null,
     roomsSelectedDp: null,
     dossierArtifactId: null,
     dossierTypeFilter: "ALL",
+    // ---- Evidence (C6) ----
+    // Three selectors, one at a time: whichever was last chosen is the one
+    // that goes on the wire, because the BUILDER owns the precedence between
+    // them (spec section 1.2) and sending two would let the page disagree
+    // with the panel it gets back.
+    evidenceSelector: null,    // {kind:'claim_id'|'anchor_id'|'chunk_id', id}
+    evidenceFilterText: "",
+    evidenceEdgeSort: null,    // {key, dir} for THE SAME EDGES AS A TABLE
+    evidencePanel: null,       // the last payload, so a filter keystroke
+                               // re-renders instead of re-fetching
     lexiconFilterText: "",
     lexiconKindFilter: "all",
     lexiconSelected: null,     // {kind:'entity'|'claim'|'merge', id}
+    // sweep §3.6: the DIAGNOSTICS card's status chips and category text are
+    // filters, and their state has to outlive the card's own re-render.
+    consoleDoctorFilter: { status: null, category: "" },
     determSelectedId: null,
     determItemsFlat: [],
     searchK: 12,
@@ -479,15 +533,75 @@
   function show(node) { node.classList.remove("is-hidden"); }
   function hide(node) { node.classList.add("is-hidden"); }
 
+  var SVG_NS = "http://www.w3.org/2000/svg";
+  /** `el` in the SVG namespace. An <svg> made by document.createElement is an
+   * HTMLUnknownElement -- it parses, it sits in the tree, and it draws
+   * absolutely nothing, which is the worst kind of bug to look at. The
+   * Console's timeline bars go through this instead. */
+  function svgEl(tag, attrs, children) {
+    var node = document.createElementNS(SVG_NS, tag);
+    if (attrs) {
+      Object.keys(attrs).forEach(function (k) {
+        // Deliberately NO `class -> node.className` branch, unlike el(): on an
+        // SVG element `className` is a read-only SVGAnimatedString, so
+        // assigning to it silently does nothing. setAttribute is the correct
+        // path here -- do not "fix" this to match el().
+        if (k === "class") node.setAttribute("class", attrs[k]);
+        else if (k === "text") node.textContent = attrs[k];
+        else if (k.indexOf("on") === 0 && typeof attrs[k] === "function") node.addEventListener(k.slice(2), attrs[k]);
+        else node.setAttribute(k, attrs[k]);
+      });
+    }
+    (children || []).forEach(function (c) {
+      if (c === null || c === undefined) return;
+      node.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+    });
+    return node;
+  }
+
   /* The Console's renderers live in console_render.js (loaded above) and are
-     written against `el` rather than `document` -- injecting it here is the
-     whole coupling between the two files, and it is also what lets the Node
-     DOM shim run the same code in tests. `null` if the file failed to load,
-     which the generic renderer below survives (a missing script must not take
-     the page down). */
+     written against `el` rather than the global node factory -- injecting it
+     here is the whole coupling between the two files, and it is also what lets
+     the Node DOM shim run the same code in tests. `null` if the file failed to
+     load, which the generic renderer below survives (a missing script must not
+     take the page down). */
   var TECONSOLE = (typeof window !== "undefined" && window.TEConsole && typeof window.TEConsole.create === "function")
-    ? window.TEConsole.create({ h: el })
+    ? window.TEConsole.create({ h: el, hs: svgEl })
     : null;
+
+  /* `null` if evidence_render.js did not load, OR if it loaded without
+     console_render.js in front of it -- it needs that file's shared
+     primitives and refuses rather than half-copying them. Either way the
+     Evidence panel paints a callout naming the missing file; a script that
+     failed must never take the rest of the page down with it. */
+  var TEEVIDENCE = null;
+  try {
+    if (typeof window !== "undefined" && window.TEEvidence && typeof window.TEEvidence.create === "function") {
+      TEEVIDENCE = window.TEEvidence.create({ h: el, svg: svgEl });
+    }
+  } catch (e) {
+    if (typeof console !== "undefined" && console.error) console.error("TEEvidence.create refused:", e);
+  }
+
+  /* The Feed's post stream, same coupling and same reason (feed_render.js).
+     Null if the file failed to load; renderFeed falls back to a flat,
+     unthreaded list rather than leaving the panel blank -- a missing script
+     must cost structure, never the posts themselves. */
+  var TEFEED = (typeof window !== "undefined" && window.TEFeed && typeof window.TEFeed.create === "function")
+    ? window.TEFeed.create({ h: el })
+    : null;
+
+  /* Per-viewer, per-browser preferences. Never program state: nothing stored
+     here may change what the SERVER reports, only how this browser reads it.
+     Every access is wrapped -- localStorage throws outright in a file:// page
+     under some privacy settings, and a reading preference is not worth taking
+     the dashboard down for. */
+  function lsGet(key) {
+    try { return window.localStorage.getItem(key); } catch (e) { return null; }
+  }
+  function lsSet(key, value) {
+    try { window.localStorage.setItem(key, value); } catch (e) { /* private mode; the session default stands */ }
+  }
 
   function fmtHM(iso) {
     if (!iso) return "—";
@@ -679,7 +793,13 @@
   var STATIC_SELECTION_KEYS = {
     feed: ["thread_id", "active_thread_id"],
     rooms: ["room_id", "active_room_id"],
-    dossier: ["artifact_id", "active_artifact_id"]
+    dossier: ["artifact_id", "active_artifact_id"],
+    // C6. Only the claim_id form is checkable this way: the snapshot bakes
+    // `active_claim_id`, so a request for a DIFFERENT claim is a mismatch a
+    // snapshot cannot serve. An anchor_id/chunk_id request has no baked field
+    // to compare against, and the renderer's own `not_found` reading covers
+    // it -- one honest reading beats a second, guessed one.
+    evidence: ["claim_id", "active_claim_id"]
   };
 
   function staticSelectionMismatch(name, panel, params) {
@@ -849,7 +969,47 @@
    * instead of guessing at it. The text/disabled restore stays as the
    * floor for buttons whose loader does not rebuild them. */
   function wireWriteAction(btn, msgEl, action, bodyFn, requiredFields, fieldEls, onSuccess, onFailure) {
+    /* C7: the two-click confirm, for a button `requireTwoClicks` stamped.
+       It lives HERE, in the one listener that submits, because a second
+       listener would race this one and the winner would depend on wiring
+       order. First click arms and re-labels; the arm lapses after 5 s so a
+       button cannot sit armed until an unrelated click lands on it. */
+    var CONFIRM_ARM_MS = 5000;
+    var armTimer = null;
+    var idleLabel = null;
+    function disarm() {
+      if (armTimer) { clearTimeout(armTimer); armTimer = null; }
+      if (idleLabel !== null) { btn.textContent = idleLabel; idleLabel = null; }
+      btn.classList.remove("btn--destructive");
+      btn.removeAttribute("data-armed");
+    }
     btn.addEventListener("click", function () {
+      var confirmLabel = btn.getAttribute("data-confirm-label");
+      if (confirmLabel) {
+        if (btn.getAttribute("data-armed") !== "true") {
+          // Validate BEFORE arming, so the operator is not asked to confirm
+          // a submission that was never going to be sent.
+          var pre = bodyFn();
+          for (var j = 0; j < (requiredFields || []).length; j++) {
+            var pf = requiredFields[j];
+            var pv = pre[pf];
+            if (pv === undefined || pv === null || (typeof pv === "string" && pv.trim() === "")) {
+              msgEl.textContent = pf + " is required.";
+              msgEl.style.color = "var(--warn)";
+              var pfe = fieldEls && fieldEls[pf];
+              if (pfe) pfe.focus();
+              return;
+            }
+          }
+          idleLabel = btn.textContent;
+          btn.textContent = confirmLabel;
+          btn.classList.add("btn--destructive");
+          btn.setAttribute("data-armed", "true");
+          armTimer = setTimeout(disarm, CONFIRM_ARM_MS);
+          return;
+        }
+        disarm();
+      }
       var body = bodyFn();
       for (var i = 0; i < (requiredFields || []).length; i++) {
         var f = requiredFields[i];
@@ -906,6 +1066,9 @@
     opts = opts || {};
     state.activePanel = name;
     applyActivePanel();
+    // console-7's tick belongs to the Console and nowhere else: leaving the
+    // panel stops it, and loadConsole starts it again on the way back in.
+    if (name !== "console") stopConsoleTick();
     if (!opts.noHash) { try { history.replaceState(null, "", "#" + name); } catch (e) {} }
     loadPanelContent(name);
   }
@@ -914,7 +1077,7 @@
     switch (name) {
       case "home": return loadHome();
       case "search": /* query-driven, nothing to prefetch */ return;
-      case "evidence": return;
+      case "evidence": return loadEvidence();
       case "lexicon": return loadLexicon();
       case "dossier": return loadDossier();
       case "course": return loadCourse();
@@ -976,77 +1139,23 @@
      The badge is the one at-a-glance indicator on the rail, and it used to
      read OK in the most common bad state this harness has -- an open
      session that cannot close, with PROVISIONAL launches under it. Input
-     set is the sweep's §3.7 spec. `computeHealth` is pure over the bundle's
-     `panels` so it can be lifted into console_render.js (TEConsole) by K4
-     and tested by the Node harness without a DOM; setHealth is the only
-     part that touches the page.
+     set is the sweep's §3.7 spec.
+
+     The FUNCTION now lives in console_render.js as `TEConsole.computeHealth`
+     (K4): it is pure over the bundle's `panels`, which is exactly the kind
+     of thing that should be testable without a browser, and the Node harness
+     drives its whole matrix. `setHealth` below is the part that touches the
+     page, and it is the only part left here.
+
+     The no-TEConsole fallback does NOT report OK. A renderer file that
+     failed to load is a page that cannot compute its own health, and "OK" is
+     the one answer that would be a lie -- the same lie console-2 was.
      -------------------------------------------------------------------- */
   function computeHealth(panels) {
-    panels = panels || {};
-    var crit = [], warn = [];
-
-    var session = panels.session || {};
-    if (session.status === "invariant_violation") {
-      crit.push("session invariant violation: " + (session.message || "more than one open session"));
-    }
-    var readiness = (session.open_session || {}).close_readiness;
-    if (readiness && readiness.ready === false) {
-      var problems = readiness.problems || [];
-      if (problems.length) {
-        problems.forEach(function (pr) { warn.push(typeof pr === "string" ? pr : ((pr && pr.message) || "session cannot close")); });
-      } else {
-        warn.push("the open session cannot close");
-      }
-    }
-
-    var budget = panels.budget || {};
-    var dangling = (budget.dangling_bookings || []).length;
-    if (dangling) crit.push(dangling + " dangling launch booking(s)");
-    var quota = budget.plan_quota || {};
-    if (quota.available && !quota.fresh) warn.push("plan quota snapshot is stale");
-    (budget.accounts || []).forEach(function (a) {
-      (((a || {}).budget_status || {}).pools || []).forEach(function (pool) {
-        if (pool.over_hard) crit.push("pool " + pool.pool_id + " projected over hard cap");
-        else if (pool.over_soft) warn.push("pool " + pool.pool_id + " projected over soft cap");
-      });
-    });
-
-    var doctor = panels.doctor || {};
-    if (doctor.status === "ok" && doctor.last_run && Array.isArray(doctor.last_run.checks)) {
-      doctor.last_run.checks.forEach(function (c) {
-        if (c.status === "fail") crit.push("doctor FAIL: " + (c.name || "check"));
-        else if (c.status === "warn") warn.push("doctor WARN: " + (c.name || "check"));
-      });
-    }
-
-    var jobs = panels.jobs || {};
-    var stale = (jobs.stale_leases || []).length;
-    if (stale) crit.push(stale + " job lease(s) expired");
-    // `offload` is added to the jobs builder by K4 (sweep §3.10 item 2);
-    // absent today, so this contributes nothing until it lands.
-    var awaiting = (jobs.offload || {}).awaiting || 0;
-    if (awaiting) warn.push(awaiting + " job(s) awaiting the offload worker");
-
-    var corpus = panels.corpus || {};
-    if ((corpus.stale_anchors || 0) > 0) crit.push(corpus.stale_anchors + " stale anchor(s)");
-
-    var pendingEdits = ((panels.gates || {}).pending_edits || []).length;
-    if (pendingEdits) warn.push(pendingEdits + " unverified gate edit(s)");
-
-    // M-LU-2's client half: a builder that raised is reported as a panel
-    // with status "error". A console whose own data is missing is not OK.
-    Object.keys(panels).forEach(function (name) {
-      var p = panels[name];
-      if (p && typeof p === "object" && p.status === "error") {
-        crit.push(name + " panel failed to build: " + (p.message || "no message"));
-      }
-    });
-
+    if (TECONSOLE && typeof TECONSOLE.computeHealth === "function") return TECONSOLE.computeHealth(panels);
     return {
-      level: crit.length ? "crit" : warn.length ? "warn" : "ok",
-      label: crit.length ? crit.length + " CRIT" : warn.length ? warn.length + " WARN" : "OK",
-      crit: crit,
-      warn: warn
+      level: "warn", label: "HEALTH UNKNOWN", crit: [],
+      warn: ["console_render.js did not load, so health cannot be computed"]
     };
   }
 
@@ -1606,6 +1715,17 @@
       meta.appendChild(el("span", { text: r.citation.source_id }));
       if (r.citation.anchor) meta.appendChild(el("span", { text: "PAGE " + r.citation.anchor.page }));
       meta.appendChild(chip(r.citation.license_tier, r.fenced ? "crit" : "settled"));
+      // C6: ASK -> TRACE. Every result row already carries the one field the
+      // Evidence route resolves from (citation.anchor.anchor_id) -- this is
+      // the whole bridge between the two surfaces, and the reason the route
+      // takes an anchor id at all.
+      var anchorId = r.citation.anchor && r.citation.anchor.anchor_id;
+      if (anchorId) {
+        var trace = el("button", { type: "button", "class": "btn btn--secondary btn--tiny", text: "TRACE ▸",
+          title: "open the claim anchored at " + anchorId + " on the Evidence tab" });
+        trace.addEventListener("click", function () { traceToEvidence("anchor_id", anchorId); });
+        meta.appendChild(trace);
+      }
       right.appendChild(meta);
       row.appendChild(left); row.appendChild(right);
       list.appendChild(row);
@@ -1647,7 +1767,89 @@
 
   /* ==========================================================================
      7. FEED
+
+     The stream itself lives in feed_render.js (window.TEFeed). What stays here
+     is everything that needs the PAGE: the thread rail, the operator inbox
+     card, the reading-order chips and their localStorage, the composer and its
+     reply target, and the three callbacks TEFeed calls back into -- scrolling
+     to a parent, flipping a collapse, and pointing the composer at a post.
      ========================================================================== */
+  var LS_FEED_ORDER = "trialerror.dashboard.feed.order";
+
+  /** The reading order for THIS viewer: their stored choice, else THREADED
+   * (L-C4 -- the operator's complaint was the missing structure). A stored
+   * value this build does not know falls back the same way. */
+  function feedOrder() {
+    if (state.feedOrder === null) {
+      var stored = lsGet(LS_FEED_ORDER);
+      state.feedOrder = TEFEED ? TEFEED.normalizeOrder(stored) : (stored === "arrived" ? "arrived" : "threaded");
+    }
+    return state.feedOrder;
+  }
+
+  function setFeedOrder(order) {
+    state.feedOrder = TEFEED ? TEFEED.normalizeOrder(order) : order;
+    lsSet(LS_FEED_ORDER, state.feedOrder);
+    paintFeedOrderChips();
+    loadFeed();
+  }
+
+  function paintFeedOrderChips() {
+    var order = feedOrder();
+    var pairs = [["feed-order-threaded", "threaded"], ["feed-order-arrived", "arrived"]];
+    pairs.forEach(function (pair) {
+      var node = qs('[data-role="' + pair[0] + '"]');
+      if (!node) return;
+      var on = order === pair[1];
+      node.className = "chip " + (on ? "chip--live" : "chip--neutral");
+      node.setAttribute("aria-pressed", on ? "true" : "false");
+    });
+  }
+
+  /** Scroll a post into view and flash it, so a jump from a reply's head to
+   * its parent is visible rather than a silent scroll. The flash class is
+   * removed on the next frame's timeout so re-clicking the same link
+   * re-triggers the animation. */
+  function jumpToPost(postId) {
+    var card = qs('[data-role="feed-post-card"][data-post-id="' + postId + '"]');
+    if (!card) return;
+    if (card.scrollIntoView) card.scrollIntoView({ block: "center" });
+    card.classList.remove("is-flashing");
+    /* reading offsetWidth restarts the CSS animation; without it a second
+       click on the same link removes and re-adds a class in one frame and
+       nothing visibly happens. */
+    void card.offsetWidth;
+    card.classList.add("is-flashing");
+    setTimeout(function () { card.classList.remove("is-flashing"); }, 1200);
+  }
+
+  function setFeedReplyTo(post) {
+    state.feedReplyTo = post ? { post_id: post.post_id, author: post.author, ts: post.ts } : null;
+    renderFeedReplyTarget();
+  }
+
+  function renderFeedReplyTarget() {
+    var bar = qs('[data-role="feed-reply-target"]');
+    if (!bar) return;
+    clear(bar);
+    var target = state.feedReplyTo;
+    if (!target) { hide(bar); return; }
+    show(bar);
+    bar.appendChild(el("span", { "class": "note-strip", text: "replying to " + target.author + " · " + fmtHM(target.ts) + " UTC" }));
+    var dismiss = el("button", {
+      type: "button", "class": "reply-target-clear", "data-role": "feed-reply-clear",
+      title: "post to the thread instead of as a reply", text: "✕"
+    });
+    dismiss.addEventListener("click", function () { setFeedReplyTo(null); });
+    bar.appendChild(dismiss);
+  }
+
+  /* Set by the + NEW THREAD wiring at the bottom of this section, called by
+     renderFeed. Declared here because renderFeed is defined ABOVE that
+     wiring, and this file runs in strict mode -- an assignment to an
+     undeclared name would be a ReferenceError, not an implicit global. */
+  var syncNewThreadEnabled = null;
+
   function loadFeed() {
     guardPanelLoad("feed", fetchPanel("feed", { thread_id: state.feedThreadId }).then(renderFeed), loadFeed);
   }
@@ -1661,10 +1863,17 @@
       posts.appendChild(el("div", { "class": "warn-callout" }, [el("div", { "class": "body", text: p ? p.message : "no data" })]));
       return;
     }
+    /* A reply target belongs to the thread it was chosen in. Switching
+       threads must not leave the composer pointed at a post that is no
+       longer on screen -- the reply would land somewhere the operator is
+       not looking. */
+    if (state.feedThreadId !== p.active_thread_id) setFeedReplyTo(null);
     state.feedThreadId = p.active_thread_id;
+    paintFeedOrderChips();
     var transmitBtn = qs('[data-role="feed-transmit-btn"]');
     transmitBtn.disabled = !(writesEnabled() && p.active_thread_id);
     transmitBtn.title = writesEnabled() ? "" : "live mode + a write token are required (static snapshots are read-only)";
+    if (syncNewThreadEnabled) syncNewThreadEnabled();   // C7: + NEW THREAD, same rule
     unreadCount.textContent = (p.unread_directives || []).length + " UNREAD DIRECTIVES";
     var withheld = p.translation_withheld_count || 0;
     qs('[data-role="feed-translation-note"]').textContent = withheld
@@ -1672,7 +1881,13 @@
       : "GATED; WITHHELD TRANSLATIONS ARE NEVER SHOWN";
     (p.threads || []).forEach(function (t) {
       var row = el("div", { "class": "thread-row" + (t.thread_id === p.active_thread_id ? " is-active" : "") }, [
-        el("span", { "class": "name", text: t.title })
+        el("span", { "class": "name", text: t.title }),
+        /* `thread_reply_count` is undefined on a bundle exported before this
+           build; say nothing at all rather than "0 replies", which is a
+           claim this page cannot make about an old snapshot. */
+        t.thread_reply_count === undefined || t.thread_reply_count === null
+          ? null
+          : el("span", { "class": "n", text: t.thread_reply_count + " replies" })
       ]);
       row.addEventListener("click", function () { state.feedThreadId = t.thread_id; loadFeed(); });
       threadList.appendChild(row);
@@ -1697,19 +1912,51 @@
       posts.appendChild(dirCard);
     }
 
-    if (!(p.posts || []).length) { posts.appendChild(el("div", { "class": "empty", text: "no posts in this thread yet" })); return; }
-    p.posts.forEach(function (post) {
-      var kind = (post.author || "").split(":", 1)[0];
-      var card = el("div", { "class": "post-card" });
-      var head = el("div", { "class": "post-card-head" }, [
-        chip(kind.toUpperCase(), "settled"),
-        el("span", { text: post.author }),
-        el("span", { "class": "fill", "style": "flex-grow:1;" }),
-        el("span", { text: fmtHM(post.ts) + " UTC" })
-      ]);
-      card.appendChild(head);
-      card.appendChild(buildPostBody(post, p));
-      posts.appendChild(card);
+    posts.appendChild(renderFeedStream(p));
+  }
+
+  /** The post stream, through feed_render.js. Everything threading-specific
+   * is in that file; this is the seam -- the page's own helpers going in, and
+   * the page's own callbacks coming back out.
+   *
+   * The fallback when the render file did not load is a flat list of the same
+   * cards: structure is what is lost, never the posts. */
+  function renderFeedStream(p) {
+    if (!TEFEED) {
+      var flat = el("div", { "class": "feed-stream", "data-role": "feed-stream", "data-order": "arrived" });
+      if (!(p.posts || []).length) {
+        flat.appendChild(el("div", { "class": "empty", text: "no posts in this thread yet" }));
+        return flat;
+      }
+      (p.posts || []).forEach(function (post) {
+        var kind = (post.author || "").split(":", 1)[0];
+        flat.appendChild(el("div", { "class": "post-card", "data-role": "feed-post-card", "data-post-id": post.post_id }, [
+          el("div", { "class": "post-card-head" }, [
+            chip(kind.toUpperCase(), "settled"),
+            el("span", { text: post.author }),
+            el("span", { "class": "fill", "style": "flex-grow:1;" }),
+            el("span", { text: fmtHM(post.ts) + " UTC" })
+          ]),
+          buildPostBody(post, p)
+        ]));
+      });
+      return flat;
+    }
+    return TEFEED.renderStream(p, {
+      order: feedOrder(),
+      collapsed: state.feedCollapsed,
+      replyToId: state.feedReplyTo ? state.feedReplyTo.post_id : null,
+      writesEnabled: writesEnabled() && !!p.active_thread_id,
+      buildPostBody: buildPostBody,     // lane b's, unchanged
+      chip: chip,
+      fmtHM: fmtHM,
+      onReply: setFeedReplyTo,
+      onJumpToParent: jumpToPost,
+      onToggleCollapse: function (rootPostId) {
+        if (state.feedCollapsed[rootPostId]) delete state.feedCollapsed[rootPostId];
+        else state.feedCollapsed[rootPostId] = true;
+        loadFeed();
+      }
     });
   }
 
@@ -1786,7 +2033,9 @@
     return el("div", { "class": "post-body-single" }, notes);
   }
 
-  qs('[data-role="feed-order-arrived"]').addEventListener("click", function () {});
+  qs('[data-role="feed-order-threaded"]').addEventListener("click", function () { setFeedOrder("threaded"); });
+  qs('[data-role="feed-order-arrived"]').addEventListener("click", function () { setFeedOrder("arrived"); });
+  paintFeedOrderChips();
   qs('[data-role="feed-translation-toggle"]').addEventListener("click", function () {
     state.feedSideBySide = !state.feedSideBySide;
     this.className = "chip " + (state.feedSideBySide ? "chip--live" : "chip--neutral");
@@ -1799,16 +2048,76 @@
     qs('[data-role="feed-compose-note"]'),
     "feed-post",
     function () {
-      return { thread_id: state.feedThreadId, body: qs('[data-role="feed-compose-input"]').value };
+      return {
+        thread_id: state.feedThreadId,
+        body: qs('[data-role="feed-compose-input"]').value,
+        /* REPLY IN THREAD's whole effect on the wire. `null` when nothing is
+           being answered, which _validate_fields skips and _do_feed_post
+           turns back into a plain thread post. */
+        in_reply_to: state.feedReplyTo ? state.feedReplyTo.post_id : null
+      };
     },
     ["thread_id", "body"],
     { body: qs('[data-role="feed-compose-input"]') },
     function () {
       qs('[data-role="feed-compose-input"]').value = "";
+      setFeedReplyTo(null);
       loadFeed();
     },
     loadFeed   // WA-2
   );
+
+  /* C7 (ops v8): opening a thread. Before the migration this control could
+     not exist -- `thread.created_by_launch` was NOT NULL and the operator has
+     no launch -- so the feed rail could only ever show threads somebody else
+     had started. */
+  (function wireNewThread() {
+    var toggle = qs('[data-role="feed-new-thread-toggle"]');
+    var form = qs('[data-role="feed-new-thread-form"]');
+    var titleEl = qs('[data-role="feed-new-thread-title"]');
+    var bodyEl = qs('[data-role="feed-new-thread-body"]');
+    var submitBtn = qs('[data-role="feed-new-thread-btn"]');
+    var cancelBtn = qs('[data-role="feed-new-thread-cancel"]');
+    var msgEl = qs('[data-role="feed-new-thread-msg"]');
+    if (!toggle || !form) return;
+
+    function close() {
+      form.classList.add("is-hidden");
+      titleEl.value = ""; bodyEl.value = ""; msgEl.textContent = "";
+    }
+    toggle.addEventListener("click", function () {
+      var opening = form.classList.contains("is-hidden");
+      form.classList.toggle("is-hidden", !opening);
+      if (opening) titleEl.focus();
+    });
+    cancelBtn.addEventListener("click", close);
+
+    // The TOGGLE is disabled on a snapshot, not just the submit: a form that
+    // opens and then refuses is worse than one that says up front it cannot
+    // be used here (12.11 -- and the reason goes in the title). Called from
+    // renderFeed, the same place the TRANSMIT button's enablement is decided,
+    // because `state.mode` is not known yet when this wiring runs.
+    syncNewThreadEnabled = function () {
+      var can = writesEnabled();
+      toggle.disabled = !can;
+      submitBtn.disabled = !can;
+      toggle.title = can ? "" : "a static snapshot carries no write token, so it cannot open a thread";
+      if (!can) close();
+    };
+    syncNewThreadEnabled();
+
+    wireWriteAction(
+      submitBtn, msgEl, "thread-create",
+      function () { return { title: titleEl.value, body: bodyEl.value }; },
+      ["title", "body"], { title: titleEl, body: bodyEl },
+      function (result) {
+        close();
+        state.feedThreadId = result.thread_id;   // land on the thread just opened
+        loadFeed();
+      },
+      loadFeed   // WA-2
+    );
+  })();
 
   /* ==========================================================================
      8. ROOMS
@@ -2135,11 +2444,26 @@
     ]);
     body.appendChild(summaryCard);
 
+    // C7: an objection already recorded against this edit. It is still in the
+    // queue -- a sent-back edit is an unverified one and the union is still
+    // refused -- so the next operator to reach the row has to see that
+    // somebody already said no, and why, rather than verifying it blind.
+    if (item.sent_back) {
+      body.appendChild(el("div", { "class": "warn-callout" }, [
+        el("div", { "class": "head", text: "▲ SENT BACK · " + (item.sent_back_note || "no note recorded") }),
+        el("div", {
+          "class": "body",
+          text: "by " + (item.sent_back_by_launch || "unknown") + " at " + (item.sent_back_ts || "unknown time") +
+            " — the edit still blocks the union until it is re-applied and verified.",
+        }),
+      ]));
+    }
+
     var fieldsCard = el("div", { "class": "card" });
     fieldsCard.appendChild(el("div", { "class": "card-header" }, [el("span", { "class": "title", text: "DETAIL" })]));
     var fieldsBody = el("div", { "class": "card-body" });
     fieldsCard.appendChild(fieldsBody);
-    fieldsBody.appendChild(renderObjectG(item));
+    renderDeterminationFields(fieldsBody, item);
     body.appendChild(fieldsCard);
 
     var whyCard = el("div", { "class": "card" });
@@ -2156,17 +2480,87 @@
     detail.appendChild(body);
   }
 
+  /** The DETAIL card, per kind (C7). This replaces the last generic
+   * `renderObjectG(item)` call site outside the ext panels -- two kinds
+   * genuinely cannot be read as a key/value dump:
+   *
+   * - a pre-registration must show its HASHES ONLY until it is revealed
+   *   (REDESIGN 5.4). Dumping the item was safe today only because the
+   *   builder happens not to carry the procedure; making the OMISSION
+   *   explicit is what keeps it safe when somebody adds a field.
+   * - a memory conflict is a choice between two BODIES, and "versions: [2
+   *   objects]" in a key/value table is not a thing anyone can decide from.
+   *
+   * Every other kind keeps the generic renderer, which reads their flat
+   * shapes perfectly well. */
+  function renderDeterminationFields(container, item) {
+    if (item.kind === "prereg_reveal") {
+      var grid = el("div", { "class": "context-frame-grid" });
+      [
+        ["TITLE", item.title],
+        ["COMMITTED", item.committed_ts],
+        ["PROCEDURE SHA256", item.procedure_sha256 || "—"],
+        ["PARAMS SHA256", item.params_sha256 || "—"],
+        ["ESCROW", item.escrow_present ? "present" : "MISSING"],
+      ].forEach(function (pair) {
+        grid.appendChild(el("span", { "class": "k", text: pair[0] }));
+        grid.appendChild(el("span", { "class": "hash-cell", text: String(pair[1] === null || pair[1] === undefined ? "—" : pair[1]) }));
+      });
+      container.appendChild(grid);
+      container.appendChild(el("div", {
+        "class": "note-strip",
+        text: "HASHES ONLY. THE PROCEDURE AND PARAMS ARE SEALED UNTIL YOU REVEAL THEM — THAT IS WHAT THE BLIND IS.",
+      }));
+      return;
+    }
+    if (item.kind === "memory_conflict") {
+      container.appendChild(el("div", { "class": "coords-line", text: "KEY " + (item.key || "") }));
+      var cols = el("div", { "class": "two-col memory-sides" });
+      (item.versions || []).forEach(function (v) {
+        cols.appendChild(el("div", { "class": "card memory-side", "data-role": "memory-side-" + v.side }, [
+          el("div", { "class": "card-header" }, [
+            el("span", { "class": "title", text: v.side.toUpperCase() }),
+            el("span", { "class": "sub", text: [v.tier, v.kind, v.account_id].filter(Boolean).join(" · ") }),
+          ]),
+          el("div", { "class": "card-body" }, [
+            el("div", { "class": "coords-line", text: v.memory_item_id + " · updated " + (v.updated_ts || "—") }),
+            v.l0_abstract ? el("div", { "class": "sub", text: v.l0_abstract }) : null,
+            el("div", { "class": "memory-body", text: v.body || "" }),
+          ]),
+        ]));
+      });
+      container.appendChild(cols);
+      if (!(item.versions || []).length) {
+        container.appendChild(el("div", { "class": "empty", text: "this group's rows are no longer readable" }));
+      }
+      return;
+    }
+    container.appendChild(renderObjectG(item));
+  }
+
   //: item.kind -> a one-line reason a kind's buttons stay disabled --
   //: either the underlying module genuinely has no callable for it, or a
   //: real callable exists but resolving it wasn't in this build's named
   //: write-action list (see trialerror.dashboard.writes' own module docstring).
   var DETERM_DISABLED_REASONS = {
-    prereg_reveal: "trialerror.verify.prereg has a reveal callable, but pre-registration reveal wasn't in this build's write-action list.",
     room_escalation: "resolve from the Rooms panel instead (post a turn on the frozen room's discussion point, or converge-check) -- no direct \"resolve escalation\" callable exists.",
-    memory_conflict: "trialerror.memory.merge.resolve_conflict exists, but memory-conflict resolution wasn't in this build's write-action list.",
     memory_conflict_candidate: "judge from the CLI (`trialerror memory judge --relation <id> --verb <verb> --actor <you>`) -- a verdict carries the judge's identity, which a dashboard button cannot supply.",
     memory_stale: "review from the CLI (`trialerror memory reviewed <id>`) -- a review is an assertion that a person looked, so it is not a button.",
   };
+
+  /** Mark a write button as needing TWO clicks (the artboard's rule:
+   * "destructive verbs always ask twice"). The arming itself lives inside
+   * `wireWriteAction`, not here -- a second listener would race the submit
+   * one, and which of them saw the click first would depend on wiring order.
+   * This only stamps the label the armed state shows.
+   *
+   * Deliberately not `window.confirm()`: a browser dialog cannot say what is
+   * about to happen in this page's own words, and cannot show the hashes the
+   * operator is deciding against. */
+  function requireTwoClicks(btn, confirmLabel) {
+    btn.setAttribute("data-confirm-label", confirmLabel);
+    return btn;
+  }
 
   function buildDeterminationActions(item) {
     var writable = writesEnabled();
@@ -2176,26 +2570,49 @@
     function launchField(placeholder) {
       return el("input", { type: "text", "class": "write-input", placeholder: placeholder || "your launch_id", style: "width:230px;" });
     }
+    /** The arm for a kind with no wired action. It used to draw two buttons,
+     * VERIFY / ACCEPT and SEND BACK / REJECT -- verbs that none of the three
+     * remaining kinds actually has (you do not "reject" a frozen room),
+     * invented so the shape would match the wired arms. One control, labelled
+     * for what is true, plus the reason: a disabled button naming a verb the
+     * subsystem does not have is a promise the page cannot keep. It also kept
+     * the word REJECT on screen, which ruling L-C6 says this dashboard does
+     * not offer. */
     function disabledPair(reason) {
       wrap.appendChild(el("div", { "class": "btn-row" }, [
-        el("button", { type: "button", "class": "btn btn--primary", disabled: "disabled", title: reason, text: "VERIFY / ACCEPT" }),
-        el("button", { type: "button", "class": "btn btn--secondary", disabled: "disabled", title: reason, text: "SEND BACK / REJECT" }),
+        el("button", {
+          type: "button", "class": "btn btn--secondary", disabled: "disabled",
+          title: reason, text: "NO ACTION WIRED HERE",
+        }),
       ]));
       wrap.appendChild(el("div", { "class": "note-strip", text: reason }));
     }
 
     if (item.kind === "gate_edit") {
       var byLaunch = launchField();
-      var noteInput = el("input", { type: "text", "class": "write-input", placeholder: "verified note (optional)", style: "flex-grow:1;" });
-      var verifyBtn = el("button", { type: "button", "class": "btn btn--primary", text: "VERIFY EDIT" });
-      var rejectBtn = el("button", {
-        type: "button", "class": "btn btn--secondary", disabled: "disabled",
-        title: "trialerror.artifacts.gates has no reject/send-back callable for a blocking edit -- only verify_edit exists.",
-        text: "SEND BACK / REJECT",
+      var noteInput = el("input", {
+        type: "text", "class": "write-input", "data-role": "gate-edit-note",
+        placeholder: "note — optional to verify, REQUIRED to send back", style: "flex-grow:1;",
       });
+      var verifyBtn = el("button", { type: "button", "class": "btn btn--primary", "data-role": "gate-verify-btn", text: "VERIFY EDIT" });
+      // C7: SEND BACK is real now (gates.send_back_edit). REJECT is not, and
+      // is not drawn at all -- ruling L-C6 keeps `gated -> failed` a CLI
+      // verdict path until the identity ruling lands, because a destructive
+      // verb driven by a free-text launch id is not auditable.
+      var sendBackBtn = el("button", { type: "button", "class": "btn btn--secondary", "data-role": "gate-send-back-btn", text: "SEND BACK" });
       verifyBtn.disabled = !writable;
+      sendBackBtn.disabled = !writable;
+      // The keyboard shortcuts spec section 4 asks for, said where the
+      // operator can find them (the keys are live in the Decide keydown
+      // handler; see DETERM_KEY_ROLES).
+      verifyBtn.title = "V";
+      sendBackBtn.title = "B";
       wrap.appendChild(el("div", { "class": "write-form-row" }, [byLaunch, noteInput]));
-      wrap.appendChild(el("div", { "class": "btn-row" }, [verifyBtn, rejectBtn]));
+      wrap.appendChild(el("div", { "class": "btn-row" }, [verifyBtn, sendBackBtn]));
+      wrap.appendChild(el("div", {
+        "class": "note-strip",
+        text: "SENDING BACK RECORDS THE OBJECTION; THE EDIT STAYS BLOCKING UNTIL IT IS RE-APPLIED AND VERIFIED.",
+      }));
       wireWriteAction(
         verifyBtn, msg, "verify-edit",
         function () { return { gate_id: item.gate_id, edit_id: item.edit_id, by_launch: byLaunch.value, verified_note: noteInput.value }; },
@@ -2203,6 +2620,80 @@
         function () { state.determSelectedId = null; loadDeterminations(); },
         loadDeterminations   // WA-2: keep the selection, repaint the truth
       );
+      wireWriteAction(
+        sendBackBtn, msg, "gate-send-back",
+        function () { return { gate_id: item.gate_id, edit_id: item.edit_id, by_launch: byLaunch.value, note: noteInput.value }; },
+        // note is REQUIRED here and optional above -- the same input, two
+        // rules, because a send-back with no stated objection is the
+        // freeze-without-reason case.
+        ["gate_id", "edit_id", "by_launch", "note"], { by_launch: byLaunch, note: noteInput },
+        function () { loadDeterminations(); },
+        loadDeterminations
+      );
+    } else if (item.kind === "prereg_reveal") {
+      // REDESIGN 5.4: hashes only until revealed. The button is a two-click
+      // confirm (L-C3) because a reveal ends the blind and cannot be undone.
+      var revealBtn = el("button", { type: "button", "class": "btn btn--primary", "data-role": "prereg-reveal-btn", text: "REVEAL" });
+      revealBtn.disabled = !writable || item.escrow_present === false;
+      if (item.escrow_present === false) {
+        revealBtn.title = "the escrow file is not on disk at the path this commitment recorded -- a reveal will refuse and VOID this pre-registration";
+      }
+      requireTwoClicks(revealBtn, "CONFIRM REVEAL — IRREVERSIBLE");
+      wrap.appendChild(el("div", { "class": "btn-row" }, [revealBtn]));
+      wrap.appendChild(el("div", {
+        "class": "note-strip",
+        text: "REVEALING ENDS THE BLIND. IT CANNOT BE UNDONE, AND IT IS RECORDED AS A prereg_revealed EVENT.",
+      }));
+      var revealedBox = el("div", { "data-role": "prereg-revealed" });
+      wrap.appendChild(revealedBox);
+      wireWriteAction(
+        revealBtn, msg, "prereg-reveal",
+        function () { return { prereg_id: item.id }; },
+        ["prereg_id"], {},
+        function (result) {
+          // Render what came back BEFORE the panel reload drops this item out
+          // of the queue -- otherwise the one moment the procedure is on
+          // screen is the moment the list repaints without it.
+          clear(revealedBox);
+          revealedBox.appendChild(el("div", { "class": "card" }, [
+            el("div", { "class": "card-header" }, [el("span", { "class": "title", text: "REVEALED" })]),
+            el("div", { "class": "card-body" }, [
+              el("div", { "class": "note-strip", text: "PROCEDURE" }),
+              el("div", { "class": "prereg-procedure", text: result.procedure || "" }),
+              el("div", { "class": "note-strip", text: "PARAMS" }),
+              el("div", { "class": "prereg-procedure", text: JSON.stringify(result.params || {}, null, 2) }),
+              el("div", { "class": "coords-line", text: "WRITTEN TO " + (result.revealed_path || "") }),
+            ]),
+          ]));
+          loadDeterminations();
+        },
+        loadDeterminations
+      );
+    } else if (item.kind === "memory_conflict") {
+      var keepBtns = [
+        { keep: "left", label: "KEEP LEFT" },
+        { keep: "right", label: "KEEP RIGHT" },
+        { keep: "both", label: "KEEP BOTH" },
+      ].map(function (spec) {
+        var b = el("button", {
+          type: "button", "class": spec.keep === "both" ? "btn btn--secondary" : "btn btn--primary",
+          "data-role": "memory-keep-" + spec.keep, text: spec.label,
+        });
+        b.disabled = !writable;
+        wireWriteAction(
+          b, msg, "memory-resolve",
+          function () { return { group_id: item.id, keep: spec.keep }; },
+          ["group_id", "keep"], {},
+          function () { state.determSelectedId = null; loadDeterminations(); },
+          loadDeterminations
+        );
+        return b;
+      });
+      wrap.appendChild(el("div", { "class": "btn-row" }, keepBtns));
+      wrap.appendChild(el("div", {
+        "class": "note-strip",
+        text: "RESOLUTION IS ONE-SHOT PER GROUP. KEEP BOTH IS FOR TWO VERSIONS THAT WERE NEVER ONE FACT.",
+      }));
     } else if (item.kind === "kg_merge") {
       var byLaunch2 = launchField();
       var acceptBtn = el("button", { type: "button", "class": "btn btn--primary", text: "ACCEPT MERGE" });
@@ -2251,10 +2742,48 @@
     return wrap;
   }
 
+  /** The Decide arm's V / B shortcuts (spec section 4: "buttons VERIFY EDIT /
+   * SEND BACK (keys V / B)").
+   *
+   * Deliberately NOT a general "type the first letter of a button" binding.
+   * A key press is one keystroke away from an accident, so this reaches
+   * exactly two `data-role`s -- the gate arm's two verbs, both recoverable --
+   * and refuses on sight any control stamped `data-confirm-label`. That stamp
+   * is what `requireTwoClicks` puts on an irreversible verb (today: REVEAL),
+   * so the guard holds by construction rather than by this list staying
+   * correct: a future arm that arms a destructive button gets no keyboard
+   * path to it, and ruling L-C3's "two clicks, from the one listener that
+   * submits" keeps meaning what it says.
+   *
+   * The click is dispatched on the button so the submit runs through
+   * `wireWriteAction`'s own listener -- the required-field check, the
+   * disabled state, the message element and the WA-2 reload are all in
+   * there, and a second submit path would have to reproduce every one. */
+  var DETERM_KEY_ROLES = { v: "gate-verify-btn", b: "gate-send-back-btn" };
+
+  function pressDeterminationVerb(role) {
+    // The buttons are in the DETAIL pane, not in the list row -- and the
+    // detail pane only ever holds the selected item's arm, so scoping the
+    // lookup to it is what makes the shortcut act on the row the operator is
+    // looking at rather than on the first match in the document.
+    var detail = qs('[data-role="determ-detail"]');
+    var btn = detail && detail.querySelector('button[data-role="' + role + '"]');
+    if (!btn || btn.disabled) return false;
+    if (btn.hasAttribute("data-confirm-label")) return false;   // never a keyboard path to a two-click verb
+    btn.click();
+    return true;
+  }
+
   document.addEventListener("keydown", function (e) {
     if (state.activePanel !== "determinations") return;
     var tag = (document.activeElement && document.activeElement.tagName) || "";
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
+    var role = DETERM_KEY_ROLES[(e.key || "").toLowerCase()];
+    if (role) {
+      if (pressDeterminationVerb(role)) e.preventDefault();
+      return;
+    }
     if (e.key !== "j" && e.key !== "k" && e.key !== "J" && e.key !== "K") return;
     var ids = state.determItemsFlat;
     if (!ids.length) return;
@@ -2266,6 +2795,94 @@
     var target = document.getElementById("determ-item-" + ids[idx].replace(/[^a-zA-Z0-9]/g, "_"));
     if (target) target.scrollIntoView({ block: "nearest" });
   });
+
+  /* ==========================================================================
+     9b. EVIDENCE (C6)
+     Wiring only -- every node comes from evidence_render.js, which is written
+     against the injected `el`/`svgEl` helpers and therefore runs under the
+     Node DOM shim as well as here.
+     ========================================================================== */
+  /** Jump to the Evidence tab with one selector set. `kind` is the query-string
+   * name the route expects (claim_id / anchor_id / chunk_id) -- exactly ONE
+   * goes on the wire, because build_evidence_panel owns the precedence between
+   * them and a page that sent two would be able to disagree with the panel it
+   * got back. */
+  function traceToEvidence(kind, id) {
+    state.evidenceSelector = { kind: kind, id: id };
+    state.evidenceEdgeSort = null;
+    switchPanel("evidence");
+  }
+
+  function loadEvidence() {
+    var params = {};
+    var sel = state.evidenceSelector;
+    if (sel && sel.id) params[sel.kind] = sel.id;
+    guardPanelLoad("evidence", fetchPanel("evidence", params).then(renderEvidence), loadEvidence);
+  }
+
+  function evidenceCtx(panel) {
+    return {
+      filter: state.evidenceFilterText,
+      // A static snapshot has no server to ask for a second claim, so the
+      // rows are drawn disabled WITH their reason rather than wired to a
+      // handler that would silently do nothing (12.11).
+      onSelectClaim: state.mode === "static" ? null : function (claimId) {
+        state.evidenceSelector = { kind: "claim_id", id: claimId };
+        state.evidenceEdgeSort = null;
+        loadEvidence();
+      },
+      edgeSort: state.evidenceEdgeSort,
+      onSortEdges: function (key) {
+        var cur = state.evidenceEdgeSort;
+        state.evidenceEdgeSort = (cur && cur.key === key && cur.dir === "asc")
+          ? { key: key, dir: "desc" } : { key: key, dir: "asc" };
+        renderEvidence(panel);
+      }
+    };
+  }
+
+  function renderEvidence(p) {
+    var index = qs('[data-role="evidence-index"]');
+    var detail = qs('[data-role="evidence-detail"]');
+    var count = qs('[data-role="evidence-count"]');
+    if (!TEEVIDENCE) {
+      // The renderer file did not load. Say so rather than leaving two boxes
+      // at "loading…" forever -- a missing script must not look like a slow
+      // fetch (the same reason console_render.js has a generic fallback).
+      clear(index); clear(detail);
+      detail.appendChild(el("div", { "class": "warn-callout" }, [
+        el("div", { "class": "head", text: "▲ THE EVIDENCE RENDERER DID NOT LOAD" }),
+        el("div", { "class": "body", text: "static/evidence_render.js is missing, failed to parse, or loaded before console_render.js (it needs that file's shared primitives). The route itself is fine — check the console and reload." })
+      ]));
+      return;
+    }
+    state.evidencePanel = p;
+    if (p && p.status === "ok" && p.active_claim_id) {
+      // Keep the address of what is on screen, so a later refresh (an SSE
+      // `changed`, a RETRY) re-fetches the SAME claim rather than sliding
+      // back to the newest one under the operator.
+      state.evidenceSelector = { kind: "claim_id", id: p.active_claim_id };
+    }
+    if (count) {
+      count.textContent = p && p.status === "ok"
+        ? (p.index_total || 0) + " LIVE CLAIMS" + (p.index_truncated ? " · RAIL CAPPED" : "")
+        : "";
+    }
+    TEEVIDENCE.render({ index: index, detail: detail }, p, evidenceCtx(p));
+  }
+
+  (function wireEvidenceFilter() {
+    var input = qs('[data-role="evidence-filter"]');
+    if (!input) return;
+    input.addEventListener("input", function () {
+      state.evidenceFilterText = input.value;
+      // Filtering is over the rail ALREADY IN HAND. The builder caps the rail
+      // at 100 rows and the rail says so, so re-asking the server per keystroke
+      // would cost a round trip and still answer the same question -- and the
+      // renderer's own truncation line is what keeps that honest.
+      if (state.evidencePanel) renderEvidence(state.evidencePanel);
+    });
+  })();
 
   /* ==========================================================================
      10. DOSSIER
@@ -2615,23 +3232,40 @@
   }
 
   /* ==========================================================================
-     13. CONSOLE (reuses the generic renderer -- see brief: "compressed, still
-     works, keeps Console cheap")
+     13. CONSOLE -- eight bespoke cards, all of them in console_render.js
+
+     Everything this section still owns is WIRING: which container each card
+     paints into, what a click on a timeline lane should do, and the one write
+     action the surface has. The readings themselves are TEConsole's, which is
+     what makes them testable without a browser (sweep §3.11).
      ========================================================================== */
   /** The console card containers, by the name console_render.js knows them
-   * under (TEConsole.CARD_ORDER). `diagnostics` is the DOCTOR card: the card
-   * is named for what it reports, the hook for the panel that feeds it. */
+   * under (TEConsole.CARD_ORDER). Each card hands over two nodes: the body,
+   * and the head slot where the card's own status reading goes.
+   * `diagnostics` is the DOCTOR card -- the card is named for what it
+   * reports, the hook for the panel that feeds it. */
   function consoleTargets() {
+    function pair(hook) {
+      return {
+        body: qs('[data-role="console-body-' + hook + '"]'),
+        head: qs('[data-role="console-head-' + hook + '"]')
+      };
+    }
     return {
-      session: qs('[data-role="console-body-session"]'),
-      pools: qs('[data-role="console-body-pools"]'),
-      ledger: qs('[data-role="console-body-ledger"]'),
-      timeline: qs('[data-role="console-body-timeline"]'),
-      jobs: qs('[data-role="console-body-jobs"]'),
-      diagnostics: qs('[data-role="console-body-doctor"]'),
-      gates: qs('[data-role="console-body-gates"]'),
-      corpus: qs('[data-role="console-body-corpus"]')
+      session: pair("session"), pools: pair("pools"), ledger: pair("ledger"),
+      timeline: pair("timeline"), jobs: pair("jobs"), diagnostics: pair("doctor"),
+      gates: pair("gates"), corpus: pair("corpus")
     };
+  }
+
+  /** A timeline bar knows which row it came from; this is where that becomes
+   * navigation. Spec §3 item (ii): a `gate` ref goes to Dossier, a `room` ref
+   * to Rooms. A launch or job ref has no panel of its own yet, so it does
+   * nothing rather than switching to somewhere unrelated. */
+  function consoleRefClick(ref) {
+    if (!ref) return;
+    if (ref.room_id) { state.roomsRoomId = ref.room_id; switchPanel("rooms"); return; }
+    if (ref.gate_id) { switchPanel("dossier"); return; }
   }
 
   /** Paints the console cards from a bundle already in hand. Split out
@@ -2639,31 +3273,95 @@
    * health badge and then called loadConsole(), which fetched /all again
    * in the same millisecond. One tick, one bundle, both consumers.
    *
-   * TEConsole gets first refusal on every card. Whatever it does not draw
-   * falls back to the generic renderer, so the bespoke cards can land one at
-   * a time without a flag day -- and the two cards with no generic form
-   * (LAUNCH LEDGER, THIS SESSION END TO END) stay hidden until they have a
-   * renderer, rather than showing an empty box. */
+   * TEConsole gets first refusal on every card; anything it does not draw
+   * (which today means: the renderer file failed to load) falls back to the
+   * generic renderer, so a missing script degrades to the old key/value dump
+   * instead of eight empty boxes. */
+  /** Everything the cards need that is not in the bundle: the callbacks, and
+   * the little bit of per-viewer state (the DIAGNOSTICS filter) that has to
+   * outlive a re-render. */
+  function consoleOpts() {
+    return {
+      onRunDoctor: runDoctorSweep,
+      onRef: consoleRefClick,
+      doctorFilter: state.consoleDoctorFilter,
+      onDoctorFilter: function (next) {
+        state.consoleDoctorFilter = next;
+        renderConsoleFromBundle(lastBundle);
+      }
+    };
+  }
+
   function renderConsoleFromBundle(bundle) {
     var panels = (bundle || {}).panels || {};
     var targets = consoleTargets();
-    var painted = TECONSOLE ? TECONSOLE.renderInto(targets, bundle) : [];
+    var painted = TECONSOLE ? TECONSOLE.renderInto(targets, bundle, consoleOpts()) : [];
     function generic(name, panel) {
-      if (painted.indexOf(name) === -1) renderGeneric(targets[name], panel);
+      var body = (targets[name] || {}).body;
+      if (body && painted.indexOf(name) === -1) renderGeneric(body, panel);
     }
     generic("session", panels.session);
     generic("pools", panels.budget);
+    generic("ledger", panels.budget);
     generic("jobs", panels.jobs);
     generic("gates", panels.gates);
     generic("corpus", panels.corpus);
     generic("diagnostics", panels.doctor);
-    ["ledger", "timeline"].forEach(function (name) {
-      var card = document.getElementById("console-card-" + name);
-      if (card) card.classList.toggle("is-hidden", painted.indexOf(name) === -1);
+    if (painted.indexOf("timeline") === -1) {
+      // The timeline has no generic form at all -- it is a new reading, not a
+      // re-draw of an existing panel -- so its card hides rather than showing
+      // an empty bordered box.
+      var card = document.getElementById("console-card-timeline");
+      if (card) card.classList.add("is-hidden");
+    } else {
+      var shown = document.getElementById("console-card-timeline");
+      if (shown) shown.classList.remove("is-hidden");
+    }
+  }
+
+  /* ---- the one-second tick (console-7 / LU-11) --------------------------
+     Once LU-7's accidental 3-second repaint was cut, every age on the page
+     would have frozen between real changes. So while Console is the active
+     panel -- and only then -- one interval re-reads the `data-ts` stamps the
+     renderer left behind, and re-lays the timeline when it has a bar whose
+     right edge is `now`. Cleared on the way out: an ops page left open for a
+     week must not keep a timer per panel visit. */
+  var consoleTick = null;
+
+  function tickAges() {
+    if (!TECONSOLE) return;
+    var now = Date.now();
+    qsa('#panel-console [data-ts]').forEach(function (node) {
+      var iso = node.getAttribute("data-ts");
+      if (!iso) return;
+      node.textContent = node.getAttribute("data-fmt") === "elapsed"
+        ? TECONSOLE.fmtElapsedClock(iso, now)
+        : TECONSOLE.fmtAgoText(iso, now);
     });
+    var timeline = (((lastBundle || {}).panels || {}).session || {});
+    timeline = ((timeline.open_session || {}).timeline) || null;
+    var hasRunning = timeline && (timeline.spans || []).some(function (s) { return !s.end_ts; });
+    if (hasRunning) {
+      var target = consoleTargets().timeline;
+      if (target && target.body) {
+        TECONSOLE.clear(target.body);
+        target.body.appendChild(TECONSOLE.renderTimelineCard(timeline, { nowMs: now, onRef: consoleRefClick }));
+      }
+    }
+  }
+
+  function startConsoleTick() {
+    if (consoleTick !== null) return;
+    consoleTick = setInterval(tickAges, 1000);
+  }
+  function stopConsoleTick() {
+    if (consoleTick === null) return;
+    clearInterval(consoleTick);
+    consoleTick = null;
   }
 
   function loadConsole() {
+    startConsoleTick();
     guardPanelLoad("console", fetchAll().then(function (bundle) {
       lastBundle = bundle;
       state.meta = bundle.meta || state.meta;
@@ -2672,32 +3370,38 @@
       renderConsoleFromBundle(bundle);
     }), loadConsole);
   }
-  qs('[data-role="doctor-run-btn"]').addEventListener("click", function () {
-    var btn = qs('[data-role="doctor-run-btn"]');
+
+  /** RUN THE CHECK SWEEP. The button is drawn by the DIAGNOSTICS card, which
+   * re-draws on every render, so the handler is a named function the renderer
+   * is handed rather than a listener bound once to a node. */
+  function runDoctorSweep(ev) {
     if (!writesEnabled()) return;
-    btn.disabled = true; btn.textContent = "RUNNING…";
-    // Stage 3: doctor/run now WRITES a sidecar state file, so it moved to
-    // POST + the same token guard every other write action uses.
+    var btn = ev && ev.target ? ev.target : null;
+    if (btn) { btn.disabled = true; btn.textContent = "RUNNING…"; }
+    // Stage 3: doctor/run WRITES a sidecar state file, so it is a POST behind
+    // the same token guard every other write action uses.
     fetch("/dashboard/api/doctor/run", {
       method: "POST", cache: "no-store",
       headers: { "X-TrialError-Dashboard-Token": WRITE_TOKEN || "" },
     }).then(function (r) {
       if (!r.ok) throw new Error("HTTP " + r.status);
       return r.json();
-    }).then(function (doctorPanel) {
-      renderGeneric(qs('[data-role="console-body-doctor"]'), doctorPanel);
+    }).then(function () {
       // M-CON-2: a sweep that just turned up a FAIL has to move the rail
-      // badge. The old handler repainted one card and left health reading
-      // whatever it read before the run -- the single worst moment for the
-      // one-glance indicator to be stale.
+      // badge, so the whole bundle is refetched rather than one card
+      // repainted. The old handler left health reading whatever it read
+      // before the run -- the single worst moment for the one-glance
+      // indicator to be stale.
       loadConsole();
-      // LU-6: the empty catch below used to swallow every failure of this
+      // LU-6: the empty catch this replaced swallowed every failure of the
       // POST, including a 403 from a rotated token, leaving the button
       // simply snapping back to its label with nothing said.
     }).catch(function (e) {
-      showPanelFetchError("console", e, function () { qs('[data-role="doctor-run-btn"]').click(); });
-    }).finally(function () { btn.disabled = !writesEnabled(); btn.textContent = "RUN THE CHECK SWEEP"; });
-  });
+      showPanelFetchError("console", e, runDoctorSweep);
+    }).finally(function () {
+      if (btn) { btn.disabled = !writesEnabled(); btn.textContent = "RUN THE CHECK SWEEP"; }
+    });
+  }
 
   /* ==========================================================================
      14. EXTENSION PANELS (C-0070)
@@ -2942,7 +3646,6 @@
       setConn("live");
       switchPanel(initialPanelFromHash(), { noHash: true });
       clearPanelFetchError(state.activePanel);
-      show(qs('[data-role="doctor-run-btn"]'));
       state.booted = true;
       connectSSE();
     }).catch(function (e) {

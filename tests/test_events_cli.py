@@ -142,13 +142,51 @@ def test_cli_feed_post_new_thread_then_read(program_root, platform_root):
     assert any(t["thread_id"] == thread_id for t in threads_env["result"]["threads"])
 
 
-def test_cli_feed_post_new_thread_without_launch_id_is_refused(program_root, platform_root):
+def test_cli_feed_post_new_thread_without_launch_id_or_session_is_refused(program_root, platform_root):
+    """The refusal moved; it did not go away. `--new-thread` used to be
+    rejected up front for want of a `--launch-id`, because
+    `thread.created_by_launch` was NOT NULL. ops v8 made it nullable and gave
+    a thread the same derived authorship a post has, so what is refused now is
+    the real condition -- no launch AND no open session to attribute it to --
+    and the message comes from the module that owns the rule
+    (`_derive_author`), not from a second copy of it in the CLI."""
     args = _parse(
         ["feed", "post", "--program-root", str(program_root), "--body", "x", "--new-thread", "t"]
     )
     env = args.handler(args)
     assert env["ok"] is False
-    assert env["error"]["code"] == "new_thread_needs_launch"
+    assert env["error"]["code"] == "post_refused"
+    assert "no open session" in env["error"]["message"]
+
+
+def test_cli_feed_post_new_thread_under_an_open_session_is_authored_by_the_orchestrator(
+    program_root, platform_root
+):
+    """ops v8's point, from the CLI side: opening a thread no longer needs a
+    launch id, only somebody real to attribute it to."""
+    from trialerror.events.api import list_threads
+    from trialerror.stores.store import open_store
+    from tests.test_events_helpers import seed_session
+
+    store = open_store(program_root, platform_root=platform_root)
+    session_id = seed_session(store, status="open")
+    store.close()
+
+    args = _parse(
+        ["feed", "post", "--program-root", str(program_root), "--body", "hello",
+         "--new-thread", "opened by hand"]
+    )
+    env = args.handler(args)
+    assert env["ok"] is True, env
+    assert env["result"]["author"] == f"orchestrator:{session_id}"
+
+    store = open_store(program_root, platform_root=platform_root)
+    try:
+        thread = next(t for t in list_threads(store) if t["thread_id"] == env["result"]["thread_id"])
+    finally:
+        store.close()
+    assert thread["created_by_launch"] is None
+    assert thread["created_by"] == f"orchestrator:{session_id}"
 
 
 def test_cli_feed_post_missing_thread_target_is_refused(program_root, platform_root):
