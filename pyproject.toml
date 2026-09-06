@@ -20,7 +20,25 @@ classifiers = [
 # (Windows-first concern), so this is a core dependency rather than an
 # optional extra -- unlike sqlite-vec (M1), pdf-text normalization is
 # required v0 scope (design Section 12, M7 row), not an optional backend.
-dependencies = ["pypdf>=5"]
+#
+# tantivy (tantivy-py): the lexical/BM25 tier's default backend since
+# C-0080 (spikes/index_bakeoffs/BAKEOFF_REPORT.md Sec A.3, "SWITCH to
+# tantivy" -- 23-64x faster queries, ~2.1x smaller on disk, at every
+# measured scale). MIT, same license as this project. Pinned to the 0.26.x
+# family the bake-off actually measured: tantivy's on-disk index format is
+# versioned (0.26.0 ships index_format v7) and a minor bump can change it,
+# so a floating upper bound would let a `pip install -U` silently
+# invalidate a program's built index.
+#
+# CORE dependency rather than an extra, for the same reason pypdf is:
+# tantivy-py publishes prebuilt wheels for Windows, manylinux and macOS on
+# cp311/cp312, so there is no compiler step on any platform this project
+# supports -- the "optional because it needs a native build" reasoning that
+# keeps sqlite-vec in an extra does not apply. The code still degrades
+# gracefully if it is somehow absent (trialerror.retrieve.lexical falls back
+# to the SQLite FTS5 tier and notes it once), so a stripped install stays
+# functional rather than broken.
+dependencies = ["pypdf>=5", "tantivy>=0.26,<0.27"]
 
 [project.scripts]
 trialerror = "trialerror.cli:main"

@@ -10,7 +10,13 @@ citation blocks, fencing, or the untrusted-wrap.
 
 **Pipeline (Section 7, "Q5 applied"):**
 
-1. FTS5/BM25 prefilter to <=500 candidates (:mod:`trialerror.retrieve.ftssearch`).
+1. Lexical/BM25 prefilter to <=500 candidates. The backend is pluggable
+   (:mod:`trialerror.retrieve.lexical`): tantivy
+   (:mod:`trialerror.retrieve.tantivysearch`) by default since C-0080, SQLite
+   FTS5 (:mod:`trialerror.retrieve.ftssearch`) as the always-available
+   fallback. The tier is still called ``"fts"`` in ``tiers_used`` (that is
+   design Section 7's own tier name and a caller-visible contract);
+   ``stats.fulltext_backend`` reports which engine served it.
 2. Vector rerank of exactly that candidate set with the program's
    configured embed backend (:mod:`trialerror.retrieve.vecsearch`) -- ``mode``
    ``"auto"``/``"hybrid"`` both run this two-stage pipeline; ``"fts"``/
@@ -50,7 +56,9 @@ from trialerror.retrieve.errors import (
 )
 from trialerror.retrieve.fence import citation_quote, excerpt_words, fence_chunk_text, is_fenced_license, source_license_tier
 from trialerror.retrieve.fusion import reciprocal_rank_fusion
-from trialerror.retrieve.ftssearch import DEFAULT_FTS_CANDIDATE_LIMIT, fts_search
+from trialerror.retrieve import lexical, tantivysearch
+from trialerror.retrieve.ftssearch import DEFAULT_FTS_CANDIDATE_LIMIT
+from trialerror.retrieve.lexical import lexical_search
 from trialerror.retrieve.vecsearch import fetch_native_knn, fetch_vectors, rank_by_query_vector, vec_backend_for, vec_table_exists
 from trialerror.retrieve.wrap import untrusted_wrap
 from trialerror.stores.store import Store
@@ -441,7 +449,7 @@ def search(
             "query_id": new_id("QRY"),
             "tiers_used": [],
             "results": [],
-            "stats": {"fts_candidates": 0, "vector_scored": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 2)},
+            "stats": {"fts_candidates": 0, "vector_scored": 0, "fulltext_backend": None, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 2)},
         }
 
     if mode == "summary":
@@ -457,7 +465,7 @@ def search(
                 "query_id": new_id("QRY"),
                 "tiers_used": [],
                 "results": [],
-                "stats": {"fts_candidates": 0, "vector_scored": 0, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 2)},
+                "stats": {"fts_candidates": 0, "vector_scored": 0, "fulltext_backend": None, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 2)},
             }
         return _search_summary_tier(store, query=query, k=k, candidate_chunk_ids=candidate_ids, unfenced=unfenced, launch_id=launch_id, t0=t0)
 
@@ -466,12 +474,32 @@ def search(
     want_graph = mode in ("auto", "hybrid", "graph") and "graph" in requested_tiers
 
     tier_rankings: dict[str, list[str]] = {}
-    stats: dict[str, Any] = {"fts_candidates": 0, "vector_scored": 0}
+    # LD-07: `fulltext_backend` is set below only when the fts tier actually
+    # runs (`want_fts and query.strip()`) -- initialized here alongside its
+    # two siblings so it is unconditionally present (as `None` when the fts
+    # tier didn't run) rather than a key a caller must guard with
+    # `.get(...)` on some code paths (vector-only mode, an empty query) and
+    # not others.
+    stats: dict[str, Any] = {"fts_candidates": 0, "vector_scored": 0, "fulltext_backend": None}
 
     if want_fts and query.strip():
-        fts_hits = fts_search(store, query, limit=DEFAULT_FTS_CANDIDATE_LIMIT, chunk_id_allowlist=candidate_ids)
+        # C-0080: the lexical tier is now backend-pluggable
+        # (:mod:`trialerror.retrieve.lexical`) -- tantivy by default, FTS5
+        # whenever tantivy-py or a ready index is absent. Same rows, same
+        # order semantics, same allowlist contract either way; the only
+        # visible difference is ``stats.fulltext_backend``, which reports
+        # which one actually ran (design Section 7's "engine reports what
+        # it used", one level below the tier).
+        fts_hits, fulltext_backend = lexical_search(
+            store,
+            query,
+            limit=DEFAULT_FTS_CANDIDATE_LIMIT,
+            chunk_id_allowlist=candidate_ids,
+            config=_load_program_config(store),
+        )
         tier_rankings["fts"] = [h["chunk_id"] for h in fts_hits]
         stats["fts_candidates"] = len(fts_hits)
+        stats["fulltext_backend"] = fulltext_backend
 
     if want_vector and query.strip():
         # design Section 7 step 2: vector-score exactly the FTS candidate
@@ -741,6 +769,7 @@ def _search_summary_tier(
         "stats": {
             "fts_candidates": 0,
             "vector_scored": 0,
+            "fulltext_backend": None,
             "summary_candidates": len(rows),
             "elapsed_ms": round((time.perf_counter() - t0) * 1000, 2),
         },
@@ -1336,12 +1365,39 @@ def corpus_stats(store: Store) -> dict[str, Any]:
         table = reg["table_name"]
         vec_by_model[reg["model_key"]] = _count(f"SELECT COUNT(*) FROM {table}")
 
+    # C-0080: the lexical tier's second, non-SQLite index. Reported
+    # alongside chunk_fts (never instead of it) -- FTS5 stays the fallback
+    # backend, so "how fresh is chunk_fts" remains a real question even on
+    # a program serving searches out of tantivy.
+    fulltext_backend = lexical.resolve_backend(store).name
+    index_dir = lexical.fulltext_index_dir(store)
+    fulltext_index: dict[str, Any] = {"backend": fulltext_backend, "index_dir": str(index_dir) if index_dir else None}
+    if index_dir is not None and tantivysearch.tantivy_available():
+        # LD-04: this is a summary call (`trialerror query stats` / MCP tool
+        # #8), not the doctor -- `cheap=True` compares chunk COUNTS instead
+        # of running the doctor's full XOR fingerprint scan over every
+        # chunk_id, so a "summary" stays a summary at multi-million-chunk
+        # scale. Only `state` and `index_docs` are consumed below, and
+        # neither needs the fingerprint to be meaningful.
+        status = tantivysearch.index_status(store.knowledge, index_dir, cheap=True)
+        fulltext_index.update(
+            {
+                "state": status["state"],
+                "indexed_docs": status["index_docs"],
+                "chunks_missing_index": max(chunks - (status["index_docs"] or 0), 0),
+            }
+        )
+    else:
+        fulltext_index["state"] = "unavailable"
+
     return {
         "sources": sources,
         "documents": documents,
         "chunks": chunks,
         "chunk_fts_rows": chunk_fts_rows,
         "chunks_missing_fts": max(chunks - chunk_fts_rows, 0),
+        "fulltext_backend": fulltext_backend,
+        "fulltext_index": fulltext_index,
         "quote_anchors": anchors,
         "embeddings_by_model_key": emb_by_model,
         "vector_index": registry_rows,

@@ -50,6 +50,7 @@ from trialerror.ingest.sanitizer import SANITIZER_VERSION, sanitize
 from trialerror.ingest.stream import stream_v1
 from trialerror.jobs import ledger
 from trialerror.jobs.registry import register_handler
+from trialerror.retrieve import lexical
 from trialerror.stores.store import Store
 from trialerror.stores.vecindex import VecBackend, ensure_vec_table, serialize_vector_fallback, vec_table_name
 from trialerror.stores.writer import get, insert, update
@@ -358,11 +359,23 @@ def run_embed(ctx) -> None:
 @register_handler("index")
 def run_index(ctx) -> None:
     """design Section 6 stage 7: "FTS5 + sqlite-vec | rebuildable from
-    chunks+emb (indexes are cache, never truth)." Populates ``chunk_fts``
-    and the active model's ``vec_chunks__<model_key>`` table from
-    already-written ``chunk``/``emb`` rows -- reads only, no embedding
-    calls, so this stage never needs the GPU even with the real embed
-    backend configured upstream."""
+    chunks+emb (indexes are cache, never truth)." Populates ``chunk_fts``,
+    the program's tantivy full-text index (C-0080 -- see
+    :func:`trialerror.retrieve.lexical.maintain_index`), and the active
+    model's ``vec_chunks__<model_key>`` table from already-written
+    ``chunk``/``emb`` rows -- reads only, no embedding calls, so this stage
+    never needs the GPU even with the real embed backend configured
+    upstream.
+
+    ``chunk_fts`` is maintained UNCONDITIONALLY, even on a program serving
+    its searches out of tantivy: FTS5 is the fallback backend
+    (``trialerror.retrieve.lexical`` rules 3/4), and a fallback that has been
+    allowed to rot is not a fallback. The tantivy write is the LAST thing
+    this handler does, after the SQLite writes have committed, so a crash
+    between the two leaves the source of truth intact and only the derived
+    index behind -- exactly the direction of skew ``doctor``'s
+    ``fulltext_index_stale`` check and ``trialerror ingest reindex-fulltext``
+    exist to repair."""
     payload = ctx.payload
     doc_id = payload["doc_id"]
     store = ctx.store
@@ -414,6 +427,15 @@ def run_index(ctx) -> None:
                     )
         indexed += 1
         ctx.set_checkpoint({"indexed": indexed, "total": len(chunks), "model_key": model_key})
+
+    # tantivy full-text index (C-0080). Idempotent and self-healing: it
+    # appends only what the index doesn't already hold, and builds the
+    # whole index once if this program has never had one. A no-op when
+    # tantivy-py is absent or [retrieve] fulltext_backend = "fts5".
+    fulltext = lexical.maintain_index(store, [(c["chunk_id"], c["text"]) for c in chunks])
+    ctx.set_checkpoint(
+        {"indexed": indexed, "total": len(chunks), "model_key": model_key, "fulltext_index": fulltext}
+    )
 
     update(store, "document", pk_column="doc_id", pk_value=doc_id, changes={"status": "indexed"})
 

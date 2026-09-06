@@ -15,6 +15,8 @@ from pathlib import Path
 from trialerror.ingest import pipeline, requests as ingest_requests
 from trialerror.ingest.errors import IngestError
 from trialerror.jobs.errors import JobError
+from trialerror.retrieve import tantivysearch
+from trialerror.stores import paths as store_paths
 from trialerror.stores.errors import StoreError
 from trialerror.stores.store import Store, open_store
 from trialerror.util.config import find_program_root
@@ -80,6 +82,13 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     p_reembed.add_argument("--doc-id", required=True, dest="doc_id")
     p_reembed.add_argument("--launch-id", required=True, dest="launch_id")
     p_reembed.set_defaults(handler=_cmd_reembed)
+
+    p_reindex_ft = sub.add_parser(
+        "reindex-fulltext",
+        help="rebuild the tantivy full-text index from knowledge.db's chunk table (derived state; always safe)",
+    )
+    _common(p_reindex_ft)
+    p_reindex_ft.set_defaults(handler=_cmd_reindex_fulltext)
 
     p_status = sub.add_parser("status", help="show a document's pipeline status")
     _common(p_status)
@@ -249,6 +258,35 @@ def _cmd_reembed(args: argparse.Namespace) -> dict:
         return error_envelope("ingest.re-embed", type(exc).__name__, str(exc))
     finally:
         store.close()
+
+
+def _cmd_reindex_fulltext(args: argparse.Namespace) -> dict:
+    """Rebuild the tantivy lexical index from scratch (C-0080). No
+    ``--launch-id``, no cost gate, no confirmation flag: this writes
+    nothing but DERIVED state that ``knowledge.db`` can regenerate at will
+    (:mod:`trialerror.retrieve.tantivysearch`), so there is nothing here an
+    operator could destroy by running it twice, or at the wrong moment, or
+    on the wrong program. It is the documented repair for every
+    ``fulltext_index_stale`` doctor finding and the one migration step an
+    existing program needs to move off the FTS5 tier."""
+    store, program_root, err = _open(args, "ingest.reindex-fulltext")
+    if err is not None:
+        return err
+    try:
+        config = _load_program_config(program_root)
+        index_dir = store_paths.fulltext_index_path(program_root, config)
+        result = tantivysearch.reindex(store.knowledge, index_dir)
+    except tantivysearch.TantivyUnavailableError as exc:
+        return error_envelope("ingest.reindex-fulltext", "tantivy_unavailable", str(exc))
+    finally:
+        store.close()
+    return ok_envelope(
+        "ingest.reindex-fulltext",
+        result=result,
+        next_actions=[
+            next_action(["trialerror", "doctor", "--only", "fulltext_index_stale"], "confirm the index is current")
+        ],
+    )
 
 
 def _cmd_status(args: argparse.Namespace) -> dict:

@@ -14,10 +14,22 @@ XID referential integrity for ``event.launch_id`` / ``thread.created_by_
 launch`` / ``feed_post.launch_id`` is already covered generically by M1's
 ``xid_dangling`` check (every ``XID_REGISTRY`` entry, events/feed's columns
 included); this module does not duplicate that scan.
+
+FU-14 (imported history): ``feed_author_integrity`` exempts feed posts
+older than the origin-project import watermark. The 153 imported posts predate the
+author contract entirely -- 73 say plainly ``'orchestrator'`` because no
+session id was ever recorded alongside them, 37 say ``'user'``, the rest
+carry lens names -- and there is no honest way to resolve which session
+covered each one. The exemption is a strict timestamp boundary read from
+:mod:`the (excluded) tenant-migration module`, never a relaxation of the rule: a
+post one second newer than the watermark is still a failure, a post with no
+readable ``ts`` is never exempt, and the exempted count is stated in the
+check's own message so a green result never hides them.
 """
 
 from __future__ import annotations
 
+from the (excluded) tenant-migration module import at_or_before, import_ts_from_conn
 from trialerror.stores import paths
 from trialerror.stores.connection import connect
 from trialerror.stores.redact import redact_text
@@ -90,8 +102,12 @@ def check_feed_author_integrity(ctx: DoctorContext) -> CheckResult:
 
     ops_conn = connect(ops_path, read_only=True)
     try:
-        posts = [dict(r) for r in ops_conn.execute("SELECT post_id, author, launch_id FROM feed_post").fetchall()]
+        posts = [dict(r) for r in ops_conn.execute("SELECT post_id, author, launch_id, ts FROM feed_post").fetchall()]
         known_sessions = {r["session_id"] for r in ops_conn.execute("SELECT session_id FROM session").fetchall()}
+        # FU-14: the boundary, read once. None on a program that was never
+        # imported into -- in which case nothing is ever exempt and this
+        # check behaves exactly as it always did.
+        watermark_ts = import_ts_from_conn(ops_conn)
     finally:
         ops_conn.close()
 
@@ -115,35 +131,55 @@ def check_feed_author_integrity(ctx: DoctorContext) -> CheckResult:
                 plat_conn.close()
 
     offenders: dict[str, str] = {}
+    grandfathered = 0
     for post in posts:
         author = post["author"]
         launch_id = post["launch_id"]
+        problem: str | None = None
         if launch_id is not None:
             agent_kind = agent_kind_by_launch.get(launch_id)
             expected = f"{agent_kind}:{launch_id}" if agent_kind is not None else None
             if expected is None or author != expected:
-                offenders[post["post_id"]] = f"author={author!r} does not match launch-derived {expected!r}"
+                problem = f"author={author!r} does not match launch-derived {expected!r}"
         else:
             if not author.startswith(_ORCHESTRATOR_PREFIX):
-                offenders[post["post_id"]] = (
-                    f"author={author!r} has no launch_id but does not match 'orchestrator:<session_id>'"
-                )
+                problem = f"author={author!r} has no launch_id but does not match 'orchestrator:<session_id>'"
             else:
                 sid = author[len(_ORCHESTRATOR_PREFIX) :]
                 if sid not in known_sessions:
-                    offenders[post["post_id"]] = f"author={author!r} references unknown session_id {sid!r}"
+                    problem = f"author={author!r} references unknown session_id {sid!r}"
+        if problem is None:
+            continue
+        # FU-14: only a row that WOULD have failed is ever exempted, and
+        # only if its own ts proves it predates the import. The count below
+        # therefore means "failures the watermark suppressed" -- the number
+        # an operator actually needs -- not "imported rows skipped".
+        if at_or_before(post.get("ts"), watermark_ts):
+            grandfathered += 1
+            continue
+        offenders[post["post_id"]] = problem
 
     status = "fail" if offenders else "pass"
+    exempt_note = (
+        f" ({grandfathered} imported row(s) at or before the origin-project import watermark {watermark_ts} "
+        f"exempted; they would otherwise fail)"
+        if grandfathered
+        else ""
+    )
     message = (
         f"{len(offenders)} feed_post row(s) have an author string that doesn't match "
-        "trialerror.events.post_feed's derivation contract"
+        f"trialerror.events.post_feed's derivation contract{exempt_note}"
         if offenders
-        else "every feed_post.author matches the launch- or orchestrator-derived contract"
+        else f"every feed_post.author matches the launch- or orchestrator-derived contract{exempt_note}"
     )
     return CheckResult(
         name="feed_author_integrity",
         category="events",
         status=status,
         message=message,
-        details={"offenders": offenders},
+        details={
+            "offenders": offenders,
+            "imported_grandfathered": grandfathered,
+            "import_watermark_ts": watermark_ts,
+        },
     )

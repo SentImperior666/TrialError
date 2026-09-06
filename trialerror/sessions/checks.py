@@ -15,6 +15,7 @@ sessions can catch a problem before the next boot/close attempt does.
 
 from __future__ import annotations
 
+from the (excluded) tenant-migration module import at_or_before, import_ts_from_conn
 from trialerror.stores import paths
 from trialerror.stores.connection import connect
 from trialerror.util.doctor import CheckResult, DoctorContext, register_check
@@ -136,7 +137,19 @@ def check_spawns_vs_bookings(ctx: DoctorContext) -> CheckResult:
     carries no ``launch_id:`` token at all).
 
     "Recent" = every OPEN session, plus every session CLOSED within the
-    last 7 days (:data:`_RECENT_SESSION_WINDOW_DAYS`)."""
+    last 7 days (:data:`_RECENT_SESSION_WINDOW_DAYS`).
+
+    FU-14 (imported history): a session CLOSED at or before the origin-project import
+    watermark is exempt. Those sessions ran before ``plugin/hooks/
+    post_task.py`` existed, so they have real consumed bookings and zero
+    ``subagent_return`` events -- a gap that is a fact about 2026-07, not a
+    live audit-trail hole, and one no amount of re-derivation can fill
+    (nothing anywhere records which spawn returned when). The exemption is
+    a strict boundary from :mod:`the (excluded) tenant-migration module`: an OPEN
+    session is never exempt (it has no ``closed_ts`` and is by definition
+    post-import), a session closed after the watermark is never exempt, and
+    the exempted count is stated in the message.
+    """
     ops_conn = _ops_conn_or_none(ctx)
     if ops_conn is None:
         return CheckResult(
@@ -147,27 +160,30 @@ def check_spawns_vs_bookings(ctx: DoctorContext) -> CheckResult:
         )
     platform_conn = _platform_conn_or_none(ctx)
     try:
+        watermark_ts = import_ts_from_conn(ops_conn)
         sessions = ops_conn.execute(
-            "SELECT session_id FROM session WHERE status = 'open' "
+            "SELECT session_id, closed_ts FROM session WHERE status = 'open' "
             "OR (closed_ts IS NOT NULL AND julianday(?) - julianday(closed_ts) <= ?)",
             (now(), _RECENT_SESSION_WINDOW_DAYS),
         ).fetchall()
 
         mismatched: list[dict] = []
         bad_launch_id_events: list[dict] = []
+        grandfathered = 0
         for row in sessions:
             sid = row["session_id"]
             return_rows = ops_conn.execute(
                 "SELECT event_id, launch_id FROM event WHERE session_id = ? AND type = 'subagent_return'", (sid,)
             ).fetchall()
+            session_bad: list[dict] = []
             for r in return_rows:
                 lid = r["launch_id"]
                 if lid is None:
-                    bad_launch_id_events.append({"session_id": sid, "event_id": r["event_id"], "reason": "null_launch_id"})
+                    session_bad.append({"session_id": sid, "event_id": r["event_id"], "reason": "null_launch_id"})
                 elif platform_conn is not None:
                     exists = platform_conn.execute("SELECT 1 FROM launch WHERE launch_id = ? LIMIT 1", (lid,)).fetchone()
                     if exists is None:
-                        bad_launch_id_events.append(
+                        session_bad.append(
                             {"session_id": sid, "event_id": r["event_id"], "launch_id": lid, "reason": "unknown_launch_id"}
                         )
 
@@ -176,7 +192,17 @@ def check_spawns_vs_bookings(ctx: DoctorContext) -> CheckResult:
                 consumed_launch_count = platform_conn.execute(
                     "SELECT COUNT(*) FROM launch WHERE session_id = ? AND state IN ('RUNNING', 'RECONCILED')", (sid,)
                 ).fetchone()[0]
-            if len(return_rows) != consumed_launch_count:
+            session_mismatch = len(return_rows) != consumed_launch_count
+
+            # FU-14: a session is exempted only when it actually has a
+            # finding AND its own closed_ts proves it ran before the import
+            # -- so ``grandfathered`` counts warnings suppressed, and an
+            # imported session that DOES reconcile is still checked.
+            if (session_bad or session_mismatch) and at_or_before(row["closed_ts"], watermark_ts):
+                grandfathered += 1
+                continue
+            bad_launch_id_events.extend(session_bad)
+            if session_mismatch:
                 mismatched.append(
                     {"session_id": sid, "subagent_return_count": len(return_rows), "consumed_launch_count": consumed_launch_count}
                 )
@@ -186,16 +212,28 @@ def check_spawns_vs_bookings(ctx: DoctorContext) -> CheckResult:
             platform_conn.close()
 
     status = "warn" if (mismatched or bad_launch_id_events) else "pass"
+    exempt_note = (
+        f" ({grandfathered} session(s) closed at or before the origin-project import watermark {watermark_ts} "
+        f"exempted; they would otherwise warn)"
+        if grandfathered
+        else ""
+    )
     message = (
         f"{len(mismatched)} session(s) where subagent_return count != consumed (RUNNING/RECONCILED) "
-        f"booking count; {len(bad_launch_id_events)} subagent_return event(s) with a null/unknown launch_id"
+        f"booking count; {len(bad_launch_id_events)} subagent_return event(s) with a null/unknown "
+        f"launch_id{exempt_note}"
         if status == "warn"
-        else "subagent_return counts reconcile with consumed bookings for every open/recent session"
+        else f"subagent_return counts reconcile with consumed bookings for every open/recent session{exempt_note}"
     )
     return CheckResult(
         name="spawns_vs_bookings",
         category="sessions",
         status=status,
         message=message,
-        details={"mismatched_sessions": mismatched, "bad_launch_id_events": bad_launch_id_events},
+        details={
+            "mismatched_sessions": mismatched,
+            "bad_launch_id_events": bad_launch_id_events,
+            "imported_grandfathered": grandfathered,
+            "import_watermark_ts": watermark_ts,
+        },
     )

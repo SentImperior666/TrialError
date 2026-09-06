@@ -20,14 +20,16 @@ from tests._store_fixtures import populate_one_of_everything
 # (docs/reviews/REDESIGN_V2_RATIONALE.md Section 5.3 items 6/8) -- counted
 # here anyway since this test's real job is "every table TABLE_DB knows
 # about has exactly one declared home," not a frozen historical count.
-EXPECTED_TABLE_COUNT_BY_DB = {"platform": 5, "ops": 21, "knowledge": 17, "jobs": 2}
+# FU-14's ops_v5 "meta" kv table (the origin-project import watermark's home) makes it
+# 22 for ops -- same reasoning: an additive seam, not a design revision.
+EXPECTED_TABLE_COUNT_BY_DB = {"platform": 5, "ops": 22, "knowledge": 17, "jobs": 2}
 
 
 def test_table_counts_match_design_section_4():
     for db_kind, expected in EXPECTED_TABLE_COUNT_BY_DB.items():
         actual = len(SCHEMA_MODULES[db_kind].TABLES)
         assert actual == expected, f"{db_kind}: expected {expected} tables, schema module declares {actual}"
-    assert len(TABLE_DB) == sum(EXPECTED_TABLE_COUNT_BY_DB.values()) == 45
+    assert len(TABLE_DB) == sum(EXPECTED_TABLE_COUNT_BY_DB.values()) == 46
 
 
 def test_round_trip_one_row_per_table(store):

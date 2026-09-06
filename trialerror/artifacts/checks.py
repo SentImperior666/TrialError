@@ -31,6 +31,26 @@ per-program):
 
 Any DB file that doesn't exist yet, or a program with no artifacts/gates
 at all, is reported ``skip`` — not a doctor failure.
+
+FU-14 (imported history), and the sharp line between the two checks that
+touch it:
+
+- ``gated_type_without_gate`` EXEMPTS artifacts registered at or before the
+  origin-project import watermark. 22 of them are ``methods-note`` rows registered in
+  early July, before any gate law existed for that type; they are flagged
+  today only because D21 flips ``template.gated`` permissively (one later
+  gated methods-note makes the whole type gated, retroactively). Inventing
+  a gate for a review that never happened would be fabrication, so the
+  honest move is a bounded, counted exemption.
+- ``gate_illegal_transition_history`` exempts NOTHING. Its evidence is
+  reconstructable from data the import already holds (the gate's own end
+  state plus this package's transition graph), so the importer synthesizes
+  the log instead — see :mod:`the (excluded) tenant-migration module`.
+
+The exemption is a strict timestamp boundary read from
+:mod:`the (excluded) tenant-migration module`: an artifact registered after it is
+still a failure, one with no ``registered_ts`` is never exempt, and the
+exempted count is stated in the check's own message.
 """
 
 from __future__ import annotations
@@ -38,6 +58,7 @@ from __future__ import annotations
 import sqlite3
 
 from trialerror.artifacts.state_machine import is_legal_transition
+from the (excluded) tenant-migration module import at_or_before, import_ts_from_conn
 from trialerror.stores import paths
 from trialerror.stores.connection import connect
 from trialerror.util.doctor import CheckResult, DoctorContext, register_check
@@ -69,9 +90,10 @@ def check_gated_type_without_gate(ctx: DoctorContext) -> CheckResult:
             message="ops.db not found (program_root not configured, or program not yet initialized)",
         )
     try:
+        watermark_ts = import_ts_from_conn(conn)
         rows = conn.execute(
             """
-            SELECT a.artifact_id, a.type, a.gate_id, g.state AS gate_state
+            SELECT a.artifact_id, a.type, a.gate_id, a.registered_ts, g.state AS gate_state
             FROM artifact a
             JOIN template t ON a.type = t.type_key
             LEFT JOIN gate g ON a.gate_id = g.gate_id
@@ -79,24 +101,42 @@ def check_gated_type_without_gate(ctx: DoctorContext) -> CheckResult:
               AND (a.gate_id IS NULL OR g.state IS NULL OR g.state != 'registered')
             """
         ).fetchall()
-        offenders = [
-            {
-                "artifact_id": r["artifact_id"],
-                "type": r["type"],
-                "gate_id": r["gate_id"],
-                "gate_state": r["gate_state"],
-            }
-            for r in rows
-        ]
+        offenders = []
+        grandfathered = 0
+        for r in rows:
+            # FU-14: registered before the import watermark = registered
+            # before this program's gate law existed. Exempt, counted,
+            # and named in the message -- never silently dropped.
+            if at_or_before(r["registered_ts"], watermark_ts):
+                grandfathered += 1
+                continue
+            offenders.append(
+                {
+                    "artifact_id": r["artifact_id"],
+                    "type": r["type"],
+                    "gate_id": r["gate_id"],
+                    "gate_state": r["gate_state"],
+                }
+            )
         status = "fail" if offenders else "pass"
+        exempt_note = (
+            f" ({grandfathered} artifact(s) registered at or before the origin-project import watermark "
+            f"{watermark_ts} exempted; they would otherwise fail)"
+            if grandfathered
+            else ""
+        )
         message = (
-            f"{len(offenders)} registered artifact(s) of a gated type without a 'registered' gate"
+            f"{len(offenders)} registered artifact(s) of a gated type without a 'registered' gate{exempt_note}"
             if offenders
-            else "every registered gated-type artifact has a 'registered' gate"
+            else f"every registered gated-type artifact has a 'registered' gate{exempt_note}"
         )
         return CheckResult(
             name="gated_type_without_gate", category="artifacts", status=status, message=message,
-            details={"offenders": offenders},
+            details={
+                "offenders": offenders,
+                "imported_grandfathered": grandfathered,
+                "import_watermark_ts": watermark_ts,
+            },
         )
     finally:
         conn.close()

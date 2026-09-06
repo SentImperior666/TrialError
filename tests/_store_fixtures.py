@@ -359,6 +359,14 @@ def populate_one_of_everything(store: Store) -> dict[str, str]:
         },
     )
 
+    # ops_v5 (FU-14): the generic key/value side table. Its real first key
+    # is the origin-project import watermark (the (excluded) tenant-migration module); the
+    # fixture only needs one syntactically valid row so the "every declared
+    # table has exactly one home and one round-trippable row" acceptance
+    # test keeps covering it.
+    ids["meta"] = "fixture.key"
+    insert(store, "meta", {"key": ids["meta"], "value": "fixture value", "updated_ts": now()})
+
     # ---- knowledge.db --------------------------------------------------------
     ids["source"] = new_id("SRC")
     insert(

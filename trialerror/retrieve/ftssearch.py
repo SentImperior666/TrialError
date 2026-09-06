@@ -51,6 +51,18 @@ def fts_search(
     -- e.g. ``source_ids``/``kind``/``license_tier``/``year`` -- without
     this module needing to know anything about ``source``/``document``
     joins itself).
+
+    Ordered ``bm25 ASC, chunk_id ASC``: the secondary key is a fix-pass
+    addition (finding D-3), not cosmetic. Without it, two chunks BM25 scores
+    exactly (a common case -- an IDF~0 term, or two chunks of identical
+    length with the same term frequency) had no defined tie-break, so a
+    query whose candidate count exceeds ``limit`` could truncate a tied
+    block to a different subset each run -- and, worse, to a DIFFERENT
+    subset than :mod:`trialerror.retrieve.tantivysearch`'s own now-matching
+    ``chunk_id``-ascending tie-break, which is exactly the daylight C-0080
+    constraint 5 (identical hit sets) forbids. ``chunk_id`` is a stable,
+    already-unique key, so this costs nothing and makes truncation
+    deterministic on both backends.
     """
     match = fts_query_string(query)
     if not match.strip('"'):
@@ -63,11 +75,14 @@ def fts_search(
         sql = (
             f"SELECT chunk_id, bm25(chunk_fts) AS bm25 FROM chunk_fts "
             f"WHERE chunk_fts MATCH ? AND chunk_id IN ({placeholders}) "
-            f"ORDER BY bm25(chunk_fts) ASC LIMIT ?"
+            f"ORDER BY bm25(chunk_fts) ASC, chunk_id ASC LIMIT ?"
         )
         params: list[Any] = [match, *allowlist, limit]
     else:
-        sql = "SELECT chunk_id, bm25(chunk_fts) AS bm25 FROM chunk_fts WHERE chunk_fts MATCH ? ORDER BY bm25(chunk_fts) ASC LIMIT ?"
+        sql = (
+            "SELECT chunk_id, bm25(chunk_fts) AS bm25 FROM chunk_fts WHERE chunk_fts MATCH ? "
+            "ORDER BY bm25(chunk_fts) ASC, chunk_id ASC LIMIT ?"
+        )
         params = [match, limit]
     rows = store.knowledge.execute(sql, params).fetchall()
     return [{"chunk_id": r["chunk_id"], "bm25": r["bm25"]} for r in rows]

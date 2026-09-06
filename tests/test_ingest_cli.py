@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import argparse
 import json
+import shutil
 
 import pytest
 
 from trialerror.cli import ingest as cli_ingest
 from trialerror.jobs.worker import run_one
+from trialerror.retrieve import engine as retrieve_engine, tantivysearch
+from trialerror.retrieve.checks import check_fulltext_index_stale
+from trialerror.stores import paths as store_paths
+from trialerror.stores.store import open_store
+from trialerror.util.doctor import DoctorContext
 from tests._ingest_fixtures import bootstrap_launch, write_html_fixture
+from tests._retrieve_fixtures import build_small_corpus
 
 
 class _Args:
@@ -215,3 +223,104 @@ def test_cmd_add_no_program_root_errors(monkeypatch, tmp_path):
     env = cli_ingest._cmd_add(args)
     assert env["ok"] is False
     assert env["error"]["code"] == "no_program_root"
+
+
+# ---------------------------------------------------------------------------
+# reindex-fulltext (C-0080)
+# ---------------------------------------------------------------------------
+
+
+def test_reindex_fulltext_is_registered_as_a_subcommand():
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers()
+    cli_ingest.register(sub)
+    args = parser.parse_args(["ingest", "reindex-fulltext"])
+    assert args.handler is cli_ingest._cmd_reindex_fulltext
+
+
+def test_reindex_fulltext_refuses_without_a_program_root(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    env = cli_ingest._cmd_reindex_fulltext(_Args(program_root=None, platform_root=None))
+    assert env["ok"] is False
+    assert env["error"]["code"] == "no_program_root"
+
+
+@pytest.mark.skipif(not tantivysearch.tantivy_available(), reason="tantivy-py not installed")
+def test_reindex_fulltext_builds_an_index_the_doctor_then_passes(store, program_root, platform_root):
+    """The whole migration procedure an existing program runs, in one
+    test: corpus present, no index, doctor warns -> run the command ->
+    doctor passes and the engine starts serving from tantivy."""
+    build_small_corpus(store)
+    store.knowledge.commit()
+    store.close()
+
+    ctx = DoctorContext(program_root=program_root)
+    assert check_fulltext_index_stale(ctx).status == "warn"
+
+    env = cli_ingest._cmd_reindex_fulltext(
+        _Args(program_root=str(program_root), platform_root=str(platform_root))
+    )
+    assert env["ok"] is True
+    assert env["result"]["chunks_indexed"] >= 1
+    assert env["result"]["chunks_indexed"] == env["result"]["indexed_docs"]
+    assert env["result"]["schema_version"] == tantivysearch.SCHEMA_VERSION
+
+    assert check_fulltext_index_stale(ctx).status == "pass"
+
+    reopened = open_store(program_root, platform_root=platform_root)
+    try:
+        result = retrieve_engine.search(reopened, query="retry budgets", k=5)
+        assert result["stats"]["fulltext_backend"] == "tantivy"
+        assert result["results"]
+    finally:
+        reopened.close()
+
+
+@pytest.mark.skipif(not tantivysearch.tantivy_available(), reason="tantivy-py not installed")
+def test_reindex_fulltext_is_safe_to_run_twice(store, program_root, platform_root):
+    """It rebuilds DERIVED state, so re-running it is a no-op by outcome,
+    never an error or a duplicated corpus -- the property that lets the
+    doctor recommend it unconditionally."""
+    build_small_corpus(store)
+    store.knowledge.commit()
+    store.close()
+    args = _Args(program_root=str(program_root), platform_root=str(platform_root))
+    first = cli_ingest._cmd_reindex_fulltext(args)["result"]
+    second = cli_ingest._cmd_reindex_fulltext(args)["result"]
+    assert first["chunk_fingerprint"] == second["chunk_fingerprint"]
+    assert first["indexed_docs"] == second["indexed_docs"]
+
+
+@pytest.mark.skipif(not tantivysearch.tantivy_available(), reason="tantivy-py not installed")
+def test_reindex_fulltext_repairs_a_wiped_index_directory(store, program_root, platform_root):
+    """'Rebuildable from chunks, indexes are cache never truth' as an
+    executable claim: delete the entire index directory and the command
+    puts the program back exactly where it was."""
+    build_small_corpus(store)
+    store.knowledge.commit()
+    store.close()
+    args = _Args(program_root=str(program_root), platform_root=str(platform_root))
+    before = cli_ingest._cmd_reindex_fulltext(args)["result"]
+
+    shutil.rmtree(store_paths.program_index_dir(program_root))
+    assert check_fulltext_index_stale(DoctorContext(program_root=program_root)).status == "warn"
+
+    after = cli_ingest._cmd_reindex_fulltext(args)["result"]
+    assert after["chunk_fingerprint"] == before["chunk_fingerprint"]
+    assert check_fulltext_index_stale(DoctorContext(program_root=program_root)).status == "pass"
+
+
+@pytest.mark.skipif(not tantivysearch.tantivy_available(), reason="tantivy-py not installed")
+def test_reindex_fulltext_honors_a_configured_index_dir(store, program_root, platform_root):
+    (program_root / "trialerror.toml").write_text(
+        '[program]\nid = "PROG-test"\n\n[paths]\nindex_dir = "derived/idx"\n', encoding="utf-8"
+    )
+    build_small_corpus(store)
+    store.knowledge.commit()
+    store.close()
+    env = cli_ingest._cmd_reindex_fulltext(
+        _Args(program_root=str(program_root), platform_root=str(platform_root))
+    )
+    assert env["ok"] is True
+    assert (program_root / "derived" / "idx" / "tantivy" / "chunks").is_dir()
+    assert not (program_root / "index").exists()

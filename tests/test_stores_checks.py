@@ -85,10 +85,11 @@ def test_store_schema_version_passes_on_freshly_migrated_store(store, program_ro
     # MIGRATIONS tuples is the entire "bump expected versions" step; no
     # doctor-check code change was needed. platform.db has no v2 migration.
     # ops (build-v2-polish's ops-v3, rooms; build-v2dash-data's ops-v4,
-    # criterion + feed_post_translation) and knowledge (build-v2-summary's
+    # criterion + feed_post_translation; FU-14's ops-v5, the meta kv table
+    # the origin-project import watermark lives in) and knowledge (build-v2-summary's
     # knowledge-v3, the summary table) each independently gained more
     # versions later -- jobs.db has no v3 (still at 2).
-    assert r.details["ops"] == {"current_version": 4, "expected_version": 4, "match": True}
+    assert r.details["ops"] == {"current_version": 5, "expected_version": 5, "match": True}
     assert r.details["jobs"] == {"current_version": 2, "expected_version": 2, "match": True}
     assert r.details["knowledge"] == {"current_version": 3, "expected_version": 3, "match": True}
     assert r.details["platform"]["expected_version"] == 1
