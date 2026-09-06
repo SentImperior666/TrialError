@@ -41,6 +41,14 @@ def _v_only(max_version: int) -> tuple[Migration, ...]:
 
 
 def test_fresh_create_and_migrate_from_v1v2v3_land_identical_schemas():
+    # lane-b-translator: ops gained v6 (the translator's gate-verdict
+    # columns -- renumbered from v5 after master claimed that number first
+    # with FU-14's unrelated "ops_v5_meta_kv", see ops.py's TRIALERROR-DEV-
+    # NOTE at _V6), so this proof is now "everything after v3", not "v4" --
+    # the property under test (fresh-create and step-migrate land the same
+    # schema at the SAME latest version) is unchanged, and pinning a
+    # literal version number here would only mean re-editing this test on
+    # every future additive migration.
     fresh = sqlite3.connect(":memory:")
     apply_migrations(fresh, ops.MIGRATIONS)  # every version in one call, from empty
 
@@ -125,7 +133,7 @@ def test_criterion_discharged_by_artifact_is_a_same_file_fk():
 def test_feed_post_translation_table_created_with_expected_columns_and_checks():
     conn = sqlite3.connect(":memory:")
     conn.execute("PRAGMA foreign_keys = ON")
-    apply_migrations(conn, ops.MIGRATIONS)
+    apply_migrations(conn, _v_only(4))  # v4's OWN column set, before v6 adds to it
     cols = {r[1] for r in conn.execute("PRAGMA table_info(feed_post_translation)").fetchall()}
     assert cols == {
         "translation_id", "post_id", "translator_version", "style_mode", "body",

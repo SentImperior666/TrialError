@@ -185,8 +185,7 @@ what is still coming. Nothing already shipped depends on any of it.
       which does not exist on a stock Linux box.
 - [ ] Web-page ingestion pipeline. Fetched pages enter the corpus as saved markdown
       today; a hardened URL-to-corpus path is designed, not built.
-- [ ] Feed translation: side-by-side plain-language rendering of dense agent posts.
-      The storage seam ships in this release; the translator does not.
+- [x] Feed translation: `trialerror feed translate` enqueues a job behind a fail-closed gate (ids, numbers, and hedges are always checked; meaning is verified only when judgments are supplied) and the dashboard shows the plain-English rendering side-by-side with the original — the text itself comes from `--body`/`--judgments-file` today, since no generative model backend ships in this release.
 - [ ] Dashboard: a backing route for the Evidence panel (per-claim neighborhood),
       and the write actions that ship disabled (pre-registration reveal,
       memory-conflict resolve, gate send-back, new feed threads).

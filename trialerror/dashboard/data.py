@@ -53,7 +53,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import timedelta
-from typing import Any
+from typing import Any, Sequence
 
 from trialerror.artifacts.registry import list_artifacts
 from trialerror.budget.pools import budget_status, list_pools
@@ -409,29 +409,163 @@ def _derive_post_kind(author: str) -> str:
     return author.split(":", 1)[0] if author else "unknown"
 
 
-def _load_current_translation(conn: sqlite3.Connection, post_id: str) -> dict[str, Any] | None:
-    """The one ``status='current'`` translation row for ``post_id``, or
-    ``None`` -- either because the ``feed_post_translation`` table doesn't
-    exist yet on this program (pre-v4 ``ops.db``) or because this post has
-    never been translated. Never raises on a missing table (see
-    :func:`_table_exists`)."""
-    if not _table_exists(conn, "feed_post_translation"):
-        return None
-    row = conn.execute(
-        "SELECT * FROM feed_post_translation WHERE post_id = ? AND status = 'current' "
-        "ORDER BY created_ts DESC LIMIT 1",
-        (post_id,),
-    ).fetchone()
-    return dict(row) if row is not None else None
+def _load_translations_for_posts(
+    conn: sqlite3.Connection, post_ids: Sequence[str]
+) -> dict[str, dict[str, Any] | None]:
+    """The one ``status='current'`` translation row per post in
+    ``post_ids``, or ``None`` for a post with none -- either because the
+    ``feed_post_translation`` table doesn't exist yet on this program
+    (pre-v4 ``ops.db``) or because that post has never been translated.
+    Never raises on a missing table (see :func:`_table_exists`).
+
+    Batched (n2, fix pass): one ``sqlite_master`` probe and one query for
+    the whole thread, rather than a per-post query (each of which re-probed
+    ``sqlite_master`` too) -- a 100-post thread went through roughly 200
+    queries to do what 2 can. When more than one ``status='current'`` row
+    exists for a post (should not happen, given the supersede invariant,
+    but this keeps the same ``ORDER BY created_ts DESC`` tie-break a
+    per-post query would use rather than assuming it away), the most
+    recent one wins."""
+    result: dict[str, dict[str, Any] | None] = {pid: None for pid in post_ids}
+    if not post_ids or not _table_exists(conn, "feed_post_translation"):
+        return result
+    placeholders = ",".join("?" for _ in post_ids)
+    rows = conn.execute(
+        f"SELECT * FROM feed_post_translation WHERE post_id IN ({placeholders}) AND status = 'current' "
+        "ORDER BY post_id, created_ts DESC",
+        list(post_ids),
+    ).fetchall()
+    for r in rows:
+        d = dict(r)
+        result.setdefault(d["post_id"], None)
+        if result[d["post_id"]] is None:  # first row per post_id wins (created_ts DESC)
+            result[d["post_id"]] = d
+    return result
+
+
+#: ``job.kind`` + ``payload["handler"]`` the translator enqueues under
+#: (``trialerror.cli.feed.run_translate`` / the ``feed-translate`` write
+#: action). Kept here rather than imported so this read-only panel module
+#: does not pull the whole ``trialerror.feed_translate`` package (and its
+#: ``trialerror.eval`` / ``trialerror.verify`` imports) into the dashboard
+#: process just to spell one string.
+_TRANSLATE_HANDLER = "feed_translate"
+_UNSETTLED_JOB_STATES = ("pending", "claimed", "running", "failed")
+
+
+def _pending_translation_post_ids(rostore: RoStore, post_ids: Sequence[str]) -> set[str]:
+    """Which of ``post_ids`` have a translation job in flight -- the
+    dashboard's third right-column state ("translation pending", design
+    Section 4.4's cache-miss line, made honest: the operator clicked
+    Translate, a job exists, no row has landed yet).
+
+    Read from the jobs ledger rather than from a flag on the post, because
+    the ledger is already the durable record of "work asked for, not yet
+    done" (``trialerror.jobs.ledger``'s own state machine) and a second
+    per-post flag would be a thing to keep in sync for no gain. A job
+    naming no ``post_ids`` is a thread-wide or program-wide sweep, so
+    every candidate post counts as pending under it.
+    """
+    if not post_ids or not rostore.is_available("jobs"):
+        return set()
+    wanted = set(post_ids)
+    placeholders = ",".join("?" for _ in _UNSETTLED_JOB_STATES)
+    rows = rostore.jobs.execute(
+        f"SELECT payload FROM job WHERE kind = 'custom' AND state IN ({placeholders})",
+        list(_UNSETTLED_JOB_STATES),
+    ).fetchall()
+    pending: set[str] = set()
+    for r in rows:
+        try:
+            payload = json.loads(r["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict) or payload.get("handler") != _TRANSLATE_HANDLER:
+            continue
+        targets = payload.get("post_ids")
+        if targets:
+            pending |= wanted & set(targets)
+        else:
+            # a sweep: no explicit target list, so every post in view that
+            # has no translation yet is covered by it.
+            pending |= wanted
+    return pending
+
+
+def _translation_slot(row: dict[str, Any] | None, *, job_pending: bool) -> tuple[dict[str, Any] | None, str]:
+    """``(translation, state)`` for one post's right-hand column.
+
+    ``state`` is the UI contract, and it is the whole point of the
+    fail-closed gate being visible rather than silent
+    (``docs/reviews/AISPEAK_TRANSLATOR_DESIGN.md`` Section 4.4's three
+    states, plus the two this build's job path adds):
+
+    - ``"translated"`` -- a gated, passing translation. ``translation`` is
+      the row.
+    - ``"ungated"`` -- a translation stored without a gate verdict (a
+      pre-v5 row, or one hand-inserted straight through
+      ``trialerror.stores.insert``). Served, but flagged: the operator is
+      told it was never checked rather than being quietly shown
+      unverified text as if it had passed.
+    - ``"withheld"`` -- the gate FAILED this translation. ``translation``
+      is ``None``: the body is never sent to the browser at all, so no
+      amount of client-side cleverness can render it. ``gate_reasons``
+      travels instead (with its ``style`` block stripped -- FT-4, fix
+      pass, see below), so the operator can see WHY.
+    - ``"pending"`` -- a translation job is in flight for this post.
+    - ``"absent"`` -- nothing asked for yet.
+
+    FT-4 (fix pass): for a ``"withheld"`` row, ``gate_reasons.style`` is
+    dropped before it reaches this slot's caller. ``style.violations[].
+    detail`` for ``r1_sentence_length`` quotes up to 80 characters of the
+    very translation the gate just rejected
+    (:mod:`trialerror.feed_translate.style`'s own rule text), which is
+    exactly the text this docstring's ``"withheld"`` bullet promises never
+    crosses the wire. The UI's own ``gateReasonLines()`` only ever reads
+    ``gate_reasons.reasons`` (never ``.style``), so nothing the panel
+    renders is lost by dropping it.
+    """
+    if row is None:
+        return None, ("pending" if job_pending else "absent")
+
+    gate_status = row.get("gate_status") or "ungated"
+    try:
+        gate_reasons = json.loads(row["gate_reasons"]) if row.get("gate_reasons") else None
+    except (TypeError, ValueError):
+        gate_reasons = None
+
+    common = {
+        "translation_id": row["translation_id"],
+        "style_mode": row["style_mode"],
+        "translator_version": row["translator_version"],
+        "faithfulness_score": row["faithfulness_score"],
+        "created_ts": row["created_ts"],
+        "gate_status": gate_status,
+    }
+    if gate_status == "fail":
+        redacted = (
+            {k: v for k, v in gate_reasons.items() if k != "style"}
+            if isinstance(gate_reasons, dict)
+            else gate_reasons
+        )
+        return {**common, "gate_reasons": redacted, "body": None}, "withheld"
+    return {**common, "gate_reasons": gate_reasons, "body": row["body"]}, (
+        "ungated" if gate_status == "ungated" else "translated"
+    )
 
 
 def build_feed_panel(rostore: RoStore, *, thread_id: str | None = None) -> dict[str, Any]:
     """Threads, one thread's full-text post stream, unread operator
     directives, and a per-post ``translation`` slot reading the AISPEAK
     sidecar table (``docs/reviews/AISPEAK_TRANSLATOR_DESIGN.md``) IF it
-    exists on this program -- ``null`` otherwise (this build creates the
-    TABLE seam only, never the translator itself, per that design doc's own
-    step ordering).
+    exists on this program -- ``null`` otherwise.
+
+    Each post also carries ``translation_state`` -- one of ``translated``,
+    ``ungated``, ``withheld``, ``pending``, ``absent`` (see
+    :func:`_translation_slot`). A ``withheld`` post's translation BODY is
+    never included in the payload: the fail-closed gate
+    (:mod:`trialerror.feed_translate.gate`) refused it, and a body the UI is
+    forbidden to render has no business crossing the wire.
 
     ``inbox_item`` (the operator directive channel) carries NO
     ``thread_id`` column in the M1-built schema -- it is a program-wide
@@ -464,21 +598,14 @@ def build_feed_panel(rostore: RoStore, *, thread_id: str | None = None) -> dict[
             "SELECT *, rowid AS _rowid FROM feed_post WHERE thread_id = ? ORDER BY ts ASC, _rowid ASC",
             (active_thread_id,),
         ).fetchall()
-        for r in rows:
-            d = {k: v for k, v in dict(r).items() if k != "_rowid"}
+        raw = [{k: v for k, v in dict(r).items() if k != "_rowid"} for r in rows]
+        translations = _load_translations_for_posts(conn, [d["post_id"] for d in raw])
+        untranslated = [pid for pid, t in translations.items() if t is None]
+        job_pending = _pending_translation_post_ids(rostore, untranslated)
+        for d in raw:
             d["kind"] = _derive_post_kind(d["author"])
-            translation_row = _load_current_translation(conn, d["post_id"])
-            d["translation"] = (
-                {
-                    "translation_id": translation_row["translation_id"],
-                    "body": translation_row["body"],
-                    "style_mode": translation_row["style_mode"],
-                    "translator_version": translation_row["translator_version"],
-                    "faithfulness_score": translation_row["faithfulness_score"],
-                    "created_ts": translation_row["created_ts"],
-                }
-                if translation_row is not None
-                else None
+            d["translation"], d["translation_state"] = _translation_slot(
+                translations[d["post_id"]], job_pending=d["post_id"] in job_pending
             )
             posts.append(d)
 
@@ -491,6 +618,7 @@ def build_feed_panel(rostore: RoStore, *, thread_id: str | None = None) -> dict[
         "posts": posts,
         "unread_directives": unread_directives,
         "translator_table_available": _table_exists(conn, "feed_post_translation"),
+        "translation_withheld_count": sum(1 for p in posts if p["translation_state"] == "withheld"),
     }
 
 
