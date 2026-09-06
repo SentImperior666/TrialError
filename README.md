@@ -204,11 +204,14 @@ what is still coming. Nothing already shipped depends on any of it.
       extracted entities.
 - [ ] Ops polish: a retention doctor check, transactional event rows, idempotent
       Phoenix start.
-- [ ] Operator alerting: a host-side channel that pushes a phone notification when
-      a containment or doctor check fails (mass-deletion flag, mirror refusing to
-      run, firewall self-test failure, container restart loop, stale snapshot or
-      off-machine copy), with a dead-man heartbeat so a silent host is itself an
-      alarm. Not research-gating; runs as a parallel track.
+- [x] Operator alerting: a host-side detector that pushes a phone notification when
+      a containment check fails (mass-deletion flag, mirror refusing to run,
+      firewall self-test unverified, container restart loop, stale snapshot or
+      off-machine copy), with per-condition hysteresis so a flapping check cannot
+      spam the channel, a six-hourly reminder while a condition persists, an
+      all-clear on recovery, and a dead-man heartbeat so a silent host is itself an
+      alarm. It ships with the host deployment scripts, which are not part of this
+      distribution.
 - [ ] Longer term: self-learning rule promotion, multimodal retrieval,
       cross-machine operation.
 
