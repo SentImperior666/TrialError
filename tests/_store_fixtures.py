@@ -682,6 +682,28 @@ def populate_one_of_everything(store: Store) -> dict[str, str]:
         },
     )
 
+    # lane a (knowledge_v4_web_fetch_table). Deliberately a MINIMAL row:
+    # everything but the identity, the URL pair, the two closed vocabularies
+    # and the created timestamp is nullable, because a fetch refused before a
+    # socket ever opened has no status, no bytes and no signals to record --
+    # and a schema that could not hold that row would force the refusal path
+    # to invent values.
+    ids["web_fetch"] = new_id("WF")
+    insert(
+        store,
+        "web_fetch",
+        {
+            "fetch_id": ids["web_fetch"],
+            "launch_id": ids["launch"],
+            "url": "https://example.org/a",
+            "url_norm": "https://example.org/a",
+            "kind": "page",
+            "origin": "operator_list",
+            "state": "queued",
+            "created_ts": now(),
+        },
+    )
+
     # ---- jobs.db ----------------------------------------------------------
     ids["job"] = new_id("JOB")
     insert(

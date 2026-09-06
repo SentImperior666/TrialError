@@ -25,14 +25,18 @@ from tests._store_fixtures import populate_one_of_everything
 # The mining adoptions' ops_v7 "memory_relation" (engram-F4's save-time
 # conflict surface) makes it 23 for ops -- same reasoning again: an
 # additive seam, not a design revision.
-EXPECTED_TABLE_COUNT_BY_DB = {"platform": 5, "ops": 23, "knowledge": 17, "jobs": 2}
+# Lane a's knowledge_v4 "web_fetch" (one row per URL the harness has been
+# asked to fetch, from enqueue to whatever it finally became) makes it 18 for
+# knowledge -- an additive seam like every one above it, not a design
+# revision.
+EXPECTED_TABLE_COUNT_BY_DB = {"platform": 5, "ops": 23, "knowledge": 18, "jobs": 2}
 
 
 def test_table_counts_match_design_section_4():
     for db_kind, expected in EXPECTED_TABLE_COUNT_BY_DB.items():
         actual = len(SCHEMA_MODULES[db_kind].TABLES)
         assert actual == expected, f"{db_kind}: expected {expected} tables, schema module declares {actual}"
-    assert len(TABLE_DB) == sum(EXPECTED_TABLE_COUNT_BY_DB.values()) == 47
+    assert len(TABLE_DB) == sum(EXPECTED_TABLE_COUNT_BY_DB.values()) == 48
 
 
 def test_round_trip_one_row_per_table(store):

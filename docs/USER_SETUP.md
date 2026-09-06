@@ -542,6 +542,139 @@ layout, a different vector wire format) rather than just a renamed member, that'
 follow-up build to `trialerror/arxiv_index/ingest.py`'s csv+dat branch, not a config change — flag
 it back to your Claude Code session with the actual file listing/header.
 
+## 3f. Optional: web-page → corpus ingestion (`trialerror webfetch`)
+
+**Off by default, and turning it on is a decision about egress rather than a
+formality** (C-0069's disabled-by-default gate). Read this whole section before you
+add the line.
+
+### What it does
+
+You give it a URL — or a markdown file full of them — and it puts the article's text
+in the corpus: cleaned of navigation, adverts and scripts, with the provenance you
+would need to cite it (final URL, fetch time, content hash, robots verdict, declared
+licence) and quote anchors that keep resolving. PDFs and GitHub repositories reached
+from a links list work too. Anything it *cannot* lawfully fetch — a paywall, a bot
+wall, a page that only exists after JavaScript runs — ends as a `wanted` row in
+`requests/REQUESTS.md` for you to deliver by hand through the path you already use.
+Nothing is ever bypassed: there is no stealth browser, no CAPTCHA solver and no
+user-agent spoofing anywhere in this code, by ruling and by design.
+
+### The shape of it, in one paragraph
+
+Fetching happens in a **separate process from everything else**. The half with network
+access never sees the corpus or any secret; the half that parses the page — which is
+where hostile input actually lands — has no network at all. They share one directory
+and nothing else: a request goes in as a small JSON file, the bytes come back beside a
+provenance record, and the research side re-checks the size and hash of every byte
+before one of them reaches the corpus. On the sandbox those halves are two containers.
+On a workstation they are two commands in two terminals, which is what makes the whole
+pipeline testable before any image is rebuilt.
+
+### Turning it on for a program
+
+```toml
+[webfetch]
+enabled = true                      # default false — this line IS the decision
+queue_dir = "/workspace/webfetch"   # shared with the fetch process; a relative path
+                                    # is joined onto the program root
+contact_mailto = "you@example.org"  # goes in the User-Agent: C-0069 says identify
+                                    # honestly, so this is a real address of yours
+honor_tdm_optout = false            # record noai/TDMRep signals but do not enforce
+                                    # them (the internal-research posture; every
+                                    # signal is written to the row either way)
+
+[license]
+# Both routes are required: `web` for a page that was fetched, `user_delivered` for
+# the `wanted` row a refusal leaves behind. Without them the fetch works and the
+# bookkeeping refuses, which is a confusing way to find out.
+allowed_acquisition_routes = ["web", "user_delivered", "api", "author_posted"]
+```
+
+On the sandbox, add `sandbox = true`. That switches the config loader to fail-closed:
+`mode` must be `"allowlist"`, `require_sidecar` must be true, and `contact_mailto`
+must be set, or every verb refuses and says which rule it broke. This is deliberate —
+the failure it prevents (a mistyped posture quietly widening what may be fetched) is
+otherwise silent.
+
+**Which hosts may be fetched is not in this file and cannot be.** It lives in
+`webfetch/policy/allowed-hosts.conf` on the host machine, one exact fully-qualified
+name per line, mounted read-only into the fetch process and not visible from the
+research container at all. That is the point: an agent inside the sandbox can *ask*
+for a host and cannot approve one, so a prompt-injected agent cannot name a machine to
+send data to. You approve hosts with `te-webfetch.sh allow <host>` or, for a delivered
+list, `te-webfetch.sh import-list <file>`, which shows you the distinct hosts first.
+
+### Running it
+
+Two terminals. The fetch loop — the container's entrypoint on the sandbox, a plain
+command on a workstation:
+
+```console
+trialerror webfetch sidecar --foreground --queue ./webfetch-queue --policy ./webfetch/policy
+```
+
+and the program itself:
+
+```console
+# see what a delivered list contains, and which hosts it needs, without touching anything
+trialerror webfetch batch --list "deliveries/Requested links.md" --launch-id LNCH-… --dry-run
+
+# enqueue it (idempotent — re-running the same list enqueues nothing)
+trialerror webfetch batch --list "deliveries/Requested links.md" --launch-id LNCH-…
+
+# one URL at a time
+trialerror webfetch add --url https://example.org/article --launch-id LNCH-… \
+    --license-tier open        # your judgment; outranks whatever the page claims
+
+# the jobs worker does the actual work, on its own loop
+trialerror jobs start-worker --mode once
+
+# where everything is, and what it became
+trialerror webfetch status --list "deliveries/Requested links.md"
+trialerror webfetch report --list "deliveries/Requested links.md"
+```
+
+`report` is the one to read, and the number that matters is `unaccountedFor`. A run is
+finished when every link is either an indexed document or a refusal carrying a reason —
+not when some particular number of documents exists. Two links out of eight ending in
+`wanted` is a normal, correct outcome for a list containing a paywalled newsletter and
+a JavaScript-rendered marketing site.
+
+### The other three verbs
+
+- `trialerror webfetch links <fetch_id>` — the links that page pointed at. They are
+  **recorded and never followed**: there is no crawling here, and a link you want
+  comes back through `add`, which re-runs every check from the start.
+- `trialerror webfetch refresh --all --older-than 30d --launch-id LNCH-…` — a
+  conditional re-fetch, never automatic. A `304`, or an unchanged article after
+  cleaning, costs one request and produces no new document; a changed page becomes a
+  **new document under the same source**, and the old chunks and anchors are never
+  mutated.
+- `trialerror webfetch proposals` — hosts an agent asked for and you have not
+  approved. Reading them is all this side can do; `te-webfetch.sh review` on the host
+  is where you decide.
+
+### What none of these commands will ever print
+
+A line of a fetched page. Every verb returns identifiers, counts and reasons; the text
+lives under `raw/web/<host>/` and reaches an agent only through retrieval, where the
+existing quote fence applies. That is not tidiness — it is what stops a page saying
+"ignore your previous instructions" from being read aloud into the context of the
+agent that fetched it.
+
+### Two honest caveats
+
+- A fetch is attributed to a launch id, and the harness *detects* a bogus one rather
+  than preventing it: any process inside the research container can write a
+  syntactically valid launch id into a request. What bounds the damage is the host
+  allowlist and the daily caps, not the attribution — and `trialerror doctor` and
+  `te-status.sh` both flag an unattributed fetch within one cycle.
+- Pages tagged `unknown` (the default, when neither you nor the page says otherwise)
+  are served **unfenced** by the retrieval layer, consistent with the internal-research
+  posture. Tag commercial sources with `--license-tier commercial_restricted` and the
+  existing ≤20-word excerpt fence applies to them.
+
 ## 4. GPU and live-Claude-Code steps — need your real machine
 
 These eight items cannot be completed by any agent working in a sandboxed session —

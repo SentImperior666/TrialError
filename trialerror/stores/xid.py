@@ -61,6 +61,14 @@ XID_REGISTRY: dict[tuple[str, str], XidTarget] = {
     ("prov_edge", "launch_id"): XidTarget("platform", "launch", "launch_id"),
     # build-v2-summary (knowledge_v3_summary_table): summary.created_by_launch.
     ("summary", "created_by_launch"): XidTarget("platform", "launch", "launch_id"),
+    # lane a (knowledge_v4_web_fetch_table): web_fetch.launch_id. This entry
+    # carries more weight than bookkeeping. Design Section 4 T7 makes "every
+    # fetch is attributable to a real launch" a security control, and
+    # registering the column here is what turns it from a convention the
+    # enqueue path happens to follow into a write-API refusal nothing can
+    # route around. web_fetch.job_id is deliberately NOT here: jobs.db rows
+    # are swept, and a fetch record has to outlive the job that produced it.
+    ("web_fetch", "launch_id"): XidTarget("platform", "launch", "launch_id"),
     # ---- bullet 2: prereg_id referenced from knowledge.db (prereg lives in
     # ops.db). --------------------------------------------------------------
     ("hypothesis", "prereg_id"): XidTarget("ops", "prereg", "prereg_id"),

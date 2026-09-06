@@ -31,6 +31,7 @@ TABLES = (
     "record",
     "prov_edge",
     "summary",
+    "web_fetch",
 )
 
 _V1 = (
@@ -456,8 +457,132 @@ _V3 = (
     "CREATE INDEX idx_summary_supersedes ON summary(supersedes)",
 )
 
+# ---- schema-v4 (lane a, docs/reviews/LANE_A_WEB_INGESTION_DESIGN.md §2.3)
+# -------------------------------------------------------------------------
+#
+# ``web_fetch``: one row per URL the harness has been asked to fetch, from
+# the moment it is enqueued to whatever it finally became. Additive — not one
+# existing column moves — and deliberately a NEW table rather than columns on
+# ``source``: a fetch is not a source. Most fetches become one (``source_id``/
+# ``doc_id`` point at it once extraction lands), but a refused one never
+# does, an unchanged re-fetch produces no new source at all, and a superseded
+# one has to stay readable beside its replacement. Hanging all of that off
+# ``source`` would mean a source row for every 404.
+#
+# The columns are, in order: the identity and provenance the manifest carried
+# out (§2.3's ``pending/<job>.json``), the provenance the sidecar carried back
+# (§2.3's ``result.json``, flattened — SQLite has no JSON columns worth the
+# name here, and every field a query filters on wants to be a real column),
+# the extraction signals of §2.2, and the local paths of the four files a
+# fetch leaves on disk.
+#
+# ``UNIQUE(url_norm) WHERE superseded_by IS NULL`` is the dedup rule of §5,
+# enforced by the DDL rather than by the enqueue path alone: at most one LIVE
+# row per canonical URL, any number of superseded ones behind it. That is what
+# makes ``refresh`` safe — the new row is written, the old row's
+# ``superseded_by`` is set, and the index has held throughout. The partial
+# predicate is what keeps history: without it, superseding would mean deleting.
+#
+# ``launch_id`` is NOT NULL and is registered in ``trialerror.stores.xid``
+# against ``platform.launch``, so T7's attribution rule ("every fetch carries
+# a launch id that exists") is a write-API refusal rather than a convention.
+# ``job_id`` is deliberately NOT an XID: jobs.db rows are swept, and a fetch
+# record must outlive the job that produced it.
+#
+# ``superseded_by`` is deliberately NOT a same-file FK, which is a departure
+# worth stating rather than leaving to be discovered. SQLite checks same-file
+# FKs immediately, and superseding is inherently two statements whose order
+# the partial unique index above already fixes: the old row must stop being
+# live BEFORE the new one is inserted, so the pointer it would carry names a
+# row that does not exist yet. The alternatives were a self-referencing
+# placeholder, a deferred-FK transaction that bypasses the validated write
+# API for the one insert that most needs it, or an extra ``live`` column that
+# says the same thing twice. Leaving the column unconstrained follows the
+# house precedent this schema already sets twice -- ``verdict.subject_id``
+# and ``summary.subject_id`` are both deliberately non-FK id columns, checked
+# by doctor's referential scan rather than by the DDL -- and it keeps the
+# design's index predicate verbatim. The crash window is readable rather than
+# wrong: an interrupted supersede leaves the old row retired with a pointer
+# to a row that never landed, which says exactly what happened.
+#
+# ``state`` and ``outcome`` are two different questions and both are kept.
+# ``outcome`` is what the SIDECAR reported (§2.3's closed three-value set);
+# ``state`` is where the research side has got to with it. A row can be
+# ``outcome='fetched'`` and ``state='fetched'`` for the minute between the
+# fetch handler completing and the extract handler running, and telling those
+# apart is exactly what ``webfetch status`` exists for.
+_V4 = (
+    """
+    CREATE TABLE web_fetch (
+        fetch_id              TEXT PRIMARY KEY,
+        job_id                TEXT,
+        launch_id             TEXT NOT NULL,
+        program_id            TEXT,
+        url                   TEXT NOT NULL,
+        url_norm              TEXT NOT NULL,
+        final_url             TEXT,
+        redirect_chain        TEXT,
+        kind                  TEXT NOT NULL CHECK (kind IN ('page','pdf','git')),
+        origin                TEXT NOT NULL CHECK (origin IN ('operator_list','agent')),
+        list_ref              TEXT,
+        state                 TEXT NOT NULL CHECK (
+            state IN ('queued','pending','fetched','unchanged','refused','extracted','failed')
+        ),
+        outcome               TEXT CHECK (outcome IN ('fetched','unchanged','refused')),
+        reason                TEXT,
+        http_status           INTEGER,
+        content_type          TEXT,
+        content_class         TEXT CHECK (content_class IN ('html','pdf','text','git')),
+        bytes                 INTEGER,
+        content_sha256        TEXT,
+        extracted_sha256      TEXT,
+        resolved_ips          TEXT,
+        bytes_out             INTEGER,
+        headers_subset        TEXT,
+        robots_verdict        TEXT CHECK (
+            robots_verdict IN ('allow','disallow','unavailable','n/a')
+        ),
+        robots_crawl_delay_s  REAL,
+        policy_host_rule      TEXT,
+        query_stripped        INTEGER CHECK (query_stripped IN (0,1)),
+        fetched_ts            TEXT,
+        elapsed_ms            INTEGER,
+        sidecar_version       TEXT,
+        git_head              TEXT,
+        git_ref               TEXT,
+        git_path              TEXT,
+        source_id             TEXT REFERENCES source(source_id),
+        doc_id                TEXT REFERENCES document(doc_id),
+        superseded_by         TEXT,
+        extractor_version     TEXT,
+        title                 TEXT,
+        author                TEXT,
+        published             TEXT,
+        canonical_link        TEXT,
+        license_detected      TEXT,
+        lang                  TEXT,
+        extracted_words       INTEGER,
+        thin_content          INTEGER CHECK (thin_content IN (0,1)),
+        js_markers            TEXT,
+        links_json            TEXT,
+        tdm_signals_json      TEXT,
+        raw_path              TEXT,
+        clean_path            TEXT,
+        markdown_path         TEXT,
+        provenance_path       TEXT,
+        created_ts            TEXT NOT NULL,
+        updated_ts            TEXT
+    )
+    """,
+    "CREATE UNIQUE INDEX idx_web_fetch_url_norm_live ON web_fetch(url_norm) WHERE superseded_by IS NULL",
+    "CREATE INDEX idx_web_fetch_state ON web_fetch(state)",
+    "CREATE INDEX idx_web_fetch_source ON web_fetch(source_id)",
+    "CREATE INDEX idx_web_fetch_superseded ON web_fetch(superseded_by)",
+)
+
 MIGRATIONS = (
     Migration(version=1, name="knowledge_v1_initial_schema", statements=_V1),
     Migration(version=2, name="knowledge_v2_idea_promoted_columns", statements=_V2),
     Migration(version=3, name="knowledge_v3_summary_table", statements=_V3),
+    Migration(version=4, name="knowledge_v4_web_fetch_table", statements=_V4),
 )
