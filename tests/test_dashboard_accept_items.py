@@ -1,4 +1,4 @@
-"""The 1 real-browser-DOM item this build names as orchestrator/integration
+"""The real-browser-DOM items this build names as orchestrator/integration
 territory (see ``trialerror.dashboard.accept_items``'s module docstring for why
 it lives here rather than in ``trialerror.accept.journeys.GPU_LIVE_CC_ITEMS``
 itself). Same unconditional-skip discipline
@@ -23,6 +23,26 @@ def test_live_dom_dashboard_serve_real_browser():
 
 @pytest.mark.skip(reason=DASHBOARD_LIVE_ITEMS["live_dom_client_resilience"])
 def test_live_dom_client_resilience():
+    ...
+
+
+@pytest.mark.skip(reason=DASHBOARD_LIVE_ITEMS["live_dom_console_renderer"])
+def test_live_dom_console_renderer():
+    ...
+
+
+@pytest.mark.skip(reason=DASHBOARD_LIVE_ITEMS["live_dom_evidence_trace"])
+def test_live_dom_evidence_trace():
+    ...
+
+
+@pytest.mark.skip(reason=DASHBOARD_LIVE_ITEMS["live_dom_decide_write_actions"])
+def test_live_dom_decide_write_actions():
+    ...
+
+
+@pytest.mark.skip(reason=DASHBOARD_LIVE_ITEMS["live_dom_threaded_feed"])
+def test_live_dom_threaded_feed():
     ...
 
 

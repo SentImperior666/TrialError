@@ -59,7 +59,15 @@ _CSS_LINK_TAG = '<link rel="stylesheet" href="dashboard.css">'
 #: asserts no ``src=`` survives in the snapshot at all -- one missed entry
 #: would otherwise ship a file:// page whose Console renders nothing, with
 #: no error visible anywhere.
-_INLINE_SCRIPTS: tuple[str, ...] = ("console_render.js",)
+#:
+#: Order is LOAD order and it is load-bearing: ``console_render.js`` owns the
+#: two shared primitives (``h2``/``rowButton``) that the other renderers call
+#: off the global, so it is inlined first exactly as it is loaded first.
+_INLINE_SCRIPTS: tuple[str, ...] = (
+    "console_render.js",
+    "evidence_render.js",
+    "feed_render.js",
+)
 
 
 def _script_src_tag(name: str) -> str:

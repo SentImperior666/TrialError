@@ -12,6 +12,12 @@
    ============================================================================ */
 
 :root {
+  /* VA-2: without this the native widgets a dark page still uses -- the
+     scrollbars, the <details> marker, form controls, the canvas behind an
+     overscroll -- are drawn light, which is the one thing on the page the
+     palette below cannot reach. */
+  color-scheme: dark;
+
   /* 01 . COLOR -- four semantic hues, one reserved (crit). Never re-purpose
      a hue: live never means "fine", crit never decorates. */
   --bg: #070B09;
@@ -624,6 +630,64 @@ html { scroll-padding-top: calc(var(--topbar-h) + 8px); }
 .post-body-single { padding: 12px 14px; }
 .directive-card { border: 1px solid var(--hairline); border-left: 2px solid var(--crit-fill); background: var(--surface); box-shadow: inset 0 1px 0 rgba(231,240,233,0.035); }
 
+/* ---- threading (lane C item B; feed_render.js) -----------------------------
+   The stream is one node so the renderer can be swapped in with a single
+   append; it carries the column layout .feed-posts used to own. */
+.feed-stream { display: flex; flex-direction: column; gap: 12px; }
+.thread-row .n { color: var(--ink-3); font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+/* One 14px rail per level, four levels deep, then the indent stops -- past
+   the cap a card would be one word wide and the head's parent link is what
+   carries the relationship instead. The left border IS the rail: it lands
+   inside the indent, so the eye follows a line rather than an empty gap. */
+.post-card.depth-1 { margin-left: 14px; }
+.post-card.depth-2 { margin-left: 28px; }
+.post-card.depth-3 { margin-left: 42px; }
+.post-card.depth-4 { margin-left: 56px; }
+.post-card.depth-1, .post-card.depth-2, .post-card.depth-3, .post-card.depth-4 {
+  border-left: 2px solid var(--hairline);
+}
+
+/* Deep enough that two columns would be twenty characters each: stack them.
+   Lane b's markup is untouched -- only the grid it sits in changes. */
+.post-card.is-stacked .post-body-split { grid-template-columns: minmax(0,1fr); }
+.post-card.is-stacked .post-body-col.original { border-right: none; border-bottom: 1px solid var(--hairline-soft); }
+
+.post-card.is-reply-target { border-color: var(--live); }
+.post-card.is-flashing { animation: feed-parent-flash 1.1s ease-out 1; }
+@keyframes feed-parent-flash {
+  0%   { background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--live); }
+  100% { background: var(--surface); box-shadow: inset 0 1px 0 rgba(231,240,233,0.035); }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* The jump still has to be visible without the animation, so the target
+     keeps a static outline rather than losing the feedback entirely. */
+  .post-card.is-flashing { animation: none; box-shadow: inset 0 0 0 1px var(--live); }
+}
+
+.reply-head-link, .thread-collapse {
+  font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.04em;
+  background: none; border: 1px solid transparent; color: var(--ink-3);
+  padding: 1px 5px; cursor: pointer;
+}
+.reply-head-link:hover, .thread-collapse:hover { color: var(--ink-hi); border-color: var(--hairline); }
+.reply-head-link:focus-visible, .thread-collapse:focus-visible { outline: 1px solid var(--live); outline-offset: 1px; }
+.thread-collapse { color: var(--ink-2); }
+.orphan-flag { color: var(--warn); }
+.feed-reply-btn { font-size: 10px; padding: 2px 7px; }
+
+.feed-reply-target {
+  display: flex; align-items: center; gap: 9px;
+  padding: 7px 14px; border-top: 1px solid var(--hairline-soft);
+  background: var(--surface-2);
+}
+.reply-target-clear {
+  background: none; border: none; color: var(--ink-3);
+  font-family: var(--font-mono); font-size: 11px; cursor: pointer; padding: 0 4px;
+}
+.reply-target-clear:hover { color: var(--crit-text); }
+.reply-target-clear:focus-visible { outline: 1px solid var(--live); outline-offset: 1px; }
+
 /* ============================================================================
    ROOMS
    ============================================================================ */
@@ -759,11 +823,53 @@ html { scroll-padding-top: calc(var(--topbar-h) + 8px); }
 .drift-entry .quote { line-height: 1.45; border-left: 2px solid var(--hairline); padding-left: 10px; color: var(--ink); font-size: 12.5px; }
 
 /* ============================================================================
-   CONSOLE
+   CONSOLE (sweep section 3.9 -- the geometry, which is half of console-3)
+
+   The old grid was `repeat(auto-fit, minmax(320px,1fr))` with a hard 420px
+   cap on every card. Three things followed from that and none of them were
+   intended (M-CON-4): a 15-column jobs table had to fit inside a 320px
+   column, so every <th> shrank to one character wide; the 420px cap put the
+   answer to "why can't I close?" below the fold of the SESSION card; and
+   `overflow-wrap: anywhere`, inherited from `.kv-value`, told the table to
+   SHRINK rather than scroll. Named areas fix the first two, and the table
+   rules below fix the third.
    ============================================================================ */
-.console-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: var(--card-gap); padding: var(--page-margin); }
-.console-grid .card { max-height: 420px; }
-.console-grid .card-body { overflow-y: auto; }
+.console-grid {
+  display: grid;
+  grid-template-columns: minmax(300px, 1fr) minmax(300px, 1fr) minmax(300px, 1fr);
+  grid-template-areas:
+    "session  pools    ledger"
+    "timeline timeline timeline"
+    "jobs     jobs     diagnostics"
+    "gates    corpus   corpus";
+  gap: var(--card-gap);
+  padding: var(--page-margin);
+  align-items: start;
+}
+#console-card-session { grid-area: session; }
+#console-card-pools { grid-area: pools; }
+#console-card-ledger { grid-area: ledger; }
+#console-card-timeline { grid-area: timeline; }
+#console-card-jobs { grid-area: jobs; }
+#console-card-doctor { grid-area: diagnostics; }
+#console-card-gates { grid-area: gates; }
+#console-card-corpus { grid-area: corpus; }
+
+/* Short by construction: these three are readings, and a scrollbar inside a
+   nine-row grid is noise. JOBS and DIAGNOSTICS are lists and do get one. */
+#console-card-jobs, #console-card-doctor { max-height: min(60vh, 640px); }
+#console-card-jobs > .card-body, #console-card-doctor > .card-body { overflow: auto; }
+#console-card-jobs .rows-table th { position: sticky; top: 0; background: var(--surface); z-index: 1; }
+
+/* Below the shell's 1120px floor the three-column ladder stops being
+   readable, so every card takes the full width in CARD_ORDER order. */
+@media (max-width: 1119px) {
+  .console-grid { grid-template-columns: minmax(0, 1fr); grid-template-areas: none; }
+  .console-grid .card { grid-area: auto !important; }
+}
+
+.card-header .card-head { display: flex; align-items: center; gap: 8px; }
+.head-readings { display: flex; align-items: center; gap: 10px; }
 
 /* The Console repeats two readings from the topbar in its own subbar: how old
    the numbers are, and the one-glance health tally. Colour is third here as
@@ -777,6 +883,163 @@ html { scroll-padding-top: calc(var(--topbar-h) + 8px); }
 .console-health-tally[data-health="ok"] { color: var(--settled); }
 .console-health-tally[data-health="warn"] { color: var(--warn); }
 .console-health-tally[data-health="crit"] { color: var(--crit-text); }
+
+/* ---- card interior: the vocabulary every Console card is built from ----- */
+.card-stack { display: flex; flex-direction: column; gap: 9px; min-width: 0; }
+.section-sub {
+  font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.08em;
+  color: var(--ink-3); border-top: 1px solid var(--hairline-soft); padding-top: 7px;
+}
+
+/* Zero is a reading. Every one of these prints its number even when the
+   number is nothing, which is the whole point of a console. */
+.reading-row {
+  display: flex; align-items: baseline; gap: 6px;
+  font-family: var(--font-mono); font-size: 11px; color: var(--ink-2);
+}
+.reading-row .g { line-height: 1; }
+.reading-row .k { color: var(--ink-3); letter-spacing: 0.04em; }
+.reading-row .v { color: var(--ink-hi); margin-left: auto; }
+.reading-grid {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 3px 16px;
+}
+.reading-grid .reading-row { min-width: 0; }
+
+.tally-rows { display: flex; flex-direction: column; gap: 3px; }
+.tally-row {
+  display: flex; align-items: baseline; gap: 6px;
+  font-family: var(--font-mono); font-size: 11px;
+}
+.tally-row .k { letter-spacing: 0.04em; }
+.tally-row .n { margin-left: auto; color: var(--ink-hi); }
+.tally-row-inline {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-2);
+}
+.tally-row-inline .k { color: var(--ink-3); }
+.tally-row-inline .v { color: var(--ink-hi); }
+
+.meter-block { display: flex; flex-direction: column; gap: 3px; }
+.meter__fill--crit { background: var(--crit-fill); }
+.meter-sub, .quota-fresh, .trunc-note {
+  font-family: var(--font-mono); font-size: 10px; color: var(--ink-3);
+}
+.crit-line { font-family: var(--font-mono); font-size: 10.5px; }
+
+.callout--neutral {
+  border: 1px solid var(--hairline); background: var(--surface-2);
+  padding: 9px 11px; display: flex; flex-direction: column; gap: 5px;
+}
+.callout--neutral .head { font-family: var(--font-mono); font-size: 10px; color: var(--ink-2); }
+.callout--neutral .body { font-size: 11.5px; line-height: 1.5; color: var(--ink); }
+.callout--crit {
+  border: 1px solid var(--crit-band-border); background: var(--crit-band-bg);
+  padding: 9px 11px; display: flex; flex-direction: column; gap: 5px;
+}
+.callout--crit .head { font-family: var(--font-mono); font-size: 10px; color: var(--crit-text); }
+.callout--crit .body { font-size: 11.5px; line-height: 1.5; color: var(--ink); }
+.callout-payload, .check-details { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
+.kv-line { display: flex; gap: 8px; font-family: var(--font-mono); font-size: 10px; }
+.kv-line .k { color: var(--ink-3); white-space: nowrap; }
+.kv-line .v { color: var(--ink); overflow-wrap: anywhere; }
+
+.disclosure { border-top: 1px solid var(--hairline-soft); padding-top: 5px; }
+.disclosure__summary {
+  font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.06em;
+  color: var(--ink-3); cursor: pointer;
+}
+.disclosure__summary:hover { color: var(--ink-2); }
+
+.dangling-row, .history-row, .gate-row {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-2);
+  border-bottom: 1px solid var(--hairline-soft); padding-bottom: 4px;
+}
+.dangling-row .purpose, .gate-row .v {
+  color: var(--ink); flex-grow: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.dangling-row .agent { color: var(--ink-hi); }
+.dangling-row .k, .history-row .k, .gate-row .k { color: var(--ink-3); }
+.history-list { display: flex; flex-direction: column; gap: 3px; padding-top: 4px; }
+.ago { font-family: var(--font-mono); }
+
+/* ---- THIS SESSION, END TO END ------------------------------------------ */
+.timeline { gap: 5px; }
+.timeline-axis {
+  position: relative; height: 14px; border-bottom: 1px solid var(--hairline);
+  margin-left: 168px; font-family: var(--font-mono); font-size: 9px; color: var(--ink-3);
+}
+.timeline-axis .axis-tick { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; }
+.timeline-axis .gap-marker { position: absolute; top: 0; color: var(--ink-2); white-space: nowrap; }
+.lane { display: flex; align-items: center; gap: 0; height: 14px; }
+.lane .lane-name {
+  width: 168px; flex-shrink: 0; font-family: var(--font-mono); font-size: 10px;
+  color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.lane button.lane-name { border-bottom: 0; padding: 0; }
+.lane .lane-bars { flex-grow: 1; height: 12px; min-width: 0; }
+.bar--running { fill: var(--live); }
+.bar--complete { fill: var(--settled); }
+.bar--retried { fill: var(--warn); }
+.bar--failed, .bar--abandoned, .bar--frozen { fill: var(--crit-fill); }
+.bar--booked { fill: none; stroke: var(--ink-3); stroke-width: 1; }
+.bar--instant { fill: var(--ink-3); }
+@media (prefers-reduced-motion: no-preference) {
+  .bar--running.pulse { animation: live-pulse 1.8s ease-in-out infinite; }
+}
+.timeline-legend {
+  display: flex; gap: 14px; flex-wrap: wrap; padding-top: 5px;
+  border-top: 1px solid var(--hairline-soft);
+}
+
+/* ---- JOBS -------------------------------------------------------------- */
+/* M-CON-4: a wide table scrolls inside .table-scroll instead of shrinking to
+   one-character columns. `overflow-wrap: anywhere` is right for a kv value
+   and catastrophic for a table header. */
+.rows-table th { white-space: nowrap; }
+.rows-table { min-width: max-content; }
+.rows-table th, .rows-table td { overflow-wrap: normal; }
+.rows-table td.wrap, .rows-table .wrap { overflow-wrap: anywhere; white-space: normal; }
+.job-row .cell-progress { max-width: 260px; }
+.job-row .delta-marker { font-family: var(--font-mono); color: var(--ink-hi); }
+.cell-changed { background: var(--surface-2); }
+@media (prefers-reduced-motion: no-preference) {
+  .cell-changed { animation: cell-fade var(--dur-flare) ease-out 1; }
+}
+@keyframes cell-fade { from { background: var(--live-deep); } to { background: var(--surface-2); } }
+.job-row.is-new td { border-top: 1px solid var(--live); }
+.job-row.is-new .cell-id { box-shadow: inset 3px 0 0 var(--live); }
+.progress-cell { display: flex; flex-direction: column; gap: 3px; }
+.progress-cell .v { color: var(--ink); }
+.error-body { display: flex; flex-direction: column; gap: 4px; padding-top: 3px; }
+.delta-legend {
+  display: flex; gap: 14px; flex-wrap: wrap;
+  font-family: var(--font-mono); font-size: 9.5px; color: var(--ink-3);
+}
+
+/* ---- DIAGNOSTICS ------------------------------------------------------- */
+.check-list { display: flex; flex-direction: column; gap: 5px; }
+.check-row { display: flex; flex-direction: column; gap: 2px; }
+.check-head {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  font-family: var(--font-mono); font-size: 10.5px;
+}
+.check-head .name { color: var(--ink-hi); }
+.check-head .msg { color: var(--ink-3); flex-grow: 1; min-width: 0; }
+/* A tally entry that is also the filter for its own status. Clicking the one
+   already selected clears it, so there is no separate "all" control to hunt
+   for -- and in a snapshot, with no callback to hand it, it is drawn as a
+   plain reading rather than a dead button. */
+.tally-chip {
+  background: none; border: 1px solid transparent; padding: 1px 4px;
+  color: inherit; font: inherit; cursor: pointer;
+}
+.tally-chip:hover { border-color: var(--hairline); }
+.tally-chip.is-selected { border-color: var(--hairline); background: var(--surface-2); }
+.tally-chip:focus-visible { outline: 1px solid var(--live); outline-offset: 0; }
+.check-filter { min-height: 26px; padding: 4px 7px; font-size: 10.5px; }
 
 /* ============================================================================
    SHARED RENDERER PRIMITIVES (console_render.js -- TEConsole.h2 / .rowButton)
@@ -872,3 +1135,100 @@ h2.title { margin: 0; font-size: 11px; font-weight: 700; letter-spacing: 0.12em;
 .write-form-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .write-form-msg { font-family: var(--font-mono); font-size: 10.5px; min-height: 13px; line-height: 1.4; }
 .write-form-bar { border-top: 1px solid var(--hairline); background: var(--surface); flex-shrink: 0; }
+
+/* ============================================================================
+   EVIDENCE (lane C, C6) -- one claim traced to what it stands on.
+   Geometry is the .lexicon-layout rail/detail split the markup reuses; these
+   rules are only the readings inside it.
+   ============================================================================ */
+.btn--tiny { min-height: 22px; padding: 0 8px; font-size: 9.5px; }
+
+.ev-index { display: flex; flex-direction: column; }
+.ev-index-count { font-family: var(--font-mono); font-size: 10px; color: var(--ink-3); padding: 8px 14px; letter-spacing: 0.08em; }
+.ev-index-truncated {
+  font-family: var(--font-mono); font-size: 10px; line-height: 1.5;
+  color: var(--warn); background: var(--warn-band-bg);
+  border-top: 1px solid var(--warn-band-border); border-bottom: 1px solid var(--warn-band-border);
+  padding: 6px 14px;
+}
+.ev-index-row { flex-direction: column; align-items: flex-start; gap: 3px; padding: 9px 14px; border-bottom: 1px solid var(--hairline-soft); }
+.ev-index-id { font-family: var(--font-mono); font-size: 10px; color: var(--ink-3); }
+.ev-index-text { font-size: 12px; color: var(--ink); line-height: 1.45; text-align: left; }
+.ev-index-meta { font-family: var(--font-mono); font-size: 9.5px; color: var(--ink-3); letter-spacing: 0.06em; text-transform: uppercase; }
+
+.ev-detail { display: flex; flex-direction: column; min-height: 0; }
+
+/* One chip vocabulary for the whole surface. `crit` is reserved for a hash
+   that no longer matches -- the anchor may now point at different bytes,
+   which is the one thing on this page that invalidates a reading. */
+.ev-chip {
+  font-family: var(--font-mono); font-size: 9.5px; letter-spacing: 0.08em;
+  border: 1px solid var(--hairline); padding: 2px 6px; color: var(--ink-2); white-space: nowrap;
+}
+.ev-chip--ok { color: var(--settled); border-color: var(--settled); }
+.ev-chip--warn { color: var(--warn); border-color: var(--warn-band-border); }
+.ev-chip--crit { color: var(--crit-text); border-color: var(--crit-band-border); }
+
+.ev-claim-meta { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 9px; }
+.ev-claim-text { font-size: 14px; line-height: 1.55; color: var(--ink-hi); }
+.ev-lineage { font-family: var(--font-mono); font-size: 10px; color: var(--ink-3); margin-top: 8px; letter-spacing: 0.06em; }
+
+.ev-anchor { padding: 10px 0; border-bottom: 1px solid var(--hairline-soft); display: flex; flex-direction: column; gap: 6px; }
+.ev-anchor:last-child { border-bottom: none; }
+.ev-anchor-quote { font-size: 12.5px; line-height: 1.5; color: var(--ink-hi); border-left: 2px solid var(--hairline); padding-left: 10px; }
+/* A dim monospace coordinate line. Shared: Evidence's anchor coords and
+   Decide's memory-item / revealed-path readings are the same reading, so
+   the class is surface-neutral -- an `ev-` name used on Decide would send
+   the next reader to the wrong file. */
+.coords-line { font-family: var(--font-mono); font-size: 10px; color: var(--ink-3); }
+.ev-anchor-coords { font-family: var(--font-mono); font-size: 10px; color: var(--ink-3); }
+.ev-anchor-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.ev-verdict { padding: 8px 0; border-bottom: 1px solid var(--hairline-soft); }
+.ev-verdict-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.ev-verdict-label { font-family: var(--font-mono); font-size: 12px; color: var(--ink-hi); letter-spacing: 0.06em; }
+.ev-verdict-meta { font-family: var(--font-mono); font-size: 10px; color: var(--ink-3); margin-top: 4px; }
+
+.ev-graph { display: block; background: var(--bg); border: 1px solid var(--hairline-soft); }
+.ev-graph-edge { stroke: var(--settled); stroke-width: 1; }
+.ev-graph-edge.is-fenced { stroke: var(--warn); }
+.ev-graph-spoke { stroke: var(--hairline); stroke-width: 1; }
+.ev-graph-node { fill: var(--ink-3); }
+.ev-graph-node--claim { fill: var(--live); }
+.ev-graph-node.is-seed { fill: var(--settled); }
+.ev-graph-label { fill: var(--ink-2); font-family: var(--font-mono); font-size: 9px; }
+.ev-seed-line { font-family: var(--font-mono); font-size: 10px; color: var(--ink-3); margin-top: 8px; line-height: 1.5; }
+
+.ev-edge-head { display: flex; border-bottom: 1px solid var(--hairline); }
+.ev-edge-headcell { flex: 1; justify-content: flex-start; padding: 6px 8px; }
+.ev-edge-row { display: flex; padding: 6px 8px; border-bottom: 1px solid var(--hairline-soft); text-align: left; }
+.ev-edge-row .row-button__cell, .ev-edge-headcell .row-button__cell { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.ev-edge-row.is-fenced .row-button__cell { color: var(--warn); }
+.ev-prov-row, .ev-coanchor-row, .ev-term-conflict { display: flex; gap: 10px; padding: 6px 8px; border-bottom: 1px solid var(--hairline-soft); text-align: left; }
+.ev-coanchor-row .row-button__cell { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.ev-action { border: 1px solid var(--hairline-soft); padding: 7px 12px; justify-content: center; }
+
+/* ============================================================================
+   DECIDE (lane C, C7) -- the four write actions and their detail readings.
+   ============================================================================ */
+/* A hash is read by comparing it to another hash, so it wraps rather than
+   truncating: an ellipsised sha256 is a shape, not a value. */
+.hash-cell { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-2); word-break: break-all; }
+.prereg-procedure {
+  font-family: var(--font-mono); font-size: 11.5px; line-height: 1.55; color: var(--ink-hi);
+  background: var(--surface-2); border: 1px solid var(--hairline-soft);
+  padding: 9px 11px; white-space: pre-wrap; word-break: break-word; margin: 4px 0 10px 0;
+}
+/* An armed destructive verb: btn--destructive already carries the fill, and
+   the outline is what makes "this is now loaded" legible without colour. */
+.btn[data-armed="true"] { outline: 1px solid var(--crit-text); outline-offset: 2px; }
+
+.memory-sides { gap: 12px; align-items: stretch; }
+.memory-side { min-width: 0; }
+.memory-body {
+  font-size: 12.5px; line-height: 1.55; color: var(--ink-hi);
+  white-space: pre-wrap; word-break: break-word; margin-top: 6px;
+}
+
+.new-thread-box { padding: 10px 12px; border-bottom: 1px solid var(--hairline-soft); display: flex; flex-direction: column; gap: 8px; }
+.new-thread-box .write-form { gap: 7px; }

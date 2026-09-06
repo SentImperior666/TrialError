@@ -26,7 +26,7 @@ from trialerror.stores.redact import redact_payload
 from trialerror.stores.store import Store
 from trialerror.stores.xid import xid_columns_for_table
 
-__all__ = ["table_columns", "insert", "get", "update"]
+__all__ = ["table_columns", "insert", "get", "update", "require_xid_targets"]
 
 
 def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -57,6 +57,34 @@ def _validate_xids(store: Store, table: str, row: Mapping[str, Any]) -> None:
                 f"{table}.{col} = {value!r} has no matching row in "
                 f"{target.db}.{target.table}.{target.pk_column} (XID refused)"
             )
+
+
+def require_xid_targets(store: Store, table: str, row: Mapping[str, Any]) -> None:
+    """The public face of :func:`_validate_xids`, for a caller that must
+    refuse BEFORE it starts writing.
+
+    :func:`insert` and :func:`update` validate XIDs at the moment of the
+    write, which is the right place when the write is the whole action.
+    It is the wrong place for a multi-step action whose audit ``event``
+    lands LAST: the state change commits, then the event's ``launch_id``
+    turns out to name no ``platform.launch`` row, and the caller reports a
+    refusal for a mutation that already happened (lane C, finding F1 — see
+    :func:`trialerror.ingest.requests.transition` and
+    :func:`trialerror.ingest.extract.accept_merge_proposal`). Such a caller
+    pre-flights exactly the row it will eventually write::
+
+        require_xid_targets(store, "event", {"launch_id": launch_id})
+
+    and gets the identical :class:`~trialerror.stores.errors.
+    XidTargetMissingError` message the deferred write would have raised —
+    only now nothing has been mutated. ``None`` values are skipped, same
+    as at write time (a nullable XID column may legitimately be empty).
+
+    This is a read-only check and therefore inherently advisory: the
+    target row could be deleted between the pre-flight and the write. It
+    narrows the window from "always, for a bad id" to "a concurrent delete
+    of a launch row", which nothing in this system does."""
+    _validate_xids(store, table, row)
 
 
 def _apply_event_redaction(table: str, row: dict[str, Any]) -> dict[str, Any]:

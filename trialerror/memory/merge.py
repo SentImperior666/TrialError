@@ -300,6 +300,13 @@ def resolve_conflict(store: Store, *, group_id: str, keep: str, ts: str | None =
     group whose sides are already resolved — resolution is a one-shot
     transition per group, not an idempotent re-apply, so a caller cannot
     silently "resolve" a group twice with different answers.
+
+    **Emits a ``memory_conflict_resolved`` event** (lane C, C7). The two
+    ``memory_item`` rows record the OUTCOME -- one active, one superseded --
+    but not the act: nothing in them says somebody looked at both sides and
+    chose, or when. A one-shot transition with no trail is a decision nobody
+    can revisit. Written after the row updates, on the same ops.db, so a
+    crash in between loses the event and never the resolution.
     """
     if keep not in ("left", "right", "both"):
         raise ValueError(f"resolve_conflict: keep must be 'left'|'right'|'both', got {keep!r}")
@@ -331,13 +338,31 @@ def resolve_conflict(store: Store, *, group_id: str, keep: str, ts: str | None =
             changes={"status": "active" if keep_right else "superseded"},
         )
 
-    return {
+    result = {
         "group_id": group_id,
         "keep": keep,
         "left_id": left_id if left is not None else None,
         "right_id": right_id if right is not None else None,
         "resolved_ts": ts or now(),
     }
+    # Imported at call time: trialerror.events.api imports trialerror.stores,
+    # exactly as this module does -- a top-level import works today and is one
+    # refactor away from a cycle.
+    from trialerror.events.api import append_event
+
+    append_event(
+        store,
+        event_type="memory_conflict_resolved",
+        payload={
+            "group_id": group_id,
+            "keep": keep,
+            "left_id": result["left_id"],
+            "right_id": result["right_id"],
+            "key": (left or right)["key"],
+        },
+        ts=result["resolved_ts"],
+    )
+    return result
 
 
 def list_conflicts(store: Store, *, account_id: str | None = None) -> list[dict[str, Any]]:

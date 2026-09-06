@@ -46,6 +46,12 @@ more, over the SAME ``RoStore -> dict`` contract: :func:`build_feed_panel`,
 full contract (every endpoint, exact payload shape, real captured JSON
 examples) -- that document, not this docstring, is the frontend-facing
 source of truth for the V2 build.
+
+Lane C (C6) adds the fourteenth: :func:`build_evidence_panel`, one claim
+traced to what it stands on. It is the first builder here that takes THREE
+alternative selectors (``claim_id``/``anchor_id``/``chunk_id``) and decides
+between them itself -- which is why ``serve.PANEL_QUERY_PARAMS`` is a tuple
+of ``(query param, keyword)`` pairs rather than a single pair.
 """
 
 from __future__ import annotations
@@ -54,6 +60,7 @@ import json
 import sqlite3
 import traceback
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, Sequence
 
 from trialerror.artifacts.registry import list_artifacts
@@ -64,10 +71,13 @@ from trialerror.ingest.extract import EXTRACT_REGISTER_KEY, list_pending
 from trialerror.ingest.requests import TRANSITIONS as REQUEST_TRANSITIONS
 from trialerror.jobs.ledger import list_jobs
 from trialerror.memory.merge import list_conflicts as list_memory_conflicts
+from trialerror.offload import protocol as offload_protocol
 from trialerror.offload.dashboard_items import offload_backlog_items
 from trialerror.webfetch.dashboard_items import webfetch_items
 from trialerror.retrieve import engine as retrieve_engine
 from trialerror.retrieve.errors import InvalidSearchModeError
+from trialerror.retrieve.fence import citation_quote, is_fenced_license
+from trialerror.retrieve.wrap import untrusted_wrap
 from trialerror.rooms.api import CONVERGENCE_BAR_PCT, check_room_converged, get_freeze_reason, list_room_turns
 from trialerror.sessions.lifecycle import session_status
 from trialerror.util.timeutil import now, now_dt, parse
@@ -83,6 +93,7 @@ __all__ = [
     "build_rooms_panel",
     "build_determinations_panel",
     "build_dossier_panel",
+    "build_evidence_panel",
     "build_lexicon_panel",
     "build_course_panel",
     "build_since_you_left_panel",
@@ -151,6 +162,20 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     return row is not None
 
 
+def _short_id(value: Any, n: int = 8) -> str:
+    """``LNCH-01M1R8J31R24P6781WT1G05PZC`` -> ``LNCH-…5PZC``. A console packs
+    twenty of these onto one screen; the last characters are the ones that
+    differ, and the full id always travels beside the short one (``title=``
+    on the client) so nothing is actually lost."""
+    text = "" if value is None else str(value)
+    if len(text) <= n:
+        return text
+    prefix, sep, _rest = text.partition("-")
+    if sep and len(prefix) <= 6:
+        return f"{prefix}-…{text[-n:]}"
+    return f"…{text[-n:]}"
+
+
 def _truncate(text: str | None, n: int = 140) -> str:
     if not text:
         return ""
@@ -170,6 +195,296 @@ def _iso(dt: Any) -> str:
 # ---------------------------------------------------------------------------
 # session panel
 # ---------------------------------------------------------------------------
+#: Caps for :func:`_session_timeline`. A session that ran a bulk ingest has
+#: thousands of job rows; the timeline is a SHAPE, not a log, and 200 bars is
+#: already more than the 24 lanes the canvas draws. Truncation reports itself
+#: (house rule) via ``timeline.truncated``.
+MAX_TIMELINE_SPANS = 200
+MAX_TIMELINE_INSTANTS = 200
+
+#: One session's ops.event scan bound. Above this the timeline would be
+#: reading a log rather than a session; the cap is reported the same way.
+_TIMELINE_EVENT_SCAN_LIMIT = 5000
+
+#: platform.launch.state -> the timeline's own span vocabulary (sweep §3.4).
+#: DEFERRED joins ABANDONED/REFUSED: all three are bookings that will never
+#: run, and the bar says so rather than implying work in flight.
+_LAUNCH_SPAN_STATUS = {
+    "PROVISIONAL": "booked",
+    "RUNNING": "running",
+    "RECONCILED": "complete",
+    "ABANDONED": "abandoned",
+    "REFUSED": "abandoned",
+    "DEFERRED": "abandoned",
+}
+
+#: jobs.job.state -> span status. ``retried`` is decided separately (attempts
+#: > 1, or a ``reclaimed`` job_event), because it is a fact ABOUT a completed
+#: run rather than a state the ledger holds.
+_JOB_SPAN_STATUS = {
+    "pending": "booked",
+    "paused": "booked",
+    "claimed": "running",
+    "running": "running",
+    "complete": "complete",
+    "failed": "failed",
+    "abandoned": "abandoned",
+}
+
+
+def _within(ts: str | None, start: str | None, end: str | None) -> bool:
+    """Is this ISO stamp inside the session window? Stamps are all written by
+    ``trialerror.util.timeutil.now()`` in one fixed format, so a lexicographic
+    compare IS a chronological compare -- no parse per row."""
+    if not ts:
+        return False
+    if start and ts < start:
+        return False
+    if end and ts > end:
+        return False
+    return True
+
+
+def _job_subject(payload: Any) -> str | None:
+    """What a job is ABOUT, in one short string (sweep §3.5's KIND AND SUBJECT
+    column). ``kind`` alone says ``custom`` for every handler-dispatched job,
+    which is the least informative column on the busiest table in the page.
+
+    Order is most-specific-first: the handler name, then the document or
+    source it names, then the file it was handed, and finally -- when the
+    payload says nothing recognisable -- how many fields it has, which is a
+    reading rather than a blank."""
+    if not isinstance(payload, dict):
+        return None
+    for key in ("handler", "doc_id", "source_id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    for key in ("zip_path", "path", "file"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or value
+    if payload:
+        return f"{len(payload)} field(s)"
+    return None
+
+
+def _offload_summary(rostore: RoStore, jobs: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """The GPU offload queue as the JOBS card reads it (sweep §3.10 item 1).
+
+    Two independent sources, deliberately: the queue directory
+    (``<program_root>/offload/``, the only place that says "this is waiting
+    for a machine that is switched off") and the ledger rows themselves,
+    whose ``last_error`` starts with ``awaiting DEV GPU`` from the moment the
+    stage parks them. ``awaiting`` is the UNION by job id, so the count is
+    right both before the queue directory exists and after it does."""
+    program_root = getattr(rostore, "program_root", None)
+    counts = {"pending": 0, "claimed": 0, "done": 0, "failed": 0}
+    per_job: dict[str, dict[str, Any]] = {}
+    available = False
+
+    if program_root is not None:
+        root = offload_protocol.offload_root(program_root)
+        available = root.is_dir()
+        if available:
+            for job_id in offload_protocol.list_pending(root):
+                counts["pending"] += 1
+                entry: dict[str, Any] = {"state": "pending", "worker_id": None, "heartbeat_ts": None}
+                try:
+                    manifest = offload_protocol.read_json(
+                        offload_protocol.pending_dir(root) / f"{job_id}.json"
+                    )
+                except (OSError, ValueError):
+                    manifest = {}
+                entry["offload_attempts"] = manifest.get("offload_attempts")
+                per_job[job_id] = entry
+            for claim in offload_protocol.list_claims(root):
+                counts["claimed"] += 1
+                per_job[claim["job_id"]] = {
+                    "state": "claimed",
+                    "worker_id": claim.get("worker_id"),
+                    "heartbeat_ts": claim.get("heartbeat_ts"),
+                    "offload_attempts": None,
+                }
+            for job_id in offload_protocol.list_done(root):
+                counts["done"] += 1
+                per_job.setdefault(
+                    job_id, {"state": "done", "worker_id": None, "heartbeat_ts": None, "offload_attempts": None}
+                )
+            for job_id in offload_protocol.list_failed(root):
+                counts["failed"] += 1
+                per_job[job_id] = {
+                    "state": "failed", "worker_id": None, "heartbeat_ts": None, "offload_attempts": None,
+                }
+
+    awaiting_ids = {
+        job_id for job_id, entry in per_job.items() if entry["state"] in ("pending", "claimed")
+    }
+    for job in jobs:
+        last_error = job.get("last_error")
+        if isinstance(last_error, str) and last_error.startswith(OFFLOAD_PARK_PREFIX):
+            awaiting_ids.add(job["job_id"])
+
+    return {
+        "available": available,
+        "counts": counts,
+        "awaiting": len(awaiting_ids),
+        "jobs": per_job,
+    }
+
+
+def _session_timeline(rostore: RoStore, session_row: dict[str, Any]) -> dict[str, Any]:
+    """THIS SESSION, END TO END (sweep §3.4) -- a pure derivation over rows
+    that already exist: the launches booked under this session, the jobs
+    created inside its window, the rooms it opened, and the gate transitions
+    it recorded. No new table, no new writer.
+
+    The client compresses the idle stretches (``TEConsole.compressIdleGaps``);
+    the server's job is only to say what happened and when. Spans with no end
+    are still running -- ``end_ts: null`` is the reading, not a missing
+    value."""
+    session_id = session_row["session_id"]
+    start_ts = session_row.get("opened_ts")
+    end_ts = session_row.get("closed_ts")
+    window = {"start_ts": start_ts, "end_ts": end_ts}
+
+    spans: list[dict[str, Any]] = []
+    instants: list[dict[str, Any]] = []
+
+    # ---- launches (platform.launch) --------------------------------------
+    for row in rostore.platform.execute(
+        "SELECT launch_id, agent_kind, purpose, state, booked_ts, reconciled_ts "
+        "FROM launch WHERE session_id = ? ORDER BY booked_ts",
+        (session_id,),
+    ).fetchall():
+        launch = dict(row)
+        spans.append(
+            {
+                "id": launch["launch_id"],
+                "kind": "launch",
+                "lane": launch.get("agent_kind") or "launch",
+                "label": launch.get("purpose") or launch["launch_id"],
+                "start_ts": launch.get("booked_ts"),
+                "end_ts": launch.get("reconciled_ts"),
+                "status": _LAUNCH_SPAN_STATUS.get(launch.get("state") or "", "booked"),
+                "ref": {"launch_id": launch["launch_id"]},
+            }
+        )
+
+    # ---- jobs (jobs.job + job_event) -------------------------------------
+    if rostore.is_available("jobs"):
+        claimed_at: dict[str, str] = {}
+        reclaimed: set[str] = set()
+        for ev in rostore.jobs.execute(
+            "SELECT job_id, type, MIN(ts) AS ts FROM job_event "
+            "WHERE type IN ('claimed', 'reclaimed') GROUP BY job_id, type"
+        ).fetchall():
+            if ev["type"] == "claimed":
+                claimed_at[ev["job_id"]] = ev["ts"]
+            else:
+                reclaimed.add(ev["job_id"])
+        for row in rostore.jobs.execute(
+            "SELECT job_id, kind, payload, state, attempts, created_ts, settled_ts "
+            "FROM job ORDER BY created_ts"
+        ).fetchall():
+            job = dict(row)
+            if not _within(job.get("created_ts"), start_ts, end_ts):
+                continue
+            subject = _job_subject(_decode_json_text(job.get("payload")))
+            status = _JOB_SPAN_STATUS.get(job.get("state") or "", "booked")
+            if status == "complete" and ((job.get("attempts") or 0) > 1 or job["job_id"] in reclaimed):
+                status = "retried"
+            spans.append(
+                {
+                    "id": job["job_id"],
+                    "kind": "job",
+                    "lane": f"{job.get('kind')} · {subject}" if subject else str(job.get("kind")),
+                    "label": subject or job["job_id"],
+                    "start_ts": claimed_at.get(job["job_id"]) or job.get("created_ts"),
+                    "end_ts": job.get("settled_ts"),
+                    "status": status,
+                    "ref": {"job_id": job["job_id"]},
+                }
+            )
+
+    # ---- rooms + hook_alive + dp scores (ops.event) ----------------------
+    room_open: dict[str, dict[str, Any]] = {}
+    events_scanned = 0
+    for row in rostore.ops.execute(
+        "SELECT ts, type, payload FROM event WHERE session_id = ? ORDER BY ts LIMIT ?",
+        (session_id, _TIMELINE_EVENT_SCAN_LIMIT),
+    ).fetchall():
+        events_scanned += 1
+        etype = row["type"]
+        payload = _decode_json_text(row["payload"])
+        payload = payload if isinstance(payload, dict) else {}
+        room_id = payload.get("room_id")
+        if etype == "room_created" and room_id:
+            span = {
+                "id": room_id,
+                "kind": "room",
+                "lane": f"room {_short_id(room_id)}",
+                "label": payload.get("question") or payload.get("title") or room_id,
+                "start_ts": row["ts"],
+                "end_ts": None,
+                "status": "running",
+                "ref": {"room_id": room_id},
+            }
+            room_open[room_id] = span
+            spans.append(span)
+        elif etype in ("room_frozen", "room_converged") and room_id:
+            span = room_open.get(room_id)
+            if span is not None:
+                span["end_ts"] = row["ts"]
+                span["status"] = "frozen" if etype == "room_frozen" else "complete"
+        elif etype in ("room_dp_scored", "hook_alive"):
+            instants.append(
+                {
+                    "ts": row["ts"],
+                    "kind": etype,
+                    "lane": f"room {_short_id(room_id)}" if room_id else "session",
+                    "label": etype.replace("_", " "),
+                    "ref": {"room_id": room_id} if room_id else {},
+                }
+            )
+
+    # ---- gate transitions (ops.gate_transition) --------------------------
+    for row in rostore.ops.execute(
+        "SELECT gate_id, from_state, to_state, ts FROM gate_transition ORDER BY ts"
+    ).fetchall():
+        if not _within(row["ts"], start_ts, end_ts):
+            continue
+        instants.append(
+            {
+                "ts": row["ts"],
+                "kind": "gate_transition",
+                "lane": f"gate {_short_id(row['gate_id'])}",
+                "label": f"{row['from_state']} → {row['to_state']}",
+                "ref": {"gate_id": row["gate_id"]},
+            }
+        )
+
+    spans.sort(key=lambda s: (s.get("start_ts") or "", s.get("id") or ""))
+    instants.sort(key=lambda i: (i.get("ts") or "", i.get("kind") or ""))
+    spans_dropped = max(0, len(spans) - MAX_TIMELINE_SPANS)
+    instants_dropped = max(0, len(instants) - MAX_TIMELINE_INSTANTS)
+    if spans_dropped:
+        spans = spans[-MAX_TIMELINE_SPANS:]
+    if instants_dropped:
+        instants = instants[-MAX_TIMELINE_INSTANTS:]
+
+    return {
+        "window": window,
+        "spans": spans,
+        "instants": instants,
+        "truncated": {
+            "spans_dropped": spans_dropped,
+            "instants_dropped": instants_dropped,
+            "events_scan_limited": events_scanned >= _TIMELINE_EVENT_SCAN_LIMIT,
+        },
+    }
+
+
 def build_session_panel(rostore: RoStore) -> dict[str, Any]:
     if not rostore.is_available("ops"):
         return {"status": "not_initialized", "message": "ops.db not found"}
@@ -203,12 +518,16 @@ def build_session_panel(rostore: RoStore) -> dict[str, Any]:
             "boot_bundle_stats": {
                 "boot_pin_version": session_row.get("boot_pin_version"),
                 "boot_bundle_sha": session_row.get("boot_bundle_sha"),
-                "queue": session_row.get("queue"),
+                # sweep §3.10 item 2 / M-CON-3: `queue` is a JSON-text column,
+                # and the Console prints its LENGTH ("0 queued"). Decoded here
+                # so no renderer has to know which side of the wire parses it.
+                "queue": _decode_json_text(session_row.get("queue")),
             },
             "close_readiness": status.get("readiness"),
             "unread_inbox_count": status.get("unread_inbox_count"),
             "hook_alive_count": status.get("hook_alive_count"),
             "active_jobs_count": len(status.get("active_jobs") or []),
+            "timeline": _session_timeline(rostore, session_row),
         }
 
     recent_rows = rostore.ops.execute(
@@ -285,6 +604,14 @@ def build_budget_panel(rostore: RoStore) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # jobs panel
 # ---------------------------------------------------------------------------
+#: The prefix ``trialerror.offload.stage`` puts on the EnvironmentalFailure it
+#: raises when a stage parks work for the GPU worker. It is the only marker a
+#: ledger row carries that distinguishes "waiting for a machine that is
+#: switched off" from any other deferred job, which is why it is matched here
+#: rather than inferred from ``failure_class``.
+OFFLOAD_PARK_PREFIX = "awaiting DEV GPU"
+
+
 def build_jobs_panel(rostore: RoStore) -> dict[str, Any]:
     if not rostore.is_available("jobs"):
         return {"status": "not_initialized", "message": "jobs.db not found"}
@@ -316,12 +643,35 @@ def build_jobs_panel(rostore: RoStore) -> dict[str, Any]:
             if lease_expired:
                 stale_leases.append(entry)
 
+    # Sweep §3.10 item 1 / console-3 / M-CON-3. `payload` and `checkpoint`
+    # are JSON-text columns, and the old Console printed them into a table
+    # cell as the raw string -- the ingest checkpoint (3.5M rows, a dozen
+    # keys) was the single least readable thing on the page. Decoded here so
+    # the renderer can pick the two numbers it wants; `subject` and
+    # `duration_s` are the other two facts the k9s-style table needs and the
+    # row does not carry, both derivable and neither worth a client
+    # convention. Unparseable text stays a string (`_decode_json_text`).
+    recent_jobs: list[dict[str, Any]] = []
+    for job in jobs[:50]:
+        row = dict(job)
+        row["payload"] = _decode_json_text(row.get("payload"))
+        row["checkpoint"] = _decode_json_text(row.get("checkpoint"))
+        row["subject"] = _job_subject(row["payload"])
+        settled_ts = row.get("settled_ts")
+        row["duration_s"] = (
+            (parse(settled_ts) - parse(row["created_ts"])).total_seconds()
+            if settled_ts and row.get("created_ts")
+            else None
+        )
+        recent_jobs.append(row)
+
     return {
         "status": "ok",
         "state_counts": state_counts,
         "live_jobs": live_jobs,
         "stale_leases": stale_leases,
-        "recent_jobs": jobs[:50],
+        "recent_jobs": recent_jobs,
+        "offload": _offload_summary(rostore, jobs),
     }
 
 
@@ -604,11 +954,111 @@ def _translation_slot(row: dict[str, Any] | None, *, job_pending: bool) -> tuple
     )
 
 
+def _thread_shape(posts: list[dict[str, Any]]) -> list[str]:
+    """Annotate one thread's posts with their reply structure IN PLACE and
+    return ``order_threaded`` -- the DFS pre-order the THREADED reading
+    order renders (lane C spec §2.1; ruling L-C4 makes THREADED the
+    default the operator sees).
+
+    ``posts`` arrives in ARRIVAL order (``ts ASC, rowid ASC``) and stays
+    that way: it is the append-only truth, and the AS IT ARRIVED view
+    renders it verbatim. The threading is a second, derived reading of the
+    same list -- an id sequence beside it, never a reshuffle of it.
+
+    Added per post:
+
+    ``reply_to``          the parent id (an alias of ``in_reply_to``; the
+                          client reads ONE name for the relation, and the
+                          raw column keeps its own name for anyone
+                          round-tripping the row).
+    ``reply_to_missing``  the parent is not in this thread -- cross-thread,
+                          deleted, or part of a cycle. Such a post renders
+                          at depth 0 with the flag visible; it is NEVER
+                          dropped (L-C4: "never dropped" is the ruling's
+                          own word).
+    ``depth``             0 for a root, +1 per real parent.
+    ``root_post_id``      the top of this post's chain (itself, for a root)
+                          -- what the ``N REPLIES`` collapse toggles on.
+    ``reply_count``       DIRECT children inside this thread. Not the
+                          subtree: a card's own head says how many posts
+                          answer *it*, and the collapse control (which
+                          hides a whole subtree) counts what it hides
+                          client-side, where the visible set is known.
+
+    **Cycle guard.** ``feed_post.in_reply_to`` is a plain self-FK: SQLite
+    enforces that the parent EXISTS, not that the graph is acyclic, and a
+    hand-written row (or a restore that renumbered ids) can close a loop.
+    A post whose ancestor chain revisits any id -- including itself -- is
+    cut loose and treated as a root with ``reply_to_missing`` set, exactly
+    like a post whose parent is absent. Cutting every member of a cycle
+    (the walk below revisits an id from any node in or leading into one)
+    is what guarantees the parent map is a forest, so the traversal that
+    follows terminates by construction rather than by a depth cap.
+
+    The walk is O(n·chain) in the worst case, which for a feed thread is
+    O(n²) with a small n -- the alternative (a proper SCC pass) buys
+    nothing at these sizes and costs a reader's afternoon.
+    """
+    by_id = {p["post_id"]: p for p in posts}
+    parent_of: dict[str, str | None] = {}
+
+    for p in posts:
+        pid = p["post_id"]
+        raw_parent = p.get("in_reply_to")
+        p["reply_to"] = raw_parent
+        parent = raw_parent if (raw_parent is not None and raw_parent in by_id) else None
+        missing = raw_parent is not None and parent is None
+        if parent is not None:
+            seen = {pid}
+            cur: str | None = parent
+            while cur is not None:
+                if cur in seen:
+                    parent, missing = None, True
+                    break
+                seen.add(cur)
+                nxt = by_id[cur].get("in_reply_to")
+                cur = nxt if (nxt is not None and nxt in by_id) else None
+        parent_of[pid] = parent
+        p["reply_to_missing"] = missing
+
+    # children lists inherit `posts`' own (ts, rowid) ordering, which is
+    # exactly the sibling order the spec asks for -- no second sort.
+    children: dict[str | None, list[str]] = {}
+    for p in posts:
+        children.setdefault(parent_of[p["post_id"]], []).append(p["post_id"])
+
+    depth: dict[str, int] = {}
+    root: dict[str, str] = {}
+    order: list[str] = []
+    stack: list[tuple[str, int, str]] = [
+        (pid, 0, pid) for pid in reversed(children.get(None, []))
+    ]
+    while stack:
+        pid, d, r = stack.pop()
+        depth[pid], root[pid] = d, r
+        order.append(pid)
+        for kid in reversed(children.get(pid, [])):
+            stack.append((kid, d + 1, r))
+
+    for p in posts:
+        pid = p["post_id"]
+        p["depth"] = depth.get(pid, 0)
+        p["root_post_id"] = root.get(pid, pid)
+        p["reply_count"] = len(children.get(pid, []))
+    return order
+
+
 def build_feed_panel(rostore: RoStore, *, thread_id: str | None = None) -> dict[str, Any]:
     """Threads, one thread's full-text post stream, unread operator
     directives, and a per-post ``translation`` slot reading the AISPEAK
     sidecar table (``docs/reviews/AISPEAK_TRANSLATOR_DESIGN.md``) IF it
     exists on this program -- ``null`` otherwise.
+
+    Every post also carries its place in the thread's reply structure --
+    ``reply_to``, ``root_post_id``, ``depth``, ``reply_count``,
+    ``reply_to_missing`` -- and the panel carries ``order_threaded``, the
+    id sequence the THREADED reading order renders (see
+    :func:`_thread_shape`). ``posts`` itself stays in ARRIVAL order.
 
     Each post also carries ``translation_state`` -- one of ``translated``,
     ``ungated``, ``withheld``, ``pending``, ``absent`` (see
@@ -643,6 +1093,7 @@ def build_feed_panel(rostore: RoStore, *, thread_id: str | None = None) -> dict[
             active_thread_id = threads[0]["thread_id"]
 
     posts: list[dict[str, Any]] = []
+    order_threaded: list[str] = []
     if active_thread_id is not None:
         rows = conn.execute(
             "SELECT *, rowid AS _rowid FROM feed_post WHERE thread_id = ? ORDER BY ts ASC, _rowid ASC",
@@ -658,6 +1109,24 @@ def build_feed_panel(rostore: RoStore, *, thread_id: str | None = None) -> dict[
                 translations[d["post_id"]], job_pending=d["post_id"] in job_pending
             )
             posts.append(d)
+        order_threaded = _thread_shape(posts)
+
+    # One GROUP BY for the whole rail, not one COUNT per thread row: the
+    # rail lists up to 100 threads and the number beside each is decoration
+    # on a list, not a reason to issue 100 queries. Counts RAW replies
+    # (`in_reply_to IS NOT NULL`) per thread, so a cross-thread or cycle
+    # parent -- which the ACTIVE thread reports as `reply_to_missing` --
+    # still counts as a reply here. The rail's number is "posts written as
+    # answers", which is the honest reading of an un-opened thread.
+    thread_reply_counts = {
+        r["thread_id"]: r["n"]
+        for r in conn.execute(
+            "SELECT thread_id, COUNT(*) AS n FROM feed_post "
+            "WHERE in_reply_to IS NOT NULL GROUP BY thread_id"
+        ).fetchall()
+    }
+    for t in threads:
+        t["thread_reply_count"] = thread_reply_counts.get(t["thread_id"], 0)
 
     unread_directives = read_inbox(rostore, mark_read=False)
 
@@ -666,6 +1135,7 @@ def build_feed_panel(rostore: RoStore, *, thread_id: str | None = None) -> dict[
         "threads": threads,
         "active_thread_id": active_thread_id,
         "posts": posts,
+        "order_threaded": order_threaded,
         "unread_directives": unread_directives,
         "translator_table_available": _table_exists(conn, "feed_post_translation"),
         "translation_withheld_count": sum(1 for p in posts if p["translation_state"] == "withheld"),
@@ -865,6 +1335,18 @@ def _gate_edit_items(conn_ops: sqlite3.Connection) -> list[dict[str, Any]]:
                     "blocking": True,
                     "raised_by_launch": d.get("critic_launch"),
                     "raised_ts": d.get("verdict_ts"),
+                    # lane C C7: an edit that was SENT BACK is still an
+                    # unverified blocking edit -- it stays in this queue, and
+                    # must, because the union is still refused. What changes is
+                    # that somebody already objected and said why, and the next
+                    # operator to reach this row needs to see that rather than
+                    # verify it blind. `_normalize_edits` carries these keys
+                    # through a later record_verdict (C3), so the objection
+                    # survives.
+                    "sent_back": bool(e.get("sent_back")),
+                    "sent_back_note": e.get("sent_back_note"),
+                    "sent_back_by_launch": e.get("sent_back_by_launch"),
+                    "sent_back_ts": e.get("sent_back_ts"),
                     "consequence": consequence,
                 }
             )
@@ -929,23 +1411,56 @@ def _acquisition_items(rostore: RoStore) -> list[dict[str, Any]]:
 
 
 def _prereg_reveal_items(conn_ops: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Committed pre-registrations, and the HASHES ONLY (REDESIGN section 5.4;
+    lane C C7): the whole point of a blind commitment is that the procedure
+    stays unread until somebody deliberately un-blinds it, so the queue item
+    must not carry the content -- not even to a page that promises not to draw
+    it. What it carries is what an operator needs in order to decide: the two
+    committed hashes, and whether the escrow file is still on disk.
+
+    ``escrow_present`` is a stat, not a hash check: a reveal recomputes both
+    hashes and voids the row if either has moved
+    (``verify.prereg.reveal_prereg``), and doing that work here -- for every
+    committed prereg, on every panel refresh -- would read the escrowed
+    content on a passive page load. Missing file means the reveal will refuse;
+    present says nothing more than that it can be attempted."""
     rows = conn_ops.execute(
         "SELECT * FROM prereg WHERE status = 'committed' ORDER BY committed_ts"
     ).fetchall()
-    return [
-        {
-            "kind": "prereg_reveal",
-            "id": r["prereg_id"],
-            "title": r["title"],
-            "committed_ts": r["committed_ts"],
-            "blocking": False,
-            "consequence": (
-                "Revealing unseals the committed procedure/params hash so the pre-registered "
-                "result can be checked against them."
-            ),
-        }
-        for r in rows
-    ]
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        escrow_path = d.get("escrow_path")
+        escrow_present = False
+        if escrow_path:
+            try:
+                escrow_present = Path(escrow_path).is_file()
+            except OSError:
+                escrow_present = False
+        items.append(
+            {
+                "kind": "prereg_reveal",
+                "id": d["prereg_id"],
+                "title": d["title"],
+                "committed_ts": d["committed_ts"],
+                "procedure_sha256": d.get("procedure_sha256"),
+                "params_sha256": d.get("params_sha256"),
+                "escrow_present": escrow_present,
+                "blocking": False,
+                "consequence": (
+                    "Revealing unseals the committed procedure/params hash so the pre-registered "
+                    "result can be checked against them. It cannot be undone, and it is recorded "
+                    "as a prereg_revealed event."
+                    if escrow_present
+                    else (
+                        "The escrow file is not on disk at the path this commitment recorded. A "
+                        "reveal will refuse and VOID this pre-registration -- a missing escrow is "
+                        "a tamper finding, not a retryable error."
+                    )
+                ),
+            }
+        )
+    return items
 
 
 def _room_escalation_items(rostore: RoStore, conn_ops: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -968,18 +1483,45 @@ def _room_escalation_items(rostore: RoStore, conn_ops: sqlite3.Connection) -> li
 
 
 def _memory_conflict_items(rostore: RoStore) -> list[dict[str, Any]]:
+    """Open conflict groups, each carrying BOTH SIDES (lane C C7).
+
+    ``version_count`` alone made this the one determination kind an operator
+    could not actually decide from the page: "2 versions of X disagree" is not
+    something you can choose between. ``versions`` is the two rows, side
+    labelled, with the bodies -- which is the whole content of the decision
+    KEEP LEFT / KEEP RIGHT / KEEP BOTH asks for."""
     groups = list_memory_conflicts(rostore)
-    return [
-        {
-            "kind": "memory_conflict",
-            "id": g["group_id"],
-            "key": g["key"],
-            "version_count": len(g["versions"]),
-            "blocking": False,
-            "consequence": f"Resolving keeps one version of {g['key']!r} active and marks the other superseded.",
-        }
-        for g in groups
-    ]
+    items: list[dict[str, Any]] = []
+    for g in groups:
+        versions = [
+            {
+                "side": v["side"],
+                "memory_item_id": v["memory_item_id"],
+                "tier": v.get("tier"),
+                "kind": v.get("kind"),
+                "account_id": v.get("account_id"),
+                "updated_ts": v.get("updated_ts"),
+                "l0_abstract": v.get("l0_abstract"),
+                "body": v.get("body"),
+            }
+            for v in sorted(g["versions"], key=lambda v: v["side"])
+        ]
+        items.append(
+            {
+                "kind": "memory_conflict",
+                "id": g["group_id"],
+                "key": g["key"],
+                "version_count": len(versions),
+                "versions": versions,
+                "blocking": False,
+                "consequence": (
+                    f"Resolving keeps one version of {g['key']!r} active and marks the other "
+                    "superseded (or KEEP BOTH, when the two were never one fact). It is one-shot "
+                    "per group -- a second answer is refused."
+                ),
+            }
+        )
+    return items
 
 
 def _memory_stale_items(rostore: RoStore) -> list[dict[str, Any]]:
@@ -1254,6 +1796,698 @@ def build_dossier_panel(rostore: RoStore, *, artifact_id: str | None = None) -> 
         "version_chain": version_chain,
         "lineage": lineage,
     }
+
+
+# ---------------------------------------------------------------------------
+# evidence panel (lane C item A, spec section 1)
+# ---------------------------------------------------------------------------
+
+#: Live claims listed in the Evidence rail. Past this the rail says how many
+#: it is not showing rather than growing without bound (``index_truncated``).
+EVIDENCE_INDEX_LIMIT = 100
+
+#: Seed entities the neighbourhood expands from -- spec section 1.2's cap. One
+#: ``k_hop_neighbors`` call per seed, so this multiplies the graph query cost
+#: directly; the count NOT expanded is reported as ``seeds_dropped`` rather
+#: than dropped in silence.
+EVIDENCE_MAX_SEEDS = 5
+
+#: Edges written into the payload. The union may be larger -- ``edge_count``
+#: is the true size and the table footer prints the difference.
+EVIDENCE_MAX_EDGES_LISTED = 100
+
+#: How many co-anchored claim candidates are examined. A claim's document may
+#: carry thousands of claims; this is the read that would otherwise scale with
+#: the corpus rather than with the claim.
+EVIDENCE_CO_ANCHORED_SCAN_LIMIT = 200
+
+#: Ids bound into ONE ``IN (...)`` list. The neighbourhood's anchor pool and
+#: its entity candidates are sized by the corpus, not by any cap this module
+#: sets: every anchor sharing a chunk with the claim joins the pool, and every
+#: entity endpoint of a live relation on one of those anchors joins the
+#: candidates. Past ``SQLITE_LIMIT_VARIABLE_NUMBER`` the query raises
+#: ``sqlite3.OperationalError: too many SQL variables`` -- 32766 on SQLite
+#: 3.32+, but 999 on older builds, which one chunk's anchors can reach.
+#: ``isolated_panel`` fences it, so the symptom is an Evidence panel
+#: permanently reading ``{"status": "error"}`` rather than a 500: visible, and
+#: undiagnosable from the page. :func:`_rows_in_batches` SPLITS the list
+#: rather than capping it, so no anchor is dropped from the region and the
+#: payload keeps meaning exactly what it says (lane C, finding F3).
+_SQL_MAX_IN_PARAMS = 400
+
+
+def _rows_in_batches(
+    conn: sqlite3.Connection, sql: str, ids: Sequence[str], *, batch_size: int | None = None
+) -> list[sqlite3.Row]:
+    """Run ``sql`` -- which carries exactly one ``{placeholders}`` slot for an
+    ``IN`` list and no other braces -- once per batch of ``ids``, returning
+    the concatenated rows.
+
+    The batches are independent queries, so any ORDER BY inside ``sql`` orders
+    within a batch and not across them: a caller that needs a global order
+    must select its sort columns and re-sort the result (as
+    :func:`_evidence_neighbourhood` does). Rows are NOT de-duplicated -- every
+    caller here queries a primary key or a column the ids partition, so a row
+    cannot match two batches."""
+    size = batch_size or _SQL_MAX_IN_PARAMS
+    out: list[sqlite3.Row] = []
+    ordered = list(ids)
+    for start in range(0, len(ordered), size):
+        chunk = ordered[start : start + size]
+        placeholders = ",".join("?" for _ in chunk)
+        out.extend(conn.execute(sql.format(placeholders=placeholders), chunk).fetchall())
+    return out
+
+
+def _extra_anchor_ids(value: Any) -> list[str]:
+    """``claim.extra_anchors`` / ``relation.extra_anchors`` decoded to a list
+    of anchor ids. The column is nullable JSON text; anything that is not a
+    JSON array of strings yields ``[]`` rather than raising -- a malformed
+    column must cost this panel one anchor row, never the page."""
+    decoded = _decode_json_text(value)
+    if not isinstance(decoded, list):
+        return []
+    return [a for a in decoded if isinstance(a, str) and a]
+
+
+def _evidence_claim_anchor_ids(claim_row: dict[str, Any]) -> list[str]:
+    """Primary first, then extras, de-duplicated, order preserved -- the
+    ``role`` a rendered anchor row carries is exactly "is it index 0"."""
+    out: list[str] = []
+    for aid in [claim_row.get("anchor_id"), *_extra_anchor_ids(claim_row.get("extra_anchors"))]:
+        if aid and aid not in out:
+            out.append(aid)
+    return out
+
+
+def _evidence_anchor_context(conn: sqlite3.Connection, anchor_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+    """``anchor_id -> {anchor row, doc row, source row}`` in three queries,
+    the same anchor -> document -> source license-provenance walk
+    :func:`trialerror.retrieve.engine._fence_relation_edges` does (and for the
+    same reason: the license tier that decides the fence is two joins away
+    from the text being fenced)."""
+    ids = [a for a in dict.fromkeys(anchor_ids) if a]
+    if not ids:
+        return {}
+    aph = ",".join("?" for _ in ids)
+    anchors = {r["anchor_id"]: dict(r) for r in conn.execute(f"SELECT * FROM quote_anchor WHERE anchor_id IN ({aph})", ids)}
+    doc_ids = sorted({a["doc_id"] for a in anchors.values() if a.get("doc_id")})
+    documents: dict[str, dict[str, Any]] = {}
+    if doc_ids:
+        dph = ",".join("?" for _ in doc_ids)
+        documents = {r["doc_id"]: dict(r) for r in conn.execute(f"SELECT * FROM document WHERE doc_id IN ({dph})", doc_ids)}
+    source_ids = sorted({d["source_id"] for d in documents.values() if d.get("source_id")})
+    sources: dict[str, dict[str, Any]] = {}
+    if source_ids:
+        sph = ",".join("?" for _ in source_ids)
+        sources = {r["source_id"]: dict(r) for r in conn.execute(f"SELECT * FROM source WHERE source_id IN ({sph})", source_ids)}
+
+    out: dict[str, dict[str, Any]] = {}
+    for aid, anchor in anchors.items():
+        doc = documents.get(anchor.get("doc_id"))
+        source = sources.get(doc["source_id"]) if doc else None
+        out[aid] = {"anchor": anchor, "document": doc, "source": source}
+    return out
+
+
+def _evidence_anchor_rows(conn: sqlite3.Connection, claim_row: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
+    """WHAT IT STANDS ON, plus whether the PRIMARY anchor's source is fenced
+    (which is what decides the fence on ``claim.text`` -- one claim, one
+    license posture, taken from the anchor the schema calls primary).
+
+    Two hash chips per row, and they answer different questions:
+
+    - ``doc_sha_matches`` -- ``quote_anchor.doc_sha256`` against the
+      ``document.sha256`` the document carries NOW. False means the document
+      was re-ingested under this anchor's feet, so the char offsets may point
+      at different bytes (the corpus panel's own stale-anchor predicate).
+    - ``quote_sha_matches`` -- the stored ``quote_text`` re-hashed against
+      ``quote_sha256``. ``None``, not ``False``, when no ``quote_text`` was
+      stored: "not re-checkable here" is a third reading, and collapsing it
+      into False would accuse an anchor that is merely terse.
+    """
+    from trialerror.ingest.anchors import sha256_hex
+
+    anchor_ids = _evidence_claim_anchor_ids(claim_row)
+    context = _evidence_anchor_context(conn, anchor_ids)
+    rows: list[dict[str, Any]] = []
+    primary_fenced = False
+    for position, aid in enumerate(anchor_ids):
+        entry = context.get(aid)
+        role = "primary" if position == 0 else "extra"
+        if entry is None:
+            # A claim naming an anchor row that is not there is a broken FK,
+            # not a reason to render nothing -- say which anchor is missing.
+            rows.append(
+                {
+                    "anchor_id": aid, "role": role, "doc_id": None, "chunk_id": None, "source_id": None,
+                    "source_title": None, "license_tier": None, "page": None,
+                    "char_start": None, "char_end": None, "quote": "", "fenced": False,
+                    "doc_sha_matches": False, "quote_sha_matches": None, "missing": True,
+                }
+            )
+            continue
+        anchor, doc, source = entry["anchor"], entry["document"], entry["source"]
+        license_tier = source.get("license_tier") if source else None
+        fenced = is_fenced_license(license_tier)
+        if role == "primary":
+            primary_fenced = fenced
+        quote_text = anchor.get("quote_text")
+        quote_sha_matches = None
+        if quote_text:
+            quote_sha_matches = sha256_hex(quote_text) == anchor.get("quote_sha256")
+        rows.append(
+            {
+                "anchor_id": aid,
+                "role": role,
+                "doc_id": anchor.get("doc_id"),
+                "chunk_id": anchor.get("chunk_id"),
+                "source_id": doc.get("source_id") if doc else None,
+                "source_title": source.get("title") if source else None,
+                "license_tier": license_tier,
+                "page": anchor.get("page_number"),
+                "char_start": anchor.get("char_start"),
+                "char_end": anchor.get("char_end"),
+                # Per-anchor ``quote`` follows the engine's own precedent for
+                # this exact field (``get_chunk``/``resolve_quote``): capped by
+                # ``citation_quote``, NOT untrusted-wrapped. The wrapper marks a
+                # whole free-text BODY (``claim.text``, ``fact_text``), and it
+                # is those two that spec section 1.2 names.
+                "quote": citation_quote(quote_text, fenced=fenced),
+                "fenced": fenced,
+                "doc_sha_matches": bool(doc and anchor.get("doc_sha256") == doc.get("sha256")),
+                "quote_sha_matches": quote_sha_matches,
+                "missing": False,
+            }
+        )
+    return rows, primary_fenced
+
+
+def _evidence_index(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], int, bool]:
+    """The claim rail: live claims newest first, each already carrying the
+    source it hangs off, so the rail can be filtered on a title without a
+    second round trip per row."""
+    total = conn.execute("SELECT COUNT(*) FROM claim WHERE expired_at IS NULL AND invalid_at IS NULL").fetchone()[0]
+    rows = conn.execute(
+        "SELECT c.claim_id, c.kind, c.text, c.confidence, c.created_at, c.superseded_by, "
+        "c.anchor_id, c.extra_anchors, d.source_id AS source_id, s.title AS source_title, "
+        "s.license_tier AS license_tier "
+        "FROM claim c "
+        "LEFT JOIN quote_anchor qa ON qa.anchor_id = c.anchor_id "
+        "LEFT JOIN document d ON d.doc_id = qa.doc_id "
+        "LEFT JOIN source s ON s.source_id = d.source_id "
+        "WHERE c.expired_at IS NULL AND c.invalid_at IS NULL "
+        "ORDER BY c.created_at DESC, c.rowid DESC LIMIT ?",
+        (EVIDENCE_INDEX_LIMIT,),
+    ).fetchall()
+    index: list[dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        fenced = is_fenced_license(d.get("license_tier"))
+        # The rail label is fence-capped but NOT untrusted-wrapped: the
+        # wrapper delimits a whole body, and truncating a wrapped string can
+        # cut its closing delimiter off -- precisely the forged-close failure
+        # ``untrusted_wrap`` exists to make impossible. The full, wrapped text
+        # is one click away in ``claim.text``.
+        index.append(
+            {
+                "claim_id": d["claim_id"],
+                "kind": d["kind"],
+                "text_short": _truncate(citation_quote(d.get("text"), fenced=fenced)),
+                "confidence": d.get("confidence"),
+                "created_at": d.get("created_at"),
+                "source_id": d.get("source_id"),
+                "source_title": d.get("source_title"),
+                "anchor_count": len(_evidence_claim_anchor_ids(d)),
+                "superseded": bool(d.get("superseded_by")),
+            }
+        )
+    return index, total, total > len(index)
+
+
+def _evidence_resolve_claim(
+    conn: sqlite3.Connection, *, claim_id: str | None, anchor_id: str | None, chunk_id: str | None
+) -> tuple[dict[str, Any] | None, dict[str, str] | None]:
+    """Spec section 1.2's resolution order, returning ``(claim row, not_found)``.
+
+    ``claim_id`` -> ``anchor_id`` -> ``chunk_id`` -> the newest live claim.
+    An id that resolves to nothing is a READING (``not_found``), never a 404:
+    a TRACE from a search result whose anchor carries no claim yet is an
+    ordinary state of a young corpus, and the panel still renders its rail.
+
+    A claim named EXPLICITLY is returned even when it is expired/invalidated
+    -- the rail lists the live view, but an operator who followed a link to a
+    retired claim must be shown the claim they asked for, with its own
+    ``expired_at``/``invalid_at`` on the row saying so."""
+    if claim_id:
+        row = conn.execute("SELECT * FROM claim WHERE claim_id = ?", (claim_id,)).fetchone()
+        return (dict(row), None) if row is not None else (None, {"kind": "claim_id", "id": claim_id})
+
+    if anchor_id:
+        rows = conn.execute(
+            "SELECT * FROM claim WHERE expired_at IS NULL AND invalid_at IS NULL "
+            "AND (anchor_id = ? OR extra_anchors LIKE ?) ORDER BY created_at DESC, rowid DESC",
+            (anchor_id, f"%{anchor_id}%"),
+        ).fetchall()
+        # LIKE is a prefilter only -- the authoritative membership test is the
+        # decoded JSON list, so an anchor id that merely appears as a
+        # substring inside another id can never claim a row.
+        matches = [dict(r) for r in rows if anchor_id in _evidence_claim_anchor_ids(dict(r))]
+        if matches:
+            return matches[0], None
+        return None, {"kind": "anchor_id", "id": anchor_id}
+
+    if chunk_id:
+        chunk_anchor_ids = [
+            r["anchor_id"] for r in conn.execute("SELECT anchor_id FROM quote_anchor WHERE chunk_id = ?", (chunk_id,)).fetchall()
+        ]
+        if chunk_anchor_ids:
+            # Batched, and re-sorted across the batches: one chunk's anchor
+            # count is corpus-sized (F3), and the newest row is the answer.
+            rows = sorted(
+                _rows_in_batches(
+                    conn,
+                    "SELECT *, rowid AS _rowid FROM claim WHERE expired_at IS NULL AND invalid_at IS NULL "
+                    "AND anchor_id IN ({placeholders})",
+                    chunk_anchor_ids,
+                ),
+                key=lambda r: ((r["created_at"] or ""), r["_rowid"]),
+                reverse=True,
+            )
+            if rows:
+                found = dict(rows[0])
+                found.pop("_rowid", None)
+                return found, None
+            # A claim reaching this chunk only through an EXTRA anchor counts too.
+            for aid in chunk_anchor_ids:
+                for r in conn.execute(
+                    "SELECT * FROM claim WHERE expired_at IS NULL AND invalid_at IS NULL "
+                    "AND extra_anchors LIKE ? ORDER BY created_at DESC, rowid DESC",
+                    (f"%{aid}%",),
+                ).fetchall():
+                    d = dict(r)
+                    if aid in _evidence_claim_anchor_ids(d):
+                        return d, None
+        return None, {"kind": "chunk_id", "id": chunk_id}
+
+    row = conn.execute(
+        "SELECT * FROM claim WHERE expired_at IS NULL AND invalid_at IS NULL "
+        "ORDER BY created_at DESC, rowid DESC LIMIT 1"
+    ).fetchone()
+    return (dict(row) if row is not None else None), None
+
+
+def _evidence_argues(conn: sqlite3.Connection, claim_id: str) -> dict[str, Any]:
+    """WHAT ARGUES WITH IT. Two sources, and the panel is explicit that only
+    one of them has a writer today: ``verdict(subject_kind='claim')`` is the
+    live signal (``procedure='contracrow'`` is the contradiction check), while
+    ``prov_edge`` -- the general provenance graph a "contradicts" edge would
+    live on -- has ZERO writers anywhere in this codebase (the same finding
+    :func:`build_dossier_panel` records in its own ``lineage.note``). Reading
+    it and reporting empty is the honest form; drawing an empty graph as
+    though it meant "nothing contradicts this" is not."""
+    edges = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT * FROM prov_edge WHERE role IN ('contradicts','supports') "
+            "AND ((src_kind = 'claim' AND src_id = ?) OR (dst_kind = 'claim' AND dst_id = ?)) "
+            "ORDER BY ts DESC",
+            (claim_id, claim_id),
+        ).fetchall()
+    ]
+    verdicts = [
+        {
+            "verdict_id": r["verdict_id"],
+            "procedure": r["procedure"],
+            "procedure_version": r["procedure_version"],
+            "label": r["label"],
+            "ts": r["ts"],
+            "issued_by_launch": r["issued_by_launch"],
+            "prereg_compliant": r["prereg_compliant"],
+        }
+        for r in conn.execute(
+            "SELECT * FROM verdict WHERE subject_kind = 'claim' AND subject_id = ? ORDER BY ts DESC",
+            (claim_id,),
+        ).fetchall()
+    ]
+    return {
+        "contradicts": [e for e in edges if e["role"] == "contradicts"],
+        "supports": [e for e in edges if e["role"] == "supports"],
+        "verdicts": verdicts,
+        "note": (
+            "prov_edge has zero writers; contradiction verdicts (procedure='contracrow') "
+            "are the live signal"
+        ),
+    }
+
+
+def _evidence_co_anchored(
+    conn: sqlite3.Connection, *, claim_id: str, anchor_ids: Sequence[str], context: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Other live claims standing on the SAME evidence, strongest sharing
+    first: the same anchor, then the same chunk, then merely the same
+    document. Bounded by :data:`EVIDENCE_CO_ANCHORED_SCAN_LIMIT` candidates --
+    a heavily-claimed document would otherwise make this read scale with the
+    corpus instead of with the claim.
+
+    Known bound, stated rather than hidden: candidates are found through
+    their PRIMARY anchor's document, plus a direct extras match on THIS
+    claim's own anchors. A claim that shares only a document with this one,
+    and only through one of its own extra anchors, is not listed."""
+    own = set(anchor_ids)
+    own_chunks = {e["anchor"].get("chunk_id") for e in context.values() if e["anchor"].get("chunk_id")}
+    own_docs = {e["anchor"].get("doc_id") for e in context.values() if e["anchor"].get("doc_id")}
+    if not own_docs:
+        return []
+
+    doc_list = sorted(own_docs)
+    dph = ",".join("?" for _ in doc_list)
+    candidates: dict[str, dict[str, Any]] = {}
+    for r in conn.execute(
+        f"SELECT c.* FROM claim c JOIN quote_anchor qa ON qa.anchor_id = c.anchor_id "
+        f"WHERE c.expired_at IS NULL AND c.invalid_at IS NULL AND c.claim_id != ? "
+        f"AND qa.doc_id IN ({dph}) ORDER BY c.created_at DESC, c.rowid DESC LIMIT ?",
+        [claim_id, *doc_list, EVIDENCE_CO_ANCHORED_SCAN_LIMIT],
+    ).fetchall():
+        candidates[r["claim_id"]] = dict(r)
+    for aid in sorted(own):
+        for r in conn.execute(
+            "SELECT * FROM claim WHERE expired_at IS NULL AND invalid_at IS NULL AND claim_id != ? "
+            "AND extra_anchors LIKE ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+            (claim_id, f"%{aid}%", EVIDENCE_CO_ANCHORED_SCAN_LIMIT),
+        ).fetchall():
+            candidates.setdefault(r["claim_id"], dict(r))
+
+    if not candidates:
+        return []
+    all_anchor_ids = {a for row in candidates.values() for a in _evidence_claim_anchor_ids(row)}
+    cand_context = _evidence_anchor_context(conn, sorted(all_anchor_ids))
+
+    out: list[dict[str, Any]] = []
+    for row in candidates.values():
+        their = _evidence_claim_anchor_ids(row)
+        shared: str | None = None
+        if own.intersection(their):
+            shared = "anchor"
+        else:
+            their_chunks = {cand_context[a]["anchor"].get("chunk_id") for a in their if a in cand_context} - {None}
+            their_docs = {cand_context[a]["anchor"].get("doc_id") for a in their if a in cand_context} - {None}
+            if own_chunks.intersection(their_chunks):
+                shared = "chunk"
+            elif own_docs.intersection(their_docs):
+                shared = "document"
+        if shared is None:
+            continue
+        primary = cand_context.get(row.get("anchor_id"))
+        fenced = is_fenced_license((primary["source"] or {}).get("license_tier")) if primary else False
+        out.append(
+            {
+                "claim_id": row["claim_id"],
+                "kind": row["kind"],
+                "text_short": _truncate(citation_quote(row.get("text"), fenced=fenced)),
+                "shared": shared,
+            }
+        )
+    rank = {"anchor": 0, "chunk": 1, "document": 2}
+    out.sort(key=lambda c: (rank[c["shared"]], c["claim_id"]))
+    return out
+
+
+def _evidence_neighbourhood(
+    rostore: RoStore, *, claim_row: dict[str, Any], anchor_ids: Sequence[str], context: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    """The bounded knowledge-graph view around this claim's evidence.
+
+    Seeds are the entity endpoints of LIVE relations whose ``evidence_anchor``
+    is one of this claim's anchors, or an anchor on one of the same chunks --
+    the chunk widening is what makes the region non-empty for a corpus whose
+    KG writer anchors relations at chunk granularity while the claim writer
+    anchors at quote granularity.
+
+    Expansion is :func:`trialerror.retrieve.engine.k_hop_neighbors` per seed,
+    unioned by ``rel_id``. That function is used unmodified, which is what
+    buys this panel the engine's own caps, its bi-temporal live filter, and
+    -- load-bearing here -- ``_fence_relation_edges``: every ``fact_text``
+    arriving from it is already license-fenced and untrusted-wrapped.
+
+    The anchor pool and the entity candidates are sized by the corpus (every
+    anchor on the claim's chunks; every endpoint of a live relation on one of
+    them), so every ``IN`` list below goes through :func:`_rows_in_batches`
+    rather than binding one parameter per id -- see ``_SQL_MAX_IN_PARAMS``."""
+    conn = rostore.knowledge
+    chunk_ids = sorted({e["anchor"].get("chunk_id") for e in context.values() if e["anchor"].get("chunk_id")})
+    anchor_pool = set(anchor_ids)
+    if chunk_ids:
+        # chunk_ids is bounded by the claim's own anchors, but batched with
+        # the rest so one convention covers every IN list in this function.
+        anchor_pool |= {
+            r["anchor_id"]
+            for r in _rows_in_batches(
+                conn,
+                "SELECT anchor_id FROM quote_anchor WHERE chunk_id IN ({placeholders})",
+                chunk_ids,
+            )
+        }
+
+    seed_rows: list[dict[str, Any]] = []
+    if anchor_pool:
+        pool = sorted(anchor_pool)
+        # Batched (F3): the pool is corpus-sized. `created_at`/`rowid` are
+        # selected so the newest-first order survives being reassembled from
+        # several queries -- the order decides which anchor is recorded as a
+        # seed's `via_anchor` and which five entities get expanded, so it is
+        # not cosmetic.
+        seed_rows = [
+            dict(r)
+            for r in sorted(
+                _rows_in_batches(
+                    conn,
+                    "SELECT rel_id, src_entity, dst_entity, evidence_anchor, created_at, rowid AS _rowid "
+                    "FROM relation WHERE evidence_anchor IN ({placeholders}) "
+                    "AND expired_at IS NULL AND invalid_at IS NULL",
+                    pool,
+                ),
+                key=lambda r: ((r["created_at"] or ""), r["_rowid"]),
+                reverse=True,
+            )
+        ]
+
+    seen: dict[str, str] = {}
+    for r in seed_rows:
+        for eid in (r["src_entity"], r["dst_entity"]):
+            if eid and eid not in seen:
+                seen[eid] = r["evidence_anchor"]
+    candidate_ids = list(seen)
+    # An entity id with no row cannot be expanded; filter here rather than let
+    # k_hop_neighbors raise EntityNotFoundError from inside a panel builder.
+    known: dict[str, dict[str, Any]] = {}
+    if candidate_ids:
+        known = {
+            r["entity_id"]: dict(r)
+            for r in _rows_in_batches(
+                conn,
+                "SELECT entity_id, name, entity_type FROM entity WHERE entity_id IN ({placeholders})",
+                candidate_ids,
+            )
+        }
+    resolvable = [eid for eid in candidate_ids if eid in known]
+    seeds = resolvable[:EVIDENCE_MAX_SEEDS]
+    seeds_dropped = len(resolvable) - len(seeds)
+
+    edges_by_id: dict[str, dict[str, Any]] = {}
+    node_ids: set[str] = set()
+    truncated = False
+    hops_reached = 0
+    max_hops = retrieve_engine.DEFAULT_MAX_HOPS
+    hop_limit = retrieve_engine.DEFAULT_HOP_LIMIT
+    for eid in seeds:
+        result = retrieve_engine.k_hop_neighbors(rostore, eid, max_hops=retrieve_engine.DEFAULT_MAX_HOPS)
+        max_hops = result["max_hops"]
+        hop_limit = result["hop_limit"]
+        hops_reached = max(hops_reached, result["hops_reached"])
+        truncated = truncated or bool(result["truncated"])
+        node_ids |= set(result["nodes"])
+        for e in result["edges"]:
+            edges_by_id.setdefault(e["rel_id"], e)
+
+    label_ids = sorted(node_ids - set(known))
+    if label_ids:
+        for r in _rows_in_batches(
+            conn,
+            "SELECT entity_id, name, entity_type FROM entity WHERE entity_id IN ({placeholders})",
+            label_ids,
+        ):
+            known[r["entity_id"]] = dict(r)
+
+    nodes: list[dict[str, Any]] = [{"id": claim_row["claim_id"], "kind": "claim", "label": claim_row["claim_id"]}]
+    for eid in sorted(node_ids):
+        nodes.append({"id": eid, "kind": "entity", "label": (known.get(eid) or {}).get("name") or eid})
+
+    ordered = sorted(edges_by_id.values(), key=lambda e: ((e.get("created_at") or ""), e["rel_id"]), reverse=True)
+    edges = [
+        {
+            "rel_id": e["rel_id"],
+            "src": e["src_entity"],
+            "dst": e["dst_entity"],
+            "rel_type": e["rel_type"],
+            "fact_text": e["fact_text"],
+            "fenced": e.get("fenced", False),
+            "evidence_anchor": e.get("evidence_anchor"),
+        }
+        for e in ordered[:EVIDENCE_MAX_EDGES_LISTED]
+    ]
+    return {
+        "seed_entities": [
+            {
+                "entity_id": eid,
+                "name": known[eid].get("name"),
+                "entity_type": known[eid].get("entity_type"),
+                "via_anchor": seen[eid],
+            }
+            for eid in seeds
+        ],
+        "nodes": nodes,
+        "edges": edges,
+        "max_hops": max_hops,
+        "hops_reached": hops_reached,
+        "hop_limit": hop_limit,
+        "truncated": truncated,
+        "node_count": len(nodes),
+        "edge_count": len(edges_by_id),
+        "edges_listed": len(edges),
+        "seeds_dropped": seeds_dropped,
+    }
+
+
+def _evidence_lexicon_conflicts(rostore: RoStore, claim_id: str) -> dict[str, Any] | None:
+    """Ruling L-C5's import-guarded hook, and nothing more.
+
+    Lane e (E4) is what ADDS ``trialerror.lexicon.api.conflicts_for_claim`` --
+    the disjoint-source sense conflict that belongs under WHAT ARGUES WITH IT.
+    Until it lands, the module is absent and this returns ``None``, which the
+    builder renders as the ``awaiting_migration`` reading the convention calls
+    for: the region is OMITTED with a stated reason, never drawn as an empty
+    box that reads "no term conflicts" when what is true is "nothing can
+    answer that yet".
+
+    ``sqlite3.OperationalError`` is caught beside ``ImportError`` for the
+    middle state a two-step ruling creates -- lane e's module present on a
+    store that has not run its migration -- exactly the shape
+    :func:`_memory_conflict_candidate_items` already handles for the mining
+    lane's own tables."""
+    try:  # pragma: no cover - the module does not exist until lane e (E4)
+        from trialerror.lexicon.api import conflicts_for_claim  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+    try:  # pragma: no cover - same
+        return {"status": "ok", "conflicts": conflicts_for_claim(rostore, claim_id)}
+    except sqlite3.OperationalError:
+        return None
+
+
+def build_evidence_panel(
+    rostore: RoStore,
+    *,
+    claim_id: str | None = None,
+    anchor_id: str | None = None,
+    chunk_id: str | None = None,
+) -> dict[str, Any]:
+    """The Evidence backing route -- lane C item A, spec section 1; the
+    operator's 2026-09-05 walkthrough complaint ("Evidence page: no backing
+    route yet"), answered.
+
+    One claim, traced: WHAT IT STANDS ON (its anchors, with the two hash chips
+    that say whether the ground has moved under them), WHAT ARGUES WITH IT
+    (claim verdicts, and ``prov_edge`` reported honestly empty), the other
+    claims standing on the same evidence, and the bounded KG neighbourhood
+    around that evidence.
+
+    Three entry points, resolved in this order (spec section 1.2):
+    ``claim_id`` names the claim; ``anchor_id`` is the TRACE from a search
+    result row (``citation.anchor.anchor_id``, which every result already
+    carries); ``chunk_id`` is that same trace one level coarser. With none of
+    them, the newest live claim -- the default :func:`build_dossier_panel`
+    uses for its own rail.
+
+    Every read here already exists and is read-only (spec section 1.1): no new
+    table, no new column, no migration.
+
+    The lexicon term-conflict region is deliberately NOT implemented (ruling
+    L-C5): the hook is :func:`_evidence_lexicon_conflicts`, and while lane e's
+    module is absent the region is omitted with its reason stated rather than
+    drawn empty."""
+    if not rostore.is_available("knowledge"):
+        return {"status": "not_initialized", "message": "knowledge.db not found"}
+
+    conn = rostore.knowledge
+    index, index_total, index_truncated = _evidence_index(conn)
+    claim_row, not_found = _evidence_resolve_claim(conn, claim_id=claim_id, anchor_id=anchor_id, chunk_id=chunk_id)
+
+    panel: dict[str, Any] = {
+        "status": "ok",
+        "index": index,
+        "index_total": index_total,
+        "index_truncated": index_truncated,
+        "active_claim_id": None,
+        "claim": None,
+        "anchors": [],
+        "argues": None,
+        "co_anchored_claims": [],
+        "neighbourhood": None,
+        "lineage": None,
+    }
+    if not_found is not None:
+        panel["not_found"] = not_found
+    if claim_row is None:
+        return panel
+
+    anchors, primary_fenced = _evidence_anchor_rows(conn, claim_row)
+    anchor_ids = [a["anchor_id"] for a in anchors]
+    context = _evidence_anchor_context(conn, anchor_ids)
+    supersedes = [
+        r["claim_id"]
+        for r in conn.execute("SELECT claim_id FROM claim WHERE superseded_by = ?", (claim_row["claim_id"],)).fetchall()
+    ]
+
+    panel["active_claim_id"] = claim_row["claim_id"]
+    panel["claim"] = {
+        "claim_id": claim_row["claim_id"],
+        "kind": claim_row["kind"],
+        # Spec section 1.2: the claim BODY is fence-capped and then
+        # untrusted-wrapped. The client strips the wrapper and never injects
+        # it as HTML (evidence_render.js builds text nodes only).
+        "text": untrusted_wrap(citation_quote(claim_row.get("text"), fenced=primary_fenced)),
+        "fenced": primary_fenced,
+        "confidence": claim_row.get("confidence"),
+        "created_at": claim_row.get("created_at"),
+        "valid_at": claim_row.get("valid_at"),
+        "expired_at": claim_row.get("expired_at"),
+        "invalid_at": claim_row.get("invalid_at"),
+        "superseded_by": claim_row.get("superseded_by"),
+        "created_by_launch": claim_row.get("created_by_launch"),
+    }
+    panel["anchors"] = anchors
+    panel["argues"] = _evidence_argues(conn, claim_row["claim_id"])
+    panel["co_anchored_claims"] = _evidence_co_anchored(
+        conn, claim_id=claim_row["claim_id"], anchor_ids=anchor_ids, context=context
+    )
+    panel["neighbourhood"] = _evidence_neighbourhood(
+        rostore, claim_row=claim_row, anchor_ids=anchor_ids, context=context
+    )
+    panel["lineage"] = {"superseded_by": claim_row.get("superseded_by"), "supersedes": supersedes}
+
+    term_conflicts = _evidence_lexicon_conflicts(rostore, claim_row["claim_id"])
+    if term_conflicts is not None:  # pragma: no cover - lane e (E4) lands the module
+        panel["term_conflicts"] = term_conflicts
+    else:
+        panel["term_conflicts_omitted"] = {
+            "reason": "awaiting_migration",
+            "message": (
+                "the per-claim term-sense conflict read (lexicon.api.conflicts_for_claim) is not in "
+                "this program yet -- this region is omitted rather than drawn empty"
+            ),
+        }
+    return panel
 
 
 # ---------------------------------------------------------------------------
@@ -1586,6 +2820,7 @@ PANEL_BUILDERS = {
     "rooms": build_rooms_panel,
     "determinations": build_determinations_panel,
     "dossier": build_dossier_panel,
+    "evidence": build_evidence_panel,
     "lexicon": build_lexicon_panel,
     "course": build_course_panel,
     "since_you_left": build_since_you_left_panel,

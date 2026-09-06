@@ -152,12 +152,13 @@ def run_post(args: argparse.Namespace) -> dict:
         return error_envelope("feed post", "missing_thread", "give --thread-id or --new-thread")
     if args.thread_id and args.new_thread:
         return error_envelope("feed post", "conflicting_thread_args", "give exactly one of --thread-id / --new-thread")
-    if args.new_thread and not args.launch_id:
-        return error_envelope(
-            "feed post",
-            "new_thread_needs_launch",
-            "opening a new thread requires --launch-id (thread.created_by_launch is NOT NULL)",
-        )
+    # `--new-thread` used to also require `--launch-id`, because
+    # thread.created_by_launch was NOT NULL. ops v8 made it nullable and gave
+    # `thread` the same derived `created_by` a post already carries, so the
+    # orchestrator can now OPEN a thread under its open session exactly as it
+    # could always post into one. `create_thread` refuses with its own named
+    # error when there is no open session either -- one refusal, in the module
+    # that owns the rule, rather than two that can disagree.
 
     try:
         store = open_program_store(args.program_root)
@@ -167,7 +168,9 @@ def run_post(args: argparse.Namespace) -> dict:
     try:
         thread_id = args.thread_id
         if args.new_thread:
-            thread = create_thread(store, title=args.new_thread, launch_id=args.launch_id)
+            thread = create_thread(
+                store, title=args.new_thread, launch_id=args.launch_id, session_id=args.session_id
+            )
             thread_id = thread["thread_id"]
         post = post_feed(
             store,

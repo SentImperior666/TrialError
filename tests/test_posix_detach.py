@@ -76,7 +76,6 @@ from __future__ import annotations
 
 import os
 import signal
-import socket
 import subprocess
 import sys
 import textwrap
@@ -84,6 +83,8 @@ import time
 from pathlib import Path
 
 import pytest
+
+from tests._ports import free_port
 
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32",
@@ -94,14 +95,6 @@ pytestmark = pytest.mark.skipif(
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _PIDFILE_TIMEOUT_S = 10.0
 _POLL_S = 0.05
-
-
-def _free_port() -> int:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 def _communicate(driver: subprocess.Popen, timeout: float = _PIDFILE_TIMEOUT_S) -> str:
@@ -376,7 +369,7 @@ def _seeded_dashboard_program(tmp_path: Path) -> tuple[Path, Path]:
 
 def test_dashboard_serve_child_survives_parent_process_exit(tmp_path):
     program_root, platform_root = _seeded_dashboard_program(tmp_path)
-    port = _free_port()
+    port = free_port()
     log_dir = tmp_path / "dashboard_logs"
     pidfile = tmp_path / "dashboard_pid_exit.txt"
     body = _dashboard_driver_body(
@@ -399,7 +392,7 @@ def test_dashboard_serve_child_survives_parent_process_exit(tmp_path):
 
 def test_dashboard_serve_child_survives_sigint_to_parent_process_group(tmp_path):
     program_root, platform_root = _seeded_dashboard_program(tmp_path)
-    port = _free_port()
+    port = free_port()
     log_dir = tmp_path / "dashboard_logs"
     pidfile = tmp_path / "dashboard_pid_sigint.txt"
     body = _dashboard_driver_body(

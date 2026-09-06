@@ -13,6 +13,7 @@ __all__ = [
     "PreregNotFoundError",
     "PreregTamperedError",
     "PreregVoidedError",
+    "PreregAlreadyRevealedError",
     "VerdictNotFoundError",
     "ReproductionRefError",
     "CitecheckError",
@@ -53,6 +54,18 @@ class PreregVoidedError(VerifyError):
     ``voided`` status (a previously-tampered or explicitly-voided
     commitment) — reveal/compliance checks against a voided prereg are
     refused rather than silently reporting non-compliance."""
+
+
+class PreregAlreadyRevealedError(VerifyError):
+    """``prereg reveal`` was called on a row already in ``revealed`` status.
+
+    A reveal is the one irreversible act in this subsystem: it ends the
+    blind. Doing it twice used to succeed — re-copying the escrow file,
+    OVERWRITING ``revealed_ts`` with the later time, and appending a second
+    ``prereg_revealed`` event — so the moment the blind was actually broken
+    survived only in the event log, which is exactly the record a second
+    reveal muddies. The status is the commitment's own history and is not
+    rewritten by a repeat call (lane C, finding F2)."""
 
 
 class VerdictNotFoundError(VerifyError):

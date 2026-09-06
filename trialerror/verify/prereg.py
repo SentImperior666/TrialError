@@ -33,12 +33,19 @@ from typing import Any, Mapping
 from trialerror.stores import get as store_get
 from trialerror.stores import insert as store_insert
 from trialerror.stores import update as store_update
+from trialerror.stores.errors import ValidationError
 from trialerror.stores.store import Store
 from trialerror.util.atomic import atomic_write_text
 from trialerror.util.config import ConfigError, load_config
 from trialerror.util.ids import new_id
 from trialerror.util.timeutil import now
-from trialerror.verify.errors import InvalidProcedureError, PreregNotFoundError, PreregTamperedError, PreregVoidedError
+from trialerror.verify.errors import (
+    InvalidProcedureError,
+    PreregAlreadyRevealedError,
+    PreregNotFoundError,
+    PreregTamperedError,
+    PreregVoidedError,
+)
 
 __all__ = [
     "sha256_hex",
@@ -140,7 +147,41 @@ def prereg_status(store: Store, *, prereg_id: str) -> dict[str, Any]:
     return _require_prereg(store, prereg_id)
 
 
-def reveal_prereg(store: Store, *, prereg_id: str, dest_dir: str | Path | None = None) -> dict[str, Any]:
+def _resolve_event_session(store: Store, session_id: str | None) -> str | None:
+    """Which session the ``prereg_revealed`` event is attributed to.
+
+    An explicit id must name a REAL ``ops.session`` row -- ``event.session_id``
+    is a same-file FK, so an invented one would fail the insert, and refusing
+    up front is the difference between "your session id is wrong" and "the
+    blind is broken and the audit row is missing". Any status is accepted, not
+    just ``open``: a reveal during a session that has just closed is a real
+    thing to do, and this is attribution, not authorship.
+
+    With no id given, the newest open session -- and ``None`` when nothing is
+    open, because a CLI reveal outside a session is legitimate and must not be
+    refused over an attribution field. The event still records the reveal."""
+    conn = store.ops
+    if session_id is not None:
+        found = conn.execute("SELECT session_id FROM session WHERE session_id = ?", (session_id,)).fetchone()
+        if found is None:
+            raise ValidationError(
+                f"session_id={session_id!r} has no row in ops.session "
+                "(a prereg reveal is attributed to a real session, never an arbitrary string)"
+            )
+        return session_id
+    row = conn.execute(
+        "SELECT session_id FROM session WHERE status = 'open' ORDER BY opened_ts DESC LIMIT 1"
+    ).fetchone()
+    return row[0] if row is not None else None
+
+
+def reveal_prereg(
+    store: Store,
+    *,
+    prereg_id: str,
+    dest_dir: str | Path | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
     """Read the escrowed content back, verify it still hashes to what was
     committed, copy it INTO the program tree, and mark the ``prereg`` row
     ``revealed`` (design: "reveal copies the content into the program tree
@@ -150,15 +191,59 @@ def reveal_prereg(store: Store, *, prereg_id: str, dest_dir: str | Path | None =
 
     - :class:`~trialerror.verify.errors.PreregVoidedError` if the row is already
       ``voided`` (a prior tamper detection, or an explicit void).
+    - :class:`~trialerror.verify.errors.PreregAlreadyRevealedError` if the row
+      is already ``revealed``. A reveal is the one irreversible act here, so
+      it happens exactly once: a second call used to re-copy the escrow,
+      overwrite ``revealed_ts`` with the later time and append a second
+      ``prereg_revealed`` event, losing the moment the blind was actually
+      broken. Spec section 4 named three refusals and not this one; the
+      Determinations queue drops the item after the first reveal, so only a
+      direct CLI or HTTP call could reach it (lane C, finding F2).
     - :class:`~trialerror.verify.errors.PreregTamperedError` if the escrow
       file's content no longer hashes to ``procedure_sha256``/
       ``params_sha256`` — design: "reveal w/ tampered escrow refused". The
       row is marked ``voided`` as a side effect of this refusal (a tamper
       is a permanent finding, not a retryable error).
+
+    **Emits a ``prereg_revealed`` event** (lane C, ruling L-C3). A reveal ends
+    the blind and cannot be undone, so who ended it and when has to be
+    discoverable in the event log, not only in a ``revealed_ts`` column
+    somebody would have to know to go and look at. The event is written HERE
+    rather than by any one caller, so the CLI verb and the dashboard button
+    produce the identical record; ``session_id`` is the only thing the two
+    differ on, and it carries the dashboard's own session when the reveal
+    comes from a browser.
+
+    The payload carries the two COMMITTED HASHES, never the revealed content:
+    an event log is not the place to un-blind a procedure a second time, and
+    the hashes are what ties this row to a later verdict's
+    ``prereg_compliant`` stamp.
+
+    A tampered escrow writes NO event -- nothing was revealed. The voiding is
+    recorded by the row's own ``status``, and the refusal reaches the caller.
+
+    ``dest_dir`` is a server-side choice everywhere it matters:
+    ``trialerror.dashboard.writes`` never takes one from a request body, since
+    an HTTP caller naming a write path is a path-traversal primitive rather
+    than a feature.
     """
     row = _require_prereg(store, prereg_id)
     if row["status"] == "voided":
         raise PreregVoidedError(f"prereg {prereg_id!r} is already voided; cannot reveal")
+    if row["status"] == "revealed":
+        # The row carries no revealed_path (only the ts), so this message
+        # names the ts and points at the event rather than guessing a
+        # directory -- the first reveal may have chosen its own dest_dir.
+        raise PreregAlreadyRevealedError(
+            f"prereg {prereg_id!r} was already revealed at {row['revealed_ts']!r}; "
+            f"revealing again would overwrite that timestamp and log a second "
+            f"prereg_revealed event -- the revealed_path is on the first one"
+        )
+    # Resolved BEFORE anything is written: `event.session_id` is a same-file FK
+    # to `session`, so a bogus id would fail the insert -- after the blind had
+    # already been broken and the row marked revealed. An attribution problem
+    # must refuse before the irreversible act, not after it.
+    event_session_id = _resolve_event_session(store, session_id)
 
     escrow_path = Path(row["escrow_path"])
     try:
@@ -183,6 +268,26 @@ def reveal_prereg(store: Store, *, prereg_id: str, dest_dir: str | Path | None =
 
     ts = now()
     store_update(store, "prereg", pk_column="prereg_id", pk_value=prereg_id, changes={"revealed_ts": ts, "status": "revealed"})
+
+    # Imported at call time, not at module import: trialerror.events.api
+    # imports trialerror.stores, and so does this module -- a top-level import
+    # here is fine today and is one refactor away from a cycle. The row is
+    # written AFTER the status update, so an event never claims a reveal that
+    # did not land (both are on ops.db, but they are two auto-commits).
+    from trialerror.events.api import append_event
+
+    append_event(
+        store,
+        event_type="prereg_revealed",
+        payload={
+            "prereg_id": prereg_id,
+            "revealed_path": str(dest_path),
+            "procedure_sha256": row["procedure_sha256"],
+            "params_sha256": row["params_sha256"],
+        },
+        session_id=event_session_id,
+        ts=ts,
+    )
     return {
         "prereg_id": prereg_id,
         "title": content.get("title"),

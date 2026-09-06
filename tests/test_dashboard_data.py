@@ -202,6 +202,8 @@ def test_build_all_panels_has_every_panel(seeded):
         "session", "budget", "jobs", "gates", "corpus", "doctor",
         # build-v2dash-data: the V2 dashboard's new panel builders.
         "feed", "rooms", "determinations", "dossier", "lexicon", "course", "since_you_left",
+        # lane C (C6): the Evidence backing route.
+        "evidence",
     }
     for name, panel in panels.items():
         assert "status" in panel, f"{name} panel missing a status field"

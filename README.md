@@ -192,13 +192,13 @@ what is still coming. Nothing already shipped depends on any of it.
 - [ ] Web-page ingestion pipeline. Fetched pages enter the corpus as saved markdown
       today; a hardened URL-to-corpus path is designed, not built.
 - [x] Feed translation: `trialerror feed translate` enqueues a job behind a fail-closed gate (ids, numbers, and hedges are always checked; meaning is verified only when judgments are supplied) and the dashboard shows the plain-English rendering side-by-side with the original — the text itself comes from `--body`/`--judgments-file` today, since no generative model backend ships in this release.
-- [ ] Dashboard: a backing route for the Evidence panel (per-claim neighborhood),
+- [x] Dashboard: a backing route for the Evidence panel (per-claim neighborhood),
       and the write actions that ship disabled (pre-registration reveal,
       memory-conflict resolve, gate send-back, new feed threads).
-- [ ] Dashboard Console rendering: an idle-gap-compressed session timeline
+- [x] Dashboard Console rendering: eight bespoke cards in place of the generic
+      key/value renderer, including an idle-gap-compressed session timeline
       (langfuse pattern) and a status-coloured jobs table with per-cell deltas
-      (k9s pattern), per the Console renderer brief. Until then the Console
-      uses a generic key/value renderer.
+      (k9s pattern).
 - [x] Full-text tier switch to tantivy. A bake-off found it consistently faster
       than FTS5 at every tested scale, and a shipped-path measurement at 15k
       chunks confirms it (2-30x at p50, wider on common/low-selectivity terms,
@@ -247,15 +247,13 @@ where a specific piece of this codebase actually traces back to it:
   pattern behind faithfulness scoring.
 - **DeepEval** (Apache-2.0) — the pytest-native gate-acceptance-suite
   pattern (the pattern only — no dependency on the library itself).
-- **langfuse** (MIT, core) — idle-gap time compression for long-running
-  timelines. Adopted in the dashboard's design contract for the Console
-  timeline; not yet shipped (the Console still uses a generic renderer).
+- **langfuse** (MIT, core) — idle-gap time compression, now how the
+  dashboard's Console timeline stays readable across long waits.
 - **sigma.js** (MIT) — grid-cell label decimation and barycentre cluster
   labels. Adopted in the design contract for graph views inside per-program
   extension panels; not yet shipped.
 - **k9s** (Apache-2.0) — the two-layer status colorer and per-cell delta
-  indicators. Adopted in the design contract for the Console jobs table; not
-  yet shipped.
+  indicators, now the dashboard's Console jobs table.
 - **btop** (Apache-2.0) — the 101-step, three-stop gradient for meters.
   Read and considered; the shipped meters are deliberately flat, three-colour.
 - **arxiv-sanity-lite** (MIT) — the search-first page shell and explicit

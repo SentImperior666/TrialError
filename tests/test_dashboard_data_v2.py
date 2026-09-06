@@ -129,6 +129,219 @@ def test_feed_panel_not_initialized(empty_rostore):
 
 
 # ---------------------------------------------------------------------------
+# feed panel: the reply structure (lane C item B / spec section 2.1)
+#
+# The operator's 2026-09-05 walkthrough complaint, verbatim: "messages are not
+# structured by their relationships". `in_reply_to` was on every row and in no
+# payload. These tests pin the derived shape -- depth, root, order, and the two
+# ways a parent can fail to be there.
+# ---------------------------------------------------------------------------
+def _ts(n: int) -> str:
+    """A fixed, ordered timestamp -- the builder's sibling ordering is
+    ``ts`` first and insertion order only as the tiebreak, so a fixture
+    that wants to prove ordering has to set ``ts`` rather than rely on
+    the wall clock ticking between two inserts in the same millisecond."""
+    return f"2026-09-06T00:00:{n:02d}.000Z"
+
+
+def _reply_tree(store, ids):
+    """Two roots, one of them three levels deep, and siblings whose ARRIVAL
+    order differs from their THREADED order:
+
+        P1 (ts 01)                     arrival: P1 P2 P3 P5 P4
+          P2 (ts 02)                   threaded: P1 P2 P3 P4 P5
+            P3 (ts 03)
+          P4 (ts 05)
+        P5 (ts 04)
+    """
+    from trialerror.events.api import create_thread, post_feed
+
+    thread = create_thread(store, title="threaded fixture", launch_id=ids["launch"])
+    tid = thread["thread_id"]
+
+    def post(n, parent=None):
+        return post_feed(
+            store, thread_id=tid, body=f"post {n}", launch_id=ids["launch"],
+            in_reply_to=parent, ts=_ts(n),
+        )["post_id"]
+
+    p1 = post(1)
+    p2 = post(2, p1)
+    p3 = post(3, p2)
+    p5 = post(4)
+    p4 = post(5, p1)
+    return tid, {"p1": p1, "p2": p2, "p3": p3, "p4": p4, "p5": p5}
+
+
+def test_feed_panel_threads_three_levels_in_dfs_pre_order(seeded, program_root, platform_root):
+    rostore, ids = seeded
+    store = open_store(program_root, platform_root=platform_root)
+    tid, p = _reply_tree(store, ids)
+    store.close()
+    rostore.close()
+    rostore = _reopen_ro(program_root, platform_root)
+    try:
+        panel = data.build_feed_panel(rostore, thread_id=tid)
+        by_id = {row["post_id"]: row for row in panel["posts"]}
+
+        # `posts` is the append-only truth and stays in ARRIVAL order.
+        assert [row["post_id"] for row in panel["posts"]] == [p["p1"], p["p2"], p["p3"], p["p5"], p["p4"]]
+        # `order_threaded` is the derived reading: DFS pre-order, roots by ts,
+        # children by ts -- so P4 (ts 05) precedes root P5 (ts 04).
+        assert panel["order_threaded"] == [p["p1"], p["p2"], p["p3"], p["p4"], p["p5"]]
+
+        assert [by_id[p[k]]["depth"] for k in ("p1", "p2", "p3", "p4", "p5")] == [0, 1, 2, 1, 0]
+        assert [by_id[p[k]]["root_post_id"] for k in ("p1", "p2", "p3", "p4", "p5")] == [
+            p["p1"], p["p1"], p["p1"], p["p1"], p["p5"]
+        ]
+        # DIRECT children only -- P1 has two, not the three in its subtree.
+        assert [by_id[p[k]]["reply_count"] for k in ("p1", "p2", "p3", "p4", "p5")] == [2, 1, 0, 0, 0]
+        assert by_id[p["p2"]]["reply_to"] == p["p1"]
+        assert all(row["reply_to_missing"] is False for row in panel["posts"])
+
+        # the rail's own number, one GROUP BY for every thread at once
+        row = next(t for t in panel["threads"] if t["thread_id"] == tid)
+        assert row["thread_reply_count"] == 3
+        other = next(t for t in panel["threads"] if t["thread_id"] == ids["thread"])
+        assert other["thread_reply_count"] == 0
+    finally:
+        rostore.close()
+
+
+def test_feed_panel_renders_a_reply_whose_parent_is_in_another_thread(seeded, program_root, platform_root):
+    """L-C4, verbatim: a reply whose parent is missing from this thread
+    "renders at root level with the flag visible, never dropped". The
+    realistic case is a cross-thread parent -- ``feed_post.in_reply_to`` is
+    a plain self-FK with no same-thread constraint, so the row is legal and
+    the panel has to have an answer for it."""
+    rostore, ids = seeded
+    store = open_store(program_root, platform_root=platform_root)
+    from trialerror.events.api import create_thread, post_feed
+
+    thread = create_thread(store, title="orphan fixture", launch_id=ids["launch"])
+    tid = thread["thread_id"]
+    root = post_feed(store, thread_id=tid, body="a root", launch_id=ids["launch"], ts=_ts(1))
+    orphan = post_feed(
+        store, thread_id=tid, body="answering elsewhere", launch_id=ids["launch"],
+        in_reply_to=ids["feed_post"], ts=_ts(2),   # a post in the OTHER thread
+    )
+    store.close()
+    rostore.close()
+    rostore = _reopen_ro(program_root, platform_root)
+    try:
+        panel = data.build_feed_panel(rostore, thread_id=tid)
+        by_id = {row["post_id"]: row for row in panel["posts"]}
+
+        assert orphan["post_id"] in panel["order_threaded"], "an orphan must never be dropped"
+        row = by_id[orphan["post_id"]]
+        assert row["reply_to_missing"] is True
+        assert row["reply_to"] == ids["feed_post"]   # the flag explains, it does not erase
+        assert row["depth"] == 0
+        assert row["root_post_id"] == orphan["post_id"]
+        assert by_id[root["post_id"]]["reply_count"] == 0
+        assert panel["order_threaded"] == [root["post_id"], orphan["post_id"]]
+    finally:
+        rostore.close()
+
+
+def test_feed_panel_cuts_a_reply_cycle_loose_instead_of_looping(seeded, program_root, platform_root):
+    """SQLite's self-FK enforces that a parent EXISTS, never that the graph
+    is acyclic. A hand-written row (or a restore that renumbered ids) can
+    close a loop; a builder that walks parents naively hangs the whole
+    ``/all`` bundle on it. Every member of the cycle is cut loose and
+    reported as an orphan root instead."""
+    rostore, ids = seeded
+    store = open_store(program_root, platform_root=platform_root)
+    from trialerror.events.api import create_thread, post_feed
+
+    thread = create_thread(store, title="cycle fixture", launch_id=ids["launch"])
+    tid = thread["thread_id"]
+    a = post_feed(store, thread_id=tid, body="A", launch_id=ids["launch"], ts=_ts(1))
+    b = post_feed(store, thread_id=tid, body="B", launch_id=ids["launch"], in_reply_to=a["post_id"], ts=_ts(2))
+    # close the loop: A now replies to B, which replies to A.
+    store_update(
+        store, "feed_post", pk_column="post_id", pk_value=a["post_id"],
+        changes={"in_reply_to": b["post_id"]},
+    )
+    store.close()
+    rostore.close()
+    rostore = _reopen_ro(program_root, platform_root)
+    try:
+        panel = data.build_feed_panel(rostore, thread_id=tid)
+        by_id = {row["post_id"]: row for row in panel["posts"]}
+
+        assert sorted(panel["order_threaded"]) == sorted([a["post_id"], b["post_id"]])
+        for pid in (a["post_id"], b["post_id"]):
+            assert by_id[pid]["reply_to_missing"] is True
+            assert by_id[pid]["depth"] == 0
+            assert by_id[pid]["root_post_id"] == pid
+            assert by_id[pid]["reply_count"] == 0
+    finally:
+        rostore.close()
+
+
+def test_feed_panel_self_reply_is_its_own_cycle(seeded, program_root, platform_root):
+    """The one-node case of the same guard, which a chain walk that only
+    looks at the GRANDparent would miss."""
+    rostore, ids = seeded
+    store = open_store(program_root, platform_root=platform_root)
+    from trialerror.events.api import create_thread, post_feed
+
+    thread = create_thread(store, title="self-reply fixture", launch_id=ids["launch"])
+    tid = thread["thread_id"]
+    only = post_feed(store, thread_id=tid, body="A", launch_id=ids["launch"], ts=_ts(1))
+    store_update(
+        store, "feed_post", pk_column="post_id", pk_value=only["post_id"],
+        changes={"in_reply_to": only["post_id"]},
+    )
+    store.close()
+    rostore.close()
+    rostore = _reopen_ro(program_root, platform_root)
+    try:
+        panel = data.build_feed_panel(rostore, thread_id=tid)
+        row = panel["posts"][0]
+        assert panel["order_threaded"] == [only["post_id"]]
+        assert row["reply_to_missing"] is True
+        assert row["depth"] == 0
+        assert row["reply_count"] == 0
+    finally:
+        rostore.close()
+
+
+def test_feed_panel_threading_fields_are_present_on_a_flat_thread(seeded):
+    """The default program has no replies at all. Every field still has to
+    be there and be honest -- a client that reads `depth` must not have to
+    branch on whether the server bothered to send it."""
+    rostore, ids = seeded
+    panel = data.build_feed_panel(rostore)
+    assert panel["order_threaded"] == [ids["feed_post"]]
+    post = panel["posts"][0]
+    assert post["reply_to"] is None
+    assert post["reply_to_missing"] is False
+    assert post["depth"] == 0
+    assert post["root_post_id"] == post["post_id"]
+    assert post["reply_count"] == 0
+    assert all(t["thread_reply_count"] == 0 for t in panel["threads"])
+
+
+def test_feed_panel_order_threaded_is_empty_for_a_thread_with_no_posts(seeded, program_root, platform_root):
+    rostore, ids = seeded
+    store = open_store(program_root, platform_root=platform_root)
+    from trialerror.events.api import create_thread
+
+    empty = create_thread(store, title="nothing here", launch_id=ids["launch"])
+    store.close()
+    rostore.close()
+    rostore = _reopen_ro(program_root, platform_root)
+    try:
+        panel = data.build_feed_panel(rostore, thread_id=empty["thread_id"])
+        assert panel["posts"] == []
+        assert panel["order_threaded"] == []
+    finally:
+        rostore.close()
+
+
+# ---------------------------------------------------------------------------
 # rooms panel
 # ---------------------------------------------------------------------------
 def test_rooms_panel_series_and_moderator_events(program_root, platform_root):

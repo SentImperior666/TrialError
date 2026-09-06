@@ -362,20 +362,54 @@ def _derive_author(store: Store, *, launch_id: str | None, session_id: str | Non
     return f"orchestrator:{resolved_session}"
 
 
-def create_thread(store: Store, *, title: str, launch_id: str, ts: str | None = None) -> dict[str, Any]:
-    """Open a new feed thread. ``thread.created_by_launch`` is
-    ``NOT NULL`` in the M1-built schema (design Section 4.2 verbatim) —
-    TRIALERROR-DEV-NOTE: unlike a feed post, a thread cannot be opened under the
-    orchestrator's no-launch identity; every thread's opening act is
-    booked to a real launch. This is a faithful-closest-reading of a
-    schema this module (lane isolation) does not have license to alter —
-    flagged for the M6/M14 builders in the build report, not silently
-    special-cased here."""
+def create_thread(
+    store: Store,
+    *,
+    title: str,
+    launch_id: str | None = None,
+    session_id: str | None = None,
+    ts: str | None = None,
+) -> dict[str, Any]:
+    """Open a new feed thread, under the SAME authorship contract
+    :func:`post_feed` has: ``created_by`` comes from :func:`_derive_author`
+    and is never a parameter.
+
+    ``launch_id=None`` opens the thread as ``orchestrator:<open session>``
+    (or the explicit ``session_id``, which must itself be open), leaving
+    ``created_by_launch`` NULL; a real ``launch_id`` is resolved against
+    ``platform.launch`` and yields ``<agent_kind>:<launch_id>`` with the
+    column set, exactly as before.
+
+    This used to be impossible, and the docstring that stood here said so:
+    ``thread.created_by_launch`` was NOT NULL, so the operator -- who has a
+    session and no launch -- was the one caller of this module that could post
+    INTO a thread but never START one. It was flagged as a schema constraint
+    this lane had no licence to alter. **ops v8**
+    (``ops_v8_thread_created_by_nullable_and_author``) relaxes it and adds the
+    derived ``created_by`` column; ruling L-C1 is the licence.
+
+    A pre-v8 row has ``created_by IS NULL`` -- a migration on ops.db cannot
+    derive an author, because ``platform.launch`` lives in a different file.
+    **The column is write-only today**: nothing reads it (not ``data.py``,
+    not the three renderer files), and the feed's thread rail shows no thread
+    author at all, so a pre-v8 row loses nothing by having none. This
+    docstring used to promise that "readers fall back to
+    ``created_by_launch``" for those rows -- no reader does (lane C, finding
+    F9). The first reader that wants an author is where that coalesce
+    belongs, and it should read ``COALESCE(created_by, created_by_launch)``.
+
+    A missing ``launch_id`` with NO open session raises
+    :class:`~trialerror.stores.errors.ValidationError` out of
+    :func:`_derive_author` -- the same refusal :func:`post_feed` gives, and
+    for the same reason: an unauthored thread is not a thing this subsystem
+    can write."""
+    created_by = _derive_author(store, launch_id=launch_id, session_id=session_id)
     row = {
         "thread_id": new_id("THR"),
         "title": title,
         "created_ts": ts or now(),
         "created_by_launch": launch_id,
+        "created_by": created_by,
     }
     return insert(store, "thread", row)
 

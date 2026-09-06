@@ -12,7 +12,7 @@ from typing import Any
 
 from trialerror.ingest.errors import InvalidRequestTransitionError, SourceNotFoundError
 from trialerror.stores.store import Store
-from trialerror.stores.writer import get, insert
+from trialerror.stores.writer import get, insert, require_xid_targets
 from trialerror.util.atomic import atomic_write_text
 from trialerror.util.config import resolve_configured_path
 from trialerror.util.ids import new_id
@@ -59,7 +59,11 @@ def transition(store: Store, source_id: str, to_state: str, *, launch_id: str | 
     event insert lands AFTER the knowledge commit: a crash in the gap
     loses an EVENT, never a transition, and never writes an event for a
     transition that did not happen (the reverse order would be worse --
-    an audit row claiming a state change that then failed)."""
+    an audit row claiming a state change that then failed). What the gap
+    does NOT cover any more is a BAD ``launch_id``: that is checked up
+    front (see the comment below), so an unknown launch refuses with
+    nothing written rather than moving the row and then failing its own
+    audit."""
     source = get(store, "source", pk_column="source_id", pk_value=source_id)
     if source is None:
         raise SourceNotFoundError(f"no such source: {source_id!r}")
@@ -70,6 +74,18 @@ def transition(store: Store, source_id: str, to_state: str, *, launch_id: str | 
             f"source {source_id!r}: {from_state!r} -> {to_state!r} is not a permitted "
             f"request-queue transition (allowed from {from_state!r}: {sorted(allowed)!r})"
         )
+
+    # Refuse an unknown ``launch_id`` BEFORE the state change, not after
+    # (lane C, finding F1). ``event.launch_id`` is an XID column, so the
+    # insert below would refuse a launch id naming no ``platform.launch``
+    # row -- but only once ``request_state`` had already committed, leaving
+    # the caller a refusal for a transition that DID happen and no audit
+    # row for it. This is the same "validate the identity before you
+    # mutate" discipline ``artifacts.gates`` and ``rooms.api`` apply with
+    # their own ``_require_launch_exists``; here the pre-flight is the
+    # write API's own check, run against the exact row written below, so
+    # the message is identical to the one the deferred insert would raise.
+    require_xid_targets(store, "event", {"launch_id": launch_id})
 
     _cas_request_state(store, source_id=source_id, from_state=from_state, to_state=to_state)
 

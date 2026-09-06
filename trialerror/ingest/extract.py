@@ -90,7 +90,7 @@ from trialerror.retrieve.wrap import untrusted_wrap
 from trialerror.stores.bitemporal import assert_fact
 from trialerror.stores.store import Store
 from trialerror.stores.writer import get as store_get
-from trialerror.stores.writer import insert, update
+from trialerror.stores.writer import insert, require_xid_targets, update
 from trialerror.util.ids import new_id, split_id
 from trialerror.util.timeutil import now
 
@@ -563,18 +563,40 @@ def _accept_claim_candidate(store: Store, payload: Mapping[str, Any], *, by_laun
     }
 
 
+def _require_decider_launch(store: Store, by_launch: str | None) -> None:
+    """Refuse a ``by_launch`` naming no ``platform.launch`` row BEFORE the
+    decision is written (lane C, finding F1).
+
+    Every decision function in this module ends in
+    :func:`~trialerror.events.api.append_event`, whose ``event.launch_id``
+    is an XID column. Left to the insert, an unknown launch id refused
+    only AFTER the proposal/candidate row had already been moved out of
+    ``draft``/``pending`` and the member entities rewritten: the caller
+    saw ``ok: false``, the store had changed, no audit row existed, and
+    the retry then refused with "is not draft". The dashboard's
+    merge-accept / merge-reject write path is exactly that caller. Running
+    the write API's own check up front, against the event row these
+    functions will write, keeps the refusal message identical and makes it
+    honest. ``None`` is allowed through (the XID check skips NULL, and a
+    nullable audit author is a separate question from a WRONG one)."""
+    require_xid_targets(store, "event", {"launch_id": by_launch})
+
+
 def accept_candidate(store: Store, record_id: str, *, by_launch: str) -> dict[str, Any]:
     """Promote one PENDING candidate to a real ``entity``/``relation``/
     ``claim`` row (module docstring). Refuses
     (:class:`~trialerror.ingest.errors.CandidateNotFoundError`/
     :class:`~trialerror.ingest.errors.CandidateNotPendingError`) for an unknown
-    or already-decided candidate."""
+    or already-decided candidate, and
+    (:class:`~trialerror.stores.errors.XidTargetMissingError`) for a
+    ``by_launch`` naming no launch — before anything is written."""
     candidate = _load_candidate(store, record_id)
     if candidate is None:
         raise CandidateNotFoundError(f"no such extraction candidate: {record_id!r}")
     payload = candidate["payload"]
     if payload.get("status") != "pending":
         raise CandidateNotPendingError(f"candidate {record_id!r} is not pending (status={payload.get('status')!r})")
+    _require_decider_launch(store, by_launch)
 
     kind = payload["kind"]
     if kind == "entity":
@@ -604,6 +626,7 @@ def reject_candidate(store: Store, record_id: str, *, by_launch: str, reason: st
     payload = candidate["payload"]
     if payload.get("status") != "pending":
         raise CandidateNotPendingError(f"candidate {record_id!r} is not pending (status={payload.get('status')!r})")
+    _require_decider_launch(store, by_launch)
     new_payload = {**payload, "status": "rejected", "reject_reason": reason}
     update(store, "record", pk_column="record_id", pk_value=record_id, changes={"payload": json.dumps(new_payload, ensure_ascii=False)})
     append_event(
@@ -628,6 +651,7 @@ def accept_merge_proposal(store: Store, prop_id: str, *, by_launch: str) -> dict
         raise CandidateNotFoundError(f"no such merge_proposal: {prop_id!r}")
     if prop["status"] != "draft":
         raise CandidateNotPendingError(f"merge_proposal {prop_id!r} is not draft (status={prop['status']!r})")
+    _require_decider_launch(store, by_launch)
     members = json.loads(prop["members"])
     update(store, "merge_proposal", pk_column="prop_id", pk_value=prop_id, changes={"status": "confirmed", "decided_by": by_launch, "decided_ts": now()})
     for member_id in members:
@@ -651,6 +675,7 @@ def reject_merge_proposal(store: Store, prop_id: str, *, by_launch: str) -> dict
         raise CandidateNotFoundError(f"no such merge_proposal: {prop_id!r}")
     if prop["status"] != "draft":
         raise CandidateNotPendingError(f"merge_proposal {prop_id!r} is not draft (status={prop['status']!r})")
+    _require_decider_launch(store, by_launch)
     members = json.loads(prop["members"])
     update(store, "merge_proposal", pk_column="prop_id", pk_value=prop_id, changes={"status": "rejected", "decided_by": by_launch, "decided_ts": now()})
     for member_id in members:

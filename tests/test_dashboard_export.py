@@ -46,6 +46,8 @@ def test_export_snapshot_is_self_contained_and_embeds_panels(program_root, platf
     for name in dashboard_export._INLINE_SCRIPTS:
         assert dashboard_export._script_src_tag(name) not in html
     assert "TEConsole" in html  # console_render.js's own global, inlined verbatim
+    assert "TEFeed" in html     # feed_render.js's, likewise -- the threaded
+                                # stream has to render out of the bundle too
 
     # the static snapshot still carries the new HALIDE shell -- the rail,
     # every panel's data-panel hook, and the ext-panel injection points --
@@ -73,10 +75,23 @@ def test_export_snapshot_is_self_contained_and_embeds_panels(program_root, platf
     assert payload["meta"]["snapshot"] is True
     assert set(payload["panels"]) == {
         "session", "budget", "jobs", "gates", "corpus", "doctor",
-        "feed", "rooms", "determinations", "dossier", "lexicon", "course", "since_you_left",
+        "feed", "rooms", "determinations", "dossier", "evidence", "lexicon", "course",
+        "since_you_left",
     }
     assert payload["panels"]["session"]["open_session"]["session_id"] == ids["session"]
     assert payload["panels"]["doctor"]["status"] == "never_run"  # run_doctor=False (default)
+
+    # Sweep test 33: the Console's timeline is a SERVER derivation, so the
+    # snapshot carries it like any other reading. Were it computed on the page
+    # from rows the bundle does not hold, THIS SESSION END TO END would be the
+    # one card that renders live and blank offline.
+    timeline = payload["panels"]["session"]["open_session"]["timeline"]
+    assert timeline is not None
+    assert timeline["window"]["start_ts"]
+    assert any(s["kind"] == "launch" for s in timeline["spans"])
+    # ...and the JOBS card's decoded columns, for the same reason.
+    assert "offload" in payload["panels"]["jobs"]
+    assert "subject" in payload["panels"]["jobs"]["recent_jobs"][0]
 
 
 def test_export_snapshot_run_doctor_populates_doctor_panel(program_root, platform_root, tmp_path):
@@ -146,10 +161,40 @@ def test_export_snapshot_has_no_write_token_and_every_write_button_disabled(prog
     # content="..." attribute at all.
     assert re.search(r'<meta\s+name="dashboard-write-token"\s+content="[0-9a-f]+">', html) is None
 
-    for data_role in ("feed-transmit-btn", "room-turn-btn"):
+    for data_role in (
+        "feed-transmit-btn",
+        "room-turn-btn",
+        # C7: + NEW THREAD. Both halves -- the TOGGLE as well as the submit,
+        # because a form that opens and then refuses is worse than one that
+        # says up front it cannot be used here.
+        "feed-new-thread-toggle",
+        "feed-new-thread-btn",
+    ):
         m = re.search(rf'<[^>]*data-role="{data_role}"[^>]*>', html)
         assert m is not None, f"missing markup for data-role={data_role!r}"
         assert "disabled" in m.group(0), f"data-role={data_role!r} is not disabled in the raw export markup"
+
+    # A control a RENDERER draws has no raw markup to inspect, so the guard
+    # has to be the renderer's own: feed_render.js disables every REPLY IN
+    # THREAD unless it is handed `writesEnabled`, and the page computes that
+    # from the write token this snapshot does not have. Pin the two halves --
+    # the reason text lives in the inlined file, and the page's only source
+    # for the flag is `writesEnabled()`.
+    assert "REPLY IN THREAD" in html
+    assert "static snapshots are read-only" in html
+    m = re.search(r"return TEFEED\.renderStream\(p, \{.*?\}\);", html, re.S)
+    assert m is not None, "the page no longer calls TEFEED.renderStream the way this test reads it"
+    assert re.search(r"writesEnabled:\s*writesEnabled\(\)", m.group(0)), \
+        "the reply controls' enabled state must come from writesEnabled(), which a snapshot makes false"
+
+    # The Determinations arms (prereg-reveal, gate-verify, gate-send-back, the
+    # three memory-keep buttons) are built by `el()` inside a detail pane a
+    # snapshot never opens, so no assertion HERE can reach them. Their half of
+    # this contract is
+    # tests/test_dashboard_client_resilience.py::
+    #   test_every_determination_button_takes_its_disabled_state_from_writesEnabled,
+    # which reads `buildDeterminationActions`' own source. Keep the two
+    # together: between them they cover every write control the page draws.
 
 
 def test_export_snapshot_embeds_extension_panels(program_root, platform_root, tmp_path):
