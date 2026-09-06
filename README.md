@@ -3,18 +3,21 @@
 [![CI](https://github.com/SentImperior666/TrialError/actions/workflows/ci.yml/badge.svg)](https://github.com/SentImperior666/TrialError/actions/workflows/ci.yml)
 
 TrialError is a research-operations harness for Claude Code. Iteration is the
-method: a long-running research system that churns through tasks in rounds,
-built for one researcher running long, multi-session AI-agent research
-programs: literature review, hypothesis testing, and structured write-ups
-over weeks or months, not a single afternoon chat.
+method: a long-running research system that works through a research program
+in rounds, where agents propose, other agents try to break what was proposed,
+and every claim, spend and decision leaves a record that can be re-derived
+later. It is built for one researcher running long, multi-session AI-agent
+research programs: literature review, ideation, hypothesis testing, and
+structured write-ups over weeks or months, not a single afternoon chat.
 
-Plain Claude Code gives you an agent loop. It does not give you a spend
-ledger that actually blocks an unbooked subagent spawn, a corpus where every
-quoted sentence resolves to a real page and license tier, a critique-gate
-workflow for artifacts, or a local dashboard to see what your agents have
-been doing while you were away. TrialError adds that layer on top of Claude Code
-without becoming a separate agent runtime itself: it is a CLI, two MCP
-servers, and a set of hooks that Claude Code drives.
+Plain Claude Code gives you an agent loop. It does not give you an ideation
+protocol whose novelty is measured rather than asserted, rooms where agents
+argue about ideas that belong to neither of them, pre-registration committed
+before any agent spawns, a spend ledger that actually blocks an unbooked
+subagent, or a corpus where every quoted sentence resolves to a real page and
+license tier. TrialError adds that layer on top of Claude Code without becoming
+a separate agent runtime itself: it is a CLI, two MCP servers, and a set of
+hooks that Claude Code drives.
 
 It targets a single operator working locally on Windows or Linux, with SQLite
 as the only storage engine and no required external services. Both platforms
@@ -24,33 +27,108 @@ run the full test suite in CI.
 
 TrialError is for a researcher who already uses Claude Code (or a similar
 coding-agent CLI) to run research work, and who has been burned by at least
-one of: an agent spawning more subagents than the budget allowed, a citation
-that turned out not to say what the summary claimed, or a week of work with
-no record of what actually happened. It is not a chatbot product, a hosted
-service, or a general-purpose RAG framework. If your research program is a
-single question answered in one sitting, a plain deep-research tool will
-serve you better and cost less setup time.
+one of: an ideation round that produced twenty paraphrases of the same idea,
+an agent spawning more subagents than the budget allowed, a citation that
+turned out not to say what the summary claimed, a decision nobody could
+reconstruct a month later, or a week of work with no record of what actually
+happened. It is not a chatbot product, a hosted service, or a general-purpose
+RAG framework. If your research program is a single question answered in one
+sitting, a plain deep-research tool will serve you better and cost less setup
+time.
 
-## What it does
+## Outstanding features
 
-- Budget-gated agent spawning: a `PreToolUse:Task` hook refuses an unbooked
-  subagent spawn with exit code 2, not a warning. The booking is consumed
-  atomically on spawn and a replayed token is refused.
-- A quote-anchored corpus: every ingested source is chunked, embedded, and
-  indexed with a citation anchor. A source's license tier is enforced at
-  the retrieval layer, not just recorded as metadata: a
-  `commercial_restricted` source returns no verbatim run over 20 words.
-- Critique gates: typed artifacts move through a state machine (submit,
-  review, verdict) with edit-union verification, so a fix in response to a
-  reviewer's finding is checked, not just claimed.
-- Deliberation rooms: moderated multi-agent convergence in an append-only
-  room document, with a fixed agreement bar and a freeze-and-escalate path
-  when agents do not converge.
-- A local, read-only dashboard: spend, jobs, gates, and corpus state,
-  served over Server-Sent Events on localhost, no external hosting.
-- Local semantic search over a public arXiv embeddings dataset (about 3.6
-  million papers, confirmed against the real download), queryable from
-  your own machine once you build the index.
+Ordered by how far each departs from what other agent tooling does. Everything
+here ships in this release unless it is marked *landing*; the landing pieces
+are the unchecked lines in the roadmap below, not hidden in the prose.
+
+**1. Ideation rounds whose novelty is measured, not claimed.** The AI Ideation
+Framework (AIIF) is TrialError's protocol for a round of idea generation. It
+does not ask agents to be creative. It engineers distance and constraint into
+what each agent sees: the corpus is stratified by embedding distance into near,
+moderate and far slices; every "lens" agent works alone on one slice under a
+constraint-bearing recipe card (start from a mismatch, transfer a mechanism by
+its relations, design against a known failure); a matched-budget CONTROL lens
+runs the plain brief so the protocol's effect is measured against something;
+and an assumption-buster seat holds the farthest slice with a stake in the
+outcome. Ideas are screened for novelty against named reference sets at a
+timestamp, mechanically first and then by judges who never see who wrote what;
+plants and inter-judge agreement validate the judges themselves; convergent
+discovery is logged, never punished. The design is published in
+`docs/AIIF_DESIGN.md` with its evidence lines and an honest list of what is
+not settled. Shipped today: the lens runtime (`trialerror lens roster /
+stratify / assign / log / export`), the tool-locked lens, verifier and critic
+agents, pre-registration and the rooms below. *Landing:* the mechanical novelty
+screen, arm-per-lens assignment, per-purpose model floors and the round's own
+acceptance suite.
+
+**2. Deliberation rooms with a fixed bar.** Two or three agents argue over
+decision points about an idea that belongs to neither of them: the runtime
+checks the posting launch against the idea's author launch and refuses the
+author's own seat. A decision point converges only above a fixed agreement
+bar; a room that does not converge is frozen and escalated to the operator
+rather than talked into agreement; the whole exchange is an append-only record
+exported as a document. The runtime never calls a model itself. The moderator's
+scoring is a judge callable that a real subagent fills at run time, so the
+judgment boundary is visible in code rather than buried in a prompt.
+
+**3. Blind pre-registration with escrow.** `trialerror prereg commit` hashes a
+procedure text and its parameters into escrow before any agent spawns.
+Generators and judges see only the public criteria. `prereg reveal` opens the
+escrow later and compliance is recomputed over exactly the committed bytes, so
+a threshold moved after the data came in is a recorded failure, not a
+footnote. The dashboard's reveal is a two-click confirm.
+
+**4. A rulings ledger the harness enforces.** Operator decisions and
+corrections are appended to a hash-chained ledger through a verb, never edited
+by hand. A session records the ledger pin it booted on, the doctor checks the
+chain and its digest in lockstep, and a session close is refused while the pin
+is stale or a launch is still dangling. Rules that only live in a prompt drift;
+these do not.
+
+**5. Spend that refuses.** A `PreToolUse` hook refuses an unbooked subagent
+spawn with exit code 2, not a warning. The booking is consumed atomically on
+spawn and a replayed token is refused. Pools are kept in billed units and
+calibrated from the plan's own usage feed; a booking that would cross the pool
+returns a deferral instead of running; a `[models]` table sets a minimum model
+class per purpose, so a round booked for a top-tier model cannot quietly run
+on a cheaper one; every launch is reconciled by id and shown with its cost.
+
+**6. A quote-anchored corpus with a license fence.** Every ingested source
+(PDF, EPUB, DjVu, Markdown, and web pages fetched through an allowlisted
+sidecar) is chunked, embedded and indexed with a citation anchor. A source's
+license tier is enforced at the retrieval layer, not just recorded as
+metadata: a `commercial_restricted` source returns no verbatim run over 20
+words. Keyword search runs on tantivy with FTS5 as the fallback; OCR and
+embedding jobs can be parked for a GPU machine (feature 9).
+
+**7. Critique gates with applier-verifies.** Typed artifacts move through a
+state machine (submit, review, verdict) with edit-union verification, so a fix
+in response to a reviewer's finding is checked, not just claimed. The critic
+is a read-only, tool-locked subagent that sees the artifact and the revealed
+pre-registration, never the generator's prompt.
+
+**8. An operator surface built for absence.** A local, read-only dashboard
+over Server-Sent Events: a Console with a session timeline, a jobs table with
+per-cell deltas, an Evidence panel that shows the neighbourhood of any claim, a
+DECIDE queue of decisions waiting for a human, and a threaded feed where each
+agent posts its full text under its own launch name rather than a summary
+written by the orchestrator. A plain-English translation of feed posts sits
+behind a fail-closed faithfulness gate (identifiers, numbers and hedges are
+always checked). The host deployment adds phone alerts when a containment
+check fails; those scripts are not part of this distribution.
+
+**9. Two-machine operation.** A CPU-only sandbox runs the program, its stores
+and the dashboard around the clock; a GPU workstation that is switched on and
+off picks up parked OCR and embedding jobs over a restricted channel and ships
+the results back (`trialerror offload worker / kick / reclaim`). The sandbox
+never needs the GPU host to be up, and the GPU host never needs write access to
+the program.
+
+**10. Local semantic search over the public arXiv embeddings dataset** (about
+3.6 million papers, confirmed against the real download), queryable from your
+own machine once you build the index, alongside OpenAlex, Semantic Scholar,
+arXiv and Unpaywall clients.
 
 ## How it compares
 
@@ -61,12 +139,14 @@ other side.
 
 | | TrialError | LangChain / LlamaIndex | AutoGen / CrewAI | paper-qa | gpt-researcher | Plain Claude Code |
 |---|---|---|---|---|---|---|
-| Subagent spend enforcement | A hook refuses an unbooked spawn (exit 2), verified live in this build's own acceptance run | No built-in spawn gate; cost callbacks log spend after the fact | Agent/turn counts are configurable, not enforced against a ledger | No multi-agent spawning to gate | Sub-queries run without a budget gate | Task spawns are ungated by default |
+| Ideation protocol | Pre-registered rounds: stratified slices, recipe cards, a matched-budget control seat, a novelty screen against named reference sets (design published; screen landing) | None | Agents brainstorm in free conversation; nothing is measured | Not an ideation tool | Not an ideation tool | None |
+| Deliberation protocol | A rooms runtime: neither-ownership enforced against launch ids, fixed agreement bar, freeze-and-escalate on non-convergence | None built in | Multi-agent conversation exists; no enforced agreement threshold | Single-perspective synthesis | Single-perspective report | None |
+| Pre-registration | Procedure and parameters hashed into escrow before spawn; compliance recomputed at reveal | None | None | None | None | None |
+| Subagent spend enforcement | A hook refuses an unbooked spawn (exit 2), verified live in this build's own acceptance run; model floors per purpose | No built-in spawn gate; cost callbacks log spend after the fact | Agent/turn counts are configurable, not enforced against a ledger | No multi-agent spawning to gate | Sub-queries run without a budget gate | Task spawns are ungated by default |
 | Citation grounding | Every result resolves to an anchor; a restricted source is capped at a 20-word verbatim quote, server-side | Chunks carry metadata; no license-tier fence on quote length | No retrieval layer of its own | Cites source and page, no license-tier fence | Cites live web URLs; no fixed corpus | No built-in citation system |
 | Storage | SQLite (WAL) only, four local stores, no external services | Usually needs a separate vector database | No built-in persistence layer | In-memory or pickle-based index | No persistent corpus; each run is largely disposable | No data layer |
-| Operator visibility | A local read-only dashboard over spend, jobs, gates, and corpus | Observability is a separate hosted product | Console and log output | None | A web UI for running reports, not for spend or gate oversight | None |
+| Operator visibility | A local read-only dashboard over spend, jobs, gates, evidence, decisions and corpus | Observability is a separate hosted product | Console and log output | None | A web UI for running reports, not for spend or gate oversight | None |
 | Runtime model | Not a runtime: a CLI plus two MCP servers and hooks that Claude Code drives | A framework you import and run inside your own agent loop | Owns its own multi-agent loop | A library with its own agentic loop | An agent with its own orchestration loop | The exoskeleton TrialError attaches to |
-| Deliberation protocol | A rooms runtime: fixed agreement bar, freeze-and-escalate on non-convergence | None built in | Multi-agent conversation exists; no enforced agreement threshold | Single-perspective synthesis | Single-perspective report | None |
 
 ## What it is not
 
@@ -77,8 +157,10 @@ through the normal ingest path, anchors and license tier included. What
 TrialError builds in is the scholarly layer: OpenAlex, Semantic Scholar, arXiv,
 and Unpaywall clients, plus a local semantic index over the full arXiv
 corpus. It does not manage API keys for you beyond reading a path you
-configure. If you want a framework that owns the whole agent loop for you,
-use AutoGen, CrewAI, or a LangChain agent instead.
+configure. It does not make agents creative by telling them to be; the
+ideation protocol changes what an agent is given and measures what comes back.
+If you want a framework that owns the whole agent loop for you, use AutoGen,
+CrewAI, or a LangChain agent instead.
 
 ## See it working first
 
@@ -179,12 +261,29 @@ session with a rendered handoff, read `docs/GETTING_STARTED.md`. For
 account setup, local model configuration, and the optional literature-API
 integrations, read `docs/USER_SETUP.md`. For the complete command
 reference and the enforcement model in full, read `docs/OPERATOR_GUIDE.md`.
+For the ideation protocol, read `docs/AIIF_DESIGN.md`.
 
 ## Roadmap to the next release
 
 Everything below is implementation work, listed so you know what is real today and
 what is still coming. Nothing already shipped depends on any of it.
 
+- [ ] The AIIF round in code: the mechanical novelty screen (`trialerror lens
+      screen --mechanical`), arm-per-lens assignment at roster level, model
+      floors enforced from the `[models]` table at booking time, room turn
+      kinds for the anti-hidden-profile order, and an `aiif_round` acceptance
+      suite. The design is published (`docs/AIIF_DESIGN.md`); its evidence
+      base, one line per source with the claim it supports and the mechanism
+      it binds, follows as `docs/AIIF_EVIDENCE_BASE.md`.
+- [ ] A daily sandbox audit: a deterministic, redacted digest of what agents did
+      in a window (tool calls, shell commands, file writes, sensitive reads,
+      network use, permission flags, hook refusals) and a portable skill that
+      carries the suspicion rubric, so a routine or a human can review a day of
+      autonomous work and be told only when something needs a look.
+- [ ] A dedicated term store for the lexicon, which is currently proxied from
+      extracted entities.
+- [ ] Ops polish: a retention doctor check, transactional event rows, idempotent
+      Phoenix start.
 - [x] Linux support and a Linux CI lane. CI now runs the full suite on
       `windows-latest` and `ubuntu-latest`; the plugin's Claude Code hooks go
       through the `trialerror` console script rather than a bare `python`,
@@ -208,10 +307,6 @@ what is still coming. Nothing already shipped depends on any of it.
       default keyword backend; FTS5 remains the fallback, `[retrieve]
       fulltext_backend` picks between them, and `trialerror ingest
       reindex-fulltext` builds the index an existing program needs.
-- [ ] A dedicated term store for the lexicon, which is currently proxied from
-      extracted entities.
-- [ ] Ops polish: a retention doctor check, transactional event rows, idempotent
-      Phoenix start.
 - [x] Operator alerting: a host-side detector that pushes a phone notification when
       a containment check fails (mass-deletion flag, mirror refusing to run,
       firewall self-test unverified, container restart loop, stale snapshot or
@@ -221,7 +316,7 @@ what is still coming. Nothing already shipped depends on any of it.
       alarm. It ships with the host deployment scripts, which are not part of this
       distribution.
 - [ ] Longer term: self-learning rule promotion, multimodal retrieval,
-      cross-machine operation.
+      cross-machine operation beyond the GPU offload channel.
 
 ## Acknowledgments
 
@@ -270,7 +365,9 @@ where a specific piece of this codebase actually traces back to it:
 Licenses are respected as stated above; where this list says a project was
 "ported" or "vendored" the code was adopted with attribution (see
 `vendored/VENDORED.md`), everywhere else a design or algorithm was read and
-reimplemented rather than copied.
+reimplemented rather than copied. The ideation protocol's principles trace to
+the creativity-science and LLM-ideation literature that its evidence base
+will list source by source.
 
 ## License
 
