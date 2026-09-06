@@ -65,6 +65,13 @@ _EXTENSION_MEDIA_TYPE = {
     ".jpeg": "image",
     ".tif": "image",
     ".tiff": "image",
+    # DjVu ("djvu", trialerror.ingest.normalize_djvu): NOT in
+    # MEDIA_TYPES_DIRECT/MEDIA_TYPES_NEEDING_OCR -- it is a third route
+    # (its own 'djvu' job stage converts to PDF, then re-dispatches into
+    # normalize/ocr, see that module's docstring), so it deliberately has
+    # no entry in _DIRECT_DISPATCH below.
+    ".djvu": "djvu",
+    ".djv": "djvu",
 }
 
 #: Below this average extracted characters/page, a ".pdf" is treated as

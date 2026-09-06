@@ -19,6 +19,11 @@ __all__ = [
     "CandidateNotFoundError",
     "CandidateNotPendingError",
     "UnresolvedEntityReferenceError",
+    "DjVuToolMissingError",
+    "DjVuConversionError",
+    "DjVuOutputTooLargeError",
+    "DjVuResumeMediaTypeError",
+    "InvalidNormalizerOverrideError",
 ]
 
 
@@ -101,3 +106,56 @@ class UnresolvedEntityReferenceError(ExtractError):
     ``entity`` row yet at accept time -- the referenced entity candidate(s)
     must be accepted first (never auto-resolved/auto-created here, same
     "never silent auto-merge" posture)."""
+
+
+# ---------------------------------------------------------------------------
+# trialerror.ingest.normalize_djvu (DjVu ingest normalizer)
+# ---------------------------------------------------------------------------
+
+
+class DjVuToolMissingError(IngestError):
+    """Neither ``shutil.which`` nor a ``[ingest.djvu]`` ``trialerror.toml``
+    override could find the DjVuLibre executable (``ddjvu`` or ``djvutxt``)
+    the ``djvu`` job stage needs. Raised, never a bare traceback --
+    :func:`trialerror.jobs.worker.run_one` settles this the same way any
+    other handler exception settles: ``failure_class='logic'``, the job row
+    carries the message, the worker process itself never crashes."""
+
+
+class DjVuConversionError(IngestError):
+    """``ddjvu``/``djvutxt`` exited non-zero, or ``ddjvu`` produced no PDF
+    at the expected path. The message carries the head of the tool's own
+    stderr (design: "named error with ddjvu's stderr head") so the failed
+    ``job.last_error`` is actionable without re-running anything."""
+
+
+class DjVuOutputTooLargeError(IngestError):
+    """The PDF ``ddjvu`` produced from a ``.djvu``/``.djv`` source exceeds
+    the configured size cap (``[ingest.djvu] max_pdf_bytes``, default
+    :data:`trialerror.ingest.normalize_djvu.DEFAULT_DJVU_MAX_PDF_BYTES`) --
+    refused rather than handed into the normalize/OCR route, mirroring
+    :mod:`trialerror.webfetch.handlers`'s own ``_REPO_MAX_PDF_BYTES`` cap on a
+    fetched PDF."""
+
+
+class DjVuResumeMediaTypeError(IngestError):
+    """Fix pass (VERIFY_ingest-djvu.md F6): a resumed ``djvu`` job
+    (``run_djvu``'s "already converted" branch -- ``document.media_type``
+    is no longer ``'djvu'``) found a ``media_type`` the conversion could
+    never have produced. Only ``'pdf-text'``/``'pdf-scan'`` are valid
+    there; anything else means this document never actually went through
+    the ``djvu`` stage (a hand-crafted ``requeue_stage``/CLI payload
+    pointing it at the wrong document, or a row rewritten by something
+    else since). Misuse-only -- not reachable from the shipped CLI -- but
+    named rather than silently guessing ``ocr`` for an unrelated document."""
+
+
+class InvalidNormalizerOverrideError(IngestError):
+    """Fix pass (VERIFY_ingest-djvu.md F11): ``payload['normalizer_id_override']``
+    on a ``normalize``/``ocr`` job did not match the small allowlist of
+    normalizer ids this codebase actually produces. Before the DjVu lane,
+    ``document.normalizer_id`` could only ever hold the generic
+    ``trialerror.ingest.normalizers`` constants; the override plumbing added
+    for ``djvu-ddjvu`` must not become a way for an arbitrary hand-written
+    job payload (``trialerror jobs start-worker --payload '{...}'``) to
+    stamp free text onto a first-class provenance column."""

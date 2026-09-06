@@ -17,6 +17,7 @@ from trialerror.ingest.errors import (
     PathOutOfTreeError,
     SourceNotFoundError,
 )
+from trialerror.ingest.normalize_djvu import DJVU_STAGE, MEDIA_TYPE_DJVU
 from trialerror.ingest.normalizers import (
     MEDIA_TYPES_DIRECT,
     MEDIA_TYPES_NEEDING_OCR,
@@ -86,7 +87,13 @@ COST_GATE_PAGE_THRESHOLD = 50
 #: ``"chunk"`` verbatim) via that same function's already-generic
 #: ``handler_name = claimed["kind"]`` path -- both spellings resolve to the
 #: same handler, proven in ``tests/test_ingest_pipeline.py``.
-_CUSTOM_STAGE_KINDS: frozenset[str] = frozenset()
+#:
+#: ``trialerror.ingest.normalize_djvu``'s ``'djvu'`` stage is the extension
+#: point's first actual tenant: a GENUINE custom stage (it converts a
+#: ``.djvu``/``.djv`` source to PDF, then re-dispatches into ``normalize``/
+#: ``ocr`` -- it will never itself become a first-class ``job.kind`` value,
+#: unlike ``normalize``/``chunk`` above which outgrew ``'custom'`` and did).
+_CUSTOM_STAGE_KINDS: frozenset[str] = frozenset({DJVU_STAGE})
 
 
 def stage_job_kind_and_payload(stage: str, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -333,7 +340,12 @@ def add_document(
         },
     )
 
-    if resolved_media_type in MEDIA_TYPES_NEEDING_OCR:
+    if resolved_media_type == MEDIA_TYPE_DJVU:
+        # trialerror.ingest.normalize_djvu: neither a direct format nor an
+        # OCR-needing one -- its own 'djvu' stage converts to PDF first,
+        # then re-enqueues 'normalize'/'ocr' for the derived PDF itself.
+        stage = DJVU_STAGE
+    elif resolved_media_type in MEDIA_TYPES_NEEDING_OCR:
         stage = "ocr"
     elif resolved_media_type in MEDIA_TYPES_DIRECT:
         stage = "normalize"

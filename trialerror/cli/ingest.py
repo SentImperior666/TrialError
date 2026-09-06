@@ -62,7 +62,7 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     p_add.add_argument("--source-id", required=True, dest="source_id")
     p_add.add_argument("--path", required=True, help="raw file path (must resolve under a configured ingest root)")
     p_add.add_argument("--media-type", default=None, dest="media_type",
-                        help="override media-type detection (pdf-text|pdf-scan|html|epub|md|image)")
+                        help="override media-type detection (pdf-text|pdf-scan|html|epub|md|image|djvu)")
     p_add.add_argument("--launch-id", required=True, dest="launch_id")
     p_add.add_argument("--yes", action="store_true", help="proceed past the cost gate")
     p_add.set_defaults(handler=_cmd_add)

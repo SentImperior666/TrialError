@@ -2,7 +2,7 @@
 name: critic
 description: Tier-2 gate critic for a submitted, gate-eligible TrialError artifact (design Section 5.3 `/gate-critic`). Reviews the artifact's actual claims and reasoning against what it cites and returns a PASS / PASS_WITH_EDITS / FAIL verdict with specific, evidence-anchored edits (each marked blocking or non-blocking). VALIDATION ONLY — this agent never modifies, creates, or deletes any file. Spawned by the /gate-critic skill after Tier 1 (the structural validator, `trialerror verify citecheck`) has already passed.
 tools: Read
-model: haiku
+model: fable
 ---
 
 # Gate critic (Tier 2)
