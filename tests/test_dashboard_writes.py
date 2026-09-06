@@ -352,3 +352,106 @@ def test_feed_post_missing_field(program_root, platform_root):
     assert result["ok"] is False
     assert result["status"] == "missing_fields"
     assert "body" in result["message"]
+
+
+# ---------------------------------------------------------------------------
+# W3 -- field-type validation (M-WA-1 / M-WA-2, sweep §5 promoted to batch W3)
+#
+# `_missing_fields` only ever asked "is this absent or blank". A JSON object
+# in a string field is neither, so it passed, reached sqlite as a `dict`, and
+# died there with `sqlite3.ProgrammingError` -- an exception nothing caught,
+# so the HTTP layer answered with a closed socket. A JSON NUMBER in the same
+# field was worse: sqlite binds it happily, so `verified_note` / `reason`
+# quietly stored a value that was never text. `_validate_fields` closes both
+# with one table.
+# ---------------------------------------------------------------------------
+
+
+def test_a_json_object_in_a_string_field_is_a_named_bad_request(program_root, platform_root, seeded):
+    result = _dispatch(program_root, platform_root, "feed-post", {
+        "thread_id": seeded["thread"], "body": {"x": 1},
+    })
+    assert result["ok"] is False
+    assert result["status"] == "bad_request"
+    assert "body must be a string, got dict" in result["message"]
+
+
+def test_a_number_in_a_text_column_field_is_refused_not_silently_stored(program_root, platform_root, seeded):
+    """M-WA-2: `verified_note` is a text column; before the type table a
+    JSON number landed in it and nothing said so."""
+    result = _dispatch(program_root, platform_root, "verify-edit", {
+        "gate_id": "CR-001", "edit_id": "EDIT-x", "by_launch": seeded["launch"], "verified_note": 42,
+    })
+    assert result["ok"] is False
+    assert result["status"] == "bad_request"
+    assert "verified_note must be a string, got int" in result["message"]
+
+
+def test_a_bad_type_never_opens_a_store(program_root, platform_root, monkeypatch):
+    """Same discipline the missing-field check has always had: a client bug
+    gets no write connection."""
+
+    def _boom(*_a, **_k):
+        raise AssertionError("open_store must not be called for a bad-type refusal")
+
+    monkeypatch.setattr(writes, "open_store", _boom)
+    result = _dispatch(program_root, platform_root, "feed-post", {"thread_id": "T", "body": ["a", "list"]})
+    assert result["status"] == "bad_request"
+
+
+def test_missing_fields_is_reported_before_bad_types(program_root, platform_root):
+    """One refusal at a time, and the more basic one first -- a caller
+    that omitted a field should be told that, not handed a type lecture
+    about a different field."""
+    result = _dispatch(program_root, platform_root, "feed-post", {"body": {"x": 1}})
+    assert result["status"] == "missing_fields"
+    assert "thread_id" in result["message"]
+
+
+def test_agreement_pct_accepts_a_json_number_and_a_numeric_string(program_root, platform_root, seeded):
+    """The one non-string field in the table. Both shapes a real caller
+    produces -- a JSON number, and the string an `<input type="number">`
+    hands back -- must pass the type gate; whether the ACTION then succeeds
+    is the room state machine's business, not this check's."""
+    for value in (91.5, "91.5"):
+        result = _dispatch(program_root, platform_root, "room-score", {
+            "room_id": "ROOM-nope", "dp_id": "DP1", "agreement_pct": value, "by_launch": seeded["launch"],
+        })
+        assert result["status"] != "bad_request", f"{value!r} should pass the type gate"
+
+
+def test_agreement_pct_refuses_a_boolean(program_root, platform_root, seeded):
+    """`True` is an `int` in Python and would score a discussion point at
+    1%."""
+    result = _dispatch(program_root, platform_root, "room-score", {
+        "room_id": "ROOM-x", "dp_id": "DP1", "agreement_pct": True, "by_launch": seeded["launch"],
+    })
+    assert result["status"] == "bad_request"
+    assert "agreement_pct must be a int/float/str, got bool" in result["message"]
+
+
+def test_verify_errors_are_clean_refusals_not_server_faults(program_root, platform_root):
+    """`_EXPECTED_ERRORS` gains `trialerror.verify.errors.VerifyError` (spec
+    §4). A tampered pre-registration escrow is a FINDING the operator must
+    read, and it would otherwise reach the HTTP layer as a 500 with the
+    message buried in a server log."""
+    from trialerror.verify.errors import PreregTamperedError, VerifyError
+
+    assert issubclass(PreregTamperedError, VerifyError)
+    assert any(issubclass(VerifyError, expected) or expected is VerifyError for expected in writes._EXPECTED_ERRORS)
+
+    def _raiser(_store, _body):
+        raise PreregTamperedError("escrow hash does not match the sealed procedure")
+
+    original = writes.WRITABLE_ACTIONS.get("__verify_probe__")
+    writes.WRITABLE_ACTIONS["__verify_probe__"] = _raiser
+    try:
+        result = _dispatch(program_root, platform_root, "__verify_probe__", {})
+    finally:
+        if original is None:
+            del writes.WRITABLE_ACTIONS["__verify_probe__"]
+        else:  # pragma: no cover - defensive
+            writes.WRITABLE_ACTIONS["__verify_probe__"] = original
+    assert result["ok"] is False
+    assert result["status"] == "PreregTamperedError"
+    assert result["message"] == "escrow hash does not match the sealed procedure"

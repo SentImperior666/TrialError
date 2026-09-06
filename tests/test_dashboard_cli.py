@@ -110,3 +110,34 @@ def test_dashboard_serve_detached_spawn_returns_pid_and_url(program_root, platfo
                 os.kill(pid, signal.SIGTERM)
             except OSError:
                 pass  # already exited -- nothing to clean up
+
+
+def test_dashboard_serve_refuses_a_port_that_is_already_served(program_root, platform_root, tmp_path, capsys):
+    """M-LU-4: two dashboards on one port is not a harmless duplicate -- each
+    serve process mints its own write token, so the page one server handed
+    out has every write 403'd by the other, and the two watchers broadcast
+    onto SSE streams clients are assigned to nondeterministically. The CLI
+    must refuse up front, with the URL of the server that IS there, rather
+    than detach a child that dies into a log file nobody reads."""
+    store = open_store(program_root, platform_root=platform_root)
+    populate_one_of_everything(store)
+    store.close()
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    try:
+        rc, env = _run(
+            [
+                "dashboard", "serve", *_common_args(program_root, platform_root),
+                "--port", str(port), "--log-dir", str(tmp_path / "logs"),
+            ],
+            capsys,
+        )
+        assert rc == 1
+        assert env["ok"] is False
+        assert env["error"]["code"] == "port_already_served"
+        assert str(port) in env["error"]["message"]
+    finally:
+        listener.close()

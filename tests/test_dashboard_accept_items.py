@@ -21,6 +21,11 @@ def test_live_dom_dashboard_serve_real_browser():
     ...
 
 
+@pytest.mark.skip(reason=DASHBOARD_LIVE_ITEMS["live_dom_client_resilience"])
+def test_live_dom_client_resilience():
+    ...
+
+
 def test_every_dashboard_live_item_has_exactly_one_skip_marked_test():
     """Guards the enumeration itself -- same structural check
     ``test_gpu_and_live_cc_journeys.py::

@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -104,9 +105,36 @@ def _resolve_platform_root(args: argparse.Namespace) -> Path | None:
     return Path(given) if given else None
 
 
+def _port_is_served(host: str, port: int, *, timeout_s: float = 0.4) -> bool:
+    """``True`` when something already accepts connections on ``host:port``.
+
+    M-LU-4: a second dashboard on an already-served port is not a harmless
+    duplicate -- each serve process mints its OWN write token, so the page
+    one of them served can have every write refused with a 403 by the other,
+    and the two watchers broadcast onto SSE streams that clients get
+    assigned to nondeterministically. ``trialerror.dashboard.serve``'s socket
+    now refuses the bind (SO_EXCLUSIVEADDRUSE on Windows); this check
+    catches it one layer earlier, where the CLI can return an envelope
+    naming the URL instead of a detached child that dies into a log file
+    nobody reads."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
+
+
 def _cmd_serve(args: argparse.Namespace) -> dict[str, Any]:
     program_root = _resolve_program_root(args)
     platform_root = _resolve_platform_root(args)
+
+    if _port_is_served(args.host, args.port):
+        return error_envelope(
+            "dashboard serve",
+            "port_already_served",
+            f"something is already listening on {args.host}:{args.port} -- "
+            f"open http://{args.host}:{args.port}/ , or pass a different --port",
+        )
 
     if args.foreground:
         argv = [

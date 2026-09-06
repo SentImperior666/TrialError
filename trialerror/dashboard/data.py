@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import traceback
 from datetime import timedelta
 from typing import Any, Sequence
 
@@ -88,8 +89,32 @@ __all__ = [
     "run_search",
     "MAX_SEARCH_K",
     "build_all_panels",
+    "isolated_panel",
     "PANEL_BUILDERS",
 ]
+
+
+def _decode_json_text(value: Any) -> Any:
+    """A JSON-text column, decoded for the wire -- or handed back exactly
+    as stored when it is not JSON after all (sweep §3.10 item 1's rule:
+    "unparseable text stays a string").
+
+    A panel payload is read by three consumers -- the live page, the static
+    export bundle, and the tests -- and every one of them had to know,
+    per field, whether a value was already an object or still a string
+    needing ``JSON.parse``. That is a convention, and conventions drift.
+    Decoding here makes the shape a property of the builder instead. The
+    non-JSON fallback matters: a column holding a plain note must survive
+    this untouched, not become ``None``."""
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped:
+        return value
+    try:
+        return json.loads(stripped)
+    except (TypeError, ValueError):
+        return value
 
 
 def _group_count(conn: sqlite3.Connection, table: str, column: str) -> dict[str, int]:
@@ -148,6 +173,16 @@ def _iso(dt: Any) -> str:
 def build_session_panel(rostore: RoStore) -> dict[str, Any]:
     if not rostore.is_available("ops"):
         return {"status": "not_initialized", "message": "ops.db not found"}
+    if not rostore.is_available("platform"):
+        # M-LU-2's live case: close-readiness and the active-launch count
+        # come out of platform.db (trialerror.sessions.lifecycle's
+        # _launches_for_session reaches straight for store.platform), so a
+        # program pointed at a platform root that was never initialized
+        # crashed this builder -- and, through the bundle, /dashboard/api/all
+        # with it. An "error" reading names the missing file instead. This
+        # is NOT "not_initialized": ops.db exists, so the program IS real;
+        # what is missing is the platform store the session hangs off.
+        return {"status": "error", "message": "platform.db not found"}
 
     try:
         status = session_status(rostore, session_id=None)
@@ -307,7 +342,20 @@ def build_gates_panel(rostore: RoStore) -> dict[str, Any]:
         "WHERE g.edits IS NOT NULL AND g.edits != '' AND g.edits != '[]' "
         "AND g.state NOT IN ('union_applied', 'registered')"
     ).fetchall()
-    pending_edits = [dict(r) for r in pending_edit_rows]
+    # Sweep §3.10 item 3, pulled forward by spec §5.1: `edits` reaches the
+    # client DECODED. It was the last panel field that made every renderer
+    # (and every test) call JSON.parse on a value the server had just
+    # serialized -- a shape the export bundle and the live route had to
+    # agree on by convention rather than by construction. `unverified_count`
+    # comes with it: the number the Console's GATES card and the rail badge
+    # both want is a property of the array, computed once, here.
+    pending_edits = []
+    for row in pending_edit_rows:
+        entry = dict(row)
+        entry["edits"] = _decode_json_text(entry.get("edits"))
+        decoded = entry["edits"] if isinstance(entry["edits"], list) else []
+        entry["unverified_count"] = sum(1 for e in decoded if isinstance(e, dict) and not e.get("verified"))
+        pending_edits.append(entry)
 
     recent_transitions = [
         dict(r)
@@ -1544,10 +1592,33 @@ PANEL_BUILDERS = {
 }
 
 
+def isolated_panel(name: str, builder: Any, rostore: RoStore, **kwargs: Any) -> dict[str, Any]:
+    """One builder call, fenced (M-LU-2).
+
+    A builder that raises is that panel's own error and nothing else's:
+    the caller gets ``{"status": "error", "message": "<ExcType>: <msg>",
+    "panel": <name>}`` -- the same "visible, not refused" shape every other
+    non-``ok`` panel status already uses -- and the traceback goes to
+    stderr, where the serve log keeps it.
+
+    Before this, one raising builder took ``/dashboard/api/all`` down with a
+    500 while the same panel's own route still answered 200 (live case: a
+    program whose ``platform.db`` does not exist, ``build_session_panel``
+    reaching through ``session_status`` into a ``None`` connection). A page
+    whose only bulk-load route 500s renders nothing at all -- and the
+    client's retry loop then spins against a crash that will never clear."""
+    try:
+        return builder(rostore, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - one panel's failure is not the page's
+        traceback.print_exc()
+        return {"status": "error", "message": f"{type(exc).__name__}: {exc}", "panel": name}
+
+
 def build_all_panels(rostore: RoStore, *, doctor_state: dict[str, Any] | None = None) -> dict[str, Any]:
     """Every panel in one dict -- what ``trialerror dashboard export`` embeds
     into its static snapshot, and what a fresh live-page load can fetch in
-    one request rather than six."""
-    panels = {name: builder(rostore) for name, builder in PANEL_BUILDERS.items()}
+    one request rather than six. Each builder is fenced by
+    :func:`isolated_panel`, so this dict always has every key."""
+    panels = {name: isolated_panel(name, builder, rostore) for name, builder in PANEL_BUILDERS.items()}
     panels["doctor"] = build_doctor_panel(doctor_state)
     return panels

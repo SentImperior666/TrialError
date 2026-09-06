@@ -114,7 +114,16 @@
       <span class="topbar-goal" data-role="topbar-goal"></span>
       <span class="topbar-fill"></span>
       <span class="topbar-field" data-role="topbar-session">&mdash;</span>
-      <span class="topbar-field" data-role="topbar-mode" data-state="static">static</span>
+      <!-- M-LU-7: the chip says whether the SOCKET is up; it never said how
+           old the numbers under it are. `AS OF` is meta.generated_ts of the
+           newest bundle this page holds -- the one figure that separates
+           "quiet program" from "this page stopped being fed". -->
+      <span class="topbar-field topbar-asof" data-role="topbar-asof">&mdash;</span>
+      <!-- VA-3 / LU-8: three states, one hue each, `data-state` set on EVERY
+           path that touches this element (the finding's own proposed CSS fix
+           would never have matched, because the error path never set it),
+           and announced politely rather than changing silently. -->
+      <span class="topbar-field" data-role="topbar-mode" data-state="static" aria-live="polite">static</span>
     </header>
 
     <main class="content" data-role="content">
@@ -174,9 +183,9 @@
                 <option value="auto">AUTO</option>
                 <option value="hybrid">HYBRID</option>
                 <option value="fts">FTS</option>
-                <option value="vector">VECTOR</option>
+                <option value="vector" disabled title="scans the whole corpus &mdash; pick a LICENSE TIER facet first">VECTOR (needs a facet)</option>
                 <option value="graph">GRAPH</option>
-                <option value="summary">SUMMARY</option>
+                <option value="summary" disabled title="scans the whole corpus &mdash; pick a LICENSE TIER facet first">SUMMARY (needs a facet)</option>
               </select>
             </div>
           </form>
@@ -331,12 +340,29 @@
           <span class="t">THE MACHINE</span>
           <span class="m">everything the old landing page used to be, on one screen you open on purpose</span>
           <span class="fill"></span>
+          <span class="console-health-tally" data-role="console-health-tally" data-health="ok">&mdash;</span>
+          <span class="console-asof" data-role="console-asof">&mdash;</span>
           <span class="m">LOOPBACK ONLY, NO AUTHENTICATION</span>
           <button type="button" class="btn btn--secondary is-hidden" data-role="doctor-run-btn">RUN THE CHECK SWEEP</button>
         </div>
+        <!--
+          The eight card containers of TEConsole.CARD_ORDER (console_render.js).
+          A card whose renderer is registered there is painted by it; the rest
+          keep the generic renderer, which is what makes the Console renderer
+          landable one card at a time instead of in one 2,000-line commit.
+
+          LAUNCH LEDGER and THIS SESSION, END TO END have no generic form at
+          all -- they are new readings, not a re-draw of an existing panel --
+          so their cards stay `is-hidden` until a renderer for them exists and
+          renderConsoleFromBundle unhides them. The hooks are in the served
+          markup either way, which is this page's rule: every container a
+          renderer writes into is real HTML a string test can find.
+        -->
         <div class="console-grid" data-role="console-grid">
           <div class="card" id="console-card-session"><div class="card-header"><span class="title">SESSION</span></div><div class="card-body" data-role="console-body-session"><div class="panel-loading">loading&hellip;</div></div></div>
-          <div class="card" id="console-card-budget"><div class="card-header"><span class="title">BUDGET / POOLS</span></div><div class="card-body" data-role="console-body-budget"><div class="panel-loading">loading&hellip;</div></div></div>
+          <div class="card" id="console-card-pools"><div class="card-header"><span class="title">BUDGET / POOLS</span></div><div class="card-body" data-role="console-body-pools"><div class="panel-loading">loading&hellip;</div></div></div>
+          <div class="card is-hidden" id="console-card-ledger"><div class="card-header"><span class="title">LAUNCH LEDGER</span></div><div class="card-body" data-role="console-body-ledger"></div></div>
+          <div class="card is-hidden" id="console-card-timeline"><div class="card-header"><span class="title">THIS SESSION, END TO END</span></div><div class="card-body" data-role="console-body-timeline"></div></div>
           <div class="card" id="console-card-jobs"><div class="card-header"><span class="title">JOBS</span></div><div class="card-body" data-role="console-body-jobs"><div class="panel-loading">loading&hellip;</div></div></div>
           <div class="card" id="console-card-gates"><div class="card-header"><span class="title">GATES</span></div><div class="card-body" data-role="console-body-gates"><div class="panel-loading">loading&hellip;</div></div></div>
           <div class="card" id="console-card-corpus"><div class="card-header"><span class="title">CORPUS / DIAGNOSTICS</span></div><div class="card-body" data-role="console-body-corpus"><div class="panel-loading">loading&hellip;</div></div></div>
@@ -350,6 +376,19 @@
 </div>
 
 <div id="peek-root" aria-live="polite"></div>
+
+<!--
+  Per-surface renderers, each in its own file (house rule: parallel builds must
+  not edit one hunk of the inline script below). Every one of them is written
+  against an injected element helper rather than `document`, so the same file
+  runs under Node against tests/_dom_shim.js. They must load BEFORE the inline
+  script, which reads window.TEConsole at start-up.
+
+  `trialerror dashboard export` inlines each of these into the snapshot
+  (export.py's _INLINE_SCRIPTS): a single portable file has no siblings to
+  fetch, and the exported page must render identically over file://.
+-->
+<script src="console_render.js"></script>
 
 <script>
 (function () {
@@ -384,6 +423,12 @@
     errorCount: 0,
     eventSource: null,
     loadedOnce: {},            // panel name -> true once fetched at least once
+    // ---- connection / freshness (batch C2) ----
+    connState: "static",       // "live" | "reconnecting" | "static" -- the chip's data-state
+    hadHello: false,           // LU-2: a SECOND `hello` means the stream was re-established
+    booted: false,             // first successful bundle has been rendered
+    pollTimer: null,           // LU-8: 30s polling fallback while the stream is down
+    bootRetryTimer: null,      // LU-3: backoff retry of the boot fetch
     // per-surface selection state
     feedThreadId: null,
     feedSideBySide: true,      // PLAIN ENGLISH column on/off (AISPEAK design 4.4)
@@ -398,6 +443,10 @@
     determItemsFlat: [],
     searchK: 12,
     searchLicenseExclude: {},
+    // P-2: every tier this query has EVER returned, so an excluded tier
+    // stays in the facet list (and stays clickable) after the server
+    // filter removes it from the results. Reset when the question changes.
+    searchTiersSeen: {},
     sinceSeenIds: null,        // Set, populated after first render
     homeLoadedOnce: false
   };
@@ -429,6 +478,16 @@
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
   function show(node) { node.classList.remove("is-hidden"); }
   function hide(node) { node.classList.add("is-hidden"); }
+
+  /* The Console's renderers live in console_render.js (loaded above) and are
+     written against `el` rather than `document` -- injecting it here is the
+     whole coupling between the two files, and it is also what lets the Node
+     DOM shim run the same code in tests. `null` if the file failed to load,
+     which the generic renderer below survives (a missing script must not take
+     the page down). */
+  var TECONSOLE = (typeof window !== "undefined" && window.TEConsole && typeof window.TEConsole.create === "function")
+    ? window.TEConsole.create({ h: el })
+    : null;
 
   function fmtHM(iso) {
     if (!iso) return "—";
@@ -608,10 +667,41 @@
   /* ==========================================================================
      3. DATA LAYER -- static (embedded snapshot) or live (fetch + SSE)
      ========================================================================== */
+
+  /* M-AC-1: a static snapshot bakes exactly ONE selection per selectable
+     surface (`trialerror dashboard export` calls each builder with no query
+     params, so `active_room_id` and friends are the builder's own default).
+     The static branch of fetchPanel used to ignore the requested id and
+     hand back the baked panel, so clicking room B rendered room A's
+     transcript under room B's highlight -- the one failure mode a snapshot
+     must never have, because there is no server to correct it. Say what the
+     bundle actually holds instead, and leave the selection state alone. */
+  var STATIC_SELECTION_KEYS = {
+    feed: ["thread_id", "active_thread_id"],
+    rooms: ["room_id", "active_room_id"],
+    dossier: ["artifact_id", "active_artifact_id"]
+  };
+
+  function staticSelectionMismatch(name, panel, params) {
+    var spec = STATIC_SELECTION_KEYS[name];
+    if (!spec || !params || !panel) return null;
+    var requested = params[spec[0]];
+    if (requested === null || requested === undefined || requested === "") return null;
+    var baked = panel[spec[1]];
+    if (!baked || String(baked) === String(requested)) return null;
+    return {
+      status: "static_selection_unavailable",
+      message: "This snapshot holds only " + baked + " for this surface; " + requested +
+        " is not in the bundle, and an offline page cannot fetch it. " +
+        "Run `trialerror dashboard serve` to browse the rest."
+    };
+  }
+
   function fetchPanel(name, params) {
     if (state.mode === "static") {
       var p = (state.staticPayload.panels || {})[name];
-      return Promise.resolve(p === undefined ? { status: "not_initialized", message: "not present in this snapshot" } : p);
+      if (p === undefined) return Promise.resolve({ status: "not_initialized", message: "not present in this snapshot" });
+      return Promise.resolve(staticSelectionMismatch(name, p, params) || p);
     }
     var qs2 = "";
     if (params) {
@@ -654,6 +744,58 @@
     return fetch("/dashboard/api/search?" + pairs.join("&"), { cache: "no-store" }).then(function (r) { return r.json(); });
   }
 
+  /* --------------------------------------------------------------------
+     3a. ONE FETCH-ERROR SURFACE (LU-5, LU-6, M-AC-3, M-P-3)
+
+     Before this, the whole page held four `.catch` sites, three of them
+     empty: a panel whose fetch rejected simply kept showing whatever was
+     on screen -- often "loading…" forever -- while the topbar still said
+     "live". Every loader now routes through `guardPanelLoad`, which paints
+     a warn callout with a RETRY control into the panel that failed and
+     clears it again on the next success. Nothing in this file may swallow
+     a rejection: if a surface cannot be repainted, it says so where the
+     operator is looking, and the console keeps the stack.
+     -------------------------------------------------------------------- */
+  function panelSection(panelName) {
+    return qs('.panel[data-panel="' + panelName + '"]');
+  }
+
+  function clearPanelFetchError(panelName) {
+    var section = panelSection(panelName);
+    if (!section) return;
+    qsa('[data-role="panel-fetch-error"]', section).forEach(function (n) { n.parentNode.removeChild(n); });
+  }
+
+  function showPanelFetchError(panelName, err, retryFn) {
+    console.error("dashboard: " + panelName + " failed to load", err);
+    var section = panelSection(panelName);
+    if (!section) return;
+    clearPanelFetchError(panelName);
+    var msg = (err && err.message) ? err.message : String(err === undefined ? "unknown error" : err);
+    var box = el("div", { "class": "warn-callout panel-fetch-error", "data-role": "panel-fetch-error", "role": "status" }, [
+      el("div", { "class": "head", text: "▲ COULD NOT LOAD " + String(panelName).toUpperCase() }),
+      el("div", { "class": "body", text: msg + " — anything below this line is the last data that did arrive, not current data." })
+    ]);
+    if (typeof retryFn === "function") {
+      var row = el("div", { "class": "btn-row" });
+      var btn = el("button", { type: "button", "class": "btn btn--secondary", "data-role": "panel-fetch-retry", text: "RETRY" });
+      btn.addEventListener("click", function () { clearPanelFetchError(panelName); retryFn(); });
+      row.appendChild(btn);
+      box.appendChild(row);
+    }
+    section.insertBefore(box, section.firstChild);
+  }
+
+  /** Wraps a loader's promise: clears any standing banner on success,
+   * paints one (with `retryFn` behind RETRY) on rejection. Always returns
+   * a resolved promise -- a caller chaining onto it never re-throws. */
+  function guardPanelLoad(panelName, promise, retryFn) {
+    return promise.then(
+      function (v) { clearPanelFetchError(panelName); return v; },
+      function (e) { showPanelFetchError(panelName, e, retryFn); return undefined; }
+    );
+  }
+
   /* ==========================================================================
      3b. WRITES (Stage 3: operator write actions)
      Every write POSTs to /dashboard/api/write/<action> with the
@@ -694,8 +836,19 @@
    * `bodyFn()` is called fresh at submit time (not once at wire time) so
    * it always reads current form/state values. `fieldEls` maps a required
    * field name to the input element to focus on a client-side validation
-   * failure (optional per field). */
-  function wireWriteAction(btn, msgEl, action, bodyFn, requiredFields, fieldEls, onSuccess) {
+   * failure (optional per field).
+   *
+   * `onFailure` (WA-2) closes the stale-affordance gap. The `finally`
+   * below re-enables the button from `writesEnabled()` ALONE, which says
+   * only "this page can write at all" -- not "this button is still a legal
+   * thing to press". After a refusal that is exactly the wrong answer, and
+   * the commonest refusal here is now WA-1's own: the room you tried to
+   * freeze is ALREADY frozen, and the button came back enabled, offering
+   * to freeze it again. A caller that owns a panel loader passes it here,
+   * so a failure repaints that panel from the server's current truth
+   * instead of guessing at it. The text/disabled restore stays as the
+   * floor for buttons whose loader does not rebuild them. */
+  function wireWriteAction(btn, msgEl, action, bodyFn, requiredFields, fieldEls, onSuccess, onFailure) {
     btn.addEventListener("click", function () {
       var body = bodyFn();
       for (var i = 0; i < (requiredFields || []).length; i++) {
@@ -710,6 +863,7 @@
         }
       }
       var origText = btn.textContent;
+      var failed = false;
       btn.disabled = true; btn.textContent = "WORKING…";
       msgEl.textContent = ""; msgEl.style.color = "var(--ink-3)";
       postWrite(action, body).then(function (res) {
@@ -718,15 +872,18 @@
           msgEl.style.color = "var(--live)";
           if (onSuccess) onSuccess(res.data.result);
         } else {
+          failed = true;
           msgEl.textContent = (res.data && res.data.message) || ("HTTP " + res.httpStatus);
           msgEl.style.color = "var(--crit-text)";
         }
       }).catch(function (e) {
+        failed = true;
         msgEl.textContent = "network error: " + e;
         msgEl.style.color = "var(--crit-text)";
       }).finally(function () {
         btn.disabled = !writesEnabled();
         btn.textContent = origText;
+        if (failed && onFailure) onFailure();
       });
     });
   }
@@ -734,11 +891,21 @@
   /* ==========================================================================
      4. RAIL / TOPBAR / TAB SWITCHING
      ========================================================================== */
+  /** Paints `state.activePanel` onto the rail and the sections. Split out
+   * of switchPanel for M-P-1: `buildExtNav` tears every ext <section> down
+   * and rebuilds it, which on an SSE reconnect deleted the very panel the
+   * operator was reading and left NOTHING marked active -- a blank page
+   * under a "live" chip. The rebuild re-applies the selection instead. */
+  function applyActivePanel() {
+    var name = state.activePanel;
+    qsa(".rail-item[data-panel]").forEach(function (b) { b.classList.toggle("is-active", b.getAttribute("data-panel") === name); });
+    qsa(".panel[data-panel]").forEach(function (p) { p.classList.toggle("is-active", p.getAttribute("data-panel") === name); });
+  }
+
   function switchPanel(name, opts) {
     opts = opts || {};
     state.activePanel = name;
-    qsa(".rail-item[data-panel]").forEach(function (b) { b.classList.toggle("is-active", b.getAttribute("data-panel") === name); });
-    qsa(".panel[data-panel]").forEach(function (p) { p.classList.toggle("is-active", p.getAttribute("data-panel") === name); });
+    applyActivePanel();
     if (!opts.noHash) { try { history.replaceState(null, "", "#" + name); } catch (e) {} }
     loadPanelContent(name);
   }
@@ -760,31 +927,147 @@
     }
   }
 
+  /** The chip reads off `state.connState`, never off a handler's local
+   * idea of the truth (VA-3: the error path used to set the TEXT and not
+   * `data-state`, so the colour rule the finding proposed could never have
+   * matched). "manual" is gone -- LU-8: it was a label with no behaviour
+   * behind it and is not one of the four chip states this dashboard's own
+   * acceptance item names. The three real ones are live / reconnecting /
+   * static, and a stream that has failed MAX_CONSECUTIVE_ERRORS times in a
+   * row says it is still trying rather than implying the operator must do
+   * something. */
+  var MAX_CONSECUTIVE_ERRORS = 6;
+
+  function renderChip() {
+    var node = qs('[data-role="topbar-mode"]');
+    var s = state.mode === "static" ? "static" : (state.connState || "reconnecting");
+    node.setAttribute("data-state", s);
+    node.textContent = (s === "reconnecting" && state.errorCount >= MAX_CONSECUTIVE_ERRORS)
+      ? "reconnecting — retrying" : s;
+  }
+
+  function setConn(s) { state.connState = s; renderChip(); }
+
+  /** M-LU-7: how old the numbers are, next to whether the socket is up.
+   * The Console repeats the reading in its own subbar -- it is the surface an
+   * operator leaves open, and the age of what is on it is the first thing
+   * that matters there. One computation, both places. */
+  function setAsOf(meta) {
+    var ts = meta && meta.generated_ts;
+    var text = "AS OF " + fmtHM(ts) + " UTC";
+    var title = ts
+      ? "server-side generated_ts of the newest bundle this page holds: " + ts
+      : "no bundle has reached this page yet";
+    qsa('[data-role="topbar-asof"], [data-role="console-asof"]').forEach(function (node) {
+      node.textContent = text;
+      node.setAttribute("title", title);
+    });
+  }
+
   function setTopbar(meta) {
     qs('[data-role="topbar-program"]').textContent = (meta && meta.program_root) ? meta.program_root.split(/[\\/]/).pop() : "—";
-    qs('[data-role="topbar-mode"]').textContent = state.mode === "static" ? "static" : "live";
-    qs('[data-role="topbar-mode"]').setAttribute("data-state", state.mode || "static");
+    setAsOf(meta);
+    renderChip();
+  }
+
+  /* --------------------------------------------------------------------
+     console-2 / M-CON-2: rail health over the WHOLE bundle.
+
+     The badge is the one at-a-glance indicator on the rail, and it used to
+     read OK in the most common bad state this harness has -- an open
+     session that cannot close, with PROVISIONAL launches under it. Input
+     set is the sweep's §3.7 spec. `computeHealth` is pure over the bundle's
+     `panels` so it can be lifted into console_render.js (TEConsole) by K4
+     and tested by the Node harness without a DOM; setHealth is the only
+     part that touches the page.
+     -------------------------------------------------------------------- */
+  function computeHealth(panels) {
+    panels = panels || {};
+    var crit = [], warn = [];
+
+    var session = panels.session || {};
+    if (session.status === "invariant_violation") {
+      crit.push("session invariant violation: " + (session.message || "more than one open session"));
+    }
+    var readiness = (session.open_session || {}).close_readiness;
+    if (readiness && readiness.ready === false) {
+      var problems = readiness.problems || [];
+      if (problems.length) {
+        problems.forEach(function (pr) { warn.push(typeof pr === "string" ? pr : ((pr && pr.message) || "session cannot close")); });
+      } else {
+        warn.push("the open session cannot close");
+      }
+    }
+
+    var budget = panels.budget || {};
+    var dangling = (budget.dangling_bookings || []).length;
+    if (dangling) crit.push(dangling + " dangling launch booking(s)");
+    var quota = budget.plan_quota || {};
+    if (quota.available && !quota.fresh) warn.push("plan quota snapshot is stale");
+    (budget.accounts || []).forEach(function (a) {
+      (((a || {}).budget_status || {}).pools || []).forEach(function (pool) {
+        if (pool.over_hard) crit.push("pool " + pool.pool_id + " projected over hard cap");
+        else if (pool.over_soft) warn.push("pool " + pool.pool_id + " projected over soft cap");
+      });
+    });
+
+    var doctor = panels.doctor || {};
+    if (doctor.status === "ok" && doctor.last_run && Array.isArray(doctor.last_run.checks)) {
+      doctor.last_run.checks.forEach(function (c) {
+        if (c.status === "fail") crit.push("doctor FAIL: " + (c.name || "check"));
+        else if (c.status === "warn") warn.push("doctor WARN: " + (c.name || "check"));
+      });
+    }
+
+    var jobs = panels.jobs || {};
+    var stale = (jobs.stale_leases || []).length;
+    if (stale) crit.push(stale + " job lease(s) expired");
+    // `offload` is added to the jobs builder by K4 (sweep §3.10 item 2);
+    // absent today, so this contributes nothing until it lands.
+    var awaiting = (jobs.offload || {}).awaiting || 0;
+    if (awaiting) warn.push(awaiting + " job(s) awaiting the offload worker");
+
+    var corpus = panels.corpus || {};
+    if ((corpus.stale_anchors || 0) > 0) crit.push(corpus.stale_anchors + " stale anchor(s)");
+
+    var pendingEdits = ((panels.gates || {}).pending_edits || []).length;
+    if (pendingEdits) warn.push(pendingEdits + " unverified gate edit(s)");
+
+    // M-LU-2's client half: a builder that raised is reported as a panel
+    // with status "error". A console whose own data is missing is not OK.
+    Object.keys(panels).forEach(function (name) {
+      var p = panels[name];
+      if (p && typeof p === "object" && p.status === "error") {
+        crit.push(name + " panel failed to build: " + (p.message || "no message"));
+      }
+    });
+
+    return {
+      level: crit.length ? "crit" : warn.length ? "warn" : "ok",
+      label: crit.length ? crit.length + " CRIT" : warn.length ? warn.length + " WARN" : "OK",
+      crit: crit,
+      warn: warn
+    };
   }
 
   function setHealth(bundle) {
-    var panels = bundle.panels || {};
-    var dangling = ((panels.budget || {}).dangling_bookings || []).length;
-    var pendingEdits = ((panels.gates || {}).pending_edits || []).length;
-    var doctor = panels.doctor || {};
-    var doctorFail = 0, doctorWarn = 0;
-    if (doctor.status === "ok" && doctor.last_run && Array.isArray(doctor.last_run.checks)) {
-      doctor.last_run.checks.forEach(function (c) {
-        if (c.status === "fail") doctorFail++;
-        else if (c.status === "warn") doctorWarn++;
-      });
-    }
+    var panels = (bundle || {}).panels || {};
+    var health = computeHealth(panels);
     var badge = qs('[data-role="rail-health"]');
     var label = qs('[data-role="rail-health-label"]');
-    var level = "ok", text = "OK";
-    if (dangling > 0 || doctorFail > 0) { level = "crit"; text = (dangling + doctorFail) + " CRIT"; }
-    else if (pendingEdits > 0 || doctorWarn > 0) { level = "warn"; text = (pendingEdits + doctorWarn) + " WARN"; }
-    badge.setAttribute("data-health", level);
-    label.textContent = text;
+    var reasons = health.crit.concat(health.warn).join(" · ") || "nothing to report";
+    badge.setAttribute("data-health", health.level);
+    badge.setAttribute("title", reasons);
+    label.textContent = health.label;
+
+    // Same reading on the Console's own subbar, where the operator is when a
+    // badge on the rail is the thing furthest from their eyes.
+    var tally = qs('[data-role="console-health-tally"]');
+    if (tally) {
+      tally.textContent = health.label;
+      tally.setAttribute("data-health", health.level);
+      tally.setAttribute("title", reasons);
+    }
 
     var determ = panels.determinations || {};
     var determBadge = qs('[data-role="determ-badge"]');
@@ -803,14 +1086,14 @@
   var lastBundle = null;
 
   function loadHome() {
-    fetchAll().then(function (bundle) {
+    guardPanelLoad("home", fetchAll().then(function (bundle) {
       lastBundle = bundle;
       state.meta = bundle.meta || {};
       setTopbar(state.meta);
       setHealth(bundle);
       renderHome(bundle);
       state.homeLoadedOnce = true;
-    }).catch(function (e) { console.error("home load failed", e); });
+    }), loadHome);
   }
 
   function renderHome(bundle) {
@@ -962,7 +1245,19 @@
     var perDp = (p.convergence && p.convergence.per_dp) || [];
     if (perDp.length) {
       var last = perDp[perDp.length - 1];
-      body.appendChild(meterRow("DP " + last.dp_id, last.agreement_pct, last.agreement_pct.toFixed(0) + "%", { warn: !last.converged, live: last.converged, tick: openRoom_bar(openRoom) }));
+      // AC-1 (blocker), site 1 of 2. `check_room_converged` returns
+      // agreement_pct: null for a discussion point nobody has scored yet,
+      // which is EVERY room from creation until the last DP is scored --
+      // and `null.toFixed` threw out of renderLiveRoom, taking the rest of
+      // Home's render with it. A DP with no score is a reading, not a zero.
+      if (last.agreement_pct === null || last.agreement_pct === undefined) {
+        body.appendChild(el("div", { "class": "meter-row" }, [
+          el("span", { "class": "k", text: "DP " + last.dp_id }),
+          statusEl("notscored", "NOT SCORED")
+        ]));
+      } else {
+        body.appendChild(meterRow("DP " + last.dp_id, last.agreement_pct, last.agreement_pct.toFixed(0) + "%", { warn: !last.converged, live: last.converged, tick: openRoom_bar(openRoom) }));
+      }
     }
     var turns = p.turns || [];
     if (turns.length) {
@@ -1088,7 +1383,7 @@
       el("span", { "class": "k", text: "POOLS" }),
       el("span", { "class": "v", text: pools.length + " TRACKED, " + overSoft + " OVER SOFT" })
     ]);
-    pSeg._scrollTarget = "budget"; ribbon.appendChild(pSeg);
+    pSeg._scrollTarget = "pools"; ribbon.appendChild(pSeg);
 
     // JOBS
     var jobsP = panels.jobs || {};
@@ -1128,7 +1423,7 @@
       dangling > 0 ? statusEl("crit", "LAUNCHES") : statusEl("settled", "LAUNCHES"),
       el("span", { "class": "v", text: dangling + " DANGLING" })
     ]);
-    lSeg._scrollTarget = "budget"; ribbon.appendChild(lSeg);
+    lSeg._scrollTarget = "pools"; ribbon.appendChild(lSeg);
 
     ribbon.appendChild(el("span", { "class": "ribbon-fill" }));
     ribbon.appendChild(el("span", { "class": "ribbon-as-of", text: "AS OF " + fmtHM(lastBundle && lastBundle.meta ? lastBundle.meta.generated_ts : null) + " UTC" }));
@@ -1178,15 +1473,70 @@
       state.searchK = 12;
       doSearch(q);
     });
+    refreshSearchModeAvailability();
+  }
+
+  /* P-2, the interactive half. The engine's own note (retrieve/engine.py,
+     B.4b) is that mode="vector" and mode="summary" with NO filters scan
+     the whole corpus through an `IN (...)` candidate list, which hits
+     SQLite's 32,766-variable ceiling on any real one. The docs claimed the
+     UI honoured that constraint; it did not — both modes sat in the RANK BY
+     dropdown, one click away, and the failure was silent.
+
+     The constraint is now enforced where it is true: those two modes are
+     selectable only once the query is BOUNDED by a facet, which is exactly
+     what the LICENSE TIER card produces. `searchLicenseTierFilter()` is
+     that bound, and it is the same list that goes on the wire — one value,
+     two uses, so the dropdown can never disagree with the request. */
+  function searchLicenseTierFilter() {
+    var seen = Object.keys(state.searchTiersSeen);
+    var excluded = seen.filter(function (t) { return state.searchLicenseExclude[t]; });
+    // Nothing excluded means "show me everything", which is not a bound:
+    // sending every tier we happen to have seen would silently hide a tier
+    // the next page of results would have introduced.
+    if (!excluded.length) return [];
+    return seen.filter(function (t) { return !state.searchLicenseExclude[t]; });
+  }
+
+  var UNBOUNDED_SEARCH_MODES = ["vector", "summary"];
+  function refreshSearchModeAvailability() {
+    var sel = qs('[data-role="search-mode"]');
+    if (!sel) return;
+    var bounded = searchLicenseTierFilter().length > 0;
+    UNBOUNDED_SEARCH_MODES.forEach(function (m) {
+      var opt = sel.querySelector('option[value="' + m + '"]');
+      if (!opt) return;
+      opt.disabled = !bounded;
+      opt.title = bounded ? "" : "scans the whole corpus — pick a LICENSE TIER facet first";
+      opt.textContent = m.toUpperCase() + (bounded ? "" : " (needs a facet)");
+    });
+    if (!bounded && UNBOUNDED_SEARCH_MODES.indexOf(sel.value) !== -1) sel.value = "auto";
   }
 
   var lastSearchQuery = "";
   function doSearch(q) {
-    lastSearchQuery = q || "";
+    var text = q || "";
+    // A NEW question means a new tier universe; the operator's exclusions
+    // are a standing preference and deliberately survive.
+    if (text !== lastSearchQuery) state.searchTiersSeen = {};
+    lastSearchQuery = text;
+    refreshSearchModeAvailability();
     var mode = qs('[data-role="search-mode"]').value || "auto";
     var excluded = Object.keys(state.searchLicenseExclude).filter(function (t) { return state.searchLicenseExclude[t]; });
     var params = { q: q, k: state.searchK, mode: mode };
-    runSearch(params).then(function (resp) { renderSearchResults(resp, excluded); });
+    // P-2 (4): the facet goes ON THE WIRE, not just into a client-side
+    // .filter() — serve.py has parsed `license_tier` since Stage 2, and
+    // filtering server-side is what makes the two bounded modes above safe.
+    var tierFilter = searchLicenseTierFilter();
+    if (tierFilter.length) params.license_tier = tierFilter.join(",");
+    // M-P-3: `do_GET` has no try/except around build_search, so a query the
+    // engine cannot answer closes the socket with no response at all and
+    // this promise rejects. Unhandled, that left the previous result list
+    // on screen as though it were the answer to the new question. (The
+    // server half -- build_search try/except and the VECTOR guard -- is
+    // W3/P-2; this is the client half of the same finding.)
+    guardPanelLoad("search", runSearch(params).then(function (resp) { renderSearchResults(resp, excluded); }),
+      function () { doSearch(q); });
   }
 
   function renderSearchResults(resp, excludedTiers) {
@@ -1203,6 +1553,18 @@
     }
     if (resp.status === "invalid_mode" || resp.status === "not_initialized") {
       list.appendChild(el("div", { "class": "warn-callout" }, [el("div", { "class": "head", text: (resp.status || "").toUpperCase() }), el("div", { "class": "body", text: resp.message || "" })]));
+      countEl.textContent = "0 RESULTS";
+      return;
+    }
+    if (resp.status === "search_error") {
+      // P-2: the server now ANSWERS a query the engine could not run
+      // (build_search's try/except) instead of dropping the connection.
+      // Say so where the results would have been -- never leave the last
+      // question's answers standing under a new question.
+      list.appendChild(el("div", { "class": "warn-callout" }, [
+        el("div", { "class": "head", text: "▲ THE ENGINE COULD NOT ANSWER THAT" }),
+        el("div", { "class": "body", text: (resp.message || "") + " — try AUTO or HYBRID, or narrow the query with a LICENSE TIER facet." })
+      ]));
       countEl.textContent = "0 RESULTS";
       return;
     }
@@ -1256,28 +1618,38 @@
 
     var tierCounts = {};
     results.forEach(function (r) { var t = r.citation.license_tier; tierCounts[t] = (tierCounts[t] || 0) + 1; });
-    if (Object.keys(tierCounts).length === 0) facets.appendChild(el("div", { "class": "empty", text: "no results yet" }));
-    Object.keys(tierCounts).forEach(function (tier) {
+    // P-2: remember every tier this question has produced. Once the filter
+    // goes on the wire an excluded tier stops coming back at all, and a
+    // facet list built only from the current response would drop the row
+    // the operator needs to click to undo their own exclusion.
+    Object.keys(tierCounts).forEach(function (t) { state.searchTiersSeen[t] = tierCounts[t]; });
+    var tiers = Object.keys(state.searchTiersSeen);
+    if (tiers.length === 0) facets.appendChild(el("div", { "class": "empty", text: "no results yet" }));
+    tiers.forEach(function (tier) {
       var row = el("div", { "class": "facet-row" });
       var excluded = !!state.searchLicenseExclude[tier];
       row.appendChild(el("span", { text: excluded ? "○" : "✓", "style": "color:" + (excluded ? "var(--ink-3)" : "var(--settled)") + "; cursor:pointer;" }));
       var nameEl = el("span", { "class": "name", text: tier });
       row.appendChild(nameEl);
-      row.appendChild(el("span", { "class": "n", text: String(tierCounts[tier]) }));
+      row.appendChild(el("span", { "class": "n", text: excluded ? "—" : String(tierCounts[tier] === undefined ? 0 : tierCounts[tier]) }));
       row.style.cursor = "pointer";
       row.addEventListener("click", function () {
         state.searchLicenseExclude[tier] = !state.searchLicenseExclude[tier];
-        renderSearchResults(resp, Object.keys(state.searchLicenseExclude).filter(function (t) { return state.searchLicenseExclude[t]; }));
+        // Re-ASK rather than re-filter: the tier list is now a server-side
+        // filter (P-2 (4)), so the results have to come back narrowed, not
+        // be hidden locally from a set the engine already over-fetched.
+        doSearch(lastSearchQuery);
       });
       facets.appendChild(row);
     });
+    refreshSearchModeAvailability();
   }
 
   /* ==========================================================================
      7. FEED
      ========================================================================== */
   function loadFeed() {
-    fetchPanel("feed", { thread_id: state.feedThreadId }).then(renderFeed);
+    guardPanelLoad("feed", fetchPanel("feed", { thread_id: state.feedThreadId }).then(renderFeed), loadFeed);
   }
   function renderFeed(p) {
     var threadList = qs('[data-role="feed-thread-list"]');
@@ -1367,7 +1739,8 @@
     wireWriteAction(btn, msg, "feed-translate",
       function () { return { post_id: post.post_id }; },
       ["post_id"], {},
-      function () { loadFeed(); });
+      function () { loadFeed(); },
+      function () { loadFeed(); });   // WA-2: repaint on refusal too
     return el("div", {}, [btn, msg]);
   }
 
@@ -1433,7 +1806,8 @@
     function () {
       qs('[data-role="feed-compose-input"]').value = "";
       loadFeed();
-    }
+    },
+    loadFeed   // WA-2
   );
 
   /* ==========================================================================
@@ -1457,7 +1831,8 @@
       function () { return { room_id: roomId, dp_id: dpId, agreement_pct: pctInput.value, by_launch: launchInput.value, note: noteInput.value }; },
       ["room_id", "dp_id", "agreement_pct", "by_launch"],
       { agreement_pct: pctInput, by_launch: launchInput },
-      function () { loadRooms(); }
+      function () { loadRooms(); },
+      function () { loadRooms(); }   // WA-2
     );
     return wrap;
   }
@@ -1478,6 +1853,10 @@
       function () { return { room_id: roomId, by_launch: launchInput.value, reason: reasonInput.value }; },
       ["room_id", "by_launch", "reason"],
       { by_launch: launchInput, reason: reasonInput },
+      function () { loadRooms(); },
+      // WA-2, the case that named the finding: a freeze refused because a
+      // concurrent operator already froze the room must not come back with
+      // CONFIRM FREEZE enabled.
       function () { loadRooms(); }
     );
     return wrap;
@@ -1506,7 +1885,7 @@
   }
 
   function loadRooms() {
-    fetchPanel("rooms", { room_id: state.roomsRoomId }).then(renderRooms);
+    guardPanelLoad("rooms", fetchPanel("rooms", { room_id: state.roomsRoomId }).then(renderRooms), loadRooms);
   }
   function renderRooms(p) {
     var list = qs('[data-role="rooms-list"]');
@@ -1591,10 +1970,20 @@
     try { dps = (JSON.parse(p.active_room.dps).discussion_points || []); } catch (e) {}
     dps.forEach(function (dp) {
       var scored = perDpMap[dp.dp_id];
+      // AC-1 (blocker), site 2 of 2 -- the one that made this a blocker.
+      // `per_dp` carries an entry for EVERY discussion point, scored or
+      // not, so `scored` is always truthy and the "NOT SCORED" arm was
+      // dead; the live arm then called .toFixed on null and threw out of
+      // renderRooms, so the SCORE / FREEZE / EXPORT block below never got
+      // appended -- i.e. the only in-UI way to leave the unscored state
+      // disappeared exactly while the room was in it. The presence of a
+      // row and the presence of a SCORE are two different facts.
+      var pct = scored ? scored.agreement_pct : null;
+      var hasPct = pct !== null && pct !== undefined;
       var row = el("div", { "class": "dp-ladder-row" + (dp.dp_id === selectedDp ? " is-active" : "") });
-      row.appendChild(scored ? (scored.converged ? statusEl("settled", "") : statusEl("warn", "")) : statusEl("notscored", ""));
+      row.appendChild(hasPct ? (scored.converged ? statusEl("settled", "") : statusEl("warn", "")) : statusEl("notscored", ""));
       row.appendChild(el("span", { "class": "name", text: dp.dp_id + " " + (dp.prompt || "").slice(0, 34) }));
-      row.appendChild(el("span", { "style": scored ? (scored.converged ? "color:var(--settled)" : "color:var(--warn)") : "color:var(--ink-3)", text: scored ? scored.agreement_pct.toFixed(0) + "%" : "NOT SCORED" }));
+      row.appendChild(el("span", { "style": hasPct ? (scored.converged ? "color:var(--settled)" : "color:var(--warn)") : "color:var(--ink-3)", text: hasPct ? pct.toFixed(0) + "%" : "NOT SCORED" }));
       row.style.cursor = "pointer";
       row.addEventListener("click", function () { state.roomsSelectedDp = dp.dp_id; renderRooms(p); });
       ladder.appendChild(row);
@@ -1652,7 +2041,8 @@
     function () {
       qs('[data-role="room-turn-body"]').value = "";
       loadRooms();
-    }
+    },
+    loadRooms   // WA-2
   );
 
   function drawTrajectory(series, bar) {
@@ -1700,7 +2090,7 @@
   /* ==========================================================================
      9. DETERMINATIONS
      ========================================================================== */
-  function loadDeterminations() { fetchPanel("determinations").then(renderDeterminations); }
+  function loadDeterminations() { guardPanelLoad("determinations", fetchPanel("determinations").then(renderDeterminations), loadDeterminations); }
   function renderDeterminations(p) {
     var list = qs('[data-role="determ-list"]');
     var summary = qs('[data-role="determ-summary"]');
@@ -1810,7 +2200,8 @@
         verifyBtn, msg, "verify-edit",
         function () { return { gate_id: item.gate_id, edit_id: item.edit_id, by_launch: byLaunch.value, verified_note: noteInput.value }; },
         ["gate_id", "edit_id", "by_launch"], { by_launch: byLaunch },
-        function () { state.determSelectedId = null; loadDeterminations(); }
+        function () { state.determSelectedId = null; loadDeterminations(); },
+        loadDeterminations   // WA-2: keep the selection, repaint the truth
       );
     } else if (item.kind === "kg_merge") {
       var byLaunch2 = launchField();
@@ -1823,13 +2214,15 @@
         acceptBtn, msg, "merge-accept",
         function () { return { prop_id: item.id, by_launch: byLaunch2.value }; },
         ["prop_id", "by_launch"], { by_launch: byLaunch2 },
-        function () { state.determSelectedId = null; loadDeterminations(); }
+        function () { state.determSelectedId = null; loadDeterminations(); },
+        loadDeterminations   // WA-2
       );
       wireWriteAction(
         rejectBtn2, msg, "merge-reject",
         function () { return { prop_id: item.id, by_launch: byLaunch2.value }; },
         ["prop_id", "by_launch"], { by_launch: byLaunch2 },
-        function () { state.determSelectedId = null; loadDeterminations(); }
+        function () { state.determSelectedId = null; loadDeterminations(); },
+        loadDeterminations   // WA-2
       );
     } else if (item.kind === "acquisition") {
       var launchOpt = launchField("your launch_id (optional)");
@@ -1848,7 +2241,8 @@
         deliverBtn, msg, "acquisition-delivered",
         function () { return { source_id: item.id, launch_id: launchOpt.value }; },
         ["source_id"], {},
-        function () { state.determSelectedId = null; loadDeterminations(); }
+        function () { state.determSelectedId = null; loadDeterminations(); },
+        loadDeterminations   // WA-2
       );
     } else {
       disabledPair(DETERM_DISABLED_REASONS[item.kind] || "no write action is wired for this item kind.");
@@ -1876,7 +2270,7 @@
   /* ==========================================================================
      10. DOSSIER
      ========================================================================== */
-  function loadDossier() { fetchPanel("dossier", { artifact_id: state.dossierArtifactId }).then(renderDossier); }
+  function loadDossier() { guardPanelLoad("dossier", fetchPanel("dossier", { artifact_id: state.dossierArtifactId }).then(renderDossier), loadDossier); }
   function renderDossier(p) {
     var typeChips = qs('[data-role="dossier-type-chips"]');
     var registryList = qs('[data-role="dossier-registry-list"]');
@@ -1956,11 +2350,32 @@
     gateCard.appendChild(el("div", { "class": "card-header" }, [el("span", { "class": "title", text: p.gate ? ("GATE " + p.gate.gate_id) : "GATE" })]));
     var gateBody = el("div", { "class": "card-body" });
     if (p.gate) {
+      // AC-2: `failed` is a legal gate state (the ops.gate CHECK
+      // enumerates it) reachable from draft, submitted OR gated -- it is
+      // the reject/abandon EXIT, not the sixth ordinal step, so it is not
+      // in GATE_STEPS and indexOf returned -1. The track then rendered
+      // with nothing ticked at all, i.e. a gate that got as far as a FAIL
+      // verdict read as "never started". Walk the track to the state the
+      // gate actually reached (gate_transition.from_state of the hop into
+      // `failed`, which the dossier builder already ships as
+      // `gate_history`), stop there, and mark the exit.
       var track = el("div", { "class": "gate-track" });
-      var reachedIdx = GATE_STEPS.indexOf(p.gate.state);
+      var gateFailed = p.gate.state === "failed";
+      var reachedState = p.gate.state;
+      if (gateFailed) {
+        var exitHop = (p.gate_history || []).filter(function (t) { return t.to_state === "failed"; }).pop();
+        reachedState = exitHop ? exitHop.from_state : "draft";
+      }
+      var reachedIdx = GATE_STEPS.indexOf(reachedState);
+      var trackSteps = [];
       GATE_STEPS.forEach(function (s, i) {
-        track.appendChild(el("span", { "class": "step" + (i <= reachedIdx ? "" : " is-pending"), text: (i <= reachedIdx ? "✓ " : "") + s.toUpperCase() }));
-        if (i < GATE_STEPS.length - 1) track.appendChild(el("span", { "class": "sep", text: "—" }));
+        if (gateFailed && i > reachedIdx) return;
+        trackSteps.push({ cls: "step" + (i <= reachedIdx ? "" : " is-pending"), text: (i <= reachedIdx ? "✓ " : "") + s.toUpperCase() });
+      });
+      if (gateFailed) trackSteps.push({ cls: "step step--failed", text: "✗ FAILED" });
+      trackSteps.forEach(function (st, i) {
+        if (i > 0) track.appendChild(el("span", { "class": "sep", text: "—" }));
+        track.appendChild(el("span", { "class": st.cls, text: st.text }));
       });
       gateBody.appendChild(track);
       gateBody.appendChild(el("div", { "style": "border-top:1px solid var(--hairline-soft); margin-top:9px; padding-top:9px; display:flex; flex-direction:column; gap:6px;" }, [
@@ -2010,7 +2425,7 @@
   /* ==========================================================================
      11. LEXICON
      ========================================================================== */
-  function loadLexicon() { fetchPanel("lexicon").then(renderLexicon); }
+  function loadLexicon() { guardPanelLoad("lexicon", fetchPanel("lexicon").then(renderLexicon), loadLexicon); }
   var LEXICON_PANEL_CACHE = null;
   function renderLexicon(p) {
     LEXICON_PANEL_CACHE = p;
@@ -2110,7 +2525,7 @@
   /* ==========================================================================
      12. COURSE
      ========================================================================== */
-  function loadCourse() { fetchPanel("course").then(renderCourse); }
+  function loadCourse() { guardPanelLoad("course", fetchPanel("course").then(renderCourse), loadCourse); }
   function renderCourse(p) {
     var sub = qs('[data-role="course-sub"]');
     var bodyRoot = qs('[data-role="course-body"]');
@@ -2163,7 +2578,12 @@
       criteriaInPhase.forEach(function (c) {
         var row = el("div", { "class": "ladder-row" + (c.state === "open" ? " is-open" : "") }, [
           c.state === "discharged" ? statusEl("settled", "") : c.state === "blocked" ? statusEl("warn", "") : statusEl("live", "", { pulse: true }),
-          el("span", { "class": "name", text: c.label }),
+          // VA-4: `.ladder-row .name` is capped at 168px with ellipsis and
+          // criterion labels run to several hundred; the full text had no
+          // recovery path at all on the one surface that carries the
+          // research course. A title is the one-line fix; A1 adds
+          // click-to-expand.
+          el("span", { "class": "name", title: c.label, text: c.label }),
           el("span", { "class": "dots" }),
           el("span", { "class": "val", text: c.discharged_by_artifact_title || c.state.toUpperCase() })
         ]);
@@ -2198,18 +2618,59 @@
      13. CONSOLE (reuses the generic renderer -- see brief: "compressed, still
      works, keeps Console cheap")
      ========================================================================== */
-  function loadConsole() {
-    fetchAll().then(function (bundle) {
-      lastBundle = bundle;
-      setHealth(bundle);
-      var panels = bundle.panels || {};
-      renderGeneric(qs('[data-role="console-body-session"]'), panels.session);
-      renderGeneric(qs('[data-role="console-body-budget"]'), panels.budget);
-      renderGeneric(qs('[data-role="console-body-jobs"]'), panels.jobs);
-      renderGeneric(qs('[data-role="console-body-gates"]'), panels.gates);
-      renderGeneric(qs('[data-role="console-body-corpus"]'), panels.corpus);
-      renderGeneric(qs('[data-role="console-body-doctor"]'), panels.doctor);
+  /** The console card containers, by the name console_render.js knows them
+   * under (TEConsole.CARD_ORDER). `diagnostics` is the DOCTOR card: the card
+   * is named for what it reports, the hook for the panel that feeds it. */
+  function consoleTargets() {
+    return {
+      session: qs('[data-role="console-body-session"]'),
+      pools: qs('[data-role="console-body-pools"]'),
+      ledger: qs('[data-role="console-body-ledger"]'),
+      timeline: qs('[data-role="console-body-timeline"]'),
+      jobs: qs('[data-role="console-body-jobs"]'),
+      diagnostics: qs('[data-role="console-body-doctor"]'),
+      gates: qs('[data-role="console-body-gates"]'),
+      corpus: qs('[data-role="console-body-corpus"]')
+    };
+  }
+
+  /** Paints the console cards from a bundle already in hand. Split out
+   * of loadConsole for LU-12: the `changed` handler fetched /all for the
+   * health badge and then called loadConsole(), which fetched /all again
+   * in the same millisecond. One tick, one bundle, both consumers.
+   *
+   * TEConsole gets first refusal on every card. Whatever it does not draw
+   * falls back to the generic renderer, so the bespoke cards can land one at
+   * a time without a flag day -- and the two cards with no generic form
+   * (LAUNCH LEDGER, THIS SESSION END TO END) stay hidden until they have a
+   * renderer, rather than showing an empty box. */
+  function renderConsoleFromBundle(bundle) {
+    var panels = (bundle || {}).panels || {};
+    var targets = consoleTargets();
+    var painted = TECONSOLE ? TECONSOLE.renderInto(targets, bundle) : [];
+    function generic(name, panel) {
+      if (painted.indexOf(name) === -1) renderGeneric(targets[name], panel);
+    }
+    generic("session", panels.session);
+    generic("pools", panels.budget);
+    generic("jobs", panels.jobs);
+    generic("gates", panels.gates);
+    generic("corpus", panels.corpus);
+    generic("diagnostics", panels.doctor);
+    ["ledger", "timeline"].forEach(function (name) {
+      var card = document.getElementById("console-card-" + name);
+      if (card) card.classList.toggle("is-hidden", painted.indexOf(name) === -1);
     });
+  }
+
+  function loadConsole() {
+    guardPanelLoad("console", fetchAll().then(function (bundle) {
+      lastBundle = bundle;
+      state.meta = bundle.meta || state.meta;
+      setTopbar(state.meta);
+      setHealth(bundle);
+      renderConsoleFromBundle(bundle);
+    }), loadConsole);
   }
   qs('[data-role="doctor-run-btn"]').addEventListener("click", function () {
     var btn = qs('[data-role="doctor-run-btn"]');
@@ -2220,9 +2681,22 @@
     fetch("/dashboard/api/doctor/run", {
       method: "POST", cache: "no-store",
       headers: { "X-TrialError-Dashboard-Token": WRITE_TOKEN || "" },
-    }).then(function (r) { return r.json(); }).then(function (doctorPanel) {
+    }).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    }).then(function (doctorPanel) {
       renderGeneric(qs('[data-role="console-body-doctor"]'), doctorPanel);
-    }).catch(function () {}).finally(function () { btn.disabled = !writesEnabled(); btn.textContent = "RUN THE CHECK SWEEP"; });
+      // M-CON-2: a sweep that just turned up a FAIL has to move the rail
+      // badge. The old handler repainted one card and left health reading
+      // whatever it read before the run -- the single worst moment for the
+      // one-glance indicator to be stale.
+      loadConsole();
+      // LU-6: the empty catch below used to swallow every failure of this
+      // POST, including a 403 from a rotated token, leaving the button
+      // simply snapping back to its label with nothing said.
+    }).catch(function (e) {
+      showPanelFetchError("console", e, function () { qs('[data-role="doctor-run-btn"]').click(); });
+    }).finally(function () { btn.disabled = !writesEnabled(); btn.textContent = "RUN THE CHECK SWEEP"; });
   });
 
   /* ==========================================================================
@@ -2257,11 +2731,20 @@
       section.appendChild(sub); section.appendChild(body);
       qs('[data-role="content"]').appendChild(section);
     });
+    // M-P-1: every ext <section> above was just destroyed and rebuilt, so
+    // whichever one was `is-active` is gone. buildExtNav runs on every SSE
+    // `hello` -- i.e. on every reconnect -- and an operator reading an ext
+    // panel was left staring at an empty content area with a "live" chip
+    // and no way back except a rail click. Re-apply the selection, and
+    // re-fetch the panel body that went with it.
+    applyActivePanel();
+    if (state.booted && state.activePanel.indexOf("ext-") === 0) loadPanelContent(state.activePanel);
   }
   function loadExt(name) {
     var container = qs('[data-role="ext-body-' + name + '"]');
     if (!container) return;
-    fetchExtPanel(name).then(function (data) { renderGeneric(container, data); });
+    guardPanelLoad("ext-" + name, fetchExtPanel(name).then(function (data) { renderGeneric(container, data); }),
+      function () { loadExt(name); });
   }
 
   /* ==========================================================================
@@ -2296,60 +2779,182 @@
     state.mode = "static";
     state.staticPayload = payload;
     state.meta = payload.meta || {};
+    setConn("static");
     setTopbar(state.meta);
     buildExtNav(state.meta.ext_panels || []);
     setHealth(payload);
     initSearchOnce();
     switchPanel(initialPanelFromHash(), { noHash: true });
+    state.booted = true;
     return true;
   }
 
-  var MAX_CONSECUTIVE_ERRORS = 6;
+  /* --------------------------------------------------------------------
+     LIVE MODE: connect, resync, and say which of those is true.
+
+     Three findings live in this block and they are one story. LU-3: the
+     boot fetch had no retry, so a single failed /all -- a program pointed
+     at a missing platform.db was enough -- left a permanently blank page
+     under a "live" label. LU-2: the SSE `hello` handler never refetched,
+     so a server restart or a laptop wake re-established the stream and
+     left every number on screen frozen at whatever it was before the gap,
+     still labelled live. LU-12: each `changed` triggered two /all fetches
+     in the same millisecond, one for health and one for the panel.
+     -------------------------------------------------------------------- */
+  var POLL_FALLBACK_MS = 30000;
+  var RETRY_BASE_MS = 1000;
+  var RETRY_CAP_MS = 30000;
+
+  /** One bundle, every consumer. Repaints the topbar, the rail badge and
+   * whatever the operator is actually looking at. */
+  function resyncFromBundle(bundle) {
+    lastBundle = bundle;
+    state.meta = bundle.meta || state.meta;
+    setTopbar(state.meta);
+    setHealth(bundle);
+    if (state.activePanel === "home") { renderHome(bundle); state.homeLoadedOnce = true; clearPanelFetchError("home"); }
+    else if (state.activePanel === "console") { renderConsoleFromBundle(bundle); clearPanelFetchError("console"); }
+    else loadPanelContent(state.activePanel);   // panels that do not read the bundle
+  }
+
+  function resync() {
+    return guardPanelLoad(state.activePanel, fetchAll().then(resyncFromBundle), resync);
+  }
+
+  /** LU-8: after MAX_CONSECUTIVE_ERRORS stream errors the page stops
+   * assuming the stream will come back on its own and polls /all instead,
+   * so the numbers keep moving while the chip says reconnecting. The loop
+   * stops the moment a `hello` or a `changed` arrives. */
+  function startPollingFallback() {
+    if (state.pollTimer !== null) return;
+    state.pollTimer = setInterval(function () {
+      fetchAll().then(resyncFromBundle, function (e) {
+        // The chip already carries this state; log rather than stack a
+        // fresh banner every 30 s on a surface that is already telling
+        // the truth. Nothing is swallowed silently.
+        console.error("dashboard: polling fallback fetch failed", e);
+      });
+    }, POLL_FALLBACK_MS);
+  }
+
+  function stopPollingFallback() {
+    if (state.pollTimer === null) return;
+    clearInterval(state.pollTimer);
+    state.pollTimer = null;
+  }
+
   function connectSSE() {
     if (!window.EventSource) return;
+    if (state.eventSource) return;   // EventSource reconnects itself; never stack streams
     var es = new EventSource("/dashboard/events");
     state.eventSource = es;
+
     es.addEventListener("hello", function (ev) {
       state.errorCount = 0;
+      stopPollingFallback();
       try {
         var meta = JSON.parse(ev.data);
         state.meta = meta;
         setTopbar(meta);
         buildExtNav(meta.ext_panels || []);
-      } catch (e) {}
-      qs('[data-role="topbar-mode"]').textContent = "live";
+      } catch (e) { console.error("dashboard: unreadable hello payload", e); }
+      setConn("live");
+      // LU-2: the FIRST hello is this page's own connect, and the boot
+      // fetch already has that data. A LATER one means the stream was
+      // re-established across a gap -- a killed and restarted server, a
+      // laptop that slept -- and everything on screen predates the gap.
+      if (state.hadHello) resync();
+      state.hadHello = true;
     });
-    es.addEventListener("changed", function () {
-      qs('[data-role="topbar-mode"]').textContent = "live";
-      fetchAll().then(function (bundle) { lastBundle = bundle; setHealth(bundle); if (state.activePanel === "home") renderHome(bundle); });
-      loadPanelContent(state.activePanel);
+
+    es.addEventListener("changed", function (ev) {
+      state.errorCount = 0;
+      stopPollingFallback();
+      setConn("live");
+      var payload = null;
+      try { payload = (ev && ev.data) ? JSON.parse(ev.data) : null; } catch (e) { payload = null; }
+      // The watcher's `changed_stores` (S1) lets the page skip a rebuild it
+      // cannot use: platform.db is shared by every program on the machine,
+      // so a launch booked under some other program ticks this stream. Home
+      // and Console are the only surfaces that read platform rows.
+      var stores = payload && payload.changed_stores;
+      if (stores && stores.length === 1 && stores[0] === "platform"
+          && state.activePanel !== "home" && state.activePanel !== "console") return;
+      resync();
     });
+
     es.onerror = function () {
       state.errorCount += 1;
-      qs('[data-role="topbar-mode"]').textContent = state.errorCount >= MAX_CONSECUTIVE_ERRORS ? "manual" : "reconnecting";
+      setConn("reconnecting");
+      if (state.errorCount >= MAX_CONSECUTIVE_ERRORS) startPollingFallback();
+      // A dropped connection leaves EventSource in CONNECTING and it
+      // retries by itself -- that is the ordinary kill-and-restart path.
+      // A CLOSED stream is the browser giving up (the reconnect was
+      // answered with a non-200, which is what a server coming back up
+      // mid-handshake can look like), and nothing revives it but a new
+      // EventSource.
+      if (es.readyState === 2) {
+        state.eventSource = null;
+        setTimeout(function () { if (!state.eventSource) connectSSE(); },
+          Math.min(RETRY_BASE_MS * state.errorCount, RETRY_CAP_MS));
+      }
     };
   }
 
   function initialPanelFromHash() {
     var h = (location.hash || "").replace("#", "");
     var known = ["home", "search", "evidence", "lexicon", "dossier", "course", "rooms", "feed", "determinations", "console"];
-    return known.indexOf(h) !== -1 ? h : "home";
+    if (known.indexOf(h) !== -1) return h;
+    // P-1: an ext panel is a real deep-link target the moment this program
+    // declares it -- reloading on one used to drop the operator on Home
+    // with the ext hash still in the address bar, which then survived into
+    // the next reload and lied again.
+    if (h.indexOf("ext-") === 0) {
+      var declared = (state.meta.ext_panels || []).some(function (e) { return ("ext-" + e.name) === h; });
+      if (declared) return h;
+    }
+    if (h) { try { history.replaceState(null, "", "#home"); } catch (e) {} }
+    return "home";
   }
 
   function tryLiveMode() {
     state.mode = "live";
+    setConn("reconnecting");   // honest until the first bundle actually lands
     initSearchOnce();
+    bootFetch(RETRY_BASE_MS);
+  }
+
+  /** LU-3: the boot fetch is the one request with nothing on screen behind
+   * it, so its failure is the worst outcome in the live-updates lens --
+   * blank page, "live" chip. It now retries 1s, 2s, 4s ... capped at 30s,
+   * for as long as the tab is open, says "reconnecting" throughout, and
+   * paints a RETRY control the operator can use instead of waiting.
+   * (S1's per-builder isolation is the other half: retrying against a
+   * builder that raises would otherwise spin forever.) */
+  function bootFetch(delayMs) {
     fetchAll().then(function (bundle) {
+      if (state.bootRetryTimer !== null) { clearTimeout(state.bootRetryTimer); state.bootRetryTimer = null; }
       lastBundle = bundle;
       state.meta = bundle.meta || {};
       setTopbar(state.meta);
       buildExtNav(state.meta.ext_panels || []);
       setHealth(bundle);
+      setConn("live");
       switchPanel(initialPanelFromHash(), { noHash: true });
+      clearPanelFetchError(state.activePanel);
       show(qs('[data-role="doctor-run-btn"]'));
+      state.booted = true;
       connectSSE();
-    }).catch(function () {
-      qs('[data-role="topbar-mode"]').textContent = "reconnecting";
+    }).catch(function (e) {
+      setConn("reconnecting");
+      showPanelFetchError(state.activePanel, e, function () {
+        if (state.bootRetryTimer !== null) { clearTimeout(state.bootRetryTimer); state.bootRetryTimer = null; }
+        bootFetch(RETRY_BASE_MS);
+      });
+      var next = Math.min(delayMs * 2, RETRY_CAP_MS);
+      state.bootRetryTimer = setTimeout(function () { state.bootRetryTimer = null; bootFetch(next); }, delayMs);
+      // Open the stream anyway: whichever recovers first wins, and a
+      // `hello` from a restarted server resyncs through the same path.
       connectSSE();
     });
   }

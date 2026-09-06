@@ -43,6 +43,10 @@ Gates (:mod:`trialerror.artifacts.gates`):
   edit verified, and ``reproduction_status != mismatch``.
 - :func:`verify_edit` — the applier-verifies layer: marks one ``edits``
   entry applied+verified (NOT a state transition).
+- :func:`send_back_edit` — the objection counterpart: marks one ``edits``
+  entry ``sent_back`` with a required note and leaves it UNVERIFIED, so it
+  still blocks ``union_applied`` (NOT a state transition; emits a
+  ``gate_edit_sent_back`` event).
 - :func:`get_gate` — read.
 
 State machine (:mod:`trialerror.artifacts.state_machine`):
@@ -81,6 +85,7 @@ from trialerror.artifacts.gates import (
     get_gate,
     open_gate,
     record_verdict,
+    send_back_edit,
     submit_gate,
     verify_edit,
 )
@@ -127,6 +132,7 @@ __all__ = [
     "record_verdict",
     "apply_union",
     "verify_edit",
+    "send_back_edit",
     "create_artifact",
     "get_artifact",
     "list_artifacts",

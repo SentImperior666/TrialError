@@ -25,8 +25,10 @@ from trialerror.artifacts.gates import (
     advance_gate,
     apply_union,
     get_gate,
+    _normalize_edits,
     open_gate,
     record_verdict,
+    send_back_edit,
     submit_gate,
     verify_edit,
 )
@@ -443,3 +445,135 @@ def test_verify_edit_refuses_unknown_edit_id(store):
 
     with pytest.raises(ValueError, match="no edit"):
         verify_edit(store, gate_id=gate_id, edit_id="EDIT-nonexistent", by_launch=launch_id)
+
+
+# ---- send_back_edit (the objection verb; also not a state transition) ------
+
+
+def _gated_gate_with_one_edit(store, *, blocking: bool = True) -> tuple[str, str, str]:
+    launch_id, _type, artifact_id = _seed_artifact(store, gated=True)
+    gate_id = _to_submitted(store, launch_id, artifact_id)
+    verdict = record_verdict(
+        store, gate_id=gate_id, verdict="PASS_WITH_EDITS", critic_launch=launch_id,
+        edits=[{"text": "reword the tally paragraph", "blocking": blocking}],
+    )
+    return gate_id, json.loads(verdict["edits"])[0]["edit_id"], launch_id
+
+
+def test_send_back_edit_marks_the_entry_and_leaves_it_unverified(store):
+    gate_id, edit_id, launch_id = _gated_gate_with_one_edit(store)
+
+    updated = send_back_edit(
+        store, gate_id=gate_id, edit_id=edit_id, by_launch=launch_id,
+        note="the tally is right; the paragraph is the part that is wrong",
+    )
+
+    edit = json.loads(updated["edits"])[0]
+    assert edit["sent_back"] is True
+    assert edit["sent_back_note"].startswith("the tally is right")
+    assert edit["sent_back_by_launch"] == launch_id
+    assert edit["sent_back_ts"]
+    # the point of the verb: it does NOT satisfy the gate.
+    assert edit["verified"] is False
+    assert edit["applied"] is False
+    assert updated["state"] == "gated"
+
+
+def test_send_back_edit_still_blocks_the_union(store):
+    """_check_union_entry is deliberately untouched by this build: a
+    sent-back edit is an unverified one, so the same refusal applies. An
+    objection is a request for work, never a way past the gate."""
+    gate_id, edit_id, launch_id = _gated_gate_with_one_edit(store, blocking=True)
+    send_back_edit(store, gate_id=gate_id, edit_id=edit_id, by_launch=launch_id, note="no")
+
+    with pytest.raises(GateEntryConditionError, match="not yet verified"):
+        apply_union(store, gate_id=gate_id, by_launch=launch_id)
+
+
+def test_send_back_edit_writes_one_discoverable_event(store):
+    """Unlike verify (whose record is the JSON entry, design 12.12), a
+    send-back has to reach whoever must now do the work."""
+    gate_id, edit_id, launch_id = _gated_gate_with_one_edit(store)
+    send_back_edit(store, gate_id=gate_id, edit_id=edit_id, by_launch=launch_id, note="see the review thread")
+
+    rows = store.ops.execute("SELECT * FROM event WHERE type = 'gate_edit_sent_back'").fetchall()
+    assert len(rows) == 1
+    payload = json.loads(rows[0]["payload"])
+    assert payload["gate_id"] == gate_id
+    assert payload["edit_id"] == edit_id
+    assert payload["note"] == "see the review thread"
+    assert payload["by_launch"] == launch_id
+    assert payload["artifact_id"]
+    assert rows[0]["launch_id"] == launch_id
+
+
+def test_send_back_edit_writes_no_gate_transition_row(store):
+    gate_id, edit_id, launch_id = _gated_gate_with_one_edit(store)
+    before = store.ops.execute("SELECT COUNT(*) FROM gate_transition WHERE gate_id = ?", (gate_id,)).fetchone()[0]
+
+    send_back_edit(store, gate_id=gate_id, edit_id=edit_id, by_launch=launch_id, note="n")
+
+    after = store.ops.execute("SELECT COUNT(*) FROM gate_transition WHERE gate_id = ?", (gate_id,)).fetchone()[0]
+    assert after == before
+
+
+def test_send_back_edit_requires_a_note(store):
+    gate_id, edit_id, launch_id = _gated_gate_with_one_edit(store)
+    with pytest.raises(ValueError, match="note is required"):
+        send_back_edit(store, gate_id=gate_id, edit_id=edit_id, by_launch=launch_id, note="   ")
+    # and nothing was written on the way to refusing
+    assert store.ops.execute("SELECT COUNT(*) FROM event WHERE type = 'gate_edit_sent_back'").fetchone()[0] == 0
+
+
+def test_send_back_edit_refuses_an_already_verified_edit(store):
+    gate_id, edit_id, launch_id = _gated_gate_with_one_edit(store)
+    verify_edit(store, gate_id=gate_id, edit_id=edit_id, by_launch=launch_id, verified_note="applied")
+
+    with pytest.raises(ValueError, match="already verified"):
+        send_back_edit(store, gate_id=gate_id, edit_id=edit_id, by_launch=launch_id, note="changed my mind")
+
+    edit = json.loads(get_gate(store, gate_id)["edits"])[0]
+    assert edit["verified"] is True
+    assert edit.get("sent_back") is None
+
+
+def test_send_back_edit_refuses_outside_gated_state(store):
+    launch_id, _type, artifact_id = _seed_artifact(store, gated=True)
+    gate = open_gate(store, artifact_id=artifact_id)
+    with pytest.raises(ValueError, match="must be 'gated'"):
+        send_back_edit(store, gate_id=gate["gate_id"], edit_id="EDIT-x", by_launch=launch_id, note="n")
+
+
+def test_send_back_edit_refuses_unknown_edit_and_unknown_launch(store):
+    gate_id, _edit_id, launch_id = _gated_gate_with_one_edit(store)
+    with pytest.raises(ValueError, match="no edit"):
+        send_back_edit(store, gate_id=gate_id, edit_id="EDIT-nope", by_launch=launch_id, note="n")
+    with pytest.raises(XidTargetMissingError):
+        send_back_edit(store, gate_id=gate_id, edit_id="EDIT-nope", by_launch="LNCH-nope", note="n")
+
+
+def test_a_verify_after_a_send_back_keeps_the_objection_on_the_record(store):
+    """The send-back fields are not the seven the DDL comment names, so
+    _normalize_edits used to drop them. They must survive both a later
+    verify and a later re-normalization: an objection that vanishes when
+    the work is done is an audit trail that lies about what happened."""
+    gate_id, edit_id, launch_id = _gated_gate_with_one_edit(store)
+    send_back_edit(store, gate_id=gate_id, edit_id=edit_id, by_launch=launch_id, note="wrong paragraph")
+
+    updated = verify_edit(store, gate_id=gate_id, edit_id=edit_id, by_launch=launch_id, verified_note="reworded")
+    edit = json.loads(updated["edits"])[0]
+    assert edit["verified"] is True
+    assert edit["sent_back"] is True
+    assert edit["sent_back_note"] == "wrong paragraph"
+    apply_union(store, gate_id=gate_id, by_launch=launch_id)
+
+
+def test_normalize_edits_carries_unknown_keys_through(store):
+    """_normalize_edits' own contract, asserted directly: the documented
+    seven keys are a guaranteed subset of an entry, never a maximum."""
+    normalized = _normalize_edits([{"text": "t", "sent_back": True, "sent_back_note": "n", "custom": 1}])
+    assert normalized[0]["sent_back"] is True
+    assert normalized[0]["sent_back_note"] == "n"
+    assert normalized[0]["custom"] == 1
+    assert normalized[0]["verified"] is False
+    assert normalized[0]["edit_id"]
