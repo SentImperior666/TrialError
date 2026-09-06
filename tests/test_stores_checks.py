@@ -166,3 +166,63 @@ def test_anchors_dangling_catches_planted_stale_anchor(store, program_root):
     r = results["anchors_dangling"]
     assert r.status == "warn"  # staleness is informational, not a hard failure
     assert r.details["doc_sha256_mismatches"] == 1
+
+
+# ---------------------------------------------------------------------------
+# platform.db is shared across an account's programs (first seen live in the e2e,
+# whose smoke and corpus programs share one scratch platform): a launch that belongs
+# to ANOTHER program points at that program's session and must not read as dangling
+# here, while this program's own launch with a missing session still must.
+# ---------------------------------------------------------------------------
+
+
+def _ensure_program_id(program_root, fallback="PROG-xid-test"):
+    from pathlib import Path as _P
+
+    from trialerror.stores.checks import _program_id
+    from trialerror.util.doctor import DoctorContext as _Ctx
+
+    pid = _program_id(_Ctx(program_root=_P(program_root)))
+    if pid:
+        return pid
+    toml = _P(program_root) / "trialerror.toml"
+    existing = toml.read_text(encoding="utf-8") if toml.exists() else ""
+    toml.write_text("[program]" + chr(10) + "id = \"" + fallback + "\"" + chr(10) + existing, encoding="utf-8")
+    return fallback
+
+
+def _clone_launch(store, **overrides):
+    conn = store.platform
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(launch)").fetchall()]
+    row = conn.execute("SELECT * FROM launch LIMIT 1").fetchone()
+    assert row is not None, "populate_one_of_everything left no launch row"
+    values = {c: row[i] for i, c in enumerate(cols)}
+    values.update(overrides)
+    with conn:
+        conn.execute(
+            "INSERT INTO launch (" + ", ".join(cols) + ") VALUES (" + ", ".join("?" for _ in cols) + ")",
+            [values[c] for c in cols],
+        )
+
+
+def test_xid_dangling_ignores_another_programs_launch_on_a_shared_platform(store, program_root):
+    populate_one_of_everything(store)
+    _ensure_program_id(program_root)
+    _clone_launch(
+        store,
+        launch_id=new_id("LNCH"),
+        program_id="PROG-someone-else",
+        session_id="SESS-lives-in-the-other-programs-ops-db",
+    )
+    r = _run(["xid_dangling"], program_root)["xid_dangling"]
+    assert r.status == "pass", r.details
+    assert "launch.session_id" in r.details["scoped_columns"]
+
+
+def test_xid_dangling_still_catches_this_programs_launch_with_a_missing_session(store, program_root):
+    populate_one_of_everything(store)
+    pid = _ensure_program_id(program_root)
+    _clone_launch(store, launch_id=new_id("LNCH"), program_id=pid, session_id="SESS-does-not-exist")
+    r = _run(["xid_dangling"], program_root)["xid_dangling"]
+    assert r.status == "fail"
+    assert r.details["offenders"].get("launch.session_id -> ops.session") == 1
