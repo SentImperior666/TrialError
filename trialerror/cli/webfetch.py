@@ -19,6 +19,8 @@ The verbs, in the order a session uses them::
     trialerror webfetch links   <fetch_id>          what one page pointed at
     trialerror webfetch refresh --all --older-than 30d --launch-id L
     trialerror webfetch proposals                   hosts awaiting approval
+    trialerror webfetch ack --fetch-id F --launch-id L --note "…"
+    trialerror webfetch acks                        the current ack for every id
     trialerror webfetch sidecar --foreground        the fetch loop itself
 
 Everything they return is **ids, counts and closed-vocabulary reasons**
@@ -198,6 +200,50 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     )
     _roots(p_proposals)
     p_proposals.set_defaults(handler=_cmd_proposals)
+
+    # -- ack / acks ------------------------------------------------------
+    p_ack = sub.add_parser(
+        "ack",
+        help="record that an unattributed fetch id is accounted for (the audit line stays; "
+        "the doctor check stops counting it)",
+    )
+    _roots(p_ack)
+    p_ack.add_argument(
+        "--fetch-id",
+        action="append",
+        default=[],
+        dest="fetch_ids",
+        help="a WF-… fetch id from the audit line; repeatable",
+    )
+    p_ack.add_argument(
+        "--job-id",
+        action="append",
+        default=[],
+        dest="job_ids",
+        help="a JOB-webfetch-… id from the audit line; repeatable (either id covers the line)",
+    )
+    p_ack.add_argument(
+        "--launch-id",
+        required=True,
+        dest="launch_id",
+        help="the booked launch this acknowledgement is attributed to — the record that "
+        "excuses an unattributed fetch is itself attributable",
+    )
+    p_ack.add_argument(
+        "--note",
+        required=True,
+        help="why this id is accounted for, in a sentence (required: an acknowledgement "
+        "nobody wrote down is a dashboard being silenced)",
+    )
+    p_ack.set_defaults(handler=_cmd_ack)
+
+    p_acks = sub.add_parser(
+        "acks",
+        help="the current acknowledgement for every id: kind, launch, note, timestamp, "
+        "and how many times it has been re-acknowledged",
+    )
+    _roots(p_acks)
+    p_acks.set_defaults(handler=_cmd_acks)
 
     p_sidecar = sub.add_parser(
         "sidecar",
@@ -680,6 +726,99 @@ def _cmd_proposals(args: argparse.Namespace) -> dict:
                 "approve or refuse these on the host — the allowlist is not reachable from here",
             )
         ],
+    )
+
+
+def _cmd_ack(args: argparse.Namespace) -> dict:
+    """Record that an unattributed fetch id is accounted for.
+
+    Deliberately NOT behind the ``[webfetch] enabled`` gate the fetching
+    verbs sit behind. Turning web ingestion off is a common thing to do
+    after a wave, and it must not strand the operator with a permanently red
+    ``webfetch_unattributed`` and no verb that can answer it — the gate is
+    about egress, and this verb has none.
+    """
+    from trialerror.webfetch.acks import AckError, acknowledge
+
+    store, _program_root, _config, err = _open(args, "webfetch ack")
+    if err is not None:
+        return err
+    try:
+        try:
+            results = acknowledge(
+                store,
+                fetch_ids=args.fetch_ids,
+                job_ids=args.job_ids,
+                launch_id=args.launch_id,
+                note=args.note,
+            )
+        except AckError as exc:
+            return error_envelope("webfetch ack", "ack_refused", str(exc))
+    finally:
+        store.close()
+
+    already = [r for r in results if r.already]
+    return ok_envelope(
+        "webfetch ack",
+        result={
+            "acknowledged": [r.as_dict() for r in results],
+            "new": len(results) - len(already),
+            "alreadyAcknowledged": len(already),
+            "auditUnchanged": True,
+        },
+        next_actions=[
+            next_action(
+                ["trialerror", "doctor", "--only", "webfetch_unattributed"],
+                "re-run the check: acknowledged ids move to its 'acknowledged' list and "
+                "the audit lines stay exactly where they are",
+            )
+        ],
+    )
+
+
+def _cmd_acks(args: argparse.Namespace) -> dict:
+    """The current acknowledgement for every id. The counterweight to the
+    verb above: an acknowledgement that could not be listed back would be a
+    way to make a finding disappear rather than a way to answer one.
+
+    "Current" is exact and load-bearing. Re-acknowledging an id UPDATEs its
+    single ``ops.meta`` row, so a second signer's launch, note and timestamp
+    replace the first signer's here — ``revisions``/``superseded`` say when
+    that has happened, and the superseded records themselves are in the
+    ``webfetch_ack`` event log, which nothing rewrites.
+    """
+    from trialerror.webfetch.acks import list_acks
+
+    store, _program_root, _config, err = _open(args, "webfetch acks")
+    if err is not None:
+        return err
+    try:
+        records = list_acks(store)
+    finally:
+        store.close()
+
+    superseded = sum(int(r.get("superseded") or 0) for r in records)
+    return ok_envelope(
+        "webfetch acks",
+        result={
+            "acks": [
+                {
+                    "id": r["id"],
+                    "kind": r["kind"],
+                    "launchId": r["launch_id"],
+                    "note": r["note"],
+                    "ts": r["ts"],
+                    "revisions": r.get("revisions", 0),
+                    "superseded": r.get("superseded", 0),
+                }
+                for r in records
+            ],
+            "total": len(records),
+            "supersededRecords": superseded,
+            "note": "the CURRENT acknowledgement per id; a re-ack replaces the row and "
+            "moves its boundary forward — superseded ones stay in the webfetch_ack "
+            "event log",
+        },
     )
 
 

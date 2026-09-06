@@ -655,6 +655,38 @@ a JavaScript-rendered marketing site.
   approved. Reading them is all this side can do; `te-webfetch.sh review` on the host
   is where you decide.
 
+### When an unattributed fetch is one you made on purpose
+
+`trialerror doctor` fails on a fetch naming a launch nobody booked, and the trail it
+reads is append-only — nothing on the research side may edit or truncate it, because a
+trail its own suspect can rewrite is not a trail. So the deliberate test of that alarm
+(write a request naming a made-up launch, watch both surfaces go red) would otherwise
+leave the check red for the life of the program, which is exactly how an operator learns
+to ignore a category. `trialerror webfetch ack --fetch-id WF-… --launch-id LNCH-… --note
+"why"` is the answer, and it is an addition rather than a deletion: it records that a
+named person, working under a launch that *is* booked, has accounted for that id. The
+audit line stays exactly where it is, the offender keeps appearing in the check's
+details with your note attached, and `trialerror webfetch acks` lists the current
+acknowledgement for every id — with a count of how many times each has been re-signed,
+because re-acknowledging replaces the row and the earlier signature then lives only in
+the `webfetch_ack` event log. The host machine has the same verb for its own
+authoritative line — `te-webfetch.sh ack <fetch_id|job_id> [note]` — and you want both,
+because they are two independent records read by two independent checks.
+
+**An acknowledgement is a boundary, not a switch.** It covers the fetches already on
+record when you signed and nothing that arrives afterwards, so a new unattributed fetch
+turns the check red again whether it carries a new id or *reuses the one you
+acknowledged* — the second case is called out by name ("arrived AFTER the
+acknowledgement"). That bound is what keeps the feature honest, because the acknowledged
+ids are printed: they are in the green line and in `webfetch acks`, so anything that can
+read a doctor run can see which ids have been signed for, and without a bound signing
+for an id would hand out a permanent exemption for it. To cover a genuinely new line
+under an id you already know about, acknowledge it again — a second deliberate,
+attributed, logged act, not something the first one granted in advance. On the host the
+same bound is a `covers=N` count on the `acknowledged.conf` line (the host log carries no
+per-line timestamp to compare against); `te-webfetch.sh ack` writes it, says out loud
+when it is widening one, and reports a hand-written entry that has none as ignored.
+
 ### What none of these commands will ever print
 
 A line of a fetched page. Every verb returns identifiers, counts and reasons; the text
@@ -669,7 +701,8 @@ agent that fetched it.
   than preventing it: any process inside the research container can write a
   syntactically valid launch id into a request. What bounds the damage is the host
   allowlist and the daily caps, not the attribution — and `trialerror doctor` and
-  `te-status.sh` both flag an unattributed fetch within one cycle.
+  `te-status.sh` both flag an unattributed fetch within one cycle. One you made on
+  purpose is retired with `webfetch ack` (above), never by editing the trail.
 - Pages tagged `unknown` (the default, when neither you nor the page says otherwise)
   are served **unfenced** by the retrieval layer, consistent with the internal-research
   posture. Tag commercial sources with `--license-tier commercial_restricted` and the

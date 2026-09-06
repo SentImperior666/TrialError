@@ -112,7 +112,21 @@ def test_the_group_registers_every_verb_the_design_names():
     for action in actions:
         if getattr(action, "choices", None) and isinstance(action.choices, dict):
             commands |= set(action.choices)
-    assert {"add", "batch", "refresh", "status", "report", "links", "proposals", "sidecar"} == commands
+    # `ack`/`acks` are not in the design's own verb list: they close the gap
+    # H-attrib found (an append-only audit copy that no acknowledgement path
+    # could ever answer). Everything else here is §3.3's list, unchanged.
+    assert {
+        "add",
+        "batch",
+        "refresh",
+        "status",
+        "report",
+        "links",
+        "proposals",
+        "ack",
+        "acks",
+        "sidecar",
+    } == commands
 
 
 def test_the_group_is_auto_discovered_and_edits_no_shared_file():
