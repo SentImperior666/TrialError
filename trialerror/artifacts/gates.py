@@ -33,15 +33,15 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from trialerror.artifacts._txn import raw_insert, raw_update
 from trialerror.artifacts.errors import GateEntryConditionError, IllegalTransitionError
 from trialerror.artifacts.state_machine import assert_legal_transition
+from trialerror.events.api import append_event_in_txn
 from trialerror.stores import get as store_get
 from trialerror.stores.errors import ValidationError, XidTargetMissingError
 from trialerror.stores.store import Store
-from trialerror.stores.writer import update as store_update
 from trialerror.util.ids import new_id
 from trialerror.util.timeutil import now
 
@@ -55,6 +55,7 @@ __all__ = [
     "record_verdict",
     "apply_union",
     "verify_edit",
+    "send_back_edit",
 ]
 
 #: Matches ``gate.verdict``'s CHECK constraint (``trialerror/stores/schema/ops.py``).
@@ -119,10 +120,19 @@ def _normalize_edits(edits: Sequence[dict[str, Any]] | None) -> list[dict[str, A
     subset a critic actually supplies — every entry gets a stable
     ``edit_id`` (generated if the caller didn't supply one) and the
     applied/verified fields start ``False``/``None`` until
-    :func:`verify_edit` touches them."""
+    :func:`verify_edit` touches them.
+
+    Keys this function does not name are CARRIED THROUGH, not dropped --
+    :func:`send_back_edit` adds ``sent_back``/``sent_back_note``/
+    ``sent_back_by_launch``/``sent_back_ts`` to an entry, and a later
+    ``record_verdict`` that re-normalizes an array containing them must
+    not silently erase an objection. The seven keys above are still forced
+    to their canonical shape on every entry, so the documented DDL shape
+    is a guaranteed SUBSET of what is stored, never a maximum."""
     normalized: list[dict[str, Any]] = []
     for e in edits or []:
-        normalized.append(
+        entry = dict(e)
+        entry.update(
             {
                 "edit_id": e.get("edit_id") or new_id("EDIT"),
                 "text": e["text"],
@@ -133,6 +143,7 @@ def _normalize_edits(edits: Sequence[dict[str, Any]] | None) -> list[dict[str, A
                 "verified_note": e.get("verified_note"),
             }
         )
+        normalized.append(entry)
     return normalized
 
 
@@ -440,25 +451,164 @@ def verify_edit(
 
     Requires the gate to be in ``gated`` state (post-verdict, pre-union) —
     editing after ``union_applied`` would silently invalidate a check that
-    already passed."""
+    already passed.
+
+    **Concurrency (WA-1, sweep batch W3, the worst case in that finding).**
+    ``edits`` is ONE JSON column holding the whole array, so marking one
+    entry is a read-modify-write of every entry. Before this fix that
+    read-modify-write straddled two auto-commits: six appliers verifying
+    six DIFFERENT edits on the same gate each read the array, changed
+    their own entry, and wrote the whole thing back — the last writer's
+    copy won and five acknowledged verifications vanished with no audit
+    trail (``verify_edit`` writes no event, by design, so nothing recorded
+    that they had happened). The entire read-modify-write now runs inside
+    one ``BEGIN IMMEDIATE`` transaction (:func:`_mutate_edit_in_txn`),
+    which restores per-EDIT granularity: concurrent verifications of
+    different edits all survive, and concurrent verifications of the SAME
+    edit are idempotent rather than interleaved."""
     if not by_launch:
         raise ValueError("verify_edit: by_launch is required")
     _require_launch_exists(store, by_launch, field_name="by_launch")
-    gate = _require_gate(store, gate_id)
-    if gate["state"] != "gated":
-        raise ValueError(f"verify_edit: gate {gate_id!r} must be 'gated' to verify an edit, is {gate['state']!r}")
 
-    edits = _parse_edits(gate.get("edits"))
-    match = next((e for e in edits if e["edit_id"] == edit_id), None)
-    if match is None:
-        raise ValueError(f"verify_edit: no edit {edit_id!r} on gate {gate_id!r}")
-    match["applied"] = True
-    match["applied_by_launch"] = by_launch
-    match["verified"] = True
-    match["verified_note"] = verified_note
+    def _apply(entry: dict[str, Any]) -> None:
+        entry["applied"] = True
+        entry["applied_by_launch"] = by_launch
+        entry["verified"] = True
+        entry["verified_note"] = verified_note
 
-    store_update(
-        store, "gate", pk_column="gate_id", pk_value=gate_id,
-        changes={"edits": json.dumps(edits, ensure_ascii=False)},
+    return _mutate_edit_in_txn(store, caller="verify_edit", gate_id=gate_id, edit_id=edit_id, mutate=_apply)
+
+
+def send_back_edit(
+    store: Store,
+    *,
+    gate_id: str,
+    edit_id: str,
+    by_launch: str,
+    note: str,
+    ts: str | None = None,
+) -> dict[str, Any]:
+    """The non-destructive counterpart to :func:`verify_edit`: the applier
+    (or the operator at the dashboard) objects to a critic's edit and
+    sends it BACK instead of applying it.
+
+    Like :func:`verify_edit`, this is NOT a state transition — it mutates
+    one entry of the ``edits`` JSON array and writes no ``gate_transition``
+    row. The entry is marked ``applied=False, verified=False,
+    sent_back=True`` plus ``sent_back_note`` / ``sent_back_by_launch`` /
+    ``sent_back_ts``. Because it leaves the entry UNVERIFIED,
+    :func:`_check_union_entry` is untouched by design: a sent-back
+    blocking edit still blocks ``union_applied``, with the same
+    "blocking edit(s) not yet verified" refusal. Sending back is a request
+    for work, not a way around the gate.
+
+    ``note`` is REQUIRED — a send-back with no stated objection is the
+    freeze-without-reason case (``trialerror.rooms.api.freeze_room`` refuses
+    it for the same reason).
+
+    Unlike verify (whose record is the JSON entry itself, design 12.12),
+    a send-back DOES emit an event, ``gate_edit_sent_back``, in the same
+    transaction: the objection has to be discoverable by whoever has to do
+    the work, and nothing else in the schema would carry it.
+
+    Refuses (:class:`ValueError`) if the gate is not ``gated``, if
+    ``edit_id`` names no edit on it, or if that edit is already
+    ``verified`` (re-opening a verification is a verdict-level act, not an
+    applier-level one); refuses
+    (:class:`~trialerror.stores.errors.XidTargetMissingError`) if
+    ``by_launch`` names no real launch."""
+    if not by_launch:
+        raise ValueError("send_back_edit: by_launch is required")
+    if not note or not str(note).strip():
+        raise ValueError("send_back_edit: note is required (a send-back with no stated objection is not actionable)")
+    _require_launch_exists(store, by_launch, field_name="by_launch")
+    stamped = ts or now()
+
+    def _apply(entry: dict[str, Any]) -> None:
+        if entry.get("verified"):
+            raise ValueError(
+                f"send_back_edit: edit {edit_id!r} on gate {gate_id!r} is already verified; "
+                "a verified edit cannot be sent back (record a new verdict instead)"
+            )
+        entry["applied"] = False
+        entry["verified"] = False
+        entry["sent_back"] = True
+        entry["sent_back_note"] = note
+        entry["sent_back_by_launch"] = by_launch
+        entry["sent_back_ts"] = stamped
+
+    return _mutate_edit_in_txn(
+        store, caller="send_back_edit", gate_id=gate_id, edit_id=edit_id, mutate=_apply,
+        event=lambda gate: (
+            "gate_edit_sent_back",
+            {
+                "gate_id": gate_id,
+                "edit_id": edit_id,
+                "artifact_id": gate.get("artifact_id"),
+                "note": note,
+                "by_launch": by_launch,
+            },
+        ),
+        ts=stamped,
+        by_launch=by_launch,
     )
+
+
+def _mutate_edit_in_txn(
+    store: Store,
+    *,
+    caller: str,
+    gate_id: str,
+    edit_id: str,
+    mutate: Callable[[dict[str, Any]], None],
+    event: Callable[[dict[str, Any]], tuple[str, dict[str, Any]]] | None = None,
+    ts: str | None = None,
+    by_launch: str | None = None,
+) -> dict[str, Any]:
+    """The ONE place a single entry of ``gate.edits`` is mutated, and the
+    close of WA-1's worst case (see :func:`verify_edit`'s own docstring for
+    what the race lost).
+
+    The gate row is re-read INSIDE a ``BEGIN IMMEDIATE`` transaction, so
+    the ``edits`` array this mutates is the array as it stands under the
+    write lock — never a copy read before some other writer's commit. The
+    state precondition is re-checked on that fresh row too: a gate that
+    left ``gated`` while this caller was deciding refuses rather than
+    writing into a gate that already passed its union check.
+
+    ``event``, when given, is called with the fresh gate row and returns
+    ``(event_type, payload)`` for one ``event`` row written inside the SAME
+    transaction — so a mutation and its audit record land together or not
+    at all. ``by_launch`` must already be XID-validated by the public
+    caller (``trialerror.artifacts._txn``'s contract)."""
+    conn = store.ops
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        fresh = conn.execute("SELECT * FROM gate WHERE gate_id = ?", (gate_id,)).fetchone()
+        if fresh is None:
+            raise ValueError(f"no such gate: {gate_id!r}")
+        gate = dict(fresh)
+        if gate["state"] != "gated":
+            raise ValueError(
+                f"{caller}: gate {gate_id!r} must be 'gated' to change an edit, is {gate['state']!r}"
+            )
+        edits = _parse_edits(gate.get("edits"))
+        match = next((e for e in edits if e["edit_id"] == edit_id), None)
+        if match is None:
+            raise ValueError(f"{caller}: no edit {edit_id!r} on gate {gate_id!r}")
+        mutate(match)
+        raw_update(
+            conn, "gate", pk_column="gate_id", pk_value=gate_id,
+            changes={"edits": json.dumps(edits, ensure_ascii=False)},
+        )
+        if event is not None:
+            event_type, payload = event(gate)
+            append_event_in_txn(conn, event_type=event_type, payload=payload, launch_id=by_launch, ts=ts)
+        conn.execute("COMMIT")
+    except sqlite3.IntegrityError as exc:
+        conn.execute("ROLLBACK")
+        raise ValidationError(f"{caller}: integrity violation on gate {gate_id!r}: {exc}") from exc
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
     return _require_gate(store, gate_id)

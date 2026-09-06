@@ -12,6 +12,7 @@ from __future__ import annotations
 import pytest
 
 from trialerror.dashboard import data
+from trialerror.dashboard import serve
 from trialerror.dashboard.store_ro import open_store_ro
 from trialerror.stores.store import open_store
 from tests._store_fixtures import populate_one_of_everything
@@ -204,3 +205,78 @@ def test_build_all_panels_has_every_panel(seeded):
     }
     for name, panel in panels.items():
         assert "status" in panel, f"{name} panel missing a status field"
+
+
+# ---------------------------------------------------------------------------
+# S1 -- per-builder isolation (M-LU-2). One builder's failure is that panel's
+# reading, never the bundle's 500: the page's ONLY bulk-load route must
+# always answer, or a client retry loop spins against a crash that will
+# never clear (LU-3's other half).
+# ---------------------------------------------------------------------------
+@pytest.fixture()
+def seeded_without_platform(program_root, platform_root):
+    """A real program whose platform store is then deleted -- close-readiness
+    and the launch counts live in platform.db, so ``build_session_panel``
+    used to crash here and take ``/dashboard/api/all`` with it."""
+    store = open_store(program_root, platform_root=platform_root)
+    ids = populate_one_of_everything(store)
+    store.close()
+    for leftover in platform_root.glob("platform.db*"):
+        leftover.unlink()
+    rostore = open_store_ro(program_root, platform_root=platform_root)
+    yield rostore, ids
+    rostore.close()
+
+
+def test_session_panel_platform_missing_is_error_not_crash(seeded_without_platform):
+    rostore, _ids = seeded_without_platform
+    assert rostore.is_available("ops")
+    assert not rostore.is_available("platform")
+
+    panel = data.build_session_panel(rostore)
+    # "error", not "not_initialized": the program is real, the platform
+    # store it hangs off is not there.
+    assert panel["status"] == "error"
+    assert "platform.db" in panel["message"]
+
+    panels = data.build_all_panels(rostore, doctor_state=None)
+    assert panels["session"]["status"] == "error"
+    assert panels["budget"]["status"] == "not_initialized"  # platform-only panel, its own honest empty state
+    for name in ("feed", "rooms", "gates", "corpus", "course", "lexicon", "determinations"):
+        assert panels[name]["status"] == "ok", (name, panels[name])
+
+
+def test_build_all_panels_isolates_a_raising_builder(seeded, monkeypatch):
+    rostore, _ids = seeded
+
+    def boom(_rostore, **_kwargs):
+        raise ValueError("deliberate builder failure")
+
+    monkeypatch.setitem(data.PANEL_BUILDERS, "corpus", boom)
+
+    panels = data.build_all_panels(rostore, doctor_state=None)
+    assert panels["corpus"]["status"] == "error"
+    assert panels["corpus"]["message"].startswith("ValueError: ")
+    assert panels["corpus"]["panel"] == "corpus"
+    for name in ("session", "feed", "rooms", "gates", "course"):
+        assert panels[name]["status"] == "ok", (name, panels[name])
+
+
+def test_build_one_panel_isolates_a_raising_builder(program_root, platform_root, monkeypatch):
+    """The single-panel route gets the same fence as the bundle -- before
+    this they disagreed (one 200 with data, the other a 500)."""
+    store = open_store(program_root, platform_root=platform_root)
+    populate_one_of_everything(store)
+    store.close()
+
+    def boom(_rostore, **_kwargs):
+        raise RuntimeError("deliberate builder failure")
+
+    monkeypatch.setitem(data.PANEL_BUILDERS, "corpus", boom)
+    config = serve.ServerConfig(
+        repo_root=program_root, program_root=program_root, platform_root=platform_root
+    )
+    panel = serve.build_one_panel(config, "corpus")
+    assert panel["status"] == "error"
+    assert panel["message"].startswith("RuntimeError: ")
+    assert serve.build_one_panel(config, "not-a-panel") is None

@@ -255,6 +255,19 @@ html { scroll-padding-top: calc(var(--topbar-h) + 8px); }
 }
 .topbar-fill { flex-grow: 1; }
 
+/* ---- freshness pair: how old the data is, then whether the feed is up.
+   VA-3: the mode chip is the only freshness signal on the page, so it obeys
+   the house status rule -- one hue per state, never decorative. The client
+   sets `data-state` on EVERY path that touches the element (the finding's
+   own proposed fix could not work, because the error path set only the
+   text). M-LU-7 adds "AS OF": a live socket over three-hour-old numbers is
+   the state these two together are here to make impossible to misread. ---- */
+.topbar-asof { color: var(--ink-3); white-space: nowrap; }
+.topbar-field[data-state] { letter-spacing: 0.08em; }
+.topbar-field[data-state="live"] { color: var(--live); }
+.topbar-field[data-state="reconnecting"] { color: var(--warn); }
+.topbar-field[data-state="static"] { color: var(--ink-3); }
+
 .content { flex-grow: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
 
 .panel { display: none; flex-direction: column; min-height: 0; flex-grow: 1; }
@@ -479,6 +492,13 @@ html { scroll-padding-top: calc(var(--topbar-h) + 8px); }
 .warn-callout .head { font-family: var(--font-mono); font-size: 10px; color: var(--warn); }
 .warn-callout .body { font-size: 11.5px; line-height: 1.5; color: var(--ink); }
 
+/* ---- the shared fetch-error banner (LU-5). Prepended to the panel that
+   failed, so the message sits above the stale content it is warning about
+   rather than replacing it -- last-known data is still worth reading, as
+   long as the page says that is what it is. ---- */
+.panel-fetch-error { margin: 12px var(--page-margin) 0; flex-shrink: 0; }
+.panel-fetch-error .btn-row { margin-top: 3px; }
+
 /* ---- note strip (seam/lineage honesty notes) ---- */
 .note-strip { font-family: var(--font-mono); font-size: 10px; color: var(--ink-3); line-height: 1.6; }
 
@@ -675,6 +695,9 @@ html { scroll-padding-top: calc(var(--topbar-h) + 8px); }
 .gate-track { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; font-family: var(--font-mono); font-size: 10px; }
 .gate-track .step { color: var(--settled); }
 .gate-track .step.is-pending { color: var(--ink-3); }
+/* AC-2: `failed` is the track's EXIT, not its last step -- crit, and drawn
+   after whatever step the gate actually reached. */
+.gate-track .step--failed { color: var(--crit-text); }
 .gate-track .sep { color: var(--hairline); }
 .kv-mini { display: flex; justify-content: space-between; font-family: var(--font-mono); font-size: 10px; }
 .kv-mini .k { color: var(--ink-3); }
@@ -741,6 +764,49 @@ html { scroll-padding-top: calc(var(--topbar-h) + 8px); }
 .console-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: var(--card-gap); padding: var(--page-margin); }
 .console-grid .card { max-height: 420px; }
 .console-grid .card-body { overflow-y: auto; }
+
+/* The Console repeats two readings from the topbar in its own subbar: how old
+   the numbers are, and the one-glance health tally. Colour is third here as
+   everywhere -- the tally carries its level as data-health, and the word
+   ("OK" / "2 WARN" / "1 CRIT") is the reading. */
+.console-asof { font-family: var(--font-mono); font-size: 10px; color: var(--ink-3); white-space: nowrap; }
+.console-health-tally {
+  font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.06em;
+  white-space: nowrap; color: var(--ink-2);
+}
+.console-health-tally[data-health="ok"] { color: var(--settled); }
+.console-health-tally[data-health="warn"] { color: var(--warn); }
+.console-health-tally[data-health="crit"] { color: var(--crit-text); }
+
+/* ============================================================================
+   SHARED RENDERER PRIMITIVES (console_render.js -- TEConsole.h2 / .rowButton)
+
+   These style nodes the per-surface renderer FILES build, so they sit here
+   rather than under any one surface: the Console, Evidence and Feed all draw
+   rows that are themselves controls.
+   ============================================================================ */
+
+/* M-VA-1: card titles are real headings. `.title` already carries the type
+   scale, so this only has to undo the element's own default box and size --
+   an <h2 class="title"> must be pixel-identical to the <span class="title">
+   it replaces, or an accessibility fix reads as a visual regression. */
+h2.title { margin: 0; font-size: 11px; font-weight: 700; letter-spacing: 0.12em; color: var(--ink-hi); }
+
+/* A row that IS the control. A clickable <div> is invisible to the keyboard;
+   this is a real <button>, stripped back to look like the row it replaces. */
+.row-button {
+  display: flex; align-items: baseline; gap: 12px; width: 100%;
+  padding: 6px 0; text-align: left;
+  background: none; border: 0; border-bottom: 1px solid var(--hairline-soft);
+  color: inherit; font: inherit; cursor: pointer;
+}
+.row-button:hover:not(:disabled) { background: var(--surface-2); }
+.row-button:focus-visible { outline: 1px solid var(--live); outline-offset: -1px; }
+.row-button.is-selected { background: var(--surface-2); border-left: 2px solid var(--live); padding-left: 8px; }
+/* A disabled row is drawn, not hidden: the operator can see that the verb
+   exists and read (title=) why it is not available. */
+.row-button:disabled { cursor: default; color: var(--disabled-ink); }
+.row-button__cell { font-family: var(--font-mono); font-size: 11px; }
 
 /* ============================================================================
    EVIDENCE (documented API gap -- claim-trace graph has no backing route

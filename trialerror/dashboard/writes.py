@@ -82,6 +82,7 @@ from trialerror.rooms import api as rooms_api
 from trialerror.rooms.errors import RoomsError
 from trialerror.stores.errors import StoreError
 from trialerror.stores.store import Store, open_store
+from trialerror.verify.errors import VerifyError
 
 __all__ = ["WRITABLE_ACTIONS", "REQUIRED_FIELDS", "dispatch"]
 
@@ -90,8 +91,13 @@ __all__ = ["WRITABLE_ACTIONS", "REQUIRED_FIELDS", "dispatch"]
 #: ``ExtractError``/every ``trialerror.ingest`` subclass is already covered by
 #: ``IngestError``; ``ValidationError``/``XidTargetMissingError`` are already
 #: covered by ``StoreError`` (see ``trialerror/stores/errors.py``).
+#: ``VerifyError`` covers ``trialerror.verify``'s own refusal family
+#: (``PreregNotFoundError``/``PreregVoidedError``/``PreregTamperedError``,
+#: ...) -- listed here ahead of the actions that raise it (spec §4's
+#: ``prereg-reveal``, C7) so a verify refusal can never reach the HTTP
+#: layer as a 500: a tampered escrow is a finding, not a server fault.
 _EXPECTED_ERRORS: tuple[type[Exception], ...] = (
-    ArtifactsError, IngestError, RoomsError, StoreError, ValueError,
+    ArtifactsError, IngestError, RoomsError, StoreError, VerifyError, ValueError,
 )
 
 
@@ -274,7 +280,46 @@ REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _missing_fields(action: str, body: dict[str, Any]) -> list[str]:
+#: Every body field this module reads that is NOT a plain string, and the
+#: Python type(s) a JSON body may legitimately carry it as. Anything absent
+#: from this table is a STRING field -- which is what makes
+#: :func:`_validate_fields` a closed check rather than a best-effort one.
+#:
+#: M-WA-1/M-WA-2 (sweep §5, promoted to batch W3): before this table, a JSON
+#: object or number in a string field sailed past the old
+#: ``_missing_fields`` (it is neither ``None`` nor a blank string), reached
+#: SQLite as a ``dict``, and died there with ``sqlite3.ProgrammingError`` --
+#: an exception no layer caught, so the socket closed with NO response at
+#: all (HTTP 000) even though this module's docstring promises a 500.
+#: Worse, a JSON value sqlite CAN bind (a number in
+#: ``verified_note``/``reason``) was silently persisted into a text column.
+#: Both are the same missing type check.
+#:
+#: ``agreement_pct`` also accepts ``str``: the dashboard's own score form
+#: reads it off an ``<input type="number">``, whose ``.value`` is a string,
+#: and the CLI's ``--agreement-pct`` is argv. Whether that string is a
+#: NUMBER is :func:`_do_room_score`'s own check, which already raises a
+#: ``ValueError`` naming the field and echoing the value -- a better
+#: message than anything this table could produce, and the reason this
+#: check is about JSON SHAPE only.
+_NON_STRING_FIELDS: dict[str, tuple[type, ...]] = {
+    "agreement_pct": (int, float, str),
+}
+
+
+def _validate_fields(action: str, body: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """``(missing, type_errors)`` for one action's body.
+
+    ``missing`` keeps the original semantics (a required field that is
+    absent, ``None``, or whitespace-only). ``type_errors`` is the new half:
+    EVERY field present in the body is checked against
+    :data:`_NON_STRING_FIELDS` (string unless listed there), so a client
+    bug is refused by name before any store is opened -- never handed to
+    the database to fail on.
+
+    A boolean is rejected for a numeric field deliberately: ``True`` is an
+    ``int`` in Python, but it is never what a caller meant by
+    ``agreement_pct``."""
     missing: list[str] = []
     for field in REQUIRED_FIELDS.get(action, ()):
         value = body.get(field)
@@ -282,7 +327,19 @@ def _missing_fields(action: str, body: dict[str, Any]) -> list[str]:
             missing.append(field)
         elif isinstance(value, str) and not value.strip():
             missing.append(field)
-    return missing
+
+    type_errors: list[str] = []
+    for field, value in body.items():
+        if value is None:
+            continue
+        expected = _NON_STRING_FIELDS.get(field)
+        if expected is None:
+            if not isinstance(value, str):
+                type_errors.append(f"{field} must be a string, got {type(value).__name__}")
+        elif isinstance(value, bool) or not isinstance(value, expected):
+            names = "/".join(t.__name__ for t in expected)
+            type_errors.append(f"{field} must be a {names}, got {type(value).__name__}")
+    return missing, type_errors
 
 
 def dispatch(
@@ -293,11 +350,13 @@ def dispatch(
     body: dict[str, Any],
 ) -> dict[str, Any]:
     """Validate + execute one write action. Never raises for an EXPECTED
-    refusal (unknown action, no program selected, missing required field, or
-    any :data:`_EXPECTED_ERRORS` the business-logic call itself raises) --
-    each of those is reported as ``{"ok": False, "message": ...}``. Any
-    OTHER exception propagates (module docstring: a genuine bug must look
-    like one, never a disguised refusal)."""
+    refusal (unknown action, no program selected, a missing required field,
+    a field of the wrong JSON type, or any :data:`_EXPECTED_ERRORS` the
+    business-logic call itself raises) -- each of those is reported as
+    ``{"ok": False, "message": ...}``. Any OTHER exception propagates
+    (module docstring: a genuine bug must look like one, never a disguised
+    refusal); the HTTP layer turns it into a 500 JSON envelope with the
+    traceback on stderr."""
     handler = WRITABLE_ACTIONS.get(action)
     if handler is None:
         return {"ok": False, "status": "unknown_action", "message": f"no such write action: {action!r}"}
@@ -306,11 +365,16 @@ def dispatch(
             "ok": False, "status": "no_program_root",
             "message": "no program is selected on this dashboard (no --program-root) -- writes need a real program",
         }
-    missing = _missing_fields(action, body)
+    missing, type_errors = _validate_fields(action, body)
     if missing:
         return {
             "ok": False, "status": "missing_fields",
             "message": f"missing required field(s) for {action!r}: {', '.join(missing)}",
+        }
+    if type_errors:
+        return {
+            "ok": False, "status": "bad_request",
+            "message": f"bad field type(s) for {action!r}: {'; '.join(sorted(type_errors))}",
         }
 
     store = open_store(Path(program_root), platform_root=Path(platform_root) if platform_root else None)

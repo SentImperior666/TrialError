@@ -9,6 +9,7 @@ never a second implementation of author derivation.
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from trialerror.util.timeutil import now
 
 __all__ = [
     "append_event",
+    "append_event_in_txn",
     "record_hook_alive_once",
     "tail_events",
     "export_events",
@@ -73,6 +75,60 @@ def append_event(
         "payload": payload,
     }
     return insert(store, "event", row)
+
+
+def append_event_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    event_type: str,
+    payload: Any,
+    session_id: str | None = None,
+    launch_id: str | None = None,
+    workpackage: str | None = None,
+    ts: str | None = None,
+) -> dict[str, Any]:
+    """The SAME event row :func:`append_event` writes, inserted on an
+    ALREADY-OPEN ``BEGIN IMMEDIATE`` transaction on ``conn`` (which must be
+    ``store.ops``) instead of committing on its own -- the
+    ``trialerror.artifacts._txn`` split, applied to the one table every
+    subsystem writes.
+
+    Why this exists (WA-1, sweep batch W3): a state change and the event
+    that records it must land together or not at all. Before this, every
+    caller wrote the row AFTER its own ``COMMIT`` via
+    :func:`append_event`, so a crash in between left a transition with no
+    audit trail -- and, worse, calling :func:`append_event` from INSIDE an
+    open transaction would have committed that transaction early
+    (``trialerror.stores.writer.insert`` uses ``with conn:``), silently
+    defeating the very lock the caller took.
+
+    Redaction is applied exactly as the generic writer applies it (design
+    Section 4.2), so an event written this way is byte-identical to one
+    written through :func:`append_event`.
+
+    XID validation is NOT applied here -- same contract as
+    ``trialerror.artifacts._txn``'s own helpers: ``event.launch_id`` is a
+    registered XID, so every caller MUST have validated it (typically
+    ``_require_launch_exists``) BEFORE opening the transaction, so a bad
+    launch id refuses before any row is touched.
+    """
+    from trialerror.artifacts._txn import raw_insert
+    from trialerror.stores.writer import _apply_event_redaction
+
+    row = _apply_event_redaction(
+        "event",
+        {
+            "event_id": new_id("EVT"),
+            "ts": ts or now(),
+            "session_id": session_id,
+            "launch_id": launch_id,
+            "workpackage": workpackage,
+            "type": event_type,
+            "payload": payload,
+        },
+    )
+    raw_insert(conn, "event", row)
+    return row
 
 
 def record_hook_alive_once(store: Store, *, session_id: str | None, hook_name: str) -> dict[str, Any] | None:

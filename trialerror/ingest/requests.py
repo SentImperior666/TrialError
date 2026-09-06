@@ -41,7 +41,25 @@ def transition(store: Store, source_id: str, to_state: str, *, launch_id: str | 
     logging the change as an ``event`` row (design: "every state change is
     an event") -- a plain ``event`` insert, not ``trialerror.events``' higher-level
     API (M5-owned, out of this build's lane); the ``event`` table's own
-    write-API redaction pass (``trialerror.stores.writer``) still applies."""
+    write-API redaction pass (``trialerror.stores.writer``) still applies.
+
+    **Concurrency (WA-1, sweep batch W3).** The legality check and the
+    write are now one atomic step: :func:`_cas_request_state` re-reads the
+    row under a ``BEGIN IMMEDIATE`` write lock on ``knowledge.db`` and
+    updates it with a compare-and-swap ``UPDATE ... WHERE source_id = ?
+    AND request_state = ?``. Before this, two concurrent ``requested ->
+    delivered`` calls both passed the check and both "succeeded", writing
+    two ``ingest_request_transition`` events for one real transition; now
+    exactly one wins and every loser raises
+    :class:`~trialerror.ingest.errors.InvalidRequestTransitionError`
+    naming the state actually found.
+
+    **Where the atomicity stops.** ``source`` lives in ``knowledge.db``
+    and ``event`` in ``ops.db`` -- two files, so two transactions. The
+    event insert lands AFTER the knowledge commit: a crash in the gap
+    loses an EVENT, never a transition, and never writes an event for a
+    transition that did not happen (the reverse order would be worse --
+    an audit row claiming a state change that then failed)."""
     source = get(store, "source", pk_column="source_id", pk_value=source_id)
     if source is None:
         raise SourceNotFoundError(f"no such source: {source_id!r}")
@@ -53,14 +71,7 @@ def transition(store: Store, source_id: str, to_state: str, *, launch_id: str | 
             f"request-queue transition (allowed from {from_state!r}: {sorted(allowed)!r})"
         )
 
-    from trialerror.stores.writer import update
-
-    changes: dict[str, Any] = {"request_state": to_state}
-    if to_state == "requested":
-        changes["requested_ts"] = now()
-    elif to_state == "delivered":
-        changes["delivered_ts"] = now()
-    update(store, "source", pk_column="source_id", pk_value=source_id, changes=changes)
+    _cas_request_state(store, source_id=source_id, from_state=from_state, to_state=to_state)
 
     insert(
         store,
@@ -77,6 +88,52 @@ def transition(store: Store, source_id: str, to_state: str, *, launch_id: str | 
     updated = get(store, "source", pk_column="source_id", pk_value=source_id)
     assert updated is not None
     return updated
+
+
+#: ``to_state`` -> the ``source`` timestamp column that state stamps (states
+#: not listed here stamp nothing). Kept beside :func:`_cas_request_state`,
+#: which is the only writer of either column.
+_TS_COLUMN_FOR_STATE: dict[str, str] = {"requested": "requested_ts", "delivered": "delivered_ts"}
+
+
+def _cas_request_state(store: Store, *, source_id: str, from_state: str, to_state: str) -> None:
+    """The compare-and-swap half of :func:`transition` -- WA-1's fix.
+
+    ``trialerror.stores.writer.update`` builds ``UPDATE <table> SET ...
+    WHERE <pk> = ?`` with no room for an extra predicate, so this issues
+    the statement directly on ``store.knowledge`` (a plain column write:
+    ``request_state``/``requested_ts``/``delivered_ts`` carry no XID and no
+    redaction, the two things the generic writer adds). Both the re-read
+    and the write happen inside one ``BEGIN IMMEDIATE`` transaction, so no
+    other writer can interleave between them."""
+    ts_column = _TS_COLUMN_FOR_STATE.get(to_state)
+    conn = store.knowledge
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        fresh = conn.execute("SELECT request_state FROM source WHERE source_id = ?", (source_id,)).fetchone()
+        if fresh is None:
+            raise SourceNotFoundError(f"no such source: {source_id!r}")
+        assignments = ["request_state = ?"]
+        params: list[Any] = [to_state]
+        if ts_column is not None:
+            assignments.append(f"{ts_column} = ?")
+            params.append(now())
+        params.extend([source_id, from_state])
+        cur = conn.execute(
+            f"UPDATE source SET {', '.join(assignments)} WHERE source_id = ? AND request_state = ?",
+            params,
+        )
+        if cur.rowcount == 0:
+            found = conn.execute("SELECT request_state FROM source WHERE source_id = ?", (source_id,)).fetchone()
+            found_state = found["request_state"] if found is not None else "<row disappeared>"
+            raise InvalidRequestTransitionError(
+                f"source {source_id!r}: {from_state!r} -> {to_state!r} did not apply — the row "
+                f"is now {found_state!r} (a concurrent writer moved it first; nothing was written)"
+            )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def _event_payload(source_id: str, from_state: str, to_state: str, note: str | None) -> str:

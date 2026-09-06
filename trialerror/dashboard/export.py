@@ -8,13 +8,18 @@ never a second copy), then two build-time transforms turn the
 MINIMAL-FUNCTIONAL ``static/dashboard.html`` template into one portable
 file:
 
-1. **CSS inlining.** The template's ``<link rel="stylesheet"
-   href="dashboard.css">`` is replaced with an inline ``<style>`` block
-   containing ``dashboard.css``'s own content verbatim. The *source*
-   template stays "one external CSS file, no inline styles" (so a re-skin
-   only ever touches ``dashboard.css``); only the EXPORT step inlines it,
-   because a snapshot dropped anywhere on disk by ``--out`` cannot rely on
-   a sibling file being copied alongside it.
+1. **Asset inlining.** Every asset the template pulls in by a relative
+   path is replaced with its own content: the ``<link rel="stylesheet"
+   href="dashboard.css">`` becomes an inline ``<style>`` block, and each
+   ``<script src="...">`` named in :data:`_INLINE_SCRIPTS` -- the
+   per-surface renderers the dashboard's house rule keeps in files of
+   their own (``console_render.js`` and its siblings) -- becomes an inline
+   ``<script>``. The *source* template keeps them separate (a re-skin only
+   ever touches ``dashboard.css``; two parallel builds never edit the same
+   renderer hunk); only the EXPORT step inlines them, because a snapshot
+   dropped anywhere on disk by ``--out`` cannot rely on sibling files
+   travelling with it -- and over ``file://`` a missing sibling script is
+   a silently half-rendered page, not an error anyone is shown.
 2. **Data embedding.** The panel JSON is written into a
    ``<script id="dashboard-data" type="application/json">`` tag the page's
    own inline script already knows to look for (``tryStaticMode()``) --
@@ -41,6 +46,60 @@ __all__ = ["build_snapshot_html", "export_snapshot"]
 HERE = Path(__file__).resolve().parent
 STATIC_DIR = HERE / "static"
 _CSS_LINK_TAG = '<link rel="stylesheet" href="dashboard.css">'
+
+#: Every ``<script src="...">`` in ``static/dashboard.html`` that must be
+#: inlined into the snapshot, in load order. These are the per-surface
+#: renderer files the dashboard's house rule keeps out of the inline script
+#: (LANE_C_DASHBOARD_COMPLETION_SPEC section 0) -- the export has to carry
+#: them, since a single portable file has no siblings to fetch.
+#:
+#: Adding a renderer file is two lines: the ``<script src>`` in the template
+#: and its name here. Forgetting the second is caught by this module (the
+#: tag must exist, or the export raises) *and* by the export test, which
+#: asserts no ``src=`` survives in the snapshot at all -- one missed entry
+#: would otherwise ship a file:// page whose Console renders nothing, with
+#: no error visible anywhere.
+_INLINE_SCRIPTS: tuple[str, ...] = ("console_render.js",)
+
+
+def _script_src_tag(name: str) -> str:
+    return f'<script src="{name}"></script>'
+
+
+def _inline_static_assets(html: str) -> str:
+    """Replace the stylesheet ``<link>`` and every :data:`_INLINE_SCRIPTS`
+    ``<script src>`` with the file's own content.
+
+    Each marker must be present exactly as written: a template edit that
+    renames or reformats one is a *stale exporter*, and this raises rather
+    than quietly producing a snapshot that is missing a stylesheet or a
+    renderer (the failure mode a portable file cannot report at open time).
+    """
+    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
+    if _CSS_LINK_TAG not in html:
+        raise RuntimeError(
+            "trialerror/dashboard/static/dashboard.html no longer contains the expected "
+            f"stylesheet <link> tag ({_CSS_LINK_TAG!r}) -- export.py's CSS-inlining "
+            "marker is stale; update both together"
+        )
+    html = html.replace(_CSS_LINK_TAG, f"<style>\n{css}\n</style>", 1)
+
+    for name in _INLINE_SCRIPTS:
+        tag = _script_src_tag(name)
+        if tag not in html:
+            raise RuntimeError(
+                "trialerror/dashboard/static/dashboard.html does not load "
+                f"{name!r} with the expected tag ({tag!r}) -- export.py's "
+                "_INLINE_SCRIPTS entry is stale; update both together"
+            )
+        source = (STATIC_DIR / name).read_text(encoding="utf-8")
+        if "</script" in source:
+            # The tokenizer would end the element early -- and a renderer has
+            # no business containing that byte sequence in the first place.
+            raise RuntimeError(f"{name} contains a literal '</script' and cannot be inlined")
+        html = html.replace(tag, f"<script>\n{source}\n</script>", 1)
+
+    return html
 
 
 def _embed_json_safely(payload: dict[str, Any]) -> str:
@@ -99,15 +158,7 @@ def build_snapshot_html(
     payload = {"meta": meta, "panels": panels}
 
     html = (STATIC_DIR / "dashboard.html").read_text(encoding="utf-8")
-    css = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
-
-    if _CSS_LINK_TAG not in html:
-        raise RuntimeError(
-            "trialerror/dashboard/static/dashboard.html no longer contains the expected "
-            f"stylesheet <link> tag ({_CSS_LINK_TAG!r}) -- export.py's CSS-inlining "
-            "marker is stale; update both together"
-        )
-    html = html.replace(_CSS_LINK_TAG, f"<style>\n{css}\n</style>", 1)
+    html = _inline_static_assets(html)
 
     if "</body>" not in html:
         raise RuntimeError("trialerror/dashboard/static/dashboard.html has no </body> tag to embed data before")

@@ -1,18 +1,22 @@
 """``trialerror dashboard export`` -- the static self-contained snapshot writer.
-Proves the two build-time transforms (CSS inlining, JSON data embedding)
-land correctly and that the result is genuinely self-contained (no
-external ``dashboard.css`` reference left behind)."""
+Proves the two build-time transforms (asset inlining, JSON data embedding)
+land correctly and that the result is genuinely self-contained: no external
+``dashboard.css`` reference and no ``<script src>`` left behind for a
+``file://`` page to fail to fetch in silence."""
 
 from __future__ import annotations
 
 import json
 import re
 
+import pytest
+
 from trialerror.dashboard import export as dashboard_export
 from trialerror.stores.store import open_store
 from tests._store_fixtures import populate_one_of_everything
 
 _DATA_TAG_RE = re.compile(r'<script id="dashboard-data" type="application/json">(.*?)</script>', re.S)
+_SCRIPT_SRC_RE = re.compile(r"<script[^>]*\bsrc\s*=", re.I)
 
 
 def test_export_snapshot_is_self_contained_and_embeds_panels(program_root, platform_root, tmp_path):
@@ -33,6 +37,15 @@ def test_export_snapshot_is_self_contained_and_embeds_panels(program_root, platf
     assert 'href="dashboard.css"' not in html
     assert "<style>" in html
     assert "--live: #3FE07A" in html  # a real HALIDE token rule from dashboard.css landed inline
+
+    # ...and so is every renderer file. A <script src> that survived the
+    # export is the worst failure this page has: over file:// the fetch fails
+    # with no status line, no console anyone is reading, and a Console that
+    # simply renders nothing.
+    assert _SCRIPT_SRC_RE.search(html) is None, "an external <script src> survived the export"
+    for name in dashboard_export._INLINE_SCRIPTS:
+        assert dashboard_export._script_src_tag(name) not in html
+    assert "TEConsole" in html  # console_render.js's own global, inlined verbatim
 
     # the static snapshot still carries the new HALIDE shell -- the rail,
     # every panel's data-panel hook, and the ext-panel injection points --
@@ -166,3 +179,26 @@ def test_export_snapshot_embeds_extension_panels(program_root, platform_root, tm
     assert payload["meta"]["ext_panels"] == [
         {"name": "fixture", "manifest_status": "ok", "title": "Fixture", "nav_group": "KNOW", "order": 1, "description": "", "min_schema": []}
     ]
+
+
+def test_inline_scripts_entry_and_template_tag_must_agree(monkeypatch):
+    """The two halves of the split -- the ``<script src>`` in the template and
+    the ``_INLINE_SCRIPTS`` entry that inlines it -- have to be edited
+    together. Divergence in either direction is caught here rather than
+    shipping a snapshot with a missing renderer, which a portable file has no
+    way to report at open time."""
+    monkeypatch.setattr(
+        dashboard_export, "_INLINE_SCRIPTS", dashboard_export._INLINE_SCRIPTS + ("nowhere_render.js",)
+    )
+    with pytest.raises(RuntimeError, match="nowhere_render.js"):
+        dashboard_export.build_snapshot_html(program_root=None, platform_root=None)
+
+
+def test_every_inline_script_is_a_real_file_the_template_loads():
+    """The forward direction of the same pairing, without monkeypatching: each
+    declared name exists on disk and is pulled in by the template."""
+    template = (dashboard_export.STATIC_DIR / "dashboard.html").read_text(encoding="utf-8")
+    assert dashboard_export._INLINE_SCRIPTS, "the split has at least one renderer file"
+    for name in dashboard_export._INLINE_SCRIPTS:
+        assert (dashboard_export.STATIC_DIR / name).is_file(), name
+        assert f'<script src="{name}"></script>' in template, name

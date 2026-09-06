@@ -100,8 +100,12 @@ from typing import Any, Callable, Mapping, Sequence
 
 from trialerror.artifacts._txn import raw_insert
 from trialerror.artifacts.registry import create_artifact
-from trialerror.events.api import append_event
-from trialerror.rooms.errors import ConvergenceBarNotMetError, OwnershipConflictError
+from trialerror.events.api import append_event, append_event_in_txn
+from trialerror.rooms.errors import (
+    ConvergenceBarNotMetError,
+    IllegalRoomTransitionError,
+    OwnershipConflictError,
+)
 from trialerror.rooms.state_machine import assert_legal_transition
 from trialerror.stores import get as store_get
 from trialerror.stores import insert as store_insert
@@ -678,6 +682,78 @@ def check_room_converged(store: Store, room_id: str) -> dict[str, Any]:
     }
 
 
+def _transition_room_cas(
+    store: Store,
+    *,
+    room_id: str,
+    expected_state: str,
+    to_state: str,
+    by_launch: str,
+    ts: str,
+    event_type: str,
+    payload_extra: Mapping[str, Any],
+) -> None:
+    """The ONE place ``room.state`` moves to a terminal state, and the
+    close of WA-1's lost-write race for both :func:`converge_room` and
+    :func:`freeze_room`.
+
+    Before this, both verbs did a plain check-then-write: read the room,
+    ``assert_legal_transition``, then a bare ``UPDATE room SET state=?``
+    with no WHERE on the old state. Six concurrent freezes on one open
+    room therefore ALL passed the check (they all read ``open``) and all
+    six "succeeded", each emitting its own ``room_frozen`` event with its
+    own reason -- so the room's audit trail claimed six escalations and
+    the last writer's reason silently won.
+
+    Now: one ``BEGIN IMMEDIATE`` write lock (the shape
+    :func:`post_message` already uses), re-read the room UNDER that lock,
+    re-check the edge against the state actually found, then a
+    compare-and-swap ``UPDATE ... WHERE room_id = ? AND state = ?``. A
+    ``rowcount`` of 0 means the row moved between the read and the write
+    and is reported as :class:`~trialerror.rooms.errors.
+    IllegalRoomTransitionError` naming the state actually found, never a
+    silent no-op. The companion event is written inside the SAME
+    transaction (:func:`trialerror.events.api.append_event_in_txn`), so a
+    transition and its audit row land together or not at all -- the one
+    behavioural change from the pre-fix code, which emitted the event
+    after its own auto-committed UPDATE.
+
+    ``by_launch`` is validated by the public caller BEFORE the transaction
+    opens (``event.launch_id`` is a registered XID and the raw insert path
+    does not re-check it) -- see ``trialerror.artifacts._txn``'s module
+    docstring for the same contract."""
+    conn = store.ops
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        fresh = conn.execute("SELECT state FROM room WHERE room_id = ?", (room_id,)).fetchone()
+        if fresh is None:
+            raise ValueError(f"no such room: {room_id!r}")
+        assert_legal_transition(fresh["state"], to_state)
+        cur = conn.execute(
+            "UPDATE room SET state = ? WHERE room_id = ? AND state = ?",
+            (to_state, room_id, expected_state),
+        )
+        if cur.rowcount == 0:
+            found = conn.execute("SELECT state FROM room WHERE room_id = ?", (room_id,)).fetchone()
+            found_state = found["state"] if found is not None else "<row disappeared>"
+            raise IllegalRoomTransitionError(
+                f"room {room_id!r}: cannot move to {to_state!r} — expected state "
+                f"{expected_state!r} but found {found_state!r} (a concurrent writer "
+                "moved this room first; nothing was written)"
+            )
+        append_event_in_txn(
+            conn,
+            event_type=event_type,
+            payload={"room_id": room_id, **dict(payload_extra)},
+            launch_id=by_launch,
+            ts=ts,
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
 def converge_room(store: Store, *, room_id: str, by_launch: str, ts: str | None = None) -> dict[str, Any]:
     """``open -> converged`` — refuses (:class:`~trialerror.rooms.errors.
     ConvergenceBarNotMetError`) unless :func:`check_room_converged` reports
@@ -685,7 +761,9 @@ def converge_room(store: Store, *, room_id: str, by_launch: str, ts: str | None 
     IllegalRoomTransitionError`) if the room is already ``converged``/
     ``frozen`` (the state graph itself — ``trialerror.rooms.state_machine`` —
     has no outgoing edge from either terminal state, so this naturally
-    also refuses converging an already-frozen room)."""
+    also refuses converging an already-frozen room), INCLUDING when a
+    concurrent caller wins the race between this call's own check and its
+    write (:func:`_transition_room_cas`)."""
     room = _require_room(store, room_id)
     _require_launch_exists(store, by_launch, field_name="by_launch")
     status = check_room_converged(store, room_id)
@@ -697,8 +775,11 @@ def converge_room(store: Store, *, room_id: str, by_launch: str, ts: str | None 
         )
     assert_legal_transition(room["state"], "converged")
     ts = ts or now()
-    store_update(store, "room", pk_column="room_id", pk_value=room_id, changes={"state": "converged"})
-    _emit_room_event(store, event_type="room_converged", room_id=room_id, launch_id=by_launch, ts=ts, payload_extra={"per_dp": status["per_dp"]})
+    _transition_room_cas(
+        store, room_id=room_id, expected_state=room["state"], to_state="converged",
+        by_launch=by_launch, ts=ts, event_type="room_converged",
+        payload_extra={"per_dp": status["per_dp"]},
+    )
     return _require_room(store, room_id)
 
 
@@ -710,15 +791,21 @@ def freeze_room(store: Store, *, room_id: str, by_launch: str, reason: str, ts: 
     "reason" column, and ``room_turn`` is for discussion-point turns, not a
     room-level moderator act — the event trail is the faithful home for
     this). Refuses (:class:`~trialerror.rooms.errors.
-    IllegalRoomTransitionError`) if the room is not currently ``open``."""
+    IllegalRoomTransitionError`) if the room is not currently ``open`` —
+    including when the room stopped being ``open`` between this call's own
+    check and its write (:func:`_transition_room_cas`): exactly one of N
+    concurrent freezes lands, and exactly one ``room_frozen`` event is
+    written."""
     if not reason:
         raise ValueError("freeze_room: reason is required (freeze-and-escalate needs something to escalate)")
     room = _require_room(store, room_id)
     _require_launch_exists(store, by_launch, field_name="by_launch")
     assert_legal_transition(room["state"], "frozen")
     ts = ts or now()
-    store_update(store, "room", pk_column="room_id", pk_value=room_id, changes={"state": "frozen"})
-    _emit_room_event(store, event_type="room_frozen", room_id=room_id, launch_id=by_launch, ts=ts, payload_extra={"reason": reason})
+    _transition_room_cas(
+        store, room_id=room_id, expected_state=room["state"], to_state="frozen",
+        by_launch=by_launch, ts=ts, event_type="room_frozen", payload_extra={"reason": reason},
+    )
     return _require_room(store, room_id)
 
 
@@ -726,15 +813,22 @@ def get_freeze_reason(store: Store, room_id: str) -> str | None:
     """The ``reason`` recorded by the room's most recent ``room_frozen``
     event, or ``None`` if the room was never frozen (or is not itself
     ``frozen`` right now, though this reads history regardless of current
-    state)."""
-    rows = store.ops.execute(
-        "SELECT payload FROM event WHERE type = 'room_frozen' ORDER BY ts DESC, rowid DESC"
-    ).fetchall()
-    for r in rows:
-        payload = json.loads(r["payload"])
-        if payload.get("room_id") == room_id:
-            return payload.get("reason")
-    return None
+    state).
+
+    M-WA-7: the predicate is pushed into SQL (``json_extract`` on the
+    payload's ``room_id``, which :func:`_emit_room_event` guarantees every
+    room event carries) with a ``LIMIT 1`` — the previous version pulled
+    EVERY ``room_frozen`` row in the program back into Python and decoded
+    them one at a time until it found a match, which is O(all freezes ever)
+    per dashboard panel build."""
+    row = store.ops.execute(
+        "SELECT payload FROM event WHERE type = 'room_frozen' "
+        "AND json_extract(payload, '$.room_id') = ? ORDER BY ts DESC, rowid DESC LIMIT 1",
+        (room_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return json.loads(row["payload"]).get("reason")
 
 
 # ---------------------------------------------------------------------------

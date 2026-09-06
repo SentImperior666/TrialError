@@ -64,9 +64,12 @@ def test_every_declared_pattern_actually_matches_something(package_data):
 
 
 def test_dashboard_static_files_the_code_reads_are_present():
-    """Names the two files by hand, so renaming one without updating the
-    reader (or this list) fails loudly rather than at first HTTP request."""
+    """Names the files by hand, so renaming one without updating the reader
+    (or this list) fails loudly rather than at the first HTTP request. The
+    per-surface renderer files are read twice over -- served by ``serve.py``,
+    inlined by ``export.py`` -- so they belong in the same guard."""
+    from trialerror.dashboard.export import _INLINE_SCRIPTS
     from trialerror.dashboard.serve import STATIC_DIR
 
-    for name in ("dashboard.html", "dashboard.css"):
+    for name in ("dashboard.html", "dashboard.css", *_INLINE_SCRIPTS):
         assert (Path(STATIC_DIR) / name).is_file(), f"{name} missing from {STATIC_DIR}"
