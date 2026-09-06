@@ -240,7 +240,7 @@ the `atomic` scheduler pattern).
 
 ## Doctor checks catalog
 
-`trialerror doctor` runs every check registered by every subsystem (**65 checks across 23
+`trialerror doctor` runs every check registered by every subsystem (**64 checks across 22
 categories**); each subsystem owns its own `checks.py`, auto-discovered — adding a new one
 never touches a shared file. That figure had drifted twice before anyone noticed, precisely
 because nothing enforced it, so it is now pinned by a test against the live registry
