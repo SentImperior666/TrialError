@@ -85,7 +85,7 @@ rewrite them: save-time conflict candidates (advisory only) and age-based
 Both are hand-rolled stdio JSON-RPC 2.0 servers (`trialerror/mcp/protocol.py`) implementing the
 MCP 2025-06-18 spec's tools-only subset directly — no `resources`/`prompts`/`sampling`.
 Tool-count is asserted in tests (`trialerror-ops` = 12, `trialerror-knowledge` = 11), matching the
-design's own per-context tool-ceiling reasoning (§5.1): attach Haiku-class subagents to
+design's own per-context tool-ceiling reasoning (§5.1): attach subagents (Fable-tier, C-0088) to
 only the one server they need.
 
 **`trialerror-knowledge`** (read-only, 11 tools) — `search`, `get_chunk`, `get_source`,
@@ -189,6 +189,27 @@ the `atomic` scheduler pattern).
 
 - **Enqueue**: `trialerror ingest add` (and `rechunk`/`re-embed`) create jobs; ingestion stages
   auto-chain — each handler enqueues the next stage's job on its own completion.
+- **DjVu route**: `.djvu`/`.djv` sources get a `djvu` stage in front of `normalize`/`ocr`
+  (`trialerror.ingest.normalize_djvu`): it shells out to DjVuLibre's `ddjvu -format=pdf` to
+  produce a derived PDF under `<archive_dir>/derived/<doc_id>/` (durable — a sibling of
+  `archive/<doc_id>.txt`, never `jobs_work/` scratch space, which this document's `raw_path`
+  now permanently points at), probes the text layer with `djvutxt` (>=200 non-whitespace
+  characters over the document counts as "has one", then cross-checked against the derived
+  PDF's own average extractable chars/page — the same heuristic a native PDF's own
+  pdf-text/pdf-scan route is decided by — and downgraded to `pdf-scan` on disagreement), then
+  hands that PDF into the exact same `normalize`/`ocr` code a native PDF gets. Install the
+  Debian package `djvulibre-bin` (ships both binaries); on a machine without it on `PATH`,
+  point `[ingest.djvu] ddjvu_exe`/`djvutxt_exe` at their paths in `trialerror.toml` (a
+  configured path is validated the same way a bare command on `PATH` is — a typo or a
+  machine-specific stale path raises the same named "tool missing" error, not a bare
+  `FileNotFoundError`). A document's `normalizer_id`/`normalizer_version` read
+  `djvu-ddjvu`/the `ddjvu --version` probe (or `unknown`) instead of the generic normalizer id
+  for anything that went through this route; the derived PDF's own sha256/route/text-layer
+  signal is on the `djvu` job's own checkpoint, readable via `trialerror jobs list` (not
+  `jobs logs`, which only shows event history). `DEFAULT_DJVU_TIMEOUT_S` (1800s) exceeds the
+  default job lease (900s, same trap the real OCR backend's own timeout has) — pair
+  `[ingest.djvu] timeout_s` with a matching `--lease-s` for a real long-running book
+  conversion so this worker's own timeout fires before the lease-expiry reclaim would.
 - **Run**: `trialerror jobs start-worker` — `--mode once` claims and runs a single job then
   exits; `--mode loop` polls until idle (`--max-idle-polls`, default 3) or
   `--max-iterations` is hit. `--foreground` runs inline in your terminal (what a detached

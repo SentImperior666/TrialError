@@ -87,7 +87,8 @@ def test_each_agent_file_has_valid_frontmatter(stem):
     assert fields["name"] == stem
     assert fields["description"], "description must not be empty"
     assert "tools" in fields
-    assert fields.get("model"), "Haiku-class per design §5.1 — model should be declared, not left to inherit"
+    assert fields.get("model"), "model must be declared, never left to inherit (Fable for lens/critic/verifier per C-0088 / C-0075)"
+    assert fields.get("model") != "haiku", "no Haiku-class agent does research work (C-0088)"
 
 
 # ---------------------------------------------------------------------------

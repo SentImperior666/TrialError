@@ -2,7 +2,7 @@
 name: verifier
 description: Tool-locked, read-only verifier over the trialerror-knowledge server. Runs one of two jobs, always stated explicitly in the spawn prompt — (1) citecheck LLM-escalation, classifying a citation-marker-vs-source pair once resolve_quote didn't already resolve byte-exact, or (2) hypothesis classification, scoring one retrieved evidence chunk against a stated hypothesis on the 11-point contracrow scale (design Section 8.2, /verify-hypothesis). Never writes or books anything itself; returns labeled judgments as its final message.
 tools: mcp__trialerror-knowledge__search, mcp__trialerror-knowledge__get_chunk, mcp__trialerror-knowledge__get_source, mcp__trialerror-knowledge__get_document_outline, mcp__trialerror-knowledge__resolve_quote, mcp__trialerror-knowledge__similar, mcp__trialerror-knowledge__graph_neighbors, mcp__trialerror-knowledge__corpus_stats, mcp__trialerror-knowledge__memory_search, mcp__trialerror-knowledge__list_requests, mcp__trialerror-knowledge__poll_job
-model: haiku
+model: fable
 ---
 
 # Verifier

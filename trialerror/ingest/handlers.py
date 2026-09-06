@@ -45,6 +45,7 @@ from typing import Any
 from trialerror.ingest.anchors import build_chunk_anchor, sha256_hex
 from trialerror.ingest.backends import load_embed_backend, load_ocr_backend
 from trialerror.ingest.chunker import build_chunks
+from trialerror.ingest.errors import InvalidNormalizerOverrideError
 from trialerror.ingest.normalizers import NORMALIZER_ID, NORMALIZER_VERSION, normalize_direct
 from trialerror.ingest.sanitizer import SANITIZER_VERSION, sanitize
 from trialerror.ingest.stream import stream_v1
@@ -59,7 +60,7 @@ from trialerror.util.atomic import atomic_write_text
 from trialerror.util.ids import new_id
 from trialerror.util.timeutil import now
 
-__all__ = ["run_normalize", "run_ocr", "run_chunk", "run_embed", "run_index", "run_extract"]
+__all__ = ["run_djvu", "run_normalize", "run_ocr", "run_chunk", "run_embed", "run_index", "run_extract"]
 
 
 def _enqueue_next_stage(store: Store, *, stage: str, payload: dict[str, Any], job_id: str) -> None:
@@ -126,12 +127,25 @@ def _finish_normalize_stage(
     *,
     ocr_backend: str | None,
     ocr_version: str | None,
+    normalizer_id: str = NORMALIZER_ID,
+    normalizer_version: str = NORMALIZER_VERSION,
 ) -> None:
     """Shared tail of ``normalize``/``ocr``: sanitize + insert every
     element draft, build ``stream_v1`` over them, stamp the document's
     ``sha256`` (design Section 4.1: "sha256 (normalized text)") and
     ``status = 'normalized'``, archive the stream text to disk, then
-    enqueue the ``chunk`` stage."""
+    enqueue the ``chunk`` stage.
+
+    ``normalizer_id``/``normalizer_version`` default to the generic
+    ``trialerror.ingest.normalizers`` constants every direct format and every
+    OCR route gets -- ``run_normalize``/``run_ocr`` below forward
+    ``payload['normalizer_id_override']``/``['normalizer_version_override']``
+    here instead when present (via :func:`_resolve_normalizer_override`,
+    which validates the override -- Fix pass F11), which is how a document
+    that went through ``trialerror.ingest.normalize_djvu``'s ``djvu`` stage
+    first ends up stamped ``normalizer_id='djvu-ddjvu'`` rather than the
+    generic id, without this shared tail needing to know DjVu exists at
+    all."""
     store = ctx.store
     doc_id = doc["doc_id"]
 
@@ -163,8 +177,8 @@ def _finish_normalize_stage(
     changes: dict[str, Any] = {
         "sha256": sha256_hex(stream_text),
         "status": "normalized",
-        "normalizer_id": NORMALIZER_ID,
-        "normalizer_version": NORMALIZER_VERSION,
+        "normalizer_id": normalizer_id,
+        "normalizer_version": normalizer_version,
         "sanitizer_version": SANITIZER_VERSION,
     }
     if ocr_backend is not None:
@@ -186,10 +200,169 @@ def _finish_normalize_stage(
     )
 
 
+def _resolve_normalizer_override(payload: dict[str, Any]) -> tuple[str, str]:
+    """Fix pass (VERIFY_ingest-djvu.md F11): before the DjVu lane,
+    ``document.normalizer_id``/``normalizer_version`` could only ever hold
+    the two generic ``trialerror.ingest.normalizers`` constants -- no caller
+    could influence them. ``_finish_normalize_stage`` now takes them from
+    ``payload.get('normalizer_id_override'/'normalizer_version_override')``,
+    and ``run_one`` accepts a caller-supplied job payload
+    (``trialerror jobs start-worker --payload '{...}'`` -> ``cli/jobs.py``'s
+    ``json.loads`` -> ``claim_or_create``), so an unvalidated override let
+    any hand-written payload stamp ``document.normalizer_id`` with
+    arbitrary free text on an ordinary document that never went near DjVu.
+    Validated here against the only override this codebase actually
+    produces -- :data:`trialerror.ingest.normalize_djvu.NORMALIZER_ID_DJVU`
+    -- via a LOCAL import (mirrors ``run_djvu``'s own local import of the
+    same module, and keeps ``normalize_djvu`` import-optional for callers
+    of this module that never touch DjVu)."""
+    from trialerror.ingest.normalize_djvu import NORMALIZER_ID_DJVU
+
+    normalizer_id = payload.get("normalizer_id_override", NORMALIZER_ID)
+    normalizer_version = payload.get("normalizer_version_override", NORMALIZER_VERSION)
+    if normalizer_id not in (NORMALIZER_ID, NORMALIZER_ID_DJVU):
+        raise InvalidNormalizerOverrideError(
+            f"payload['normalizer_id_override'] = {normalizer_id!r} is not a recognized "
+            f"normalizer id ({NORMALIZER_ID!r}, {NORMALIZER_ID_DJVU!r}) -- refusing to stamp "
+            "document.normalizer_id from an unvalidated job payload"
+        )
+    return normalizer_id, normalizer_version
+
+
+@register_handler("djvu")
+def run_djvu(ctx) -> None:
+    """design Section 6 stage 3 extension (trialerror.ingest.normalize_djvu's own
+    module docstring has the full design): converts a ``.djvu``/``.djv``
+    source to a derived PDF via DjVuLibre's ``ddjvu``, decides the
+    pdf-text/pdf-scan route via ``djvutxt``'s text-layer probe, rewrites
+    THIS document's ``media_type``/``raw_path`` to that derived PDF, then
+    re-enqueues ``normalize`` or ``ocr`` for it -- carrying
+    ``normalizer_id_override``/``normalizer_version_override`` in that
+    job's payload so ``_finish_normalize_stage`` stamps
+    ``NORMALIZER_ID_DJVU`` instead of the generic normalizer id/version.
+
+    Rides ``kind='custom'``/``payload['handler']='djvu'``
+    (``trialerror.ingest.pipeline._CUSTOM_STAGE_KINDS`` -- a stage that will
+    never become a first-class ``job.kind`` value, unlike ``normalize``/
+    ``chunk``), enqueued by ``add_document`` for ``media_type='djvu'``
+    exactly like every other stage's first job.
+
+    **Restart-safety** (module docstring's "each idempotent ... resumable
+    via the jobs ledger", same as every other handler here): a WORKER
+    crash can land between this handler's document-row rewrite and its own
+    settlement, same as any other stage -- but unlike ``run_normalize``/
+    ``run_ocr`` (which always re-derive from an UNCHANGING ``raw_path``/
+    ``media_type``), a resumed ``run_djvu`` would otherwise try to feed the
+    derived PDF it already produced back into ``ddjvu`` as if it were the
+    original ``.djvu`` source. So this checks ``doc['media_type']`` FIRST:
+    still ``'djvu'`` means convert for real; anything else means a prior
+    attempt at this SAME job already got at least as far as the row
+    rewrite, and this run just re-derives the next stage from what is
+    already on disk/in the ledger (the checkpoint this same prior attempt
+    wrote BEFORE that rewrite -- see the ordering below -- carries the
+    ``normalizer_version`` a bare resume has no other way to recover)."""
+    from trialerror.ingest.normalize_djvu import MEDIA_TYPE_DJVU, NORMALIZER_ID_DJVU, convert_and_route
+    from trialerror.ingest.errors import DjVuResumeMediaTypeError
+    from trialerror.ingest.pipeline import DEFAULT_ARCHIVE_DIR
+
+    payload = ctx.payload
+    doc_id = payload["doc_id"]
+    created_by_launch = payload["created_by_launch"]
+    store = ctx.store
+    doc = get(store, "document", pk_column="doc_id", pk_value=doc_id)
+    if doc is None:
+        raise RuntimeError(f"djvu: no such document {doc_id!r}")
+
+    if doc["media_type"] == MEDIA_TYPE_DJVU:
+        raw_path = _resolve_raw_path(store, doc)
+        config = _load_config(store)
+        djvu_cfg = config.get("ingest", {}).get("djvu", {})
+        archive_dir_value = config.get("paths", {}).get("archive_dir", DEFAULT_ARCHIVE_DIR)
+
+        # Fix pass (F5): renew the lease right before the (potentially
+        # 30-minute) ddjvu call -- DEFAULT_DJVU_TIMEOUT_S (1800s) exceeds
+        # trialerror.jobs.ledger.LEASE_DURATION_S (900s default), so a
+        # legitimate long conversion can otherwise outlive its lease and be
+        # reclaimed by another worker mid-convert (see that constant's own
+        # docstring). This alone doesn't cover the conversion call itself
+        # (one blocking subprocess.run with no heartbeat granularity
+        # inside it) -- deployments still need to pair [ingest.djvu]
+        # timeout_s with a matching --lease-s for real long-running books.
+        ctx.heartbeat()
+        result = convert_and_route(
+            program_root=store.program_root,
+            doc_id=doc_id,
+            src_path=raw_path,
+            config=djvu_cfg,
+            archive_dir=archive_dir_value,
+        )
+
+        # No free-form JSON/notes column exists on `document` (checked
+        # against trialerror/stores/schema/knowledge.py, not assumed) -- the
+        # derived PDF's own sha256 (and the routing signal that produced
+        # it, and the normalizer_version a resumed attempt below needs)
+        # lands on THIS stage's own job checkpoint instead, the nearest
+        # already-existing durable JSON slot every handler in this module
+        # already treats as free-form informational metadata (module
+        # docstring above, and trialerror.ingest.normalize_djvu's own
+        # "Provenance note" says the same). Written BEFORE the document
+        # row itself changes, so it survives a crash that lands between
+        # the two (the restart-safety note above).
+        ctx.set_checkpoint(
+            {
+                "djvu_pdf_sha256": result["derived_pdf_sha256"],
+                "djvu_text_layer": result["text_layer"],
+                "djvu_text_chars": result["text_chars"],
+                "djvu_route": result["media_type"],
+                "djvu_normalizer_version": result["normalizer_version"],
+            }
+        )
+        update(
+            store,
+            "document",
+            pk_column="doc_id",
+            pk_value=doc_id,
+            changes={"media_type": result["media_type"], "raw_path": result["derived_pdf_rel_path"]},
+        )
+        resolved_media_type = result["media_type"]
+        normalizer_version = result["normalizer_version"]
+    else:
+        # Fix pass (F6): this branch used to trust whatever media_type it
+        # found on the row with no guard that it is one the conversion
+        # could ever have produced -- a misuse-only path (requeue_stage
+        # against a document that never went through 'djvu') silently sent
+        # an unrelated document through OCR and stamped it 'djvu-ddjvu'.
+        # Only the two outcomes convert_and_route can actually produce are
+        # accepted; anything else is a named error, not a guess.
+        resolved_media_type = doc["media_type"]
+        if resolved_media_type not in ("pdf-text", "pdf-scan"):
+            raise DjVuResumeMediaTypeError(
+                f"djvu: resumed job for document {doc_id!r} found media_type="
+                f"{resolved_media_type!r}, but a djvu conversion can only ever have left "
+                "'pdf-text' or 'pdf-scan' behind -- this document did not go through the "
+                "djvu stage (or its row was rewritten by something else since)"
+            )
+        normalizer_version = ctx.checkpoint.get("djvu_normalizer_version", "unknown")
+
+    next_stage = "normalize" if resolved_media_type == "pdf-text" else "ocr"
+    _enqueue_next_stage(
+        store,
+        stage=next_stage,
+        payload={
+            "doc_id": doc_id,
+            "created_by_launch": created_by_launch,
+            "normalizer_id_override": NORMALIZER_ID_DJVU,
+            "normalizer_version_override": normalizer_version,
+        },
+        job_id=f"JOB-ingest-{doc_id}-{next_stage}",
+    )
+
+
 @register_handler("normalize")
 def run_normalize(ctx) -> None:
     """design Section 6 stage 3 for a directly-normalizable ``media_type``
-    (pdf-text/html/epub/md)."""
+    (pdf-text/html/epub/md, or the derived-pdf-text route
+    ``trialerror.ingest.normalize_djvu``'s ``djvu`` stage re-dispatches into)."""
     payload = ctx.payload
     doc_id = payload["doc_id"]
     store = ctx.store
@@ -198,14 +371,25 @@ def run_normalize(ctx) -> None:
         raise RuntimeError(f"normalize: no such document {doc_id!r}")
     raw_path = _resolve_raw_path(store, doc)
     drafts = normalize_direct(doc["media_type"], raw_path)
-    _finish_normalize_stage(ctx, doc, drafts, ocr_backend=None, ocr_version=None)
+    normalizer_id, normalizer_version = _resolve_normalizer_override(payload)
+    _finish_normalize_stage(
+        ctx,
+        doc,
+        drafts,
+        ocr_backend=None,
+        ocr_version=None,
+        normalizer_id=normalizer_id,
+        normalizer_version=normalizer_version,
+    )
 
 
 @register_handler("ocr")
 def run_ocr(ctx) -> None:
     """design Section 6 stage 4: "marker GPU (existing); detached job;
     GPU-only (standing law); batch-chunked; page anchors preserved" --
-    routed formats (pdf-scan/image), backend chosen via
+    routed formats (pdf-scan/image, or the derived-pdf-scan route
+    ``trialerror.ingest.normalize_djvu``'s ``djvu`` stage re-dispatches into
+    when the source has no usable text layer), backend chosen via
     ``trialerror.ingest.backends.load_ocr_backend`` (fake by default; real
     marker per ``trialerror.toml [ingest.ocr]``)."""
     payload = ctx.payload
@@ -248,7 +432,16 @@ def run_ocr(ctx) -> None:
         }
         for i, page in enumerate(result.pages)
     ]
-    _finish_normalize_stage(ctx, doc, drafts, ocr_backend=result.ocr_backend, ocr_version=result.ocr_version)
+    normalizer_id, normalizer_version = _resolve_normalizer_override(payload)
+    _finish_normalize_stage(
+        ctx,
+        doc,
+        drafts,
+        ocr_backend=result.ocr_backend,
+        ocr_version=result.ocr_version,
+        normalizer_id=normalizer_id,
+        normalizer_version=normalizer_version,
+    )
 
 
 @register_handler("chunk")
