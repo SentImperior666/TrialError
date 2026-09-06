@@ -29,7 +29,7 @@ check's own message so a green result never hides them.
 
 from __future__ import annotations
 
-from the (excluded) tenant-migration module import at_or_before, import_ts_from_conn
+from trialerror.stores.watermark import at_or_before, import_ts_from_conn
 from trialerror.stores import paths
 from trialerror.stores.connection import connect
 from trialerror.stores.redact import redact_text
