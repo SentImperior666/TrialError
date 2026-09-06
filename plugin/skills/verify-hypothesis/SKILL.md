@@ -72,3 +72,16 @@ adjudicated.
    mismatch blocks `gate apply-union` on any gate this verdict feeds
    (design Section 4.2/8.3); do not talk yourself past a reproduction
    mismatch, escalate it.
+
+## When NOT to apply
+
+- The question is exploratory, not a hypothesis being adjudicated —
+  `/lit-review` answers questions; this skill writes verdict rows.
+- You cannot supply a `--judgments-file` covering every retrieved chunk. The
+  pipeline never calls a model itself; a verdict with missing judgments is
+  not a verdict.
+- The hypothesis feeds a keystone and you have already looked at the results
+  — pre-register BEFORE retrieval or accept that the verdict is marked
+  non-compliant; never back-fill a prereg.
+- To hand-write or "correct" a verdict row. A wrong verdict is superseded by
+  a new run, never edited.

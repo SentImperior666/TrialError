@@ -365,11 +365,14 @@
     gate_edit: "GATE EDITS · VERIFICATION DUE",
     kg_merge: "KNOWLEDGE-GRAPH MERGES · NEVER SILENT",
     memory_conflict: "MEMORY CONFLICTS · NEVER SILENT",
+    memory_conflict_candidate: "MEMORY CONFLICT CANDIDATES · UNJUDGED, ADVISORY ONLY",
+    memory_stale: "MEMORY REVIEW DUE · NOTHING EXPIRES ON A TIMER",
     prereg_reveal: "PRE-REGISTRATION REVEALS",
     room_escalation: "ROOM ESCALATIONS · FROZEN",
     acquisition: "ACQUISITIONS · ONLY YOU CAN DELIVER THESE"
   };
-  var KIND_ORDER = ["gate_edit", "kg_merge", "memory_conflict", "prereg_reveal", "room_escalation", "acquisition"];
+  var KIND_ORDER = ["gate_edit", "kg_merge", "memory_conflict", "memory_conflict_candidate",
+    "memory_stale", "prereg_reveal", "room_escalation", "acquisition"];
 
   var GATE_STEPS = ["draft", "submitted", "gated", "union_applied", "registered"];
 
@@ -1139,6 +1142,8 @@
       case "prereg_reveal": return item.title;
       case "room_escalation": return item.topic;
       case "memory_conflict": return item.key;
+      case "memory_conflict_candidate": return item.key + " ↔ " + item.target_key;
+      case "memory_stale": return item.key + " (" + item.item_kind + ", " + item.overdue_days + "d overdue)";
       default: return item.id;
     }
   }
@@ -1769,6 +1774,8 @@
     prereg_reveal: "trialerror.verify.prereg has a reveal callable, but pre-registration reveal wasn't in this build's write-action list.",
     room_escalation: "resolve from the Rooms panel instead (post a turn on the frozen room's discussion point, or converge-check) -- no direct \"resolve escalation\" callable exists.",
     memory_conflict: "trialerror.memory.merge.resolve_conflict exists, but memory-conflict resolution wasn't in this build's write-action list.",
+    memory_conflict_candidate: "judge from the CLI (`trialerror memory judge --relation <id> --verb <verb> --actor <you>`) -- a verdict carries the judge's identity, which a dashboard button cannot supply.",
+    memory_stale: "review from the CLI (`trialerror memory reviewed <id>`) -- a review is an assertion that a person looked, so it is not a button.",
   };
 
   function buildDeterminationActions(item) {

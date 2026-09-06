@@ -111,6 +111,60 @@ def _find_active_by_key(store: Store, *, key: str, account_id: str) -> dict[str,
     return dict(row) if row is not None else None
 
 
+def _attach_conflict_advisory(
+    store: Store,
+    row: Mapping[str, Any],
+    *,
+    surface_conflicts: bool,
+    rescan: bool,
+    ts: str | None,
+) -> dict[str, Any]:
+    """MINING ADOPTION engram-F4's save-time hook (``docs/reviews/
+    MINING_2026-09_OPERATOR_LINKS.md`` section 3: "adopt-now:memory WITH
+    CONSTRAINT — advisory candidates only, never auto-applied verdicts").
+
+    **This function may not fail the save.** The write already happened by
+    the time it runs, and an advisory that can turn a successful capture
+    into an exception is worse than no advisory: a session would lose the
+    lesson it was recording because a ranking query tripped. So every
+    error is caught, reported in ``conflict_scan_error``, and swallowed.
+    That is a deliberate exception to this module's fail-loud posture, and
+    the error key exists so the failure is still VISIBLE rather than
+    silent.
+
+    ``rescan=False`` (the idempotent no-op path) re-reads whatever was
+    already pending instead of scanning again: nothing changed, so nothing
+    new can have become contradictory, but the standing advisory should
+    still be in front of the caller.
+    """
+    out = dict(row)
+    out["conflict_candidates"] = []
+    out["conflict_note"] = None
+    if not surface_conflicts:
+        return out
+    try:
+        from trialerror.memory import conflicts as _conflicts
+
+        if rescan:
+            found = _conflicts.scan_and_record(store, item=out, ts=ts)
+        else:
+            found = [
+                {
+                    "relation_id": r["relation_id"],
+                    "target_id": r["target_id"],
+                    "key": r["target_key"],
+                    "l0_abstract": r.get("target_abstract"),
+                    "score": r.get("score"),
+                }
+                for r in _conflicts.list_candidates(store, source_id=out["memory_item_id"], status="pending")
+            ]
+        out["conflict_candidates"] = found
+        out["conflict_note"] = _conflicts.render_note(out["key"], found)
+    except Exception as exc:  # noqa: BLE001 - deliberate: an advisory never blocks a save
+        out["conflict_scan_error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
 def put_item(
     store: Store,
     *,
@@ -121,6 +175,7 @@ def put_item(
     account_id: str,
     l0_abstract: str | None = None,
     ts: str | None = None,
+    surface_conflicts: bool = True,
 ) -> dict[str, Any]:
     """Upsert one memory item, scoped to ``(key, account_id)``.
 
@@ -137,6 +192,17 @@ def put_item(
     for a clean message; the DDL's own CHECK constraints would refuse the
     write regardless, wrapped in a less specific
     :class:`~trialerror.stores.errors.ValidationError` — see module docstring).
+
+    **The returned dict is the row PLUS two non-column advisory keys**
+    (mining adoption engram-F4): ``conflict_candidates`` (a possibly-empty
+    list of existing items that may relate to or contradict this one, each
+    already persisted as a ``pending`` ``memory_relation`` row) and
+    ``conflict_note`` (rendered human-facing text, or ``None``). They are
+    NOT columns — never hand this dict back to
+    :func:`trialerror.stores.insert`. ``surface_conflicts=False`` skips the
+    scan entirely (bulk import paths, and anything that must not pay for
+    it). The advisory never blocks, alters, or reorders the save; see
+    :func:`_attach_conflict_advisory`.
     """
     if not key or not key.strip():
         raise ValueError("put_item: key is required and must be non-empty")
@@ -150,12 +216,14 @@ def put_item(
     existing = _find_active_by_key(store, key=key, account_id=account_id)
     if existing is not None:
         if content_sha256(existing) == content_sha256(candidate):
-            return existing
+            return _attach_conflict_advisory(
+                store, existing, surface_conflicts=surface_conflicts, rescan=False, ts=ts
+            )
         changes = {"tier": tier, "kind": kind, "body": body, "l0_abstract": l0_abstract, "updated_ts": ts}
         update(store, "memory_item", pk_column="memory_item_id", pk_value=existing["memory_item_id"], changes=changes)
         merged = dict(existing)
         merged.update(changes)
-        return merged
+        return _attach_conflict_advisory(store, merged, surface_conflicts=surface_conflicts, rescan=True, ts=ts)
 
     row = {
         "memory_item_id": new_id("MEM"),
@@ -168,7 +236,8 @@ def put_item(
         "account_id": account_id,
         "status": "active",
     }
-    return insert(store, "memory_item", row)
+    written = insert(store, "memory_item", row)
+    return _attach_conflict_advisory(store, written, surface_conflicts=surface_conflicts, rescan=True, ts=ts)
 
 
 def get_item(store: Store, memory_item_id: str) -> dict[str, Any] | None:

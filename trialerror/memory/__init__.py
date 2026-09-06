@@ -79,6 +79,17 @@ from trialerror.memory.api import (
     put_item,
     search_items,
 )
+from trialerror.memory.conflicts import (
+    ACTOR_KINDS,
+    JUDGMENT_STATUSES,
+    RELATION_VERBS,
+    candidates_for,
+    judge,
+    list_candidates,
+    record_candidates,
+    render_note,
+    scan_and_record,
+)
 from trialerror.memory.content import CONTENT_FIELDS, content_sha256, items_identical
 from trialerror.memory.merge import (
     MERGE_SUFFIX_LEFT,
@@ -87,6 +98,16 @@ from trialerror.memory.merge import (
     list_conflicts,
     resolve_conflict,
     two_way_merge,
+)
+from trialerror.memory.staleness import (
+    DEFAULT_HALF_LIFE_DAYS,
+    HALF_LIFE_DAYS,
+    REVIEW_THRESHOLD,
+    freshness,
+    half_life_days,
+    mark_reviewed,
+    review_state,
+    stale_items,
 )
 from trialerror.memory.render import (
     FRONT_MATTER_FIELDS,
@@ -124,4 +145,23 @@ __all__ = [
     "parse_item_markdown",
     "export_memory",
     "import_memory",
+    # mining adoption engram-F4 (save-time conflict candidates)
+    "RELATION_VERBS",
+    "JUDGMENT_STATUSES",
+    "ACTOR_KINDS",
+    "candidates_for",
+    "record_candidates",
+    "scan_and_record",
+    "list_candidates",
+    "judge",
+    "render_note",
+    # mining adoption engram-F5 (type-keyed staleness decay)
+    "HALF_LIFE_DAYS",
+    "DEFAULT_HALF_LIFE_DAYS",
+    "REVIEW_THRESHOLD",
+    "half_life_days",
+    "freshness",
+    "review_state",
+    "stale_items",
+    "mark_reviewed",
 ]

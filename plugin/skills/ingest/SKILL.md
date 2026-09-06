@@ -87,3 +87,17 @@ another `start-worker` to pick back up.
    machine (`wanted → requested → delivered → verifying → archived →
    indexed`, or `rejected`/`failed`); `trialerror ingest requests-md` renders
    `requests/REQUESTS.md`, the human-facing view the user fulfills against.
+
+## When NOT to apply
+
+- The license tier or acquisition route is unknown and the user is not
+  available to answer — never guess a tier; intake waits.
+- To push a document past the page-count cost gate without the user's
+  confirmation. `--yes` is the user's word, not yours.
+- The content sha is already registered — `add-source` will answer with
+  `dedup_of`; a second pipeline run is the bug this design closed.
+- A pipeline is already mid-flight for the document — `trialerror ingest status
+  --doc-id <id>` and `jobs tick` / `start-worker` resume it; re-adding does
+  not.
+- The raw file lives outside every configured ingest root — bridge it with
+  `[paths].ingest_roots` (`/import-existing-project`), do not copy it in.

@@ -74,7 +74,15 @@ def test_fresh_create_and_migrate_from_v4_land_identical_schemas():
     applied_rest = apply_migrations(migrated, ops.MIGRATIONS)  # every version > 4 that exists in THIS branch
     assert applied_rest == sorted(m.version for m in ops.MIGRATIONS if m.version > 4)
 
-    assert current_version(fresh) == current_version(migrated) == latest_version(ops.MIGRATIONS) == 6
+    # No frozen tip number here -- same reasoning as
+    # tests/test_stores_migrate_v4_dashboard.py, which dropped its own literal
+    # when v5 landed after it. The tip was 6 when this test was written and is
+    # 7 since the 2026-09 mining lane's ops_v7_memory_relation_and_reviewed_ts
+    # merged in; this test's real claim is that a step-wise migration and a
+    # from-empty create land the SAME schema, which survives every later
+    # addition. What still needs pinning is that v6 itself actually ran.
+    assert 6 in applied_rest
+    assert current_version(fresh) == current_version(migrated) == latest_version(ops.MIGRATIONS)
     assert _schema_snapshot(fresh) == _schema_snapshot(migrated)
 
 

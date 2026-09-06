@@ -292,6 +292,24 @@ def populate_one_of_everything(store: Store) -> dict[str, str]:
         },
     )
 
+    # mining adoption engram-F4 (ops v7). source_id == target_id here on
+    # purpose: the round-trip test asserts exactly one memory_item row, and
+    # a self-relation is a valid row shape the DDL deliberately permits
+    # (no UNIQUE(source, target), no source != target CHECK -- see the
+    # ops_v7 migration comment on "multi-actor disagreement allowed").
+    ids["memory_relation"] = new_id("MREL")
+    insert(
+        store,
+        "memory_relation",
+        {
+            "relation_id": ids["memory_relation"],
+            "source_id": ids["memory_item"],
+            "target_id": ids["memory_item"],
+            "judgment_status": "pending",
+            "created_ts": now(),
+        },
+    )
+
     ids["room"] = new_id("ROOM")
     insert(
         store,

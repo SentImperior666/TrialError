@@ -21,6 +21,20 @@ is reported ``skip``, not a doctor failure").
   re-verifying that guarantee; it surfaces the operator-relevant fact that
   truncation is silently happening on every boot because the L0 tier
   itself has outgrown its budget.
+- ``memory_stale_items`` — MINING ADOPTION engram-F5 (``docs/reviews/
+  MINING_2026-09_OPERATOR_LINKS.md`` section 3: "adopt-now:memory as a
+  DOCTOR CHECK (needs_review surfacing by type-keyed age); never mutates a
+  pin or a ruling"). Every ACTIVE item past its per-kind half-life
+  (:mod:`trialerror.memory.staleness`) — nobody has edited or reviewed it
+  in longer than its kind's clock allows. ``warn``, never ``fail``, and
+  read-only in the strongest sense available: it holds a
+  ``read_only=True`` connection, so a future edit that tried to make decay
+  WRITE something would fail at the driver rather than quietly expire a
+  law on a timer (review section 5.7).
+- ``memory_pending_conflict_candidates`` — MINING ADOPTION engram-F4. How
+  many save-time conflict candidates sit unjudged. ``warn`` for the same
+  reason the unresolved-conflict-group check is: an unjudged candidate is
+  a legitimate waiting state, not corruption.
 """
 
 from __future__ import annotations
@@ -30,12 +44,22 @@ from pathlib import Path
 
 from trialerror.memory.api import DEFAULT_TOKEN_BUDGET, estimate_tokens
 from trialerror.memory.merge import group_id_from_item_id
+from trialerror.memory.staleness import REVIEW_THRESHOLD, stale_items, summarize
 from trialerror.stores import paths
 from trialerror.stores.connection import connect
 from trialerror.util.config import CONFIG_FILENAME, load_config
 from trialerror.util.doctor import CheckResult, DoctorContext, register_check
 
-__all__ = ["check_memory_unresolved_conflict_groups", "check_memory_l0_index_budget"]
+__all__ = [
+    "check_memory_unresolved_conflict_groups",
+    "check_memory_l0_index_budget",
+    "check_memory_stale_items",
+    "check_memory_pending_conflict_candidates",
+]
+
+#: How many stale items the check names inline. The count is the signal;
+#: an unbounded list in a doctor envelope is noise.
+_STALE_SAMPLE = 10
 
 
 def _ops_conn_or_none(ctx: DoctorContext) -> sqlite3.Connection | None:
@@ -131,6 +155,121 @@ def check_memory_l0_index_budget(ctx: DoctorContext) -> CheckResult:
             status=status,
             message=message,
             details={"l0_item_count": len(rows), "estimated_tokens": total, "token_budget": budget},
+        )
+    finally:
+        conn.close()
+
+
+@register_check("memory_stale_items", category="memory")
+def check_memory_stale_items(ctx: DoctorContext) -> CheckResult:
+    """MINING ADOPTION engram-F5. Surfaces every ACTIVE memory item whose
+    kind-specific half-life has elapsed since it was last edited or
+    explicitly reviewed.
+
+    ``warn``, never ``fail``: an item nobody has looked at in a year is a
+    prompt, not a broken store, and a hard failure here would block every
+    other gate that wants a clean doctor run for a reason that is
+    inherently a judgement call. Nothing about the item changes as a
+    result of appearing here -- resetting the clock takes an explicit
+    ``trialerror memory reviewed <id>``.
+
+    Tolerant of a store predating the ops v7 migration, exactly as its
+    engram-F4 sibling below is: ``memory_item.reviewed_ts`` simply is not
+    there yet, reported ``skip`` the same way a missing DB file is. Letting
+    that ``OperationalError`` escape would have
+    ``trialerror.util.doctor.run_checks`` convert it into a ``fail`` --
+    precisely the hard failure the paragraph above forbids.
+    """
+    conn = _ops_conn_or_none(ctx)
+    if conn is None:
+        return CheckResult(
+            name="memory_stale_items",
+            category="memory",
+            status="skip",
+            message="ops.db not found (program_root not configured, or program not yet initialized)",
+        )
+    try:
+        try:
+            stale = stale_items(conn)
+        except sqlite3.OperationalError:
+            return CheckResult(
+                name="memory_stale_items",
+                category="memory",
+                status="skip",
+                message="memory_item.reviewed_ts absent (ops schema predates the v7 migration)",
+            )
+        rollup = summarize(stale)
+        status = "warn" if stale else "pass"
+        if stale:
+            worst = stale[0]
+            message = (
+                f"{rollup['count']} active memory item(s) past their type-keyed review half-life "
+                f"(worst: {worst['key']!r}, {worst['overdue_days']:.0f}d overdue on a "
+                f"{worst['half_life_days']}d clock) -- review with `trialerror memory reviewed <id>`"
+            )
+        else:
+            message = "no active memory items past their type-keyed review half-life"
+        return CheckResult(
+            name="memory_stale_items",
+            category="memory",
+            status=status,
+            message=message,
+            details={
+                "count": rollup["count"],
+                "by_kind": rollup["by_kind"],
+                "threshold": REVIEW_THRESHOLD,
+                "items": stale[:_STALE_SAMPLE],
+                "truncated": max(0, rollup["count"] - _STALE_SAMPLE),
+            },
+        )
+    finally:
+        conn.close()
+
+
+@register_check("memory_pending_conflict_candidates", category="memory")
+def check_memory_pending_conflict_candidates(ctx: DoctorContext) -> CheckResult:
+    """MINING ADOPTION engram-F4. Counts save-time conflict candidates
+    nobody has judged yet. Tolerant of a store predating the ops v7
+    migration (the table simply is not there yet) -- reported as ``skip``,
+    the same way a missing DB file is, rather than as a failure."""
+    conn = _ops_conn_or_none(ctx)
+    if conn is None:
+        return CheckResult(
+            name="memory_pending_conflict_candidates",
+            category="memory",
+            status="skip",
+            message="ops.db not found (program_root not configured, or program not yet initialized)",
+        )
+    try:
+        try:
+            rows = conn.execute(
+                "SELECT r.relation_id, s.key AS source_key, t.key AS target_key "
+                "FROM memory_relation r "
+                "JOIN memory_item s ON s.memory_item_id = r.source_id "
+                "JOIN memory_item t ON t.memory_item_id = r.target_id "
+                "WHERE r.judgment_status = 'pending' ORDER BY r.created_ts DESC"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return CheckResult(
+                name="memory_pending_conflict_candidates",
+                category="memory",
+                status="skip",
+                message="memory_relation table absent (ops schema predates the v7 migration)",
+            )
+        pairs = [{"relation_id": r["relation_id"], "source": r["source_key"], "target": r["target_key"]} for r in rows]
+        status = "warn" if pairs else "pass"
+        message = (
+            f"{len(pairs)} unjudged memory conflict candidate(s) awaiting "
+            "`trialerror memory judge --relation <id> --verb <verb> --actor <name>`"
+            if pairs
+            else "no unjudged memory conflict candidates"
+        )
+        return CheckResult(
+            name="memory_pending_conflict_candidates",
+            category="memory",
+            status=status,
+            message=message,
+            details={"count": len(pairs), "candidates": pairs[:_STALE_SAMPLE]},
         )
     finally:
         conn.close()

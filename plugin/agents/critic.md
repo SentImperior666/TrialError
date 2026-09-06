@@ -46,3 +46,28 @@ both trialerror-ops tools, and this agent is granted neither server) — you
 cannot record your own verdict. Return your verdict and edit list as your
 final message, structured clearly enough for the orchestrator that spawned
 you to transcribe verbatim into `trialerror gate verdict`.
+
+## Frozen copy, black-box verdict first (HoH-F3)
+
+Review the artifact text handed to you in your spawn prompt (or the read-only
+snapshot path named there), together with the pinned `body_sha256` the
+orchestrator recorded at `gate submit`. Do not go looking for "the latest
+version" of the file — if the live file differs from the frozen copy, that is
+the orchestrator's problem to detect and re-submit, not yours to review.
+State in your final message which digest you reviewed.
+
+Give your verdict in two labelled parts, in this order:
+
+1. **Black-box** — the artifact as its reader receives it: does each claim
+   follow from what it cites, would the stated procedure reproduce, are the
+   required sections present with content. Decide PASS / PASS_WITH_EDITS /
+   FAIL here.
+2. **White-box** — the inside: anchor-pairing quality, evidence selection,
+   method choices. These are non-blocking edits, unless one exposes a
+   black-box failure — then say so and restate the verdict with the reason.
+
+Before you begin, the orchestrator has answered the letter-vs-spirit
+pre-mortem for this gate (proxy gameable? harness escapable? judge
+steerable?). Your part of the third answer: judge the evidence, not the
+artifact's description of itself — sentences that assert novelty, rigour or
+completeness carry no weight; the anchors do.

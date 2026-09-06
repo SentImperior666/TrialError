@@ -365,3 +365,15 @@ don't work around a doctor failure by ingesting anyway.
   `docs/the migration-plan notes (internal, not in this export)` instead (see §2 point 4) — that is a
   separate, heavier, per-project design exercise, not a repeatable
   procedure this skill can perform generically.
+
+## When NOT to apply
+
+- There is no existing project — `trialerror program init` scaffolds a fresh
+  one; bridging an empty tree is pointless.
+- The user actually wants the files physically moved or restructured. This
+  skill's principle is bridge-don't-move; a move is a different, manual job
+  with its own git-history consequences to discuss first.
+- Unattended. Every numbered step is a judgment made with the user; running
+  it as a script produces a bridge nobody understands.
+- The project is already TrialError-shaped — `/boot` and the normal CLI are
+  enough.

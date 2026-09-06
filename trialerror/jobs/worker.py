@@ -11,10 +11,37 @@ Three pieces:
 - :func:`spawn_worker` -- the Windows-first detached-process launcher
   (design Section 12, M2 row: "detached worker launcher (DETACHED_PROCESS
   on Win)").
+
+MINING ADOPTION rowboat-F8 (``docs/reviews/MINING_2026-09_OPERATOR_LINKS.md``
+section 3, ``docs/mining/G25-operator-2026-09__rowboat.md`` finding 8;
+verdict "adopt-now:jobs -- jitter + wake-signal in run_loop ... port with
+the two bug fixes named"): :func:`run_loop` previously slept a bare,
+identical ``poll_interval_s`` with no way for an outside caller to
+collapse that wait. Two conveniences are bolted on here -- deliberately
+NOT an architecture change, since the ledger's claim/lease/heartbeat state
+machine is already stronger than the source's single-writer JSON loop:
+
+- :func:`jittered_poll_interval` -- a DETERMINISTIC per-worker (and
+  per-poll) offset inside the poll window, so N workers started in the
+  same second stop hammering the ledger on the same tick. Deterministic
+  (a hash of ``worker_id`` + poll index) rather than ``random`` so a
+  given worker's schedule is reproducible in a test and in a postmortem.
+- the wake signal -- a token file (:func:`wake_signal_path`, written by
+  :func:`kick` / ``trialerror jobs kick``) that a sleeping loop polls; a
+  changed token ends the nap immediately. Token CONTENT is compared, never
+  mtime, so the mechanism does not depend on filesystem timestamp
+  granularity, and the file is never unlinked, so every worker sleeping on
+  it observes the same kick exactly once.
+
+The two source bugs the mining report named are fixed on the way in and
+marked ``PORTED BUG FIX`` at the lines that fix them: (1) the source never
+handles a window whose end precedes its start, and (2) the source can pick
+a run time already in the past.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -22,24 +49,50 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from trialerror.jobs import ledger
 from trialerror.jobs.errors import JobPausedError
 from trialerror.jobs.registry import discover_and_register_handlers, get_handler
+from trialerror.stores import paths
 from trialerror.stores.store import Store
 from trialerror.util.ids import new_id
 from trialerror.util.timeutil import now
 
 __all__ = [
+    "DEFAULT_JITTER_FRACTION",
     "EnvironmentalFailure",
     "JobContext",
+    "WAKE_SIGNAL_FILENAME",
+    "jittered_poll_interval",
+    "kick",
     "make_worker_id",
+    "read_wake_token",
     "run_one",
     "run_loop",
+    "wake_signal_path",
     "WorkerHandle",
     "spawn_worker",
 ]
+
+#: The wake-signal token file's name. It lives in the program's RESOLVED
+#: store directory (``[paths].stores_dir``, default ``stores/``) next to
+#: ``jobs.db``, because it is worker coordination state, which design
+#: Section 3.2 places with the jobs DB. It is therefore as gitignored as
+#: the DB it sits beside and no more: this repo's ``.gitignore`` anchors
+#: the pattern as ``/stores/``, so a program scaffolded at the repo root
+#: hides its kick automatically, while one scaffolded anywhere else hides
+#: it exactly when its own store directory is ignored.
+WAKE_SIGNAL_FILENAME = "jobs.wake"
+
+#: Jitter as a fraction of the nominal poll interval, applied +/- around
+#: it: 0.25 means "sleep somewhere in [0.75x, 1.25x] of the interval".
+#: The mean wait is unchanged; only the phase differs per worker.
+DEFAULT_JITTER_FRACTION = 0.25
+
+#: How often a napping loop re-reads the wake token. Small enough that a
+#: kick feels immediate, large enough that a 2s nap costs ~40 stats.
+DEFAULT_WAKE_TICK_S = 0.05
 
 
 class EnvironmentalFailure(Exception):
@@ -215,6 +268,168 @@ def run_one(
         return {"status": "complete", "job_id": claimed["job_id"], "worker_id": worker_id}
 
 
+# ---------------------------------------------------------------------------
+# rowboat-F8: poll-window jitter + wake signal
+# ---------------------------------------------------------------------------
+def _load_paths_config(program_root: Path | str) -> dict[str, Any] | None:
+    """Best-effort ``[paths]`` read from ``<program_root>/trialerror.toml``
+    -- the same private-per-module loader convention
+    ``trialerror.dashboard.store_ro`` and every doctor ``checks.py`` already
+    use, mirroring the "ambient, no caller opt-in needed" spirit
+    ``trialerror.stores.store.open_store``'s ``_auto_load_paths_config``
+    established for ``[paths].stores_dir``. Missing/invalid
+    ``trialerror.toml`` -> ``None`` (the hardcoded-default-literal
+    behavior)."""
+    from trialerror.util.config import CONFIG_FILENAME, load_config
+
+    cfg_path = Path(program_root) / CONFIG_FILENAME
+    if not cfg_path.is_file():
+        return None
+    try:
+        return load_config(cfg_path).raw
+    except Exception:  # noqa: BLE001 - a malformed trialerror.toml is not this function's concern
+        return None
+
+
+def wake_signal_path(program_root: Path | str, config: dict[str, Any] | None = None) -> Path:
+    """Where the wake token lives for ``program_root`` -- inside the
+    RESOLVED store directory, so a program that moved its stores via
+    ``[paths].stores_dir`` moves its wake signal with them.
+
+    ``config=None`` means "discover it" here, NOT "assume the default
+    literal" (the convention most ``paths.*`` callers follow). Both sides
+    of this mechanism reach the file with only a program root in hand --
+    :func:`run_loop` via :func:`_resolve_wake_path`, ``trialerror jobs
+    kick`` via :func:`kick`, and the CLI verb deliberately opens no store
+    at all -- so a ``config`` neither of them can supply would leave the
+    promise above unkept and, worse, let a later fix to ONE side move the
+    token out from under the other. Discovering it here keeps the token
+    next to the ``jobs.db`` that ``open_store`` (which auto-discovers the
+    same way) actually opened. An explicit ``config`` still wins."""
+    if config is None:
+        config = _load_paths_config(program_root)
+    return paths.program_store_dir(program_root, config) / WAKE_SIGNAL_FILENAME
+
+
+def read_wake_token(path: Path | str | None) -> str | None:
+    """The current wake token, or ``None`` when there is no signal file
+    (or it cannot be read). Deliberately total: a napping worker must
+    never die because the signal file was mid-replace, on a directory that
+    does not exist yet, or unreadable -- the worst case is that it sleeps
+    out its nap, which is exactly the pre-adoption behaviour."""
+    if path is None:
+        return None
+    try:
+        token = Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return token or None
+
+
+def kick(program_root: Path | str, *, config: dict[str, Any] | None = None, token: str | None = None) -> dict[str, Any]:
+    """Write a fresh wake token: every worker currently napping on this
+    program's queue ends its nap at its next tick. Idempotence is NOT
+    wanted here -- each call writes a NEW token, which is precisely what
+    makes "kick twice" wake a worker twice.
+
+    Write-temp-then-``os.replace`` so a reader can never observe a
+    half-written token (``os.replace`` is atomic on both POSIX and NTFS);
+    the file itself is never unlinked, so a token is a monotonically
+    replaced value rather than a presence flag two workers could race to
+    consume.
+    """
+    path = wake_signal_path(program_root, config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    token = token or new_id("KICK")
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(token, encoding="utf-8")
+    os.replace(tmp, path)
+    return {"wake_signal_path": str(path), "token": token, "ts": now()}
+
+
+def jittered_poll_interval(
+    poll_interval_s: float,
+    *,
+    worker_id: str,
+    poll_index: int = 0,
+    jitter_frac: float = DEFAULT_JITTER_FRACTION,
+) -> float:
+    """A nap length inside ``[poll*(1-jitter_frac), poll*(1+jitter_frac)]``,
+    chosen deterministically from ``worker_id`` and ``poll_index``.
+
+    Deterministic, not random: two DIFFERENT workers get different phases
+    (the point of the adoption -- they stop claiming on the same tick),
+    while the SAME worker's schedule is reproducible, so a test can assert
+    an exact nap and an operator reading a log can reconstruct one.
+    ``jitter_frac=0`` disables jitter entirely and returns the nominal
+    interval.
+    """
+    lo = poll_interval_s * (1.0 - jitter_frac)
+    hi = poll_interval_s * (1.0 + jitter_frac)
+    # PORTED BUG FIX 1 (mining report: the source "has no wrap handling
+    # when end < start"). A negative jitter_frac -- or any caller that
+    # hands the bounds over backwards -- produced a reversed window the
+    # source would have sampled as a negative span. Normalize instead.
+    if hi < lo:
+        lo, hi = hi, lo
+    # PORTED BUG FIX 2 (mining report: in the source "the random time can
+    # be stamped into the past"). A jitter_frac > 1 drives the low bound
+    # below zero; a negative nap is a nap "already over" -- clamp both
+    # bounds at zero so the worst case is "poll immediately", never a
+    # negative sleep or a deadline behind now().
+    lo = max(0.0, lo)
+    hi = max(0.0, hi)
+    if hi <= lo:
+        return lo
+    digest = hashlib.blake2b(f"{worker_id}#{poll_index}".encode("utf-8"), digest_size=8).digest()
+    frac = int.from_bytes(digest, "big") / float(1 << 64)  # [0, 1)
+    return lo + frac * (hi - lo)
+
+
+def _nap(
+    duration_s: float,
+    *,
+    wake_path: Path | None,
+    baseline_token: str | None,
+    tick_s: float = DEFAULT_WAKE_TICK_S,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> tuple[bool, str | None]:
+    """Sleep up to ``duration_s``, cut short as soon as the wake token
+    differs from ``baseline_token``. Returns ``(woken_early, token)``.
+
+    The token is checked BEFORE the first sleep, so a kick that landed
+    while the previous job was still running is honoured immediately
+    rather than after a full nap. ``monotonic`` (never the wall clock)
+    bounds the nap, so a system clock adjustment mid-nap cannot strand a
+    worker.
+    """
+    if wake_path is not None:
+        token = read_wake_token(wake_path)
+        if token is not None and token != baseline_token:
+            return True, token
+    if duration_s <= 0:
+        return False, baseline_token
+    deadline = monotonic() + duration_s
+    while True:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return False, baseline_token
+        sleep(min(tick_s, remaining))
+        if wake_path is not None:
+            token = read_wake_token(wake_path)
+            if token is not None and token != baseline_token:
+                return True, token
+
+
+def _resolve_wake_path(store: Store, wake_signal: bool | Path | str) -> Path | None:
+    if wake_signal is False:
+        return None
+    if wake_signal is True:
+        return wake_signal_path(store.program_root)
+    return Path(wake_signal)
+
+
 def run_loop(
     store: Store,
     *,
@@ -224,6 +439,9 @@ def run_loop(
     poll_interval_s: float = 2.0,
     max_idle_polls: int = 3,
     max_iterations: int | None = None,
+    jitter_frac: float = DEFAULT_JITTER_FRACTION,
+    wake_signal: bool | Path | str = True,
+    wake_tick_s: float = DEFAULT_WAKE_TICK_S,
 ) -> list[dict[str, Any]]:
     """Drain the eligible queue: keep calling :func:`run_one` until
     ``max_idle_polls`` consecutive claims come back idle, or
@@ -231,11 +449,29 @@ def run_loop(
     own shape -- "processes the whole batch, then exits"
     (``research/tools/embeddings_local/corpus_embed_runner.py``,
     ``research/tools/marker_ocr/run_batch.py``) -- not an unbounded daemon.
+
+    rowboat-F8 adds two things to the idle wait between polls:
+
+    - ``jitter_frac`` spreads the nap deterministically per worker (see
+      :func:`jittered_poll_interval`); pass ``0.0`` for the old fixed nap.
+    - ``wake_signal`` (``True`` = this program's
+      :func:`wake_signal_path`, a path = that file, ``False`` = disabled)
+      lets ``trialerror jobs kick`` end a nap immediately.
+
+    **A wake resets the idle streak.** A kick is an outside caller
+    asserting that work now exists, which is the same evidence a
+    successful claim gives -- so a loop about to exit on its third idle
+    poll stays alive to look. Each wake is recorded in the returned list
+    as a ``{"status": "woken", ...}`` entry, so the caller can see WHY a
+    loop outlived its ``max_idle_polls`` instead of having to infer it.
     """
     worker_id = worker_id or make_worker_id()
+    wake_path = _resolve_wake_path(store, wake_signal)
+    last_token = read_wake_token(wake_path)
     results: list[dict[str, Any]] = []
     idle_streak = 0
     non_idle_count = 0
+    poll_index = 0
     while True:
         result = run_one(store, worker_id=worker_id, kinds=kinds, lease_s=lease_s)
         results.append(result)
@@ -243,7 +479,18 @@ def run_loop(
             idle_streak += 1
             if idle_streak >= max_idle_polls:
                 break
-            time.sleep(poll_interval_s)
+            nap_s = jittered_poll_interval(
+                poll_interval_s, worker_id=worker_id, poll_index=poll_index, jitter_frac=jitter_frac
+            )
+            poll_index += 1
+            woken, last_token = _nap(
+                nap_s, wake_path=wake_path, baseline_token=last_token, tick_s=wake_tick_s
+            )
+            if woken:
+                idle_streak = 0
+                results.append(
+                    {"status": "woken", "worker_id": worker_id, "token": last_token, "napped_s": nap_s}
+                )
             continue
         idle_streak = 0
         non_idle_count += 1
@@ -282,6 +529,8 @@ def spawn_worker(
     poll_interval_s: float = 2.0,
     max_idle_polls: int = 3,
     max_iterations: int | None = None,
+    jitter_frac: float | None = None,
+    wake_signal: bool = True,
     log_dir: Path | str | None = None,
     extra_handler_modules: Sequence[str] | None = None,
     python_exe: str | None = None,
@@ -338,6 +587,12 @@ def spawn_worker(
     ]
     if platform_root is not None:
         argv += ["--platform-root", str(platform_root)]
+    # rowboat-F8: appended only when the caller actually overrode the
+    # default, so the argv a pre-adoption test asserts on is unchanged.
+    if jitter_frac is not None:
+        argv += ["--jitter-frac", str(jitter_frac)]
+    if not wake_signal:
+        argv += ["--no-wake-signal"]
     if lease_s is not None:
         argv += ["--lease-s", str(lease_s)]
     if max_iterations is not None:

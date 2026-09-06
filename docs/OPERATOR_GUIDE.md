@@ -49,18 +49,36 @@ that parser recognizes.
 | `feed` | `post`, `threads`, `read`, `translate`, `translations` | Full-text agent voices. Authorship is **never** a free-text flag — it's derived from `--launch-id` (or, if omitted, the open session as `orchestrator:<session_id>`). `post --new-thread <title>` opens a thread (requires `--launch-id`); `post --thread-id <id>` posts into an existing one. `translate` ENQUEUES a plain-English translation job for `--post-id` / `--thread-id` / `--pending` (it never translates inline and never calls a model); `translations` reads what was stored, `--gate-status fail` listing what the faithfulness gate withheld. |
 | `inbox` | `post`, `read` | `inbox post` is the user's one API-backed write path — no hand-appended files. `read` marks items read unless `--no-mark-read`. |
 | `ingest` | `add-source`, `add`, `doctor`, `rechunk`, `re-embed`, `status`, `request`, `requests-md` | `add-source` registers + dedups on `content_sha256`. `add` acquires a document under a source and enqueues the first pipeline stage (`normalize` or `ocr`, by media type) — refuses past a page-count cost threshold (default 50) unless `--yes`. `doctor` runs just the 6 ingest-specific checks. `rechunk`/`re-embed` re-enqueue one stage. `request` drives the acquisition-queue state machine; `requests-md` renders `requests/REQUESTS.md`. |
-| `jobs` | `list`, `start-worker`, `tick`, `pause`, `resume`, `logs` | See **Detached jobs** below. |
+| `jobs` | `list`, `start-worker`, `tick`, `kick`, `pause`, `resume`, `logs` | See **Detached jobs** below. |
 | `query` | `search`, `quote`, `similar`, `stats` | The same retrieval engine the `trialerror-knowledge` MCP server serves live agents. `search --unfenced` is the one CLI-only, human-flagged escape hatch past the commercial-license serving fence — the MCP `search` tool never exposes it. |
 | `verify` | `citecheck`, `hypothesis`, `reproduce` | `citecheck <file\|claim-set.json\|artifact_id> --by-launch X` — mechanical pass first (6-word-shingle/number match + anchor resolve), unresolved pairs escalate (supply `--judgments-file` or they come back `escalation_selected`/`escalation_not_sampled`). `hypothesis` REQUIRES `--judgments-file` covering every retrieved chunk (this process never calls an LLM itself — judgments are supplied by the caller). `reproduce <verdict_id>` re-runs a verdict's `reproduction_ref` script and byte-compares its sha. |
 | `prereg` | `commit`, `reveal`, `status` | `commit` hash-locks a procedure+params blind, escrowed under the **platform** tree (`~/.trialerror/escrow/<program>/`, outside the program repo — a physical, not conventional, blind). `reveal` tamper-checks against the committed hash before copying content into the program tree. |
 | `artifact` | `create`, `register`, `list`, `show` | `create` makes a `draft` row. `register` is refused for a `gated=1` template type unless its gate is in `union_applied`. |
 | `gate` | `open`, `submit`, `verdict`, `apply-union`, `verify-edit`, `advance` | The state machine: `draft → submitted → gated|failed → union_applied → registered`. `advance` is the generic low-level entry point (refuses any illegal edge); the others are named shortcuts for specific legal transitions. `apply-union` is the terminal-pass gate: it enforces verdict ∈ {PASS, PASS_WITH_EDITS}, every **blocking** edit `verified=true`, and `reproduction_status != mismatch`. |
-| `memory` | `search`, `put`, `sync-export`, `sync-import`, `merge` | `search --id <item_id>` fetches one item's full body (the progressive-disclosure "step 2"); `search --boot-bundle` returns the same L0-index-plus-targeted-abstracts payload session boot injects. `put` upserts by `(key, account)`. `sync-export`/`sync-import` round-trip `memory/*.md` for git sync; a merge conflict from `sync-import` is never auto-resolved — list it with bare `memory merge`, resolve with `--group <id> --keep left\|right\|both`. |
+| `memory` | `search`, `put`, `sync-export`, `sync-import`, `merge`, `candidates`, `judge`, `stale`, `reviewed` | `search --id <item_id>` fetches one item's full body (the progressive-disclosure "step 2"); `search --boot-bundle` returns the same L0-index-plus-targeted-abstracts payload session boot injects. `put` upserts by `(key, account)`. `sync-export`/`sync-import` round-trip `memory/*.md` for git sync; a merge conflict from `sync-import` is never auto-resolved — list it with bare `memory merge`, resolve with `--group <id> --keep left\|right\|both`. `candidates`/`judge` are the 2026-09 mining adoption (engram-F4): every `put` runs a BM25 pass over existing items and files anything similar as an **unjudged, advisory** candidate — the save is never blocked, delayed, or altered, and no machine writes a verdict (`judge --actor-kind system` is refused; an agent rules under its own name). `stale`/`reviewed` are engram-F5: `stale` computes, per item kind, whether a review half-life has elapsed (rule 365d, fact/lesson 180d, preference/index 90d) and `reviewed <id>` records that you looked and left it standing. Decay **only surfaces** — nothing expires, unpins, or downgrades on a timer. |
 | `lens` | `roster`, `stratify`, `assign`, `log`, `export` | AMENDMENT-3 ideation machinery, generalized. `stratify` is a dry-run score+tercile-cut (no write); `assign` does the real seeded quota draw and writes `lens_assignment` rows (default weights 40/40/20 near/moderate/far, far-arm floor 2). `export` hands back rows shaped for `budget book`. |
 | `obs` | `status`, `start-phoenix`, `smoke` | All no-op gracefully if the `obs` extra isn't installed. `start-phoenix` launches a detached local `phoenix serve` (the same detach technique as job workers: `DETACHED_PROCESS \| CREATE_NEW_PROCESS_GROUP` on Windows, `start_new_session=True` — i.e. `setsid()` — on POSIX). `smoke` emits one span of each of the four kinds (launch/retrieval/verification/job) and reports whether they flushed. |
 | `mcp` | `ops`, `knowledge` | Starts the named stdio MCP server; **blocks** for its lifetime (serves until stdin closes). Not meant to be run interactively — see **Registering the MCP servers** below. |
 | `accept` | *(no subcommands)* | Runs the M15 acceptance harness: a full clean-checkout-shaped smoke journey against a scratch program (discarded after), plus an enumeration of the GPU/live-Claude-Code items that still need a real machine. `--skip-gpu-live-cc-enumeration` to omit the latter. |
 | `doctor` | *(top-level, no subcommands)* | `--license-audit` for just the vendored-file header scan; `--only CHECK_NAME` (repeatable) to run specific checks; **`--program-root` is required to see program-scoped checks** (schema version, dangling XIDs, stale chunks/embeddings/anchors) — without it they silently skip. See the full catalog below. |
+
+### Memory items — the `l0_abstract` authoring rule
+
+`memory search`, `search --boot-bundle` and the SessionStart hook return
+`l0_abstract` lines and never bodies (progressive disclosure; the
+`memory_l0_index_budget` doctor check warns when the L0 tier alone outgrows
+`[memory] token_budget`). The abstract is therefore the only thing that decides
+whether an item is ever read. Rule, adopted 2026-09-05 from WikiSkill's
+index-entry rule (arXiv:2608.27454): every `l0_abstract` states
+**PROBLEM + ROOT CAUSE + FIX** in one or two sentences — never a topic label.
+Bodies: root cause, not symptom; exact command sequences as run; update rather
+than duplicate (`put` upserts by `(key, account)` — reuse the key); 10-30
+lines. The `/close` skill carries a worked `memory put` example and `/boot`
+reads the index under the same rule. Not enforced in code — `put` accepts any
+string — so it is a review rule for the operator and for the close ritual. Two
+code follow-ups are tracked separately and will surface items rather than
+rewrite them: save-time conflict candidates (advisory only) and age-based
+`needs_review` surfacing as a doctor check.
 
 ## The two MCP servers
 
@@ -191,12 +209,23 @@ the `atomic` scheduler pattern).
 - **Pause/resume**: `trialerror jobs pause <job_id>` is cooperative (the worker stops at its
   next heartbeat); `trialerror jobs resume <job_id>` makes it claimable again but does **not**
   itself spawn a worker — follow it with `start-worker --job-id <id>`.
+- **Polling and waking** (2026-09 mining adoption rowboat-F8): a looping worker's idle nap
+  is jittered deterministically per worker (`--jitter-frac`, default ±25% of
+  `--poll-interval-s`; `0` restores a fixed nap) so N workers launched in the same second
+  stop claiming on the same tick. `trialerror jobs kick` writes a wake token next to
+  `jobs.db` and every napping worker ends its nap at its next tick — the way to say "a job
+  was just enqueued, stop waiting" without waiting out a poll interval. A kick wakes
+  workers that already exist; it never spawns one, and `--no-wake-signal` opts a worker out.
 
 ## Doctor checks catalog
 
-`trialerror doctor` runs every check registered by every subsystem (28 checks across 14
-categories as of this build); each subsystem owns its own `checks.py`, auto-discovered —
-adding a new one never touches a shared file.
+`trialerror doctor` runs every check registered by every subsystem (**53 checks across 21
+categories**); each subsystem owns its own `checks.py`, auto-discovered — adding a new one
+never touches a shared file. That figure had drifted twice before anyone noticed, precisely
+because nothing enforced it, so it is now pinned by a test against the live registry
+(`tests/test_docs_doctor_catalog.py`): adding a check makes that test fail until this
+sentence is updated with it. The table below is a reader's map of the busiest categories,
+not the full registry — `trialerror doctor --json` is authoritative.
 
 | Category | Checks |
 |---|---|
@@ -209,7 +238,7 @@ adding a new one never touches a shared file.
 | `feed_translate` | `feed_translation_failures`, `feed_translations_stale` |
 | `sessions` | `session_multiple_open`, `session_hook_alive` |
 | `artifacts` | `gated_type_without_gate`, `orphan_gate_transition`, `gate_illegal_transition_history` |
-| `memory` | `memory_unresolved_conflict_groups`, `memory_l0_index_budget` |
+| `memory` | `memory_unresolved_conflict_groups`, `memory_l0_index_budget`, `memory_stale_items`, `memory_pending_conflict_candidates` |
 | `lens` | `far_arm_floor_honored`, `no_duplicate_slice`, `cluster_coverage` |
 | `retrieve` | `fence_integrity` (license-fence spot-check), `retrieval_latency`, `fulltext_index_stale` (tantivy index vs corpus; repair with `trialerror ingest reindex-fulltext`) |
 | `verify` | `verdict_evidence_anchors`, `prereg_escrow_integrity` |

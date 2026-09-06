@@ -87,12 +87,22 @@ def test_store_schema_version_passes_on_freshly_migrated_store(store, program_ro
     # ops (build-v2-polish's ops-v3, rooms; build-v2dash-data's ops-v4,
     # criterion + feed_post_translation; lane-b-translator's ops-v6, the
     # translator's gate-verdict columns -- v5 landed independently on
-    # master as FU-14's "ops_v5_meta_kv" while this lane was in flight, so
-    # this lane's own migration was renumbered v5->v6 rather than colliding,
-    # see ops.py's TRIALERROR-DEV-NOTE at _V6) and knowledge (build-v2-
-    # summary's knowledge-v3, the summary table) each independently gained
-    # more versions later -- jobs.db has no v3 (still at 2).
-    assert r.details["ops"] == {"current_version": 6, "expected_version": 6, "match": True}
+    # master as FU-14's "ops_v5_meta_kv" while that lane was in flight, so
+    # its own migration was renumbered v5->v6 rather than colliding, see
+    # ops.py's TRIALERROR-DEV-NOTE at _V6; the 2026-09 mining adoptions'
+    # ops-v7, engram-F4's memory_relation table + engram-F5's
+    # memory_item.reviewed_ts) and knowledge (build-v2-summary's
+    # knowledge-v3, the summary table) each independently gained more
+    # versions later -- jobs.db has no v3 (still at 2).
+    #
+    # 7, and MIGRATIONS is contiguous 1..7 again: the mining lane authored
+    # its migration as v6, renumbered it to v8 on its own branch while lane
+    # b held v6 and orchestrator ruling L-C1 held v7 for lane C, then landed
+    # at v7 because it merged BEFORE lane c (L-C1 amended, lane c takes v8).
+    # The check reads BOTH numbers from latest_version(MIGRATIONS) and PRAGMA
+    # user_version, so the numbering history is invisible to it -- what it
+    # asserts is that the two agree.
+    assert r.details["ops"] == {"current_version": 7, "expected_version": 7, "match": True}
     assert r.details["jobs"] == {"current_version": 2, "expected_version": 2, "match": True}
     assert r.details["knowledge"] == {"current_version": 3, "expected_version": 3, "match": True}
     assert r.details["platform"]["expected_version"] == 1

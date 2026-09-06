@@ -54,3 +54,25 @@ does not "arm" anything.
    or abandoned the current one — with `--fresh` it refuses outright while
    a session is already open (without `--fresh`, the default, it is a
    no-op that just re-reads the bundle).
+
+## Reading the L0 memory index (wikiskill-F6)
+
+The bundle's L0 memory index is a list of `l0_abstract` lines, never bodies.
+Under the authoring rule (`/close`), each line states PROBLEM + ROOT CAUSE +
+FIX; read them as such — expand with `trialerror memory search --id <item_id>`
+only the items whose PROBLEM matches the work this session is about to do, and
+leave the rest folded. A line that is only a topic label tells you nothing
+about whether to expand it: note it as an item to rewrite at close rather
+than expanding every ambiguous line "to be safe".
+
+## When NOT to apply
+
+- A session is already open and you have read its bundle — re-running is a
+  no-op, and `--fresh` refuses outright; neither re-arms anything.
+- To "arm" hooks. Hooks are armed by the plugin, not by this skill; a session
+  with zero `hook_alive` events is a disabled-hooks problem, not a boot
+  problem.
+- As a substitute for reading `foreign_since_last`. A successful boot is not
+  the same as having read the rulings it surfaced.
+- On a prior session that crashed — `trialerror session abandon` first, then
+  boot.

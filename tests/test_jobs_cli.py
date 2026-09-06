@@ -136,3 +136,36 @@ def test_jobs_no_program_root_errors_cleanly(tmp_path, capsys, monkeypatch):
     assert rc == 1
     assert env["ok"] is False
     assert env["error"]["code"] == "no_program_root"
+
+
+# ---------------------------------------------------------------------------
+# mining adoption rowboat-F8: `trialerror jobs kick`
+# ---------------------------------------------------------------------------
+def test_jobs_kick_writes_a_wake_token(program_root, platform_root, capsys):
+    from trialerror.jobs.worker import read_wake_token, wake_signal_path
+
+    rc, env = _run(["jobs", "kick", *_common_args(program_root, platform_root)], capsys)
+    assert rc == 0
+    assert env["ok"] is True
+    assert env["result"]["token"].startswith("KICK-")
+    assert read_wake_token(wake_signal_path(program_root)) == env["result"]["token"]
+
+
+def test_jobs_kick_is_not_idempotent_each_call_is_a_new_signal(program_root, platform_root, capsys):
+    _, first = _run(["jobs", "kick", *_common_args(program_root, platform_root)], capsys)
+    _, second = _run(["jobs", "kick", *_common_args(program_root, platform_root)], capsys)
+    assert first["result"]["token"] != second["result"]["token"]
+
+
+def test_jobs_start_worker_foreground_loop_accepts_the_jitter_and_wake_knobs(program_root, platform_root, capsys):
+    rc, env = _run(
+        [
+            "jobs", "start-worker", *_common_args(program_root, platform_root),
+            "--foreground", "--mode", "loop",
+            "--poll-interval-s", "0.01", "--max-idle-polls", "2",
+            "--jitter-frac", "0", "--no-wake-signal",
+        ],
+        capsys,
+    )
+    assert rc == 0
+    assert [r["status"] for r in env["result"]["results"]] == ["idle", "idle"]
