@@ -42,16 +42,20 @@ def _v_only(max_version: int) -> tuple[Migration, ...]:
 
 def test_fresh_create_and_migrate_from_v1v2v3_land_identical_schemas():
     fresh = sqlite3.connect(":memory:")
-    apply_migrations(fresh, ops.MIGRATIONS)  # v1..v4 in one call, from empty
+    apply_migrations(fresh, ops.MIGRATIONS)  # every version in one call, from empty
 
     migrated = sqlite3.connect(":memory:")
     v1v2v3_only = _v_only(3)
     applied_first = apply_migrations(migrated, v1v2v3_only)
     assert applied_first == [1, 2, 3]
-    applied_v4 = apply_migrations(migrated, ops.MIGRATIONS)  # only v4 is newer now
-    assert applied_v4 == [4]
+    # everything newer than v3 -- v4 when this test was written, v4+v5 since
+    # FU-14 added the meta kv table. Asserted as "the rest of the list", not
+    # a frozen [4], so the real claim (a step-wise migration and a
+    # from-empty create land the SAME schema) survives every later addition.
+    applied_rest = apply_migrations(migrated, ops.MIGRATIONS)
+    assert applied_rest == [m.version for m in ops.MIGRATIONS if m.version > 3]
 
-    assert current_version(fresh) == current_version(migrated) == latest_version(ops.MIGRATIONS) == 4
+    assert current_version(fresh) == current_version(migrated) == latest_version(ops.MIGRATIONS)
     assert _schema_snapshot(fresh) == _schema_snapshot(migrated)
 
 

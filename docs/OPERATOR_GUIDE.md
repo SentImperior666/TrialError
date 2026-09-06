@@ -210,7 +210,7 @@ adding a new one never touches a shared file.
 | `artifacts` | `gated_type_without_gate`, `orphan_gate_transition`, `gate_illegal_transition_history` |
 | `memory` | `memory_unresolved_conflict_groups`, `memory_l0_index_budget` |
 | `lens` | `far_arm_floor_honored`, `no_duplicate_slice`, `cluster_coverage` |
-| `retrieve` | `fence_integrity` (license-fence spot-check), `retrieval_latency` |
+| `retrieve` | `fence_integrity` (license-fence spot-check), `retrieval_latency`, `fulltext_index_stale` (tantivy index vs corpus; repair with `trialerror ingest reindex-fulltext`) |
 | `verify` | `verdict_evidence_anchors`, `prereg_escrow_integrity` |
 | `obs` | `obs_exporter_reachable`, `obs_span_drop_counter` |
 | `util` | `license_audit` (vendored/ header + manifest scan) |

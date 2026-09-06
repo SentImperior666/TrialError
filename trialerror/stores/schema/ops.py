@@ -38,6 +38,7 @@ TABLES = (
     "room_link",
     "criterion",
     "feed_post_translation",
+    "meta",
 )
 
 _V1 = (
@@ -491,9 +492,38 @@ _V4 = (
     "CREATE INDEX idx_feed_post_translation_post ON feed_post_translation(post_id, translator_version, status)",
 )
 
+# ---- v5 (FU-14): the ops-scoped key/value side table -------------------
+#
+# ``meta`` is the small, generic per-program key/value side table the design
+# never needed until something had to record a fact ABOUT the store rather
+# than a row IN it. Its first (and, at this migration, only) key is the origin-project
+# import watermark (:mod:`the (excluded) tenant-migration module`): the parity commit,
+# the import timestamp, and the row counts of the one-time G1 migration.
+#
+# Why a table and not a file: every doctor check that has to ask "was this
+# row imported, or written live?" already has a read-only ops.db handle and
+# nothing else -- a JSON file next to the DB would be a second source of
+# truth that a DB copy/restore could silently separate from the rows it
+# describes. Why generic rather than an ``import_watermark`` table: the same
+# question ("one durable fact about this program") recurs (schema-era flags,
+# provenance hashes like the imported digest's source sha), and a kv row is
+# the cheapest honest home for each -- ``value`` holds JSON when a key needs
+# structure, a bare string when it does not, and the key namespace
+# (``the (excluded) tenant-migration module.*``) says who owns it.
+_V5 = (
+    """
+    CREATE TABLE meta (
+        key         TEXT PRIMARY KEY,
+        value       TEXT NOT NULL,
+        updated_ts  TEXT NOT NULL
+    )
+    """,
+)
+
 MIGRATIONS = (
     Migration(version=1, name="ops_v1_initial_schema", statements=_V1),
     Migration(version=2, name="ops_v2_memory_item_account_id_nullable_and_thread_status_refs", statements=_V2),
     Migration(version=3, name="ops_v3_rooms_created_ts_scored_link_deliverable", statements=_V3),
     Migration(version=4, name="ops_v4_criterion_and_feed_post_translation", statements=_V4),
+    Migration(version=5, name="ops_v5_meta_kv", statements=_V5),
 )

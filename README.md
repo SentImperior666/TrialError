@@ -194,8 +194,13 @@ what is still coming. Nothing already shipped depends on any of it.
       (langfuse pattern) and a status-coloured jobs table with per-cell deltas
       (k9s pattern), per the Console renderer brief. Until then the Console
       uses a generic key/value renderer.
-- [ ] Full-text tier switch to tantivy. A measured bake-off found it 23-64x faster
-      than FTS5 at every tested scale; the migration is scoped, not executed.
+- [x] Full-text tier switch to tantivy. A bake-off found it consistently faster
+      than FTS5 at every tested scale, and a shipped-path measurement at 15k
+      chunks confirms it (2-30x at p50, wider on common/low-selectivity terms,
+      where FTS5's full-corpus BM25 scan costs the most), so tantivy is now the
+      default keyword backend; FTS5 remains the fallback, `[retrieve]
+      fulltext_backend` picks between them, and `trialerror ingest
+      reindex-fulltext` builds the index an existing program needs.
 - [ ] A dedicated term store for the lexicon, which is currently proxied from
       extracted entities.
 - [ ] Ops polish: a retention doctor check, transactional event rows, idempotent

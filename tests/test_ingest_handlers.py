@@ -12,6 +12,8 @@ import pytest
 
 from trialerror.ingest import pipeline
 from trialerror.jobs.worker import run_one
+from trialerror.retrieve import tantivysearch
+from trialerror.stores import paths as store_paths
 from trialerror.stores.vecindex import vec_table_name
 from tests._ingest_fixtures import (
     bootstrap_launch,
@@ -350,3 +352,62 @@ def test_kill_mid_embed_worker_is_reclaimed_by_tick_and_resumes_byte_identical(s
         ).fetchone()
         assert actual is not None
         assert actual["vector"] == expected_bytes
+
+
+# ---------------------------------------------------------------------------
+# tantivy full-text index maintenance (C-0080)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not tantivysearch.tantivy_available(), reason="tantivy-py not installed")
+def test_index_stage_maintains_the_tantivy_index_alongside_chunk_fts(store, program_root, raw_dir):
+    """``run_index`` writes BOTH lexical indexes. ``chunk_fts`` is not
+    allowed to rot just because tantivy is the serving backend -- it is the
+    fallback, and an unmaintained fallback is not a fallback."""
+    path = write_markdown_fixture(raw_dir / "doc.md")
+    _launch_id, _source, result = _register_and_add(store, program_root, path, media_type="md")
+    doc_id = result["document"]["doc_id"]
+    _drain(store)
+
+    chunk_ids = [r["chunk_id"] for r in store.knowledge.execute("SELECT chunk_id FROM chunk WHERE doc_id=?", (doc_id,))]
+    assert chunk_ids
+
+    for chunk_id in chunk_ids:
+        assert store.knowledge.execute(
+            "SELECT COUNT(*) FROM chunk_fts WHERE chunk_id=?", (chunk_id,)
+        ).fetchone()[0] == 1
+
+    status = tantivysearch.index_status(store.knowledge, store_paths.fulltext_index_path(program_root))
+    assert status["state"] == "ok"
+    assert status["index_docs"] == len(chunk_ids)
+
+
+@pytest.mark.skipif(not tantivysearch.tantivy_available(), reason="tantivy-py not installed")
+def test_index_stage_leaves_the_tantivy_index_alone_when_the_program_pins_fts5(store, program_root, raw_dir):
+    (program_root / "trialerror.toml").write_text(
+        '[program]\nid = "PROG-test"\n\n[retrieve]\nfulltext_backend = "fts5"\n', encoding="utf-8"
+    )
+    path = write_markdown_fixture(raw_dir / "doc.md")
+    _register_and_add(store, program_root, path, media_type="md")
+    _drain(store)
+    assert not store_paths.program_index_dir(program_root).exists()
+
+
+@pytest.mark.skipif(not tantivysearch.tantivy_available(), reason="tantivy-py not installed")
+def test_rerunning_the_index_stage_adds_nothing_to_the_tantivy_index(store, program_root, raw_dir):
+    """Restart-safety, the property this handler's module docstring claims
+    for every stage: a re-run lands on byte-identical final state."""
+    path = write_markdown_fixture(raw_dir / "doc.md")
+    _launch_id, _source, result = _register_and_add(store, program_root, path, media_type="md")
+    doc_id = result["document"]["doc_id"]
+    _drain(store)
+
+    index_dir = store_paths.fulltext_index_path(program_root)
+    before = tantivysearch.read_meta(index_dir)
+
+    pipeline.requeue_stage(store, doc_id=doc_id, kind="index", created_by_launch=_launch_id)
+    _drain(store)
+
+    after = tantivysearch.read_meta(index_dir)
+    assert after["chunk_count"] == before["chunk_count"]
+    assert after["chunk_fingerprint"] == before["chunk_fingerprint"]

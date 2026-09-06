@@ -59,6 +59,26 @@ def test_search_mode_vector_only_uses_the_vector_tier(store, corpus):
     assert r["stats"]["fts_candidates"] == 0
 
 
+def test_stats_fulltext_backend_key_is_always_present(store, corpus):
+    """Fix pass, finding LD-07: ``fulltext_backend`` used to be absent from
+    ``stats`` on any code path where the fts tier didn't run (vector-only
+    mode, an empty query, a zero-hit filter) -- a caller reading
+    ``response["stats"]["fulltext_backend"]`` unconditionally would
+    ``KeyError`` on some paths and not others. It is now always present,
+    ``None`` when the fts tier didn't run."""
+    vector_only = engine.search(store, query="retry budgets", mode="vector")
+    assert vector_only["stats"]["fulltext_backend"] is None
+
+    empty_query = engine.search(store, query="", mode="fts")
+    assert empty_query["stats"]["fulltext_backend"] is None
+
+    zero_hit_filter = engine.search(store, query="retry budgets", mode="fts", filters={"source_ids": ["SRC-nonexistent"]})
+    assert zero_hit_filter["stats"]["fulltext_backend"] is None
+
+    fts_ran = engine.search(store, query="retry budgets", mode="fts")
+    assert fts_ran["stats"]["fulltext_backend"] in ("fts5", "tantivy")
+
+
 def test_search_mode_auto_and_hybrid_use_both_tiers(store, corpus):
     for mode in ("auto", "hybrid"):
         r = engine.search(store, query="retry budgets bound tail latency", mode=mode)
@@ -470,6 +490,30 @@ def test_corpus_stats_counts_match_the_fixture(store, corpus):
     assert stats["chunks_missing_fts"] == 0
     assert stats["embeddings_by_model_key"][corpus["model_key"]] == stats["chunks"]
     assert stats["chunks_missing_vec_by_model_key"][corpus["model_key"]] == 0
+
+
+def test_corpus_stats_uses_the_cheap_fulltext_index_probe(store, corpus, monkeypatch):
+    """Fix pass, finding LD-04: ``corpus_stats`` is an on-demand SUMMARY
+    call (``trialerror query stats`` / MCP tool #8), not the doctor -- it
+    must ask ``index_status`` for the cheap ``COUNT(*)`` comparison, never
+    the doctor's full XOR fingerprint scan over every ``chunk_id``, which
+    would turn a summary into a full-table scan at scale."""
+    if not engine.tantivysearch.tantivy_available():
+        pytest.skip("tantivy-py not installed")
+    engine.tantivysearch.reindex(store.knowledge, engine.lexical.fulltext_index_dir(store))
+
+    calls: list[bool] = []
+    real_index_status = engine.tantivysearch.index_status
+
+    def _spy(conn, index_dir, **kwargs):
+        calls.append(kwargs.get("cheap", False))
+        return real_index_status(conn, index_dir, **kwargs)
+
+    monkeypatch.setattr(engine.tantivysearch, "index_status", _spy)
+    stats = engine.corpus_stats(store)
+    assert calls == [True], "corpus_stats must call index_status(..., cheap=True)"
+    assert stats["fulltext_index"]["state"] == "ok"
+    assert stats["fulltext_index"]["indexed_docs"] == stats["chunks"]
 
 
 def test_list_requests_groups_by_state(store, corpus):

@@ -86,12 +86,24 @@ id = "{program_id}"
 # table and already worked -- the other six are what this table adds.
 # [paths]
 # stores_dir = "stores"
+# index_dir = "index"
 # archive_dir = "archive"
 # law_digest_path = "law/LAW_DIGEST.md"
 # handoffs_dir = "handoffs"
 # requests_path = "requests/REQUESTS.md"
 # memory_dir = "memory"
 # ingest_roots = ["raw", "inbox"]
+
+# Which engine serves the lexical (keyword/BM25) prefilter tier
+# (trialerror.retrieve.lexical). "tantivy" is the default -- a measured
+# bake-off found it 23-64x faster than SQLite FTS5 at every tested corpus
+# size -- and its index lives under [paths].index_dir as DERIVED state,
+# rebuildable at any time with `trialerror ingest reindex-fulltext`. Set
+# "fts5" to stay on the in-database FTS5 index instead; that is also what
+# the code falls back to on its own when the tantivy package or the index
+# is missing, so search never breaks over this knob.
+# [retrieve]
+# fulltext_backend = "tantivy"
 
 # OCR backend (trialerror.ingest.backends.load_ocr_backend). Defaults to the
 # deterministic FakeOcrBackend (zero-GPU, zero-model) when this table is

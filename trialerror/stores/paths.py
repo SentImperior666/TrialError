@@ -22,9 +22,11 @@ __all__ = [
     "platform_root",
     "platform_db_path",
     "program_store_dir",
+    "program_index_dir",
     "knowledge_db_path",
     "ops_db_path",
     "jobs_db_path",
+    "fulltext_index_path",
 ]
 
 _PLATFORM_ROOT_ENV = "TRIALERROR_PLATFORM_ROOT"
@@ -32,6 +34,17 @@ _PLATFORM_ROOT_ENV = "TRIALERROR_PLATFORM_ROOT"
 #: the import-design notes (internal, not in this export) Sec 5 knob #1 (``[paths].stores_dir``, punch-list
 #: item 1: "mirror the existing TRIALERROR_PLATFORM_ROOT env-var pattern").
 _DEFAULT_STORES_DIR = "stores"
+
+#: ``[paths].index_dir`` -- the home of DERIVED, rebuildable index state
+#: that does NOT live inside a ``.db`` file. Deliberately a sibling of
+#: ``stores/`` rather than a child: everything under ``stores/`` is a
+#: SQLite database that is (or contains) source of truth and belongs in a
+#: backup, while everything under ``index/`` is reconstructible from those
+#: databases by one command (``trialerror ingest reindex-fulltext``) and is
+#: therefore safe to delete, exclude from a backup, and gitignore. Today's
+#: one tenant is the tantivy full-text index
+#: (:mod:`trialerror.retrieve.tantivysearch`).
+_DEFAULT_INDEX_DIR = "index"
 
 
 def platform_root() -> Path:
@@ -65,3 +78,19 @@ def ops_db_path(program_root: Path | str, config: dict[str, Any] | None = None) 
 
 def jobs_db_path(program_root: Path | str, config: dict[str, Any] | None = None) -> Path:
     return program_store_dir(program_root, config) / "jobs.db"
+
+
+def program_index_dir(program_root: Path | str, config: dict[str, Any] | None = None) -> Path:
+    """``[paths].index_dir`` (default ``"index"``) -- see
+    :data:`_DEFAULT_INDEX_DIR` for why derived index state gets its own
+    root rather than living under ``stores/``."""
+    return resolve_configured_path(program_root, config, "index_dir", _DEFAULT_INDEX_DIR)
+
+
+def fulltext_index_path(program_root: Path | str, config: dict[str, Any] | None = None) -> Path:
+    """``<index_dir>/tantivy/chunks`` -- the tantivy lexical index over the
+    ``chunk`` corpus (:mod:`trialerror.retrieve.tantivysearch`). The
+    ``tantivy/`` level names the engine and the ``chunks`` level names the
+    indexed table, so a second tantivy index over some other table later
+    needs no path migration for this one."""
+    return program_index_dir(program_root, config) / "tantivy" / "chunks"
