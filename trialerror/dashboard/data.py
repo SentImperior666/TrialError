@@ -64,6 +64,7 @@ from trialerror.ingest.requests import TRANSITIONS as REQUEST_TRANSITIONS
 from trialerror.jobs.ledger import list_jobs
 from trialerror.memory.merge import list_conflicts as list_memory_conflicts
 from trialerror.offload.dashboard_items import offload_backlog_items
+from trialerror.webfetch.dashboard_items import webfetch_items
 from trialerror.retrieve import engine as retrieve_engine
 from trialerror.retrieve.errors import InvalidSearchModeError
 from trialerror.rooms.api import CONVERGENCE_BAR_PCT, check_room_converged, get_freeze_reason, list_room_turns
@@ -1014,9 +1015,13 @@ def build_determinations_panel(rostore: RoStore) -> dict[str, Any]:
     memory-sync conflicts, -- from the 2026-09 mining adoptions --
     unjudged save-time memory conflict candidates (engram-F4) and memory
     items past their type-keyed review half-life (engram-F5), and (lane
-    L0-C) documents waiting for the DEV GPU worker. The three newest
-    kinds are non-blocking by construction: they are prompts to LOOK at
-    something, never gates on anything."""
+    L0-C) documents waiting for the DEV GPU worker, and -- lane a --
+    web-ingestion hosts awaiting a human's approval and a stopped fetch
+    process with URLs queued behind it. Most of the newer kinds are
+    non-blocking by construction: they are prompts to LOOK at something,
+    never gates on anything. ``webfetch_sidecar_down`` is the exception
+    and says so -- a queued fetch does not move at all while the process
+    that drains it is gone."""
     if not rostore.is_available("ops"):
         return {"status": "not_initialized", "message": "ops.db not found"}
 
@@ -1031,6 +1036,7 @@ def build_determinations_panel(rostore: RoStore) -> dict[str, Any]:
     items.extend(_memory_conflict_candidate_items(rostore))
     items.extend(_memory_stale_items(rostore))
     items.extend(offload_backlog_items(rostore))
+    items.extend(webfetch_items(rostore))
 
     counts_by_kind: dict[str, int] = {}
     for item in items:

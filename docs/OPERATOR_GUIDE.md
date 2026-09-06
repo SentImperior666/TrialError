@@ -219,7 +219,7 @@ the `atomic` scheduler pattern).
 
 ## Doctor checks catalog
 
-`trialerror doctor` runs every check registered by every subsystem (**57 checks across 22
+`trialerror doctor` runs every check registered by every subsystem (**65 checks across 23
 categories**); each subsystem owns its own `checks.py`, auto-discovered — adding a new one
 never touches a shared file. That figure had drifted twice before anyone noticed, precisely
 because nothing enforced it, so it is now pinned by a test against the live registry
@@ -245,6 +245,7 @@ not the full registry — `trialerror doctor --json` is authoritative.
 | `verify` | `verdict_evidence_anchors`, `prereg_escrow_integrity` |
 | `obs` | `obs_exporter_reachable`, `obs_span_drop_counter` |
 | `util` | `license_audit` (vendored/ header + manifest scan) |
+| `webfetch` | `webfetch_sidecar_alive` (the fetch process's heartbeat), `webfetch_backlog`, `webfetch_refused_24h` (warns on the SSRF/exfil refusal class), `webfetch_unattributed` (a fetch no booked launch asked for), `webfetch_orphans`, `webfetch_queue_disk`, `webfetch_thin_backlog` (info), `webfetch_refetch_due` (info) |
 
 `--only <name>` runs one (repeatable for several); `--license-audit` is shorthand for
 `--only license_audit`; program-scoped checks (everything except `license_audit`) need

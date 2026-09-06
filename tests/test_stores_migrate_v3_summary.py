@@ -12,7 +12,7 @@ import sqlite3
 import pytest
 
 from trialerror.stores.errors import MigrationError
-from trialerror.stores.migrate import Migration, apply_migrations, current_version
+from trialerror.stores.migrate import Migration, apply_migrations, current_version, latest_version
 from trialerror.stores.schema import knowledge
 
 
@@ -30,17 +30,25 @@ def _schema_snapshot(conn: sqlite3.Connection) -> list[tuple[str, str, str]]:
 
 
 def test_fresh_create_and_migrate_from_v2_land_identical_schemas():
+    """Stepping from v2 lands the same schema a fresh create does.
+
+    Written against ``latest_version`` rather than the literal 3 it started
+    life as: the property under test is "an operator's store sitting at v2
+    catches up exactly", and that property does not change when a later lane
+    adds v4 -- only the list of versions applied on the way does.
+    """
     fresh = sqlite3.connect(":memory:")
-    apply_migrations(fresh, knowledge.MIGRATIONS)  # v1+v2+v3 in one call, from empty
+    apply_migrations(fresh, knowledge.MIGRATIONS)  # every version in one call, from empty
 
     migrated = sqlite3.connect(":memory:")
     v1_v2_only = tuple(m for m in knowledge.MIGRATIONS if m.version <= 2)
     applied_early = apply_migrations(migrated, v1_v2_only)
     assert applied_early == [1, 2]  # sanity: v1+v2 really did apply on their own first
-    applied_v3 = apply_migrations(migrated, knowledge.MIGRATIONS)  # only v3 is newer now
-    assert applied_v3 == [3]
+    applied_later = apply_migrations(migrated, knowledge.MIGRATIONS)
+    assert applied_later == sorted(m.version for m in knowledge.MIGRATIONS if m.version > 2)
+    assert 3 in applied_later
 
-    assert current_version(fresh) == current_version(migrated) == 3
+    assert current_version(fresh) == current_version(migrated) == latest_version(knowledge.MIGRATIONS)
     assert _schema_snapshot(fresh) == _schema_snapshot(migrated)
 
 
