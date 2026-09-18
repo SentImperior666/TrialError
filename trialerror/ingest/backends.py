@@ -62,6 +62,10 @@ __all__ = [
     "FakeEmbedBackend",
     "RealQwenEmbedBackend",
     "load_embed_backend",
+    "QueryEmbedUnavailable",
+    "CpuQueryEmbedBackend",
+    "load_query_embed_backend",
+    "QUERY_PRECISIONS",
     "DEFAULT_FAKE_EMBED_DIMS",
     "DEFAULT_EMBED_TIMEOUT_S",
     "RealBackendRequiredError",
@@ -529,4 +533,172 @@ def load_embed_backend(config: dict[str, Any]) -> EmbedBackend:
         model_key=backend_name,
         dims=config.get("dims", 2048),
         timeout_s=config.get("timeout_s", DEFAULT_EMBED_TIMEOUT_S),
+    )
+
+
+# --------------------------------------------------------------------------
+# Query-time embedding (docs/VASTAI_EMBED_DESIGN.md section 6;
+# TRIALERROR_FEEDBACK.md item 15)
+# --------------------------------------------------------------------------
+
+#: Precisions the CPU query path accepts. ``bfloat16`` is the chunk side's own
+#: precision (embed_backend.py ``Qwen3STBackendConfig.dtype``) and the
+#: default; ``float32`` is closer to exact but ~16 GB of weights. No quantised
+#: option ships until its drift has been measured (design section 6).
+QUERY_PRECISIONS = ("bfloat16", "float32")
+
+
+class QueryEmbedUnavailable(RuntimeError):
+    """The program's query-side embedder cannot run (unconfigured, or it
+    failed its comparability check). ``auto``/``hybrid`` retrieval degrades
+    to lexical on this; ``--mode vector`` surfaces it."""
+
+
+class CpuQueryEmbedBackend:
+    """Embeds query strings on the CPU with the SAME ``embed_backend.py``
+    the GPU side (DEV worker or vast.ai instance) runs for chunks -- same
+    prompt, pooling, matryoshka truncation and L2 normalisation, because it
+    is the same code. The model is loaded in a subprocess that exits after
+    each call, so its ~9 GB (bf16, estimate) is never resident beside the
+    store. ``CUDA_VISIBLE_DEVICES`` is emptied for the child: this path must
+    never touch a GPU.
+
+    ``model_key``/``dims`` are NOT separately configurable: they are copied
+    from ``[ingest.embed]`` so the query vector is always looked up in the
+    key space the chunk vectors were stored under."""
+
+    _DRIVER_SOURCE = "\n".join(
+        [
+            "import json, sys",
+            "sys.path.insert(0, sys.argv[2])",
+            "import embed_backend as eb",
+            "with open(sys.argv[1], 'r', encoding='utf-8') as f:",
+            "    payload = json.load(f)",
+            "b = eb._REGISTRY[payload['model_key']]()",
+            "cfg = getattr(b, 'cfg', None)",
+            "if cfg is None or not hasattr(cfg, 'device'):",
+            "    raise SystemExit('backend %r has no device-configurable cfg' % payload['model_key'])",
+            "if getattr(cfg, 'quant_4bit', False):",
+            "    raise SystemExit('refusing a quantised backend on the CPU query path')",
+            "cfg.device = 'cpu'",
+            "cfg.dtype = payload['precision']",
+            "b.load()",
+            "vecs = b.embed_batch(payload['texts'], kind=payload['kind'])",
+            "vecs = vecs.tolist() if hasattr(vecs, 'tolist') else [list(v) for v in vecs]",
+            "with open(sys.argv[3], 'w', encoding='utf-8') as f:",
+            "    json.dump({'vectors': vecs}, f)",
+            "",
+        ]
+    )
+
+    def __init__(
+        self,
+        *,
+        python_exe: str,
+        module_dir: str,
+        model_key: str,
+        dims: int,
+        precision: str = "bfloat16",
+        timeout_s: float = 600.0,
+        min_calibration_cosine: float = 0.99,
+    ):
+        if precision not in QUERY_PRECISIONS:
+            raise QueryEmbedUnavailable(
+                f"[ingest.embed.query] precision = {precision!r} is not one of {QUERY_PRECISIONS}"
+            )
+        self.python_exe = python_exe
+        self.module_dir = module_dir
+        self.model_key = model_key
+        self.dims = int(dims)
+        self.precision = precision
+        self.timeout_s = timeout_s
+        self.min_calibration_cosine = float(min_calibration_cosine)
+
+    def module_sha256(self) -> str:
+        path = Path(self.module_dir) / "embed_backend.py"
+        try:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise QueryEmbedUnavailable(f"query embedder module not readable at {path}: {exc}") from exc
+
+    def identity(self) -> dict[str, Any]:
+        """What must be unchanged for a past calibration to still hold."""
+        return {
+            "model_key": self.model_key,
+            "dims": self.dims,
+            "precision": self.precision,
+            "module_sha256": self.module_sha256(),
+            "device": "cpu",
+        }
+
+    def embed_batch(self, texts: Sequence[str], *, kind: str = "query") -> list[list[float]]:
+        import os
+        import tempfile
+
+        env = dict(os.environ)
+        env["CUDA_VISIBLE_DEVICES"] = ""  # never the GPU -- design section 6
+        with tempfile.TemporaryDirectory(prefix="trialerror-qembed-") as tmp:
+            in_path = Path(tmp) / "in.json"
+            out_path = Path(tmp) / "out.json"
+            in_path.write_text(
+                json.dumps(
+                    {"texts": list(texts), "kind": kind, "model_key": self.model_key, "precision": self.precision},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            try:
+                result = subprocess.run(
+                    [self.python_exe, "-c", self._DRIVER_SOURCE, str(in_path), self.module_dir, str(out_path)],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=self.timeout_s,
+                    env=env,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise QueryEmbedUnavailable(f"CPU query embedder did not run: {exc}") from exc
+            if result.returncode != 0:
+                raise QueryEmbedUnavailable(
+                    f"CPU query embedder exited {result.returncode}: {result.stderr[-1500:]}"
+                )
+            vectors = json.loads(out_path.read_text(encoding="utf-8"))["vectors"]
+        bad = next((v for v in vectors if len(v) != self.dims), None)
+        if bad is not None:
+            raise QueryEmbedUnavailable(
+                f"CPU query embedder returned {len(bad)}-dim vectors; [ingest.embed] dims = {self.dims}"
+            )
+        return vectors
+
+
+def load_query_embed_backend(config: dict[str, Any]) -> EmbedBackend:
+    """The backend that embeds QUERY strings for retrieval.
+
+    Non-offload programs: exactly :func:`load_embed_backend` (unchanged
+    behaviour -- the same in-process backend embeds both sides). Offload
+    programs (``gpu = "dev"`` or ``"vastai"``): a :class:`CpuQueryEmbedBackend`
+    from ``[ingest.embed.query]``, whose model_key/dims are inherited from
+    ``[ingest.embed]``. Unconfigured -> :class:`QueryEmbedUnavailable`, never
+    the :class:`OffloadMarker` (feedback item 15)."""
+    if config.get("backend", "fake") != OFFLOAD_BACKEND_NAME:
+        return load_embed_backend(config)
+    marker = OffloadMarker("embed", config)  # validates model_key / gpu
+    query = config.get("query") or {}
+    python_exe = query.get("python_exe")
+    module_dir = query.get("module_dir")
+    if not python_exe or not module_dir:
+        raise QueryEmbedUnavailable(
+            "this program embeds chunks on a GPU executor (backend = 'offload'), so query strings need a "
+            "local CPU embedder: set [ingest.embed.query] python_exe and module_dir in trialerror.toml to "
+            "the embeddings_local venv (docs/VASTAI_EMBED_DESIGN.md section 6)"
+        )
+    return CpuQueryEmbedBackend(
+        python_exe=str(python_exe),
+        module_dir=str(module_dir),
+        model_key=marker.model_key,
+        dims=marker.dims,
+        precision=str(query.get("precision", "bfloat16")),
+        timeout_s=float(query.get("timeout_s", 600.0)),
+        min_calibration_cosine=float(query.get("min_calibration_cosine", 0.99)),
     )

@@ -31,11 +31,27 @@ __all__ = [
     "OffloadMarker",
     "is_offload_config",
     "config_hash",
+    "ROUTING_KEYS",
+    "GPU_EXECUTORS",
+    "gpu_executor",
 ]
 
 #: The one string a program's ``[ingest.ocr]``/``[ingest.embed]`` table
 #: sets to route that stage through the GPU offload queue.
 OFFLOAD_BACKEND_NAME = "offload"
+
+#: Which executor may serve an offloaded ``[ingest.embed]`` queue
+#: (``docs/VASTAI_EMBED_DESIGN.md`` section 2.3). ``"dev"`` is today's
+#: behaviour and the default; ``"vastai"`` lets ``trialerror vastai run``
+#: rent a GPU for it.
+GPU_EXECUTORS = ("dev", "vastai")
+
+#: Keys of a stage table that decide WHERE a result is computed (or how the
+#: query side is embedded), never WHAT the stored result is. Excluded from
+#: :func:`config_hash`, so flipping ``gpu = "dev"`` <-> ``"vastai"`` neither
+#: re-queues finished work nor invalidates in-flight markers. Absent from
+#: every pre-existing table, so no existing hash changes.
+ROUTING_KEYS = ("gpu", "query")
 
 
 class OffloadNotRunnable(RuntimeError):
@@ -79,6 +95,8 @@ class OffloadMarker:
                 )
             self.model_key = str(model_key)
             self.dims = int(cfg.get("dims", 2048))
+            #: Fail-closed: a typo'd executor must not silently mean "dev".
+            self.gpu = gpu_executor(cfg)
         else:
             #: What the DEV worker's OCR backend must call itself. ``None``
             #: (the default) means "any non-fake backend"; set
@@ -111,6 +129,16 @@ def is_offload_config(config: dict[str, Any] | None) -> bool:
     return (config or {}).get("backend") == OFFLOAD_BACKEND_NAME
 
 
+def gpu_executor(config: dict[str, Any] | None) -> str:
+    """The configured executor for an offloaded stage (``"dev"`` default)."""
+    gpu = str((config or {}).get("gpu") or "dev")
+    if gpu not in GPU_EXECUTORS:
+        raise ValueError(
+            f"[ingest.embed] gpu = {gpu!r} is not one of {GPU_EXECUTORS} (docs/VASTAI_EMBED_DESIGN.md)"
+        )
+    return gpu
+
+
 def config_hash(config: dict[str, Any] | None) -> str:
     """A stable sha256 over one stage's config table.
 
@@ -118,6 +146,10 @@ def config_hash(config: dict[str, Any] | None) -> str:
     ``result.json``: a result produced against a different configuration
     than the one that queued the work is refused rather than folded into
     the record. JSON with sorted keys (not ``repr``) so the digest does not
-    depend on dict insertion order or on Python's own formatting."""
-    payload = json.dumps(config or {}, sort_keys=True, ensure_ascii=False, default=str)
+    depend on dict insertion order or on Python's own formatting.
+
+    :data:`ROUTING_KEYS` are dropped first: they choose the executor, not
+    the vectors."""
+    body = {k: v for k, v in (config or {}).items() if k not in ROUTING_KEYS}
+    payload = json.dumps(body, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
