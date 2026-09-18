@@ -240,7 +240,7 @@ the `atomic` scheduler pattern).
 
 ## Doctor checks catalog
 
-`trialerror doctor` runs every check registered by every subsystem (**64 checks across 22
+`trialerror doctor` runs every check registered by every subsystem (**66 checks across 23
 categories**); each subsystem owns its own `checks.py`, auto-discovered — adding a new one
 never touches a shared file. That figure had drifted twice before anyone noticed, precisely
 because nothing enforced it, so it is now pinned by a test against the live registry
@@ -267,6 +267,7 @@ not the full registry — `trialerror doctor --json` is authoritative.
 | `obs` | `obs_exporter_reachable`, `obs_span_drop_counter` |
 | `util` | `license_audit` (vendored/ header + manifest scan) |
 | `webfetch` | `webfetch_sidecar_alive` (the fetch process's heartbeat), `webfetch_backlog`, `webfetch_refused_24h` (warns on the SSRF/exfil refusal class), `webfetch_unattributed` (a fetch no booked launch asked for — the audit trail it reads is append-only, so an intentional one, such as the deliberate forged-attribution test, is retired with `trialerror webfetch ack --fetch-id … --launch-id … --note …` and its host twin `te-webfetch.sh ack`; the line is never deleted, the acknowledged offender is still reported with its note, and the acknowledgement is bounded to what was on record when it was made, so a later fetch fails the check again whether it carries a new id or reuses the acknowledged one), `webfetch_orphans`, `webfetch_queue_disk`, `webfetch_thin_backlog` (info), `webfetch_refetch_due` (info) |
+| `vastai` | `vastai_high_tier` (warns whenever the high tier is configured, approved or recently used; passes otherwise), `vastai_live_instances` (fails if any TrialError-tagged instance is past its deadline or not confirmed destroyed, warns while one is live and billing, passes when none is) |
 
 `--only <name>` runs one (repeatable for several); `--license-audit` is shorthand for
 `--only license_audit`; program-scoped checks (everything except `license_audit`) need
