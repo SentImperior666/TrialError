@@ -393,3 +393,47 @@ def test_a_key_passed_where_the_path_belongs_is_never_echoed():
     with pytest.raises(VastKeyMissing) as info:
         VastClient(key_like, http=lambda *a: (200, {})).list_instances()
     assert key_like not in str(info.value)
+
+
+def test_reaper_finds_an_unlabelled_instance_through_its_run_record(program_root, tmp_path):
+    # Whether vast.ai echoes the create-time label back was not verified before
+    # first live use; the instance id in our own run record must still find it.
+    _setup(program_root, tmp_path)
+    now = 1_900_000_000
+    fake = FakeVast()
+    fake.instances = {
+        8: {"id": 8, "label": None},   # ours per record, record says finished -> destroy
+        9: {"id": 9, "label": ""},     # ours per record, run live, owner alive -> keep
+        10: {"id": 10, "label": None},  # no record names it -> never touch
+    }
+    d = runs_dir(program_root)
+    d.mkdir(parents=True)
+    import socket
+
+    for run_id, iid, status in (("VAST-done", 8, "destroyed"), ("VAST-on", 9, "running")):
+        (d / f"{run_id}.json").write_text(json.dumps({
+            "run_id": run_id, "instance_id": iid, "pid": 222, "host": socket.gethostname(),
+            "status": status, "deadline_epoch": now + 3600,
+        }))
+    client = VastClient(program_root / "keys" / "vastai.key", http=fake.http)
+    out = reap(client, program_root, clock=lambda: now, alive=lambda pid: pid == 222)
+    assert {e["instance_id"]: e["reason"] for e in out} == {8: "run_finished"}
+    assert set(fake.instances) == {9, 10}
+
+
+def test_doctor_warns_when_blind_and_on_foreign_instances(program_root, tmp_path, monkeypatch):
+    _setup(program_root, tmp_path)
+    ctx = DoctorContext(program_root=program_root)
+
+    def blind_http(method, url, headers, body, timeout):
+        return 410, {"error": "/api/v1/instances/ is deprecated"}
+
+    monkeypatch.setattr(vchecks, "_client_factory", lambda kp: VastClient(kp, http=blind_http))
+    result = vchecks.check_vastai_live_instances(ctx)
+    assert result.status == "warn" and "cannot be ruled out" in result.message
+    fake = FakeVast()
+    fake.instances = {4: {"id": 4, "label": "someone-else's instance"}}
+    monkeypatch.setattr(vchecks, "_client_factory", lambda kp: VastClient(kp, http=fake.http))
+    result = vchecks.check_vastai_live_instances(ctx)
+    assert result.status == "warn" and "not TrialError's" in result.message
+    assert fake.instances == {4: {"id": 4, "label": "someone-else's instance"}}  # reported, never touched

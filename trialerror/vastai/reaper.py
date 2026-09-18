@@ -24,7 +24,7 @@ from typing import Any, Callable
 from trialerror.util.atomic import atomic_write_text
 from trialerror.vastai.api import VastApiError, VastClient
 from trialerror.vastai.guard import program_fingerprint
-from trialerror.vastai.lease import parse_label, read_run_records, runs_dir
+from trialerror.vastai.lease import parse_label, read_run_records, record_for_instance, runs_dir
 
 __all__ = ["pid_alive", "classify", "reap"]
 
@@ -73,7 +73,11 @@ def classify(
     """The reason to destroy ``inst``, or ``None`` to leave it."""
     tag = parse_label(inst.get("label"))
     if tag is None:
-        return None  # not ours -- never touch
+        rec = record_for_instance(inst, records.values())
+        if rec is None:
+            return None  # not ours -- never touch
+        # Unlabelled, but our own run record names it: judge it by the record.
+        tag = {"deadline_epoch": float(rec.get("deadline_epoch") or 0), "program": program_fp[:12], "run_id": rec.get("run_id")}
     if tag.get("malformed"):
         return "malformed_label"
     if now_epoch >= tag["deadline_epoch"]:
@@ -116,7 +120,7 @@ def reap(
             except VastApiError as exc:
                 entry["error"] = str(exc)
             tag = parse_label(inst.get("label")) or {}
-            rec = records.get(tag.get("run_id"))
+            rec = records.get(tag.get("run_id")) or record_for_instance(inst, records.values())
             if rec is not None and entry["destroyed"]:
                 rec.update(status="reaped", reaped_reason=reason, updated_epoch=int(now_epoch))
                 atomic_write_text(runs_dir(program_root) / f"{rec['run_id']}.json", json.dumps(rec, indent=2))
