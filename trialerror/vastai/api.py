@@ -5,7 +5,7 @@ from memory -- confirm at first live use, design section 8]:
 
     POST   /api/v0/bundles/            search offers   (body: filter JSON)
     PUT    /api/v0/asks/<offer_id>/    create instance -> {"success", "new_contract"}
-    GET    /api/v0/instances/          list own instances -> {"instances": [...]}
+    GET    /api/v1/instances/          list own instances (v0 is gone: HTTP 410) -> {"instances": [...]}
     DELETE /api/v0/instances/<id>/     destroy
 
 The API key is read from the operator-placed file whose PATH is configured
@@ -19,32 +19,66 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-__all__ = ["VAST_BASE_URL", "VastApiError", "VastKeyMissing", "read_api_key", "VastClient", "urllib_http"]
+__all__ = [
+    "VAST_BASE_URL",
+    "VastApiError",
+    "VastKeyMissing",
+    "OfferUnavailable",
+    "read_api_key",
+    "VastClient",
+    "urllib_http",
+]
 
 VAST_BASE_URL = "https://console.vast.ai/api/v0"
+_MAX_LIST_PAGES = 20
 
 #: ``http(method, url, headers, body_bytes_or_None, timeout_s) -> (status, parsed_json)``
 Http = Callable[[str, str, dict[str, str], bytes | None, float], tuple[int, Any]]
 
 
 class VastApiError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
 class VastKeyMissing(VastApiError):
     pass
 
 
+class OfferUnavailable(VastApiError):
+    """The offer was taken between search and create (vast.ai ``no_such_ask``).
+    Nothing was rented; the runner may try the next ranked offer."""
+
+    def __init__(self, message: str, *, offer_id: Any, status: int | None = None):
+        super().__init__(message, status=status)
+        self.offer_id = offer_id
+
+
+def _looks_like_a_key(value: str) -> bool:
+    """A key path has a separator or a suffix; a vast.ai key is a long bare
+    token. Anything that looks like the latter is never echoed."""
+    return len(value) >= 20 and not any(c in value for c in r"/\.:")
+
+
 def read_api_key(path: Path | str | None) -> str:
-    """Read the operator-placed key file. Error messages name the PATH only."""
+    """Read the operator-placed key file. Error messages name the PATH only,
+    and not even that when the "path" looks like key material: a caller who
+    passes the key itself where the path belongs must not get it echoed."""
     if not path:
         raise VastKeyMissing(
             "no [vastai] api_key_path in trialerror.toml -- the operator places the key in a file "
             "(e.g. keys/vastai.key) and configures its path"
+        )
+    if _looks_like_a_key(str(path)):
+        raise VastKeyMissing(
+            "the vast.ai key path looks like a key, not a path (value withheld) -- pass the PATH of the "
+            "key file ([vastai] api_key_path), never the key itself"
         )
     p = Path(path)
     try:
@@ -87,19 +121,24 @@ class VastClient:
         self._base = base_url.rstrip("/")
         self._timeout = timeout_s
 
-    def _call(self, method: str, path: str, body: Any = None) -> Any:
+    def _call(self, method: str, path: str, body: Any = None, *, v1: bool = False) -> Any:
         key = read_api_key(self._key_path)
         headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
         data = None
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        status, payload = self._http(method, f"{self._base}{path}", headers, data, self._timeout)
+        status, payload = self._http(method, f"{self._v1_base() if v1 else self._base}{path}", headers, data, self._timeout)
         del key, headers
         if status >= 400:
             msg = payload.get("msg") or payload.get("error") if isinstance(payload, dict) else None
-            raise VastApiError(f"vast.ai {method} {path} -> HTTP {status}: {str(msg or payload)[:300]}")
+            raise VastApiError(f"vast.ai {method} {path} -> HTTP {status}: {str(msg or payload)[:300]}", status=status)
         return payload
+
+    def _v1_base(self) -> str:
+        # vast.ai moved instance listing to /api/v1 (v0 answers HTTP 410,
+        # observed 2026-09-18).
+        return self._base[: -len("/v0")] + "/v1" if self._base.endswith("/v0") else self._base
 
     # -- the five calls ---------------------------------------------------
     def search_offers(self, *, gpu_names: list[str], min_vram_gb: float, max_dph: float, min_reliability: float, limit: int = 64) -> list[dict[str, Any]]:
@@ -121,18 +160,32 @@ class VastClient:
         return list(offers or [])
 
     def create_instance(self, offer_id: int | str, *, image: str, disk_gb: int, label: str, onstart: str) -> int:
-        payload = self._call(
-            "PUT",
-            f"/asks/{offer_id}/",
-            {"client_id": "me", "image": image, "disk": disk_gb, "label": label, "onstart": onstart, "runtype": "ssh"},
-        )
+        try:
+            payload = self._call(
+                "PUT",
+                f"/asks/{offer_id}/",
+                {"client_id": "me", "image": image, "disk": disk_gb, "label": label, "onstart": onstart, "runtype": "ssh"},
+            )
+        except VastApiError as exc:
+            if "no_such_ask" in str(exc):
+                raise OfferUnavailable(str(exc), offer_id=offer_id, status=exc.status) from None
+            raise
         if not (isinstance(payload, dict) and payload.get("success") and payload.get("new_contract")):
             raise VastApiError(f"vast.ai create on offer {offer_id} did not return an instance id: {str(payload)[:300]}")
         return int(payload["new_contract"])
 
     def list_instances(self) -> list[dict[str, Any]]:
-        payload = self._call("GET", "/instances/?owner=me")
-        return list((payload or {}).get("instances") or [])
+        out: list[dict[str, Any]] = []
+        token = None
+        for _page in range(_MAX_LIST_PAGES):
+            q = "?owner=me" + (f"&next_token={urllib.parse.quote(str(token))}" if token else "")
+            payload = self._call("GET", "/instances/" + q, v1=True) or {}
+            out.extend(payload.get("instances") or [])
+            nxt = payload.get("next_token")
+            if not nxt or nxt == token:
+                return out
+            token = nxt
+        raise VastApiError(f"vast.ai instance listing did not end after {_MAX_LIST_PAGES} pages")
 
     def show_instance(self, instance_id: int) -> dict[str, Any] | None:
         for inst in self.list_instances():
@@ -141,4 +194,10 @@ class VastClient:
         return None
 
     def destroy_instance(self, instance_id: int) -> None:
-        self._call("DELETE", f"/instances/{int(instance_id)}/")
+        path = f"/instances/{int(instance_id)}/"
+        try:
+            self._call("DELETE", path)
+        except VastApiError as exc:
+            if exc.status != 410:
+                raise
+            self._call("DELETE", path, v1=True)

@@ -22,7 +22,7 @@ from trialerror.stores import paths
 from trialerror.stores.connection import connect
 from trialerror.util.doctor import CheckResult, DoctorContext, register_check
 from trialerror.vastai.guard import approval_path, program_fingerprint
-from trialerror.vastai.lease import parse_label, read_run_records
+from trialerror.vastai.lease import parse_label, read_run_records, record_for_instance
 
 __all__ = ["check_vastai_high_tier", "check_vastai_live_instances", "RECENT_HIGH_TIER_DAYS"]
 
@@ -103,6 +103,8 @@ def check_vastai_live_instances(ctx: DoctorContext) -> CheckResult:
     now_epoch = time.time()
     live: list[dict[str, Any]] = []
     bad: list[dict[str, Any]] = []
+    others: list[dict[str, Any]] = []  # on the account, not TrialError's: reported, never touched
+    blind = False
     for rec in read_run_records(ctx.program_root):
         status = rec.get("status")
         if status in ("destroyed", "reaped"):
@@ -130,9 +132,23 @@ def check_vastai_live_instances(ctx: DoctorContext) -> CheckResult:
 
                     client = VastClient(kp)
                 fp12 = program_fingerprint(ctx.program_root)[:12]
+                records = read_run_records(ctx.program_root)
                 for inst in client.list_instances():
                     tag = parse_label(inst.get("label"))
                     if tag is None:
+                        rec = record_for_instance(inst, records)
+                        if rec is None:
+                            others.append({"instance_id": inst.get("id"), "label": inst.get("label")})
+                            continue
+                        # unlabelled but named by our run record: overdue if the
+                        # record thinks it is gone or its deadline has passed
+                        entry = {"source": "vast.ai", "instance_id": inst.get("id"), "label": None,
+                                 "run_id": rec.get("run_id"), "this_program": True}
+                        gone = rec.get("status") in ("destroyed", "reaped")
+                        if gone or now_epoch >= float(rec.get("deadline_epoch") or 0):
+                            bad.append(entry)
+                        else:
+                            live.append(entry)
                         continue
                     entry = {"source": "vast.ai", "instance_id": inst.get("id"), "label": inst.get("label"),
                              "this_program": tag.get("program") == fp12}
@@ -141,8 +157,9 @@ def check_vastai_live_instances(ctx: DoctorContext) -> CheckResult:
                     else:
                         live.append(entry)
             except Exception as exc:  # noqa: BLE001 - doctor reports, never crashes
+                blind = True
                 notes.append(f"live vast.ai list unavailable: {type(exc).__name__}: {exc}")
-    details = {"live": live, "overdue_or_failed": bad, "notes": notes}
+    details = {"live": live, "overdue_or_failed": bad, "other_instances": others, "notes": notes}
     if bad:
         return CheckResult(
             "vastai_live_instances", _CATEGORY, "fail",
@@ -155,5 +172,17 @@ def check_vastai_live_instances(ctx: DoctorContext) -> CheckResult:
             "vastai_live_instances", _CATEGORY, "warn",
             f"{len(live)} TrialError vast.ai instance(s) live now (billing)", details,
         )
-    msg = "no live TrialError vast.ai instances" + (f" ({'; '.join(notes)})" if notes else "")
+    if blind:
+        # A check that could not see the account must not report "none live".
+        return CheckResult(
+            "vastai_live_instances", _CATEGORY, "warn",
+            "could not list vast.ai instances, so live GPUs cannot be ruled out -- " + "; ".join(notes), details,
+        )
+    if others:
+        return CheckResult(
+            "vastai_live_instances", _CATEGORY, "warn",
+            f"{len(others)} vast.ai instance(s) on this account that are not TrialError's (billing; never reaped "
+            "by TrialError) -- check the vast.ai console", details,
+        )
+    msg = "no live TrialError vast.ai instances"
     return CheckResult("vastai_live_instances", _CATEGORY, "pass", msg, details)

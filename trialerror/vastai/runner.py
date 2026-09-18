@@ -22,7 +22,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, TextIO
+from typing import Any, Callable, Iterable, TextIO
 
 from trialerror.events.api import append_event
 from trialerror.offload import protocol
@@ -32,7 +32,7 @@ from trialerror.offload.transport import LocalTransport
 from trialerror.offload.worker import _HEARTBEAT_INTERVAL_S, _process_one
 from trialerror.util.ids import new_id
 from trialerror.vastai import guard
-from trialerror.vastai.api import VastClient
+from trialerror.vastai.api import OfferUnavailable, VastClient
 from trialerror.vastai.lease import InstanceLease, runs_dir
 from trialerror.vastai.remote import SERVE_SOURCE, LeaseExpired, RemoteEmbedBackend, SshChannel, module_bytes_and_sha
 from trialerror.vastai.tiers import (
@@ -46,6 +46,10 @@ from trialerror.vastai.tiers import (
 )
 
 __all__ = ["VastRunRefused", "select_embed_jobs", "prepare_run", "run_vastai"]
+
+#: Offers tried when each is taken between search and create (no rental
+#: happens on a ``no_such_ask``), before the run gives up.
+_MAX_OFFER_ATTEMPTS = 5
 
 
 class VastRunRefused(RuntimeError):
@@ -101,6 +105,7 @@ def prepare_run(
     *,
     client: VastClient | None = None,
     max_jobs: int | None = None,
+    exclude_offer_ids: Iterable[Any] = (),
 ) -> dict[str, Any]:
     """Steps 1-4: everything up to (not including) spending money. Returns
     ``{"cfg", "marker", "plan", "jobs", "approval", "client", "module_dir"}``
@@ -137,6 +142,8 @@ def prepare_run(
     offers = client.search_offers(
         gpu_names=list(tier.gpus), min_vram_gb=tier.min_vram_gb, max_dph=tier.max_dph, min_reliability=tier.min_reliability
     )
+    excluded = {str(o) for o in exclude_offer_ids}
+    offers = [o for o in offers if str(o.get("id")) not in excluded]
     ranked = rank_offers(offers, tier, cfg.gpu_factors)
     if ranked:
         # Size the batch: add jobs while the lease still fits under the TTL cap.
@@ -190,11 +197,43 @@ def run_vastai(
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
     heartbeat_interval_s: float = _HEARTBEAT_INTERVAL_S,
+    max_offer_attempts: int = _MAX_OFFER_ATTEMPTS,
 ) -> dict[str, Any]:
+    """Rent, embed, destroy. An offer taken between search and create
+    (``no_such_ask``) rents nothing, so the next ranked offer -- re-planned
+    under the same tier, price ceiling and TTL rules -- is tried, up to
+    ``max_offer_attempts`` offers in all."""
     program_root = Path(program_root)
     stderr = stderr or sys.stderr
     log = log or (lambda m: print(m, file=stderr))
-    prep = prepare_run(program_root, raw, client=client, max_jobs=max_jobs)
+    excluded: list[Any] = []
+    while True:
+        prep = prepare_run(program_root, raw, client=client, max_jobs=max_jobs, exclude_offer_ids=excluded)
+        try:
+            return _run_prepared(
+                program_root, prep, store=store, channel_factory=channel_factory, dry_run=dry_run, log=log,
+                stderr=stderr, clock=clock, sleep=sleep, heartbeat_interval_s=heartbeat_interval_s,
+            )
+        except OfferUnavailable as exc:
+            excluded.append(exc.offer_id)
+            if len(excluded) >= max_offer_attempts:
+                raise
+            log(f"! vast.ai offer {exc.offer_id} was taken before create (nothing rented); trying the next offer")
+
+
+def _run_prepared(
+    program_root: Path,
+    prep: dict[str, Any],
+    *,
+    store: Any,
+    channel_factory: Callable[[dict[str, Any]], Any] | None,
+    dry_run: bool,
+    log: Callable[[str], None],
+    stderr: TextIO,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+    heartbeat_interval_s: float,
+) -> dict[str, Any]:
     cfg: VastConfig = prep["cfg"]
     plan = prep["plan"]
     plan_d = plan.as_dict()

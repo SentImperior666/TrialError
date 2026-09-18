@@ -24,7 +24,7 @@ from trialerror.offload.stage import EMBED_INPUT_NAME, EMBED_OUTPUT_NAME, build_
 from trialerror.util.doctor import DoctorContext
 from trialerror.vastai import checks as vchecks
 from trialerror.vastai import guard
-from trialerror.vastai.api import VastClient
+from trialerror.vastai.api import OfferUnavailable, VastClient, VastKeyMissing, read_api_key
 from trialerror.vastai.lease import make_label, runs_dir
 from trialerror.vastai.reaper import reap
 from trialerror.vastai.runner import run_vastai
@@ -49,14 +49,24 @@ class FakeVast:
         self.instances: dict[int, dict] = {}
         self.calls: list[tuple[str, str]] = []
         self.next_id = 5000
+        self.gone: set[int] = set()  # offers taken between search and create
+        self.v0_delete_gone = False  # vast.ai may retire v0 DELETE as it did v0 GET
 
     def http(self, method, url, headers, body, timeout):
         assert headers["Authorization"] == f"Bearer {FAKE_KEY}"
-        path = url.split("/api/v0", 1)[1]
+        version = "v1" if "/api/v1" in url else "v0"
+        path = url.split(f"/api/{version}", 1)[1]
         self.calls.append((method, path))
+        # the live API, 2026-09-18: v0 instance listing is retired
+        if method == "GET" and path.startswith("/instances") and version == "v0":
+            return 410, {"error": "/api/v0/instances/ is deprecated. Use /api/v1/instances/ instead."}
+        if method == "DELETE" and version == "v0" and self.v0_delete_gone:
+            return 410, {"error": "deprecated"}
         if method == "POST" and path.startswith("/bundles"):
             return 200, {"offers": list(self.offers)}
         if method == "PUT" and path.startswith("/asks/"):
+            if int(path.strip("/").split("/")[1]) in self.gone:
+                return 400, {"error": "error 404/3603: no_such_ask  Instance type is not available."}
             self.next_id += 1
             req = json.loads(body)
             self.instances[self.next_id] = {
@@ -65,7 +75,7 @@ class FakeVast:
             }
             return 200, {"success": True, "new_contract": self.next_id}
         if method == "GET" and path.startswith("/instances"):
-            return 200, {"instances": list(self.instances.values())}
+            return 200, {"instances": list(self.instances.values()), "next_token": None}
         if method == "DELETE" and path.startswith("/instances/"):
             self.instances.pop(int(path.strip("/").split("/")[1]), None)
             return 200, {"success": True}
@@ -331,3 +341,99 @@ def test_doctor_reports_live_and_overdue_instances(program_root, tmp_path, monke
     fake.instances = {7: {"id": 7, "label": make_label(fp, "VAST-x", 1)}}
     assert vchecks.check_vastai_live_instances(ctx).status == "fail"
     assert vchecks.check_vastai_high_tier(ctx).status == "pass"
+
+
+# ---------------------------------------------------------------------------
+# live-API findings, 2026-09-18 (first live use)
+# ---------------------------------------------------------------------------
+def test_instance_listing_uses_v1_because_v0_is_retired(program_root, tmp_path):
+    _setup(program_root, tmp_path)
+    fake = FakeVast()
+    client = VastClient(program_root / "keys" / "vastai.key", http=fake.http)
+    assert client.list_instances() == []
+    assert ("GET", "/instances/?owner=me") in fake.calls
+
+
+def test_destroy_falls_back_to_v1_when_v0_is_retired(store, program_root, tmp_path):
+    env = _setup(program_root, tmp_path)
+    fake = FakeVast()
+    fake.v0_delete_gone = True
+    summary = _run(program_root, env, store, fake, FakeChannel())
+    assert summary["destroyed"] is True and fake.instances == {}
+
+
+def test_a_taken_offer_falls_through_to_the_next_one(store, program_root, tmp_path):
+    env = _setup(program_root, tmp_path)
+    fake = FakeVast(offers=[
+        {"id": 11, "gpu_name": "RTX 3090", "gpu_ram": 24576, "dph_total": 0.30, "reliability": 0.99, "num_gpus": 1},
+        {"id": 14, "gpu_name": "RTX 3090", "gpu_ram": 24576, "dph_total": 0.35, "reliability": 0.99, "num_gpus": 1},
+    ])
+    fake.gone = {11}
+    err = io.StringIO()
+    summary = _run(program_root, env, store, fake, FakeChannel(), stderr=err)
+    assert summary["published"] == [JOB] and summary["plan"]["offer_id"] == 14
+    assert fake.instances == {} and "offer 11 was taken" in err.getvalue()
+
+
+def test_all_offers_taken_rents_nothing_and_gives_up(store, program_root, tmp_path):
+    env = _setup(program_root, tmp_path)
+    fake = FakeVast()
+    fake.gone = {11, 12, 13}
+    with pytest.raises((OfferUnavailable, PlanRefused)):
+        _run(program_root, env, store, fake, FakeChannel())
+    assert fake.instances == {}
+    assert protocol.list_pending(env["root"]) == [JOB]
+
+
+def test_a_key_passed_where_the_path_belongs_is_never_echoed():
+    key_like = "0123456789abcdef" * 4
+    with pytest.raises(VastKeyMissing) as info:
+        read_api_key(key_like)
+    assert key_like not in str(info.value)
+    with pytest.raises(VastKeyMissing) as info:
+        VastClient(key_like, http=lambda *a: (200, {})).list_instances()
+    assert key_like not in str(info.value)
+
+
+def test_reaper_finds_an_unlabelled_instance_through_its_run_record(program_root, tmp_path):
+    # Whether vast.ai echoes the create-time label back was not verified before
+    # first live use; the instance id in our own run record must still find it.
+    _setup(program_root, tmp_path)
+    now = 1_900_000_000
+    fake = FakeVast()
+    fake.instances = {
+        8: {"id": 8, "label": None},   # ours per record, record says finished -> destroy
+        9: {"id": 9, "label": ""},     # ours per record, run live, owner alive -> keep
+        10: {"id": 10, "label": None},  # no record names it -> never touch
+    }
+    d = runs_dir(program_root)
+    d.mkdir(parents=True)
+    import socket
+
+    for run_id, iid, status in (("VAST-done", 8, "destroyed"), ("VAST-on", 9, "running")):
+        (d / f"{run_id}.json").write_text(json.dumps({
+            "run_id": run_id, "instance_id": iid, "pid": 222, "host": socket.gethostname(),
+            "status": status, "deadline_epoch": now + 3600,
+        }))
+    client = VastClient(program_root / "keys" / "vastai.key", http=fake.http)
+    out = reap(client, program_root, clock=lambda: now, alive=lambda pid: pid == 222)
+    assert {e["instance_id"]: e["reason"] for e in out} == {8: "run_finished"}
+    assert set(fake.instances) == {9, 10}
+
+
+def test_doctor_warns_when_blind_and_on_foreign_instances(program_root, tmp_path, monkeypatch):
+    _setup(program_root, tmp_path)
+    ctx = DoctorContext(program_root=program_root)
+
+    def blind_http(method, url, headers, body, timeout):
+        return 410, {"error": "/api/v1/instances/ is deprecated"}
+
+    monkeypatch.setattr(vchecks, "_client_factory", lambda kp: VastClient(kp, http=blind_http))
+    result = vchecks.check_vastai_live_instances(ctx)
+    assert result.status == "warn" and "cannot be ruled out" in result.message
+    fake = FakeVast()
+    fake.instances = {4: {"id": 4, "label": "someone-else's instance"}}
+    monkeypatch.setattr(vchecks, "_client_factory", lambda kp: VastClient(kp, http=fake.http))
+    result = vchecks.check_vastai_live_instances(ctx)
+    assert result.status == "warn" and "not TrialError's" in result.message
+    assert fake.instances == {4: {"id": 4, "label": "someone-else's instance"}}  # reported, never touched

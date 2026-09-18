@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from trialerror.util.atomic import atomic_write_text
 from trialerror.vastai.api import VastApiError, VastClient
@@ -44,6 +44,19 @@ def parse_label(label: str | None) -> dict[str, Any] | None:
         return {"program": prog, "run_id": run_id, "deadline_epoch": int(deadline)}
     except ValueError:
         return {"malformed": True, "label": label}
+
+
+def record_for_instance(inst: dict[str, Any], records: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
+    """This program's run record naming ``inst`` by instance id, if any. The
+    label is the primary tag, but whether vast.ai echoes it back was not
+    verified before first live use; the id in our own record is ours too."""
+    iid = inst.get("id")
+    if iid is None:
+        return None
+    for rec in records:
+        if rec.get("instance_id") is not None and str(rec.get("instance_id")) == str(iid):
+            return rec
+    return None
 
 
 def runs_dir(program_root: Path | str) -> Path:
