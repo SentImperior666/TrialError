@@ -200,7 +200,9 @@ Requirement: editing `trialerror.toml` must not be enough.
    4 h and cannot be exceeded. A watchdog thread destroys the instance at the deadline **even mid-job** and
    kills the SSH channel. The in-flight job is handed back unrun, so no offload attempt is burned, because the
    failure was a sizing miss rather than a GPU fault. No further job starts. If one job alone would exceed the
-   cap, the run refuses to start.
+   cap, the run refuses to start. Mechanism: `LeaseExpired` subclasses `KeyboardInterrupt`, so the DEV worker's
+   `_process_one` returns the claim unrun, as it does for Ctrl-C, and no `except Exception` block can
+   swallow it.
 3. **Per-job dollar cap.** `worst_case_usd = offer.dph_total × TTL_h`. If it exceeds `max_job_usd` (default
    $3.00), the run is **refused before any instance is created**. The worst case is used, not the expected
    cost, because the TTL is the most the operator can be billed.
@@ -211,6 +213,8 @@ Requirement: editing `trialerror.toml` must not be enough.
    (b) its local run record says finished or failed;
    (c) its run record names a PID on this host that is no longer alive;
    (d) it has a TrialError prefix but an unparseable label.
+   (e) it belongs to this program but has no local run record at all. The runner writes that record
+   before it calls create, so a missing record means the owner is gone.
    The reaper needs no state from the process that died. The label alone carries the deadline. Run it from
    the sandbox's supervise loop or Task Scheduler.
 5. **In-instance dead man's switch** (defence in depth). The instance's `onstart` script runs

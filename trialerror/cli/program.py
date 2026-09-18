@@ -148,6 +148,48 @@ id = "{program_id}"
 # backend = "offload"
 # model_key = "qwen3-4b"        # REQUIRED for offload -- emb rows are keyed by it
 # dims = 2048
+# gpu = "dev"                   # WHO serves the queue: "dev" (the DEV worker, default)
+#                               # or "vastai" (`trialerror vastai run` rents a GPU).
+#                               # The one-line switch; not part of the config hash.
+#
+# Query strings are embedded LOCALLY ON CPU with the same embed_backend.py
+# (same model, prompt, truncation, normalisation), checked against stored
+# chunk vectors before first use. ~9 GB RAM while a query embeds (bf16,
+# estimate), released after each query. Unset -> auto/hybrid search falls
+# back to lexical and says so; --mode vector fails.
+# [ingest.embed.query]
+# python_exe = "C:/path/to/embeddings_local/.venv/Scripts/python.exe"
+# module_dir = "C:/path/to/research/tools/embeddings_local"
+# precision = "bfloat16"        # bfloat16 (default, = chunk side) | float32 (~16 GB)
+#
+# vast.ai executor (docs/VASTAI_EMBED_DESIGN.md). Instances live only as long
+# as the job: create -> run -> destroy, hard TTL, per-job $ cap, reaper.
+# There is no keep-alive option. Tiers are for Qwen3-Embedding-4B @ 2048 dims;
+# mid ~= an RTX 5080 Laptop GPU and is the default. max_dph values are
+# ceilings you choose, not prices -- check live offers with `trialerror vastai plan`.
+# [vastai]
+# api_key_path = "keys/vastai.key"            # operator-placed; never inline the key
+# ssh_identity_path = "C:/Users/you/.ssh/id_ed25519"   # key registered with vast.ai
+# tier = "mid"                  # low | mid | high. "high" ALSO needs an operator
+#                               # approval (`trialerror vastai approve-high`, TTY only)
+# max_job_usd = 3.00            # refuse to start if the worst case ($/h x TTL) exceeds this
+# ttl_cap_s = 14400             # hard TTL ceiling; cannot exceed 4 h
+# startup_s = 1200              # estimate: boot + image + pip + model download
+# [vastai.tiers.low]
+# gpus = ["RTX 4060 Ti", "RTX 5060 Ti", "RTX A4000", "RTX 4000Ada"]
+# min_vram_gb = 16
+# max_dph = 0.25
+# min_reliability = 0.95
+# [vastai.tiers.mid]
+# gpus = ["RTX 3090", "RTX 3090 Ti", "RTX A5000", "RTX 4070S Ti", "RTX 4070 Ti Super", "RTX 4080", "RTX 4080S", "RTX 5070 Ti", "RTX 5080"]
+# min_vram_gb = 16
+# max_dph = 0.45
+# min_reliability = 0.97
+# [vastai.tiers.high]
+# gpus = ["RTX 4090", "RTX 5090", "L40S", "A100 PCIE", "A100 SXM4", "H100 PCIE", "H100 SXM"]
+# min_vram_gb = 24
+# max_dph = 2.50
+# min_reliability = 0.98
 
 # Fail-closed backends. With this true, an absent or `backend = "fake"`
 # [ingest.ocr]/[ingest.embed] table is REFUSED at load time instead of quietly
