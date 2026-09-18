@@ -144,7 +144,7 @@ def prepare_run(
     )
     excluded = {str(o) for o in exclude_offer_ids}
     offers = [o for o in offers if str(o.get("id")) not in excluded]
-    ranked = rank_offers(offers, tier, cfg.gpu_factors)
+    ranked = rank_offers(offers, tier, cfg.gpu_factors, disk_gb=cfg.disk_gb)
     if ranked:
         # Size the batch: add jobs while the lease still fits under the TTL cap.
         tps = ranked[0][1]
@@ -290,6 +290,11 @@ def _run_prepared(
             inst = lease.wait_ready(cfg.poll_interval_s)
             channel = factory(inst)
             lease.on_expire = channel.close
+            wait_reachable = getattr(channel, "wait_reachable", None)
+            if wait_reachable is not None:
+                # "running" is not "SSH accepts": the proxy refused the first
+                # connect on the first live run (2026-09-18).
+                wait_reachable(check=lease.check, sleep=sleep, timeout_s=cfg.startup_s)
             try:
                 channel.bootstrap(
                     files={"embed_backend.py": module_bytes, "serve.py": SERVE_SOURCE.encode("utf-8")},
