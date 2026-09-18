@@ -226,21 +226,40 @@ def ttl_for(compute_s: float, cfg: VastConfig) -> tuple[float, float]:
     return min(uncapped, cfg.ttl_cap_s, ABSOLUTE_TTL_CAP_S), uncapped
 
 
-def rank_offers(offers: list[dict[str, Any]], tier: Tier, factors: dict[str, float]) -> list[tuple[float, float, dict]]:
+HOURS_PER_MONTH = 730.0
+
+
+def effective_dph(offer: dict[str, Any], disk_gb: float | None) -> float:
+    """What the instance bills per hour for THIS lease: the GPU price plus
+    storage for the disk the lease rents. The search's ``dph_total`` prices a
+    small default disk instead (first live run, 2026-09-18: offer listed at
+    $0.143/h, instance billed $0.181/h with a 40 GB disk -- exactly
+    ``dph_base + 40 * storage_cost / 730``). Falls back to ``dph_total`` when
+    the offer lacks the fields."""
+    base, storage = offer.get("dph_base"), offer.get("storage_cost")
+    if disk_gb is None or base is None or storage is None:
+        return float(offer.get("dph_total") or 0)
+    return float(base) + float(disk_gb) * float(storage) / HOURS_PER_MONTH
+
+
+def rank_offers(
+    offers: list[dict[str, Any]], tier: Tier, factors: dict[str, float], *, disk_gb: float | None = None
+) -> list[tuple[float, float, dict]]:
     """Offers the tier admits, best estimated tokens-per-dollar first:
-    ``[(tokens_per_usd, est_tokens_s, offer), ...]``. A GPU with no factor is
-    skipped (an unknown card cannot be sized, so it cannot be capped)."""
+    ``[(tokens_per_usd, est_tokens_s, offer), ...]``, priced at
+    :func:`effective_dph` for ``disk_gb``. A GPU with no factor is skipped
+    (an unknown card cannot be sized, so it cannot be capped)."""
     ranked = []
     for offer in offers:
         if int(offer.get("num_gpus") or 1) != 1 or not tier.admits(offer):
             continue
         factor = factors.get(normalise_gpu_name(offer.get("gpu_name", "")))
-        dph = float(offer.get("dph_total") or 0)
+        dph = effective_dph(offer, disk_gb)
         if not factor or dph <= 0:
             continue
         tps = DEV_TOKENS_PER_S * factor
         ranked.append((tps * 3600.0 / dph, tps, offer))
-    ranked.sort(key=lambda r: (-r[0], float(r[2].get("dph_total") or 0)))
+    ranked.sort(key=lambda r: (-r[0], effective_dph(r[2], disk_gb)))
     return ranked
 
 
@@ -285,7 +304,7 @@ def plan_run(
     can bill before the watchdog destroys it) exceeds the per-job cap."""
     tier = cfg.tiers[cfg.tier]
     cap_usd = min(cfg.max_job_usd, max_job_usd) if max_job_usd is not None else cfg.max_job_usd
-    ranked = rank_offers(offers, tier, cfg.gpu_factors)
+    ranked = rank_offers(offers, tier, cfg.gpu_factors, disk_gb=cfg.disk_gb)
     if not ranked:
         raise PlanRefused(
             f"no vast.ai offer passes tier {tier.name!r} (GPUs {', '.join(tier.gpus)}; >= {tier.min_vram_gb} GB; "
@@ -300,7 +319,7 @@ def plan_run(
             f"this batch needs an estimated {uncapped:.0f} s of lease but the TTL cap is {ttl:.0f} s -- "
             "run fewer jobs (--max-jobs) rather than raising the cap"
         )
-    dph = float(offer["dph_total"])
+    dph = effective_dph(offer, cfg.disk_gb)  # what the instance will bill, disk included
     worst = dph * ttl / 3600.0
     plan = Plan(tier.name, offer, tokens, tps, compute_s, ttl, dph, worst, cap_usd)
     if worst > cap_usd:

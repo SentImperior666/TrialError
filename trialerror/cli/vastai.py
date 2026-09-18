@@ -104,6 +104,13 @@ def _cmd_run(args: argparse.Namespace) -> dict:
         summary = run_vastai(root, raw, store=store, max_jobs=args.max_jobs)
     except (VastRunRefused, PlanRefused, HighTierRefused, VastConfigError, VastApiError) as exc:
         return _refusal("vastai.run", exc)
+    except Exception as exc:  # noqa: BLE001 - the lease has already destroyed the instance on the way out
+        return error_envelope(
+            "vastai.run",
+            "vastai_run_failed",
+            f"{type(exc).__name__}: {exc} -- the lease destroyed its instance on exit (see the run record); "
+            "confirm with `trialerror vastai reap --dry-run`",
+        )
     finally:
         store.close()
     return ok_envelope(

@@ -17,7 +17,7 @@ import json
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Protocol, Sequence
+from typing import Any, Callable, Protocol, Sequence
 
 __all__ = [
     "LeaseExpired",
@@ -80,6 +80,41 @@ class SshChannel:
         if self.identity_path:
             cmd += ["-i", str(self.identity_path), "-o", "IdentitiesOnly=yes"]
         return cmd + [f"root@{self.host}"]
+
+    def wait_reachable(
+        self,
+        *,
+        check: Callable[[], None],
+        sleep: Callable[[float], None],
+        timeout_s: float,
+        interval_s: float = 10.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        """Block until ``ssh ... true`` succeeds. An instance reported
+        "running" may still refuse SSH for a while; that (exit 255, not an
+        auth failure) is retried every ``interval_s`` until ``timeout_s``.
+        ``check`` is the lease's TTL check, so the watchdog still governs.
+        A rejected key fails at once: retrying cannot fix it, only bill."""
+        start = clock()
+        while True:
+            check()
+            try:
+                res = subprocess.run(self._base() + ["true"], capture_output=True, timeout=self.connect_timeout_s + 30)
+                code, err = res.returncode, res.stderr[-400:].decode("utf-8", "replace").strip()
+            except subprocess.TimeoutExpired:
+                code, err = 255, "ssh probe timed out"
+            if code == 0:
+                return
+            if "Permission denied" in err or "Host key verification failed" in err:
+                raise RuntimeError(
+                    f"ssh refused the identity ({err}) -- is the public key registered with the vast.ai "
+                    "account, and [vastai] ssh_identity_path its private half?"
+                )
+            if code != 255:
+                raise RuntimeError(f"ssh reachability probe failed ({code}): {err}")
+            if clock() - start >= timeout_s:
+                raise RuntimeError(f"ssh not reachable after {timeout_s:.0f} s: {err}")
+            sleep(interval_s)
 
     def _run(self, remote_cmd: str, *, data: bytes | None = None, timeout_s: float = 1800) -> None:
         res = subprocess.run(self._base() + [remote_cmd], input=data, capture_output=True, timeout=timeout_s)

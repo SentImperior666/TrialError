@@ -437,3 +437,149 @@ def test_doctor_warns_when_blind_and_on_foreign_instances(program_root, tmp_path
     result = vchecks.check_vastai_live_instances(ctx)
     assert result.status == "warn" and "not TrialError's" in result.message
     assert fake.instances == {4: {"id": 4, "label": "someone-else's instance"}}  # reported, never touched
+
+
+def test_a_taken_offer_leaves_a_clean_record_not_a_doctor_failure(store, program_root, tmp_path, monkeypatch):
+    env = _setup(program_root, tmp_path)
+    fake = FakeVast()
+    fake.gone = {11, 12, 13}
+    with pytest.raises((OfferUnavailable, PlanRefused)):
+        _run(program_root, env, store, fake, FakeChannel())
+    recs = [json.loads(f.read_text()) for f in runs_dir(program_root).glob("*.json")]
+    assert recs and {r["status"] for r in recs} == {"offer_taken"}
+    monkeypatch.setattr(vchecks, "_client_factory", lambda kp: VastClient(kp, http=fake.http))
+    assert vchecks.check_vastai_live_instances(DoctorContext(program_root=program_root)).status == "pass"
+
+
+def test_an_old_create_failure_is_settled_only_by_a_successful_listing(program_root, tmp_path, monkeypatch):
+    _setup(program_root, tmp_path)
+    fp = guard.program_fingerprint(program_root)
+    now = 1_900_000_000
+    d = runs_dir(program_root)
+    d.mkdir(parents=True)
+    past = 1_000_000_000  # before both the doctor's real clock and the reaper's injected one
+    label = make_label(fp, "VAST-cf", past)
+    (d / "VAST-cf.json").write_text(json.dumps({
+        "run_id": "VAST-cf", "label": label, "status": "create_failed", "instance_id": None,
+        "pid": 1, "host": "elsewhere", "deadline_epoch": past,
+    }))
+    ctx = DoctorContext(program_root=program_root)
+
+    def blind_http(method, url, headers, body, timeout):
+        return 503, {"error": "unavailable"}
+
+    # blind: cannot rule the instance out -> still a failure
+    monkeypatch.setattr(vchecks, "_client_factory", lambda kp: VastClient(kp, http=blind_http))
+    assert vchecks.check_vastai_live_instances(ctx).status == "fail"
+    # the create DID land after all: the labelled instance is listed -> failure, and reap destroys it
+    fake = FakeVast()
+    fake.instances = {21: {"id": 21, "label": label}}
+    monkeypatch.setattr(vchecks, "_client_factory", lambda kp: VastClient(kp, http=fake.http))
+    assert vchecks.check_vastai_live_instances(ctx).status == "fail"
+    # listed and absent -> the doctor passes, and a real reap settles the record
+    fake.instances = {}
+    assert vchecks.check_vastai_live_instances(ctx).status == "pass"
+    client = VastClient(program_root / "keys" / "vastai.key", http=fake.http)
+    reap(client, program_root, dry_run=True, clock=lambda: now)
+    assert json.loads((d / "VAST-cf.json").read_text())["status"] == "create_failed"  # dry run writes nothing
+    reap(client, program_root, clock=lambda: now)
+    assert json.loads((d / "VAST-cf.json").read_text())["status"] == "absent"
+
+
+# ---------------------------------------------------------------------------
+# second live run, 2026-09-18: billed rate, SSH readiness, CLI envelope
+# ---------------------------------------------------------------------------
+def test_the_plan_prices_the_disk_the_lease_rents():
+    from trialerror.vastai.tiers import effective_dph
+
+    # the observed offer: listed $0.143/h (8 GB default disk), billed $0.181/h at 40 GB
+    offer = {"dph_base": 0.13333, "dph_total": 0.14296, "storage_cost": 0.86667}
+    assert abs(effective_dph(offer, 40) - 0.1808) < 0.001
+    assert effective_dph({"dph_total": 0.2}, 40) == 0.2  # no fields -> listed price
+    assert effective_dph(offer, None) == 0.14296
+
+
+def test_worst_case_uses_the_billed_rate(store, program_root, tmp_path):
+    env = _setup(program_root, tmp_path)
+    fake = FakeVast(offers=[{"id": 11, "gpu_name": "RTX 3090", "gpu_ram": 24576, "dph_base": 0.10,
+                             "dph_total": 0.11, "storage_cost": 7.3, "reliability": 0.99, "num_gpus": 1}])
+    summary = _run(program_root, env, store, fake, FakeChannel(), dry_run=True)
+    plan = summary["plan"]
+    assert abs(plan["dph_total"] - (0.10 + 40 * 7.3 / 730)) < 1e-9  # 0.50/h, not the listed 0.11
+    assert abs(plan["worst_case_usd"] - plan["dph_total"] * plan["ttl_s"] / 3600) < 1e-4  # as_dict rounds to 4 dp
+
+
+def _ssh_channel(tmp_path):
+    from trialerror.vastai.remote import SshChannel
+
+    return SshChannel(host="ssh1.example", port=1, identity_path=None, known_hosts=tmp_path / "kh")
+
+
+def _fake_ssh(monkeypatch, results):
+    import subprocess as sp
+
+    calls = []
+
+    def run(cmd, capture_output, timeout):
+        calls.append(cmd)
+        code, err = results.pop(0) if results else (0, b"")
+        return SimpleNamespace(returncode=code, stderr=err)
+
+    monkeypatch.setattr(sp, "run", run)
+    return calls
+
+
+def test_ssh_refusals_are_retried_until_the_port_accepts(tmp_path, monkeypatch):
+    calls = _fake_ssh(monkeypatch, [(255, b"connect to host ssh1.example port 1: Connection refused")] * 2)
+    checks, sleeps = [], []
+    _ssh_channel(tmp_path).wait_reachable(check=lambda: checks.append(1), sleep=sleeps.append, timeout_s=600)
+    assert len(calls) == 3 and len(sleeps) == 2 and len(checks) == 3  # the TTL check runs every round
+
+
+def test_a_rejected_key_fails_at_once_rather_than_billing(tmp_path, monkeypatch):
+    calls = _fake_ssh(monkeypatch, [(255, b"root@ssh1.example: Permission denied (publickey).")])
+    with pytest.raises(RuntimeError, match="registered with the vast.ai"):
+        _ssh_channel(tmp_path).wait_reachable(check=lambda: None, sleep=lambda s: None, timeout_s=600)
+    assert len(calls) == 1
+
+
+def test_ssh_readiness_gives_up_at_the_startup_budget(tmp_path, monkeypatch):
+    _fake_ssh(monkeypatch, [(255, b"Connection refused")] * 100)
+    t = [0.0]
+
+    def sleep(s):
+        t[0] += s
+
+    with pytest.raises(RuntimeError, match="not reachable after 60 s"):
+        _ssh_channel(tmp_path).wait_reachable(check=lambda: None, sleep=sleep, timeout_s=60, clock=lambda: t[0])
+
+
+def test_the_runner_waits_for_ssh_inside_the_lease(store, program_root, tmp_path):
+    env = _setup(program_root, tmp_path)
+    fake, chan = FakeVast(), FakeChannel()
+    seen = {}
+
+    def wait_reachable(*, check, sleep, timeout_s):
+        seen["timeout_s"] = timeout_s
+        seen["instances_live"] = len(fake.instances)
+        check()
+
+    chan.wait_reachable = wait_reachable
+    summary = _run(program_root, env, store, fake, chan)
+    assert summary["published"] == [JOB] and seen["instances_live"] == 1 and seen["timeout_s"] > 0
+
+
+def test_a_failed_run_answers_with_an_envelope(program_root, tmp_path, monkeypatch, capsys):
+    import trialerror.vastai.runner as runner_mod
+    from trialerror.cli import main
+
+    _setup(program_root, tmp_path)
+
+    def boom(*a, **k):
+        raise RuntimeError("remote command failed (255): Connection refused")
+
+    monkeypatch.setattr(runner_mod, "run_vastai", boom)
+    rc = main(["vastai", "run", "--program-root", str(program_root)])
+    env = json.loads(capsys.readouterr().out.strip())
+    assert rc != 0 and env["ok"] is False and env["error"]["code"] == "vastai_run_failed"
+    assert "reap --dry-run" in env["error"]["message"]
