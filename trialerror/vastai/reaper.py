@@ -24,7 +24,13 @@ from typing import Any, Callable
 from trialerror.util.atomic import atomic_write_text
 from trialerror.vastai.api import VastApiError, VastClient
 from trialerror.vastai.guard import program_fingerprint
-from trialerror.vastai.lease import parse_label, read_run_records, record_for_instance, runs_dir
+from trialerror.vastai.lease import (
+    UNCONFIRMED_CREATE_STATES,
+    parse_label,
+    read_run_records,
+    record_for_instance,
+    runs_dir,
+)
 
 __all__ = ["pid_alive", "classify", "reap"]
 
@@ -108,7 +114,8 @@ def reap(
     host = socket.gethostname()
     now_epoch = clock()
     out: list[dict[str, Any]] = []
-    for inst in client.list_instances():
+    listed = client.list_instances()
+    for inst in listed:
         reason = classify(inst, program_fp=fp, records=records, now_epoch=now_epoch, host=host, alive=alive)
         if reason is None:
             continue
@@ -125,4 +132,18 @@ def reap(
                 rec.update(status="reaped", reaped_reason=reason, updated_epoch=int(now_epoch))
                 atomic_write_text(runs_dir(program_root) / f"{rec['run_id']}.json", json.dumps(rec, indent=2))
         out.append(entry)
+    if not dry_run:
+        # A create that failed without an instance id, whose deadline has
+        # passed and whose label is on no listed instance, never produced a
+        # billing instance: settle its record so doctor stops alarming on it.
+        labels = {str(i.get("label")) for i in listed if i.get("label")}
+        for rec in records.values():
+            if (
+                rec.get("status") in UNCONFIRMED_CREATE_STATES
+                and rec.get("instance_id") is None
+                and now_epoch >= float(rec.get("deadline_epoch") or 0)
+                and str(rec.get("label")) not in labels
+            ):
+                rec.update(status="absent", absent_confirmed_epoch=int(now_epoch), updated_epoch=int(now_epoch))
+                atomic_write_text(runs_dir(program_root) / f"{rec['run_id']}.json", json.dumps(rec, indent=2))
     return out

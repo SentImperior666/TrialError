@@ -437,3 +437,50 @@ def test_doctor_warns_when_blind_and_on_foreign_instances(program_root, tmp_path
     result = vchecks.check_vastai_live_instances(ctx)
     assert result.status == "warn" and "not TrialError's" in result.message
     assert fake.instances == {4: {"id": 4, "label": "someone-else's instance"}}  # reported, never touched
+
+
+def test_a_taken_offer_leaves_a_clean_record_not_a_doctor_failure(store, program_root, tmp_path, monkeypatch):
+    env = _setup(program_root, tmp_path)
+    fake = FakeVast()
+    fake.gone = {11, 12, 13}
+    with pytest.raises((OfferUnavailable, PlanRefused)):
+        _run(program_root, env, store, fake, FakeChannel())
+    recs = [json.loads(f.read_text()) for f in runs_dir(program_root).glob("*.json")]
+    assert recs and {r["status"] for r in recs} == {"offer_taken"}
+    monkeypatch.setattr(vchecks, "_client_factory", lambda kp: VastClient(kp, http=fake.http))
+    assert vchecks.check_vastai_live_instances(DoctorContext(program_root=program_root)).status == "pass"
+
+
+def test_an_old_create_failure_is_settled_only_by_a_successful_listing(program_root, tmp_path, monkeypatch):
+    _setup(program_root, tmp_path)
+    fp = guard.program_fingerprint(program_root)
+    now = 1_900_000_000
+    d = runs_dir(program_root)
+    d.mkdir(parents=True)
+    past = 1_000_000_000  # before both the doctor's real clock and the reaper's injected one
+    label = make_label(fp, "VAST-cf", past)
+    (d / "VAST-cf.json").write_text(json.dumps({
+        "run_id": "VAST-cf", "label": label, "status": "create_failed", "instance_id": None,
+        "pid": 1, "host": "elsewhere", "deadline_epoch": past,
+    }))
+    ctx = DoctorContext(program_root=program_root)
+
+    def blind_http(method, url, headers, body, timeout):
+        return 503, {"error": "unavailable"}
+
+    # blind: cannot rule the instance out -> still a failure
+    monkeypatch.setattr(vchecks, "_client_factory", lambda kp: VastClient(kp, http=blind_http))
+    assert vchecks.check_vastai_live_instances(ctx).status == "fail"
+    # the create DID land after all: the labelled instance is listed -> failure, and reap destroys it
+    fake = FakeVast()
+    fake.instances = {21: {"id": 21, "label": label}}
+    monkeypatch.setattr(vchecks, "_client_factory", lambda kp: VastClient(kp, http=fake.http))
+    assert vchecks.check_vastai_live_instances(ctx).status == "fail"
+    # listed and absent -> the doctor passes, and a real reap settles the record
+    fake.instances = {}
+    assert vchecks.check_vastai_live_instances(ctx).status == "pass"
+    client = VastClient(program_root / "keys" / "vastai.key", http=fake.http)
+    reap(client, program_root, dry_run=True, clock=lambda: now)
+    assert json.loads((d / "VAST-cf.json").read_text())["status"] == "create_failed"  # dry run writes nothing
+    reap(client, program_root, clock=lambda: now)
+    assert json.loads((d / "VAST-cf.json").read_text())["status"] == "absent"

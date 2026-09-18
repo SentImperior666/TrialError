@@ -22,7 +22,13 @@ from trialerror.stores import paths
 from trialerror.stores.connection import connect
 from trialerror.util.doctor import CheckResult, DoctorContext, register_check
 from trialerror.vastai.guard import approval_path, program_fingerprint
-from trialerror.vastai.lease import parse_label, read_run_records, record_for_instance
+from trialerror.vastai.lease import (
+    CLEAN_RECORD_STATES,
+    UNCONFIRMED_CREATE_STATES,
+    parse_label,
+    read_run_records,
+    record_for_instance,
+)
 
 __all__ = ["check_vastai_high_tier", "check_vastai_live_instances", "RECENT_HIGH_TIER_DAYS"]
 
@@ -105,12 +111,18 @@ def check_vastai_live_instances(ctx: DoctorContext) -> CheckResult:
     bad: list[dict[str, Any]] = []
     others: list[dict[str, Any]] = []  # on the account, not TrialError's: reported, never touched
     blind = False
+    listed_labels: set[str] | None = None  # set once a live listing succeeds
+    unconfirmed: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for rec in read_run_records(ctx.program_root):
         status = rec.get("status")
-        if status in ("destroyed", "reaped"):
+        if status in CLEAN_RECORD_STATES:
             continue
         entry = {"source": "run_record", "run_id": rec.get("run_id"), "instance_id": rec.get("instance_id"), "status": status}
-        if status == "destroy_failed" or now_epoch >= float(rec.get("deadline_epoch") or 0):
+        overdue = status == "destroy_failed" or now_epoch >= float(rec.get("deadline_epoch") or 0)
+        if status in UNCONFIRMED_CREATE_STATES and rec.get("instance_id") is None:
+            # judged after the live listing: absent from it means never created
+            unconfirmed.append((rec, {**entry, "overdue": overdue}))
+        elif overdue:
             bad.append(entry)
         else:
             live.append(entry)
@@ -133,7 +145,9 @@ def check_vastai_live_instances(ctx: DoctorContext) -> CheckResult:
                     client = VastClient(kp)
                 fp12 = program_fingerprint(ctx.program_root)[:12]
                 records = read_run_records(ctx.program_root)
-                for inst in client.list_instances():
+                listed = client.list_instances()
+                listed_labels = {str(i.get("label")) for i in listed if i.get("label")}
+                for inst in listed:
                     tag = parse_label(inst.get("label"))
                     if tag is None:
                         rec = record_for_instance(inst, records)
@@ -144,7 +158,7 @@ def check_vastai_live_instances(ctx: DoctorContext) -> CheckResult:
                         # record thinks it is gone or its deadline has passed
                         entry = {"source": "vast.ai", "instance_id": inst.get("id"), "label": None,
                                  "run_id": rec.get("run_id"), "this_program": True}
-                        gone = rec.get("status") in ("destroyed", "reaped")
+                        gone = rec.get("status") in CLEAN_RECORD_STATES
                         if gone or now_epoch >= float(rec.get("deadline_epoch") or 0):
                             bad.append(entry)
                         else:
@@ -159,7 +173,16 @@ def check_vastai_live_instances(ctx: DoctorContext) -> CheckResult:
             except Exception as exc:  # noqa: BLE001 - doctor reports, never crashes
                 blind = True
                 notes.append(f"live vast.ai list unavailable: {type(exc).__name__}: {exc}")
-    details = {"live": live, "overdue_or_failed": bad, "other_instances": others, "notes": notes}
+    resolved: list[dict[str, Any]] = []
+    for rec, entry in unconfirmed:
+        if listed_labels is not None and str(rec.get("label")) not in listed_labels:
+            resolved.append(entry)  # the account has no instance with this run's label
+        elif entry.pop("overdue"):
+            bad.append(entry)
+        else:
+            live.append(entry)
+    details = {"live": live, "overdue_or_failed": bad, "other_instances": others,
+               "create_failures_not_on_account": resolved, "notes": notes}
     if bad:
         return CheckResult(
             "vastai_live_instances", _CATEGORY, "fail",

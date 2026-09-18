@@ -21,10 +21,31 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from trialerror.util.atomic import atomic_write_text
-from trialerror.vastai.api import VastApiError, VastClient
+from trialerror.vastai.api import OfferUnavailable, VastApiError, VastClient
 from trialerror.vastai.remote import LeaseExpired
 
-__all__ = ["LABEL_PREFIX", "make_label", "parse_label", "runs_dir", "read_run_records", "InstanceLease"]
+__all__ = [
+    "LABEL_PREFIX",
+    "CLEAN_RECORD_STATES",
+    "UNCONFIRMED_CREATE_STATES",
+    "make_label",
+    "parse_label",
+    "runs_dir",
+    "read_run_records",
+    "record_for_instance",
+    "InstanceLease",
+]
+
+#: Run-record states in which no instance of the run can be billing:
+#: destroyed and confirmed, reaped, refused at create (``offer_taken``: vast.ai
+#: answered no_such_ask, so nothing was rented), or a create failure a later
+#: live listing showed never produced an instance (``absent``).
+CLEAN_RECORD_STATES = ("destroyed", "reaped", "offer_taken", "absent")
+
+#: States with no instance id yet: the create may or may not have landed
+#: server-side. Only a successful live listing, showing no instance carrying the
+#: run's label, settles them.
+UNCONFIRMED_CREATE_STATES = ("creating", "create_failed")
 
 LABEL_PREFIX = "trialerror|"
 
@@ -145,6 +166,12 @@ class InstanceLease:
             self.instance_id = self.client.create_instance(
                 self.offer["id"], image=self.image, disk_gb=self.disk_gb, label=self.label, onstart=self.onstart_script()
             )
+        except OfferUnavailable as exc:
+            # vast.ai refused the create outright: no instance exists and
+            # nothing bills, so the record is terminal and clean.
+            self._write("offer_taken", error=f"{type(exc).__name__}: {exc}")
+            self.log(f"! vast.ai offer {self.offer.get('id')} was taken before create; nothing rented")
+            raise
         except BaseException as exc:
             # The create may have succeeded server-side before the error
             # reached us; the label carries the deadline, so the reaper
