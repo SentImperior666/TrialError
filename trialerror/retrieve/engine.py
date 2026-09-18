@@ -42,11 +42,13 @@ current behavior (design Section 7: "engine reports what it used").
 from __future__ import annotations
 
 import json
+import sys
 import time
 from typing import Any, Mapping, Sequence
 
 from trialerror.events.api import append_event
-from trialerror.ingest.backends import EmbedBackend, load_embed_backend
+from trialerror.ingest.backends import EmbedBackend, QueryEmbedUnavailable, load_embed_backend
+from trialerror.offload.marker import OffloadNotRunnable
 from trialerror.retrieve.errors import (
     ChunkNotFoundError,
     DocumentNotFoundError,
@@ -267,6 +269,19 @@ def _resolve_embed_backend(store: Store) -> tuple[str, EmbedBackend]:
     return backend.model_key, backend
 
 
+def _resolve_query_embed_backend(store: Store) -> tuple[str, EmbedBackend]:
+    """The backend that embeds a QUERY string (docs/VASTAI_EMBED_DESIGN.md
+    section 6). Identical to :func:`_resolve_embed_backend` for in-process
+    backends; for an offload program it is the calibrated local CPU
+    embedder, never the offload sentinel (TRIALERROR_FEEDBACK.md item 15).
+    Raises :class:`~trialerror.ingest.backends.QueryEmbedUnavailable` when
+    that embedder is unconfigured or not comparable."""
+    from trialerror.retrieve.query_embed import resolve_query_backend
+
+    config = _load_program_config(store)
+    return resolve_query_backend(store, config.get("ingest", {}).get("embed", {}))
+
+
 def _filtered_chunk_ids(store: Store, filters: Mapping[str, Any] | None) -> list[str] | None:
     """``None`` means "no restriction, use every chunk"; otherwise the
     exact (possibly empty) list of chunk ids matching every given filter
@@ -329,6 +344,54 @@ def _fetch_chunk_context(store: Store, chunk_ids: Sequence[str]) -> dict[str, di
         d = dict(r)
         anchors.setdefault(d["chunk_id"], d)  # first (earliest) anchor is the chunk's primary one
     return {"chunks": chunks, "documents": documents, "sources": sources, "anchors": anchors}
+
+
+
+def _vector_tier(
+    store: Store,
+    query: str,
+    *,
+    mode: str,
+    k: int,
+    candidate_ids: list[str] | None,
+    tier_rankings: dict[str, list[str]],
+    stats: dict[str, Any],
+) -> None:
+    """design Section 7 step 2: vector-score exactly the FTS candidate set in
+    the two-stage modes; in pure "vector" mode there is no FTS stage, so the
+    universe is the (filtered) whole corpus instead. Query embedding goes
+    through :func:`_resolve_query_embed_backend`."""
+    model_key, backend = _resolve_query_embed_backend(store)
+
+    # B.4b (build-arxiv-kaggle-index session, spikes/index_bakeoffs/
+    # BAKEOFF_REPORT.md Sec B.4b): mode="vector" with NO filters is the
+    # genuinely UNBOUNDED case that bake-off names as the native-MATCH
+    # trigger (fetch_vectors's IN-list hits a hard 32,766-variable
+    # ceiling and a ~20GB memory-pressure risk at scale -- Sec B.3).
+    # Only engages when THIS model_key's table was actually built as a
+    # real vec0 table (vec_backend_for -- TRIALERROR_VEC_BACKEND=sqlite_vec
+    # at index-build time, opt-in, per trialerror.stores.vecindex.
+    # ensure_vec_table's own B.4a default); every other combination
+    # below (filtered mode="vector", the two-stage FTS-prefiltered
+    # modes, or a fallback-backend table) is BYTE-IDENTICAL to this
+    # function's pre-B.4b behavior -- nothing here changes the default
+    # fallback path.
+    if mode == "vector" and candidate_ids is None and vec_table_exists(store, model_key) and vec_backend_for(store, model_key) == VecBackend.SQLITE_VEC:
+        query_vector = backend.embed_batch([query], kind="query")[0]
+        ranked = fetch_native_knn(store, model_key, query_vector, k=max(k, 0))
+        tier_rankings["vector"] = [cid for cid, _ in ranked]
+        stats["vector_scored"] = len(ranked)
+    else:
+        if mode == "vector":
+            vector_universe = candidate_ids if candidate_ids is not None else _all_chunk_ids(store)
+        else:
+            vector_universe = tier_rankings.get("fts", [])
+        if vector_universe and vec_table_exists(store, model_key):
+            query_vector = backend.embed_batch([query], kind="query")[0]
+            vectors = fetch_vectors(store, model_key, vector_universe)
+            ranked = rank_by_query_vector(query_vector, vectors)
+            tier_rankings["vector"] = [cid for cid, _ in ranked]
+            stats["vector_scored"] = len(ranked)
 
 
 def _log_unfenced_bypass(store: Store, *, chunk_ids: list[str], source_ids: list[str], launch_id: str | None) -> None:
@@ -502,40 +565,20 @@ def search(
         stats["fulltext_backend"] = fulltext_backend
 
     if want_vector and query.strip():
-        # design Section 7 step 2: vector-score exactly the FTS candidate
-        # set in the two-stage modes; in pure "vector" mode there is no FTS
-        # stage, so the universe is the (filtered) whole corpus instead.
-        model_key, backend = _resolve_embed_backend(store)
-
-        # B.4b (build-arxiv-kaggle-index session, spikes/index_bakeoffs/
-        # BAKEOFF_REPORT.md Sec B.4b): mode="vector" with NO filters is the
-        # genuinely UNBOUNDED case that bake-off names as the native-MATCH
-        # trigger (fetch_vectors's IN-list hits a hard 32,766-variable
-        # ceiling and a ~20GB memory-pressure risk at scale -- Sec B.3).
-        # Only engages when THIS model_key's table was actually built as a
-        # real vec0 table (vec_backend_for -- TRIALERROR_VEC_BACKEND=sqlite_vec
-        # at index-build time, opt-in, per trialerror.stores.vecindex.
-        # ensure_vec_table's own B.4a default); every other combination
-        # below (filtered mode="vector", the two-stage FTS-prefiltered
-        # modes, or a fallback-backend table) is BYTE-IDENTICAL to this
-        # function's pre-B.4b behavior -- nothing here changes the default
-        # fallback path.
-        if mode == "vector" and candidate_ids is None and vec_table_exists(store, model_key) and vec_backend_for(store, model_key) == VecBackend.SQLITE_VEC:
-            query_vector = backend.embed_batch([query], kind="query")[0]
-            ranked = fetch_native_knn(store, model_key, query_vector, k=max(k, 0))
-            tier_rankings["vector"] = [cid for cid, _ in ranked]
-            stats["vector_scored"] = len(ranked)
-        else:
+        try:
+            _vector_tier(store, query, mode=mode, k=k, candidate_ids=candidate_ids, tier_rankings=tier_rankings, stats=stats)
+        except (QueryEmbedUnavailable, OffloadNotRunnable) as exc:
+            # TRIALERROR_FEEDBACK.md item 15 fix 1: the tiers that did not ask
+            # for vectors by name degrade to lexical, loudly; --mode vector
+            # still fails, because it asked for exactly this.
             if mode == "vector":
-                vector_universe = candidate_ids if candidate_ids is not None else _all_chunk_ids(store)
-            else:
-                vector_universe = tier_rankings.get("fts", [])
-            if vector_universe and vec_table_exists(store, model_key):
-                query_vector = backend.embed_batch([query], kind="query")[0]
-                vectors = fetch_vectors(store, model_key, vector_universe)
-                ranked = rank_by_query_vector(query_vector, vectors)
-                tier_rankings["vector"] = [cid for cid, _ in ranked]
-                stats["vector_scored"] = len(ranked)
+                raise
+            tier_rankings.pop("vector", None)
+            stats["vector_unavailable"] = str(exc)
+            print(
+                f"trialerror: vector tier unavailable, ranking lexically ({mode} mode): {exc}",
+                file=sys.stderr,
+            )
 
     if want_graph and query.strip():
         # design Section 7 pipeline step 4 / Section 11 deliverable 2:

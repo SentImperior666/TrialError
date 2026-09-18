@@ -145,7 +145,7 @@ def _distance_tercile_pools(
     substituted -- ``fetch_vectors``'s own "missing is absent" contract).
     """
     chunk_ids = [r["chunk_id"] for r in rows]
-    model_key, backend = retrieve_engine._resolve_embed_backend(store)
+    model_key, backend = retrieve_engine._resolve_query_embed_backend(store)
     candidate_vectors = fetch_vectors(store, model_key, chunk_ids)
     if not candidate_vectors:
         return None
