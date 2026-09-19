@@ -365,7 +365,15 @@ def test_the_suite_never_reads_the_machines_own_quota_capture(tmp_path):
     # this test's tmp_path under the same pytest base), never the machine's
     # own capture dir -- that is the property this test guards.
     assert str(tmp_path.parent) in quota_dir and "quota_capture" in quota_dir
-    assert str(Path.home()) not in quota_dir
+    # And not the machine's REAL capture dir -- the path
+    # ``trialerror.budget.quota._default_quota_dir`` falls back to when the
+    # variable is unset. Named directly rather than as "not under the home
+    # directory": on Windows pytest's own temp root lives under the home
+    # directory (``AppData\\Local\\Temp``), so the broader claim is false there
+    # for a dir that is perfectly isolated, while this one still holds.
+    real_capture_dir = (Path.home() / ".trialerror" / "quota").resolve()
+    resolved = Path(quota_dir).resolve()
+    assert resolved != real_capture_dir and real_capture_dir not in resolved.parents
     # Empty: absent is not stale, which is the one reading that cannot age.
     assert booking_quota_reading(tmp_path)["standing"] == "absent"
 
