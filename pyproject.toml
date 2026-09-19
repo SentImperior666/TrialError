@@ -1,0 +1,120 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trialerror"
+version = "0.1.0"
+description = "TrialError - a reusable research-operations exoskeleton for Claude Code (research-harness platform core)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "TrialError contributors" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+]
+# pypdf: pure-Python PDF text extraction for M7's pdf-text normalizer
+# (design Section 6, ingestion stage 3). BSD-3-Clause; no native build step
+# (Windows-first concern), so this is a core dependency rather than an
+# optional extra -- unlike sqlite-vec (M1), pdf-text normalization is
+# required v0 scope (design Section 12, M7 row), not an optional backend.
+#
+# tantivy (tantivy-py): the lexical/BM25 tier's default backend since
+# C-0080 (spikes/index_bakeoffs/BAKEOFF_REPORT.md Sec A.3, "SWITCH to
+# tantivy" -- 23-64x faster queries, ~2.1x smaller on disk, at every
+# measured scale). MIT, same license as this project. Pinned to the 0.26.x
+# family the bake-off actually measured: tantivy's on-disk index format is
+# versioned (0.26.0 ships index_format v7) and a minor bump can change it,
+# so a floating upper bound would let a `pip install -U` silently
+# invalidate a program's built index.
+#
+# CORE dependency rather than an extra, for the same reason pypdf is:
+# tantivy-py publishes prebuilt wheels for Windows, manylinux and macOS on
+# cp311/cp312, so there is no compiler step on any platform this project
+# supports -- the "optional because it needs a native build" reasoning that
+# keeps sqlite-vec in an extra does not apply. The code still degrades
+# gracefully if it is somehow absent (trialerror.retrieve.lexical falls back
+# to the SQLite FTS5 tier and notes it once), so a stripped install stays
+# functional rather than broken.
+dependencies = ["pypdf>=5", "tantivy>=0.26,<0.27"]
+
+[project.scripts]
+trialerror = "trialerror.cli:main"
+
+[project.optional-dependencies]
+# sqlite-vec is optional by design (M1 build brief): trialerror.stores.vecindex
+# probes for it at call time and falls back to a pure-stdlib table when
+# it's absent, so tests must pass either way. It's included in `dev` so the
+# real-extension code path is exercised in the standard test run; `vec` is
+# the standalone extra for a production install that wants vector search
+# without pulling in pytest.
+dev = ["pytest>=8", "sqlite-vec>=0.1.0", "numpy>=1.24"]
+vec = ["sqlite-vec>=0.1.0"]
+# numpy: the optional fast path for every brute-force cosine scan
+# (trialerror.util.vecmath, and the resident matrix in
+# trialerror.retrieve.vecmatrix that predates it). OPTIONAL on exactly the
+# sqlite-vec argument above, and for the same reason it is an extra rather
+# than a dependency: the plain-Python path is the DEFINITION of the answer
+# here -- vecmath's own agreement tests compare the two -- so numpy changes
+# the wall clock of an unbounded scan and nothing else, and a core install
+# that never runs one must not pay for it. Turned off in a program's
+# trialerror.toml with `[retrieve] numpy_fastpath = "off"` whatever is
+# installed. In `dev` as well, so the standard test run exercises the fast
+# path rather than only the fallback (same posture as sqlite-vec).
+fast = ["numpy>=1.24"]
+# M12 (trialerror/obs/): OTel GenAI span emission + a local Arize Phoenix trace
+# sink, both OPTIONAL by design (Section 4.5 / Section 12 M12 row's
+# "graceful NO-OP degradation when Phoenix/OTel deps are absent" -- core
+# install must stay dependency-light). opentelemetry-sdk pulls in
+# opentelemetry-semantic-conventions (the GenAI attribute vocabulary
+# trialerror.obs.semconv pins its literal string values against -- see that
+# module's docstring for why it doesn't import from the package directly)
+# as a transitive dep; the otlp-http exporter is what actually POSTs spans
+# to Phoenix's OTLP/HTTP collector. arize-phoenix (ELv2 -- served as a
+# local tool over the network, never forked/embedded; see
+# trialerror/obs/tracer.py's module docstring) is the trace sink itself,
+# launched via `trialerror obs start-phoenix`.
+#
+# TRIALERROR-DEV-NOTE (deviation from the M1 sqlite-vec `dev`-extra precedent):
+# `obs` is deliberately NOT folded into `dev` below. sqlite-vec is one
+# small package; arize-phoenix's own dependency tree is ~140 packages
+# (fastapi, sqlalchemy, pandas, scikit-learn, grpc, boto3, ...) -- pulling
+# that into every lane's standard `pip install -e .[dev]` would itself
+# contradict this same block's "core install must stay dependency-light"
+# framing for what is explicitly an optional local dev tool. The real-path
+# ("with deps") test suite instead ran against `obs` installed directly
+# into .venv312 for this build; the no-deps path is proven by a genuine
+# subprocess test (tests/test_obs_noop_subprocess.py) rather than by
+# relying on `dev` omitting it. Flagged here per instruction (deviation =
+# TRIALERROR-DEV-NOTE + report) -- see the M12 build report for the full case.
+obs = [
+    "opentelemetry-sdk>=1.44.0,<1.45",
+    "opentelemetry-exporter-otlp-proto-http>=1.44.0,<1.45",
+    "arize-phoenix>=8",
+]
+
+[tool.setuptools.packages.find]
+include = ["trialerror*"]
+
+# FX-9: trialerror/artifacts/templates/*.md (the bundled, byte-exact port of
+# origin-project's 12 research/templates/*.md files) must ship in a built wheel/sdist,
+# not just be readable from an editable-install source checkout.
+#
+# The dashboard's static assets are the same class of bug, caught the same
+# way FX-9 was: trialerror.dashboard.serve and .export read dashboard.html /
+# dashboard.css from STATIC_DIR at runtime, but nothing declared them as
+# package data, so a built wheel shipped ZERO of them and `trialerror
+# dashboard serve` failed on any non-editable install. Editable installs
+# (how this project has always been developed and CI-tested) mask it
+# completely, which is why it survived this long.
+[tool.setuptools.package-data]
+"trialerror.artifacts" = ["templates/*.md"]
+"trialerror.dashboard" = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "acceptance: end-to-end acceptance-criteria tests for a build module",
+]

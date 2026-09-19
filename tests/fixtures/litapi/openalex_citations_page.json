@@ -1,0 +1,33 @@
+{
+  "meta": {
+    "count": 2,
+    "page": 1,
+    "per_page": 25,
+    "cost_usd": 0.0
+  },
+  "results": [
+    {
+      "id": "https://openalex.org/W3000000001",
+      "doi": "https://doi.org/10.1234/citer.0001",
+      "title": "A Fixture Paper That Cites The Target Work",
+      "publication_year": 2022,
+      "ids": {"openalex": "https://openalex.org/W3000000001", "doi": "https://doi.org/10.1234/citer.0001"},
+      "authorships": [
+        {"author_position": "first", "author": {"id": "https://openalex.org/A3", "display_name": "Cy Referrer"}}
+      ],
+      "cited_by_count": 3
+    },
+    {
+      "id": "https://openalex.org/W3000000002",
+      "doi": null,
+      "title": "A Second Fixture Paper With No DOI Yet",
+      "publication_year": 2023,
+      "ids": {"openalex": "https://openalex.org/W3000000002"},
+      "authorships": [
+        {"author_position": "first", "author": {"id": "https://openalex.org/A4", "display_name": "Dee Preprint"}}
+      ],
+      "cited_by_count": 0
+    }
+  ],
+  "group_by": []
+}

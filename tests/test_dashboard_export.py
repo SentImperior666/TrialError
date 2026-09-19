@@ -1,0 +1,249 @@
+"""``trialerror dashboard export`` -- the static self-contained snapshot writer.
+Proves the two build-time transforms (asset inlining, JSON data embedding)
+land correctly and that the result is genuinely self-contained: no external
+``dashboard.css`` reference and no ``<script src>`` left behind for a
+``file://`` page to fail to fetch in silence."""
+
+from __future__ import annotations
+
+import json
+import re
+
+import pytest
+
+from trialerror.dashboard import export as dashboard_export
+from trialerror.stores.store import open_store
+from tests._store_fixtures import populate_one_of_everything
+
+_DATA_TAG_RE = re.compile(r'<script id="dashboard-data" type="application/json">(.*?)</script>', re.S)
+_SCRIPT_SRC_RE = re.compile(r"<script[^>]*\bsrc\s*=", re.I)
+
+
+def test_export_snapshot_is_self_contained_and_embeds_panels(program_root, platform_root, tmp_path):
+    store = open_store(program_root, platform_root=platform_root)
+    ids = populate_one_of_everything(store)
+    store.close()
+
+    out_path = tmp_path / "snapshot.html"
+    result_path = dashboard_export.export_snapshot(
+        out_path=out_path, program_root=program_root, platform_root=platform_root
+    )
+    assert result_path == out_path
+    assert out_path.is_file()
+    html = out_path.read_text(encoding="utf-8")
+
+    # single-file portable: the external stylesheet <link> is gone, its
+    # content is inlined instead.
+    assert 'href="dashboard.css"' not in html
+    assert "<style>" in html
+    assert "--live: #3FE07A" in html  # a real HALIDE token rule from dashboard.css landed inline
+
+    # ...and so is every renderer file. A <script src> that survived the
+    # export is the worst failure this page has: over file:// the fetch fails
+    # with no status line, no console anyone is reading, and a Console that
+    # simply renders nothing.
+    assert _SCRIPT_SRC_RE.search(html) is None, "an external <script src> survived the export"
+    for name in dashboard_export._INLINE_SCRIPTS:
+        assert dashboard_export._script_src_tag(name) not in html
+    assert "TEConsole" in html  # console_render.js's own global, inlined verbatim
+    assert "TEFeed" in html     # feed_render.js's, likewise -- the threaded
+                                # stream has to render out of the bundle too
+
+    # the static snapshot still carries the new HALIDE shell -- the rail,
+    # every panel's data-panel hook, and the ext-panel injection points --
+    # not just the old MINIMAL-FUNCTIONAL scaffold this build replaced.
+    assert 'data-role="rail"' in html
+    for panel_name in (
+        "home", "search", "evidence", "lexicon", "dossier", "course",
+        "rooms", "feed", "determinations", "console",
+    ):
+        assert f'data-panel="{panel_name}"' in html
+    assert 'data-role="rail-ext-KNOW"' in html
+    assert 'data-role="rail-ext-RUN"' in html
+    assert 'id="dashboard-data"' in html
+
+    m = _DATA_TAG_RE.search(html)
+    assert m is not None, "embedded #dashboard-data script tag not found"
+    raw = m.group(1)
+
+    # </script>-safety: no literal "<" survives inside the embedded JSON
+    # body (every one was escaped to < at embed time).
+    assert "<" not in raw
+
+    payload = json.loads(raw)
+    assert payload["meta"]["program_root"] == str(program_root)
+    assert payload["meta"]["snapshot"] is True
+    assert set(payload["panels"]) == {
+        "session", "budget", "jobs", "gates", "corpus", "doctor",
+        "feed", "rooms", "determinations", "dossier", "evidence", "lexicon", "course",
+        "since_you_left",
+    }
+    assert payload["panels"]["session"]["open_session"]["session_id"] == ids["session"]
+    assert payload["panels"]["doctor"]["status"] == "never_run"  # run_doctor=False (default)
+
+    # Sweep test 33: the Console's timeline is a SERVER derivation, so the
+    # snapshot carries it like any other reading. Were it computed on the page
+    # from rows the bundle does not hold, THIS SESSION END TO END would be the
+    # one card that renders live and blank offline.
+    timeline = payload["panels"]["session"]["open_session"]["timeline"]
+    assert timeline is not None
+    assert timeline["window"]["start_ts"]
+    assert any(s["kind"] == "launch" for s in timeline["spans"])
+    # ...and the JOBS card's decoded columns, for the same reason.
+    assert "offload" in payload["panels"]["jobs"]
+    assert "subject" in payload["panels"]["jobs"]["recent_jobs"][0]
+
+
+def test_export_snapshot_run_doctor_populates_doctor_panel(program_root, platform_root, tmp_path):
+    store = open_store(program_root, platform_root=platform_root)
+    populate_one_of_everything(store)
+    store.close()
+
+    out_path = tmp_path / "snapshot_with_doctor.html"
+    dashboard_export.export_snapshot(
+        out_path=out_path,
+        program_root=program_root,
+        platform_root=platform_root,
+        repo_root=tmp_path,  # scope the license_audit vendored/ scan to an empty tmp dir
+        run_doctor=True,
+    )
+    html = out_path.read_text(encoding="utf-8")
+    payload = json.loads(_DATA_TAG_RE.search(html).group(1))
+    assert payload["panels"]["doctor"]["status"] == "ok"
+    assert payload["panels"]["doctor"]["last_run"]["summary"]["total"] > 0
+
+
+def test_export_snapshot_creates_parent_directories(program_root, platform_root, tmp_path):
+    store = open_store(program_root, platform_root=platform_root)
+    populate_one_of_everything(store)
+    store.close()
+
+    out_path = tmp_path / "nested" / "dir" / "snapshot.html"
+    result_path = dashboard_export.export_snapshot(
+        out_path=out_path, program_root=program_root, platform_root=platform_root
+    )
+    assert result_path.is_file()
+
+
+def test_build_snapshot_html_with_no_program_root(tmp_path):
+    """A program-agnostic export (no --program-root) still produces a
+    valid snapshot -- every store-backed panel reports not_initialized
+    rather than the exporter crashing."""
+    html = dashboard_export.build_snapshot_html(program_root=None, platform_root=tmp_path / "platform")
+    payload = json.loads(_DATA_TAG_RE.search(html).group(1))
+    assert payload["meta"]["program_root"] is None
+    assert payload["panels"]["session"]["status"] == "not_initialized"
+    assert payload["panels"]["budget"]["status"] == "not_initialized"
+    assert payload["meta"]["ext_panels"] == []
+    assert "ext" not in payload["panels"]
+
+
+def test_export_snapshot_has_no_write_token_and_every_write_button_disabled(program_root, platform_root, tmp_path):
+    """Design constraint (Stage 3, build-v2dash-writes): a static snapshot
+    is read-only by definition -- it must never carry a write token (only
+    ``trialerror.dashboard.serve``'s ``_serve_index`` injects one, at live
+    request time; ``export.py`` never runs through that code path at all),
+    and every write control's ``disabled`` attribute in the served markup
+    must therefore be the honest DEFAULT the raw HTML source ships with,
+    not something a client script has to remember to enforce."""
+    store = open_store(program_root, platform_root=platform_root)
+    populate_one_of_everything(store)
+    store.close()
+
+    out_path = tmp_path / "snapshot_readonly.html"
+    dashboard_export.export_snapshot(out_path=out_path, program_root=program_root, platform_root=platform_root)
+    html = out_path.read_text(encoding="utf-8")
+
+    # The actual INJECTED tag (always carries a real content="<hex>" value,
+    # written only by trialerror.dashboard.serve._serve_index) must be absent --
+    # not just the bare substring, which also (legitimately) appears in this
+    # page's own explanatory JS comments about the mechanism, with no
+    # content="..." attribute at all.
+    assert re.search(r'<meta\s+name="dashboard-write-token"\s+content="[0-9a-f]+">', html) is None
+
+    for data_role in (
+        "feed-transmit-btn",
+        "room-turn-btn",
+        # C7: + NEW THREAD. Both halves -- the TOGGLE as well as the submit,
+        # because a form that opens and then refuses is worse than one that
+        # says up front it cannot be used here.
+        "feed-new-thread-toggle",
+        "feed-new-thread-btn",
+    ):
+        m = re.search(rf'<[^>]*data-role="{data_role}"[^>]*>', html)
+        assert m is not None, f"missing markup for data-role={data_role!r}"
+        assert "disabled" in m.group(0), f"data-role={data_role!r} is not disabled in the raw export markup"
+
+    # A control a RENDERER draws has no raw markup to inspect, so the guard
+    # has to be the renderer's own: feed_render.js disables every REPLY IN
+    # THREAD unless it is handed `writesEnabled`, and the page computes that
+    # from the write token this snapshot does not have. Pin the two halves --
+    # the reason text lives in the inlined file, and the page's only source
+    # for the flag is `writesEnabled()`.
+    assert "REPLY IN THREAD" in html
+    assert "static snapshots are read-only" in html
+    m = re.search(r"return TEFEED\.renderStream\(p, \{.*?\}\);", html, re.S)
+    assert m is not None, "the page no longer calls TEFEED.renderStream the way this test reads it"
+    assert re.search(r"writesEnabled:\s*writesEnabled\(\)", m.group(0)), \
+        "the reply controls' enabled state must come from writesEnabled(), which a snapshot makes false"
+
+    # The Determinations arms (prereg-reveal, gate-verify, gate-send-back, the
+    # three memory-keep buttons) are built by `el()` inside a detail pane a
+    # snapshot never opens, so no assertion HERE can reach them. Their half of
+    # this contract is
+    # tests/test_dashboard_client_resilience.py::
+    #   test_every_determination_button_takes_its_disabled_state_from_writesEnabled,
+    # which reads `buildDeterminationActions`' own source. Keep the two
+    # together: between them they cover every write control the page draws.
+
+
+def test_export_snapshot_embeds_extension_panels(program_root, platform_root, tmp_path):
+    """trialerror.dashboard.ext (C-0070): a program with a trialerror_ext/panels/
+    extension gets it embedded in the static snapshot the SAME way the live
+    server serves it -- one build path, never two."""
+    store = open_store(program_root, platform_root=platform_root)
+    populate_one_of_everything(store)
+    store.close()
+
+    panel_dir = program_root / "trialerror_ext" / "panels" / "fixture"
+    panel_dir.mkdir(parents=True)
+    (panel_dir / "panel.toml").write_text(
+        '[panel]\ntitle = "Fixture"\nnav_group = "KNOW"\norder = 1\n', encoding="utf-8"
+    )
+    (panel_dir / "builder.py").write_text(
+        "def build_panel(rostore, program_root):\n    return {'status': 'ok', 'value': 42}\n",
+        encoding="utf-8",
+    )
+
+    out_path = tmp_path / "snapshot_ext.html"
+    dashboard_export.export_snapshot(out_path=out_path, program_root=program_root, platform_root=platform_root)
+    html = out_path.read_text(encoding="utf-8")
+    payload = json.loads(_DATA_TAG_RE.search(html).group(1))
+
+    assert payload["panels"]["ext"]["fixture"] == {"status": "ok", "value": 42}
+    assert payload["meta"]["ext_panels"] == [
+        {"name": "fixture", "manifest_status": "ok", "title": "Fixture", "nav_group": "KNOW", "order": 1, "description": "", "min_schema": []}
+    ]
+
+
+def test_inline_scripts_entry_and_template_tag_must_agree(monkeypatch):
+    """The two halves of the split -- the ``<script src>`` in the template and
+    the ``_INLINE_SCRIPTS`` entry that inlines it -- have to be edited
+    together. Divergence in either direction is caught here rather than
+    shipping a snapshot with a missing renderer, which a portable file has no
+    way to report at open time."""
+    monkeypatch.setattr(
+        dashboard_export, "_INLINE_SCRIPTS", dashboard_export._INLINE_SCRIPTS + ("nowhere_render.js",)
+    )
+    with pytest.raises(RuntimeError, match="nowhere_render.js"):
+        dashboard_export.build_snapshot_html(program_root=None, platform_root=None)
+
+
+def test_every_inline_script_is_a_real_file_the_template_loads():
+    """The forward direction of the same pairing, without monkeypatching: each
+    declared name exists on disk and is pulled in by the template."""
+    template = (dashboard_export.STATIC_DIR / "dashboard.html").read_text(encoding="utf-8")
+    assert dashboard_export._INLINE_SCRIPTS, "the split has at least one renderer file"
+    for name in dashboard_export._INLINE_SCRIPTS:
+        assert (dashboard_export.STATIC_DIR / name).is_file(), name
+        assert f'<script src="{name}"></script>' in template, name

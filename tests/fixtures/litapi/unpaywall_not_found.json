@@ -1,0 +1,4 @@
+{
+  "HTTP_status_code": 404,
+  "message": "The requested DOI was not found in Crossref or in our systems: 10.9999/missing"
+}

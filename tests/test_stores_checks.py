@@ -1,0 +1,259 @@
+"""M1's doctor checks: ``store_schema_version``, ``xid_dangling``,
+``anchors_dangling``. Auto-discovery (no import needed) plus planted-
+fixture adversarial cases for each.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from trialerror.util.doctor import DoctorContext, clear_registry, discover_and_register_checks, run_checks
+from trialerror.util.ids import new_id
+from trialerror.util.timeutil import now
+
+from tests._store_fixtures import populate_one_of_everything
+
+
+def _run(names, program_root):
+    discover_and_register_checks()
+    ctx = DoctorContext(program_root=program_root)
+    results = run_checks(ctx, only=names)
+    return {r.name: r for r in results}
+
+
+def test_platform_root_precedence_explicit_over_env_over_default(tmp_path, monkeypatch):
+    """Regression for fix-accept (C-0064, task_c92b015f): DoctorContext had
+    no ``platform_root`` field at all and ``_db_path``'s "platform" branch
+    ignored ``ctx`` entirely, always re-deriving from ``TRIALERROR_PLATFORM_ROOT``/
+    ``~/.trialerror`` -- which made `trialerror accept` false-positive ``xid_dangling``
+    against a real machine's own ``~/.trialerror/platform.db`` even though the
+    acceptance journey had resolved its own scratch ``platform_root``
+    elsewhere. This test deliberately does NOT use the ``platform_root``
+    fixture from ``tests/conftest.py`` (which sets ``TRIALERROR_PLATFORM_ROOT`` to
+    the SAME directory it hands back, so an env-only resolution would
+    coincidentally still match and mask this exact bug -- that masking is
+    exactly how the bug shipped past the full test suite in the first
+    place). Instead it points ``TRIALERROR_PLATFORM_ROOT`` at one directory and
+    ``DoctorContext.platform_root`` at a DIFFERENT one, so the two can only
+    agree if the explicit field actually wins.
+    """
+    from trialerror.stores.checks import _db_path
+    from trialerror.util.doctor import DoctorContext
+
+    env_root = tmp_path / "env_platform"
+    explicit_root = tmp_path / "explicit_platform"
+    monkeypatch.setenv("TRIALERROR_PLATFORM_ROOT", str(env_root))
+
+    # explicit ctx.platform_root wins over the env var.
+    ctx_explicit = DoctorContext(platform_root=explicit_root)
+    resolved = _db_path(ctx_explicit, "platform")
+    assert resolved == explicit_root / "platform.db"
+    assert resolved != env_root / "platform.db"
+
+    # a caller that supplies no platform_root still falls back to the env
+    # var (must not break every other test/check in this suite that relies
+    # on TRIALERROR_PLATFORM_ROOT alone).
+    ctx_env_only = DoctorContext()
+    resolved_env_only = _db_path(ctx_env_only, "platform")
+    assert resolved_env_only == env_root / "platform.db"
+
+    # and with neither an explicit platform_root nor the env var set, the
+    # ~/.trialerror default still applies (unchanged pre-fix behavior).
+    monkeypatch.delenv("TRIALERROR_PLATFORM_ROOT", raising=False)
+    ctx_default = DoctorContext()
+    resolved_default = _db_path(ctx_default, "platform")
+    assert resolved_default == Path.home() / ".trialerror" / "platform.db"
+
+
+def test_checks_are_auto_discovered_without_import():
+    clear_registry()
+    discover_and_register_checks()
+    from trialerror.util.doctor import registered_checks
+
+    names = set(registered_checks())
+    assert {"store_schema_version", "xid_dangling", "anchors_dangling"} <= names
+
+
+def test_store_schema_version_passes_on_freshly_migrated_store(store, program_root, platform_root):
+    populate_one_of_everything(store)
+    results = _run(["store_schema_version"], program_root)
+    r = results["store_schema_version"]
+    assert r.status == "pass"
+    # schema-v2 (build-v1-schemav2): the check's "expected" version comes
+    # straight from trialerror.stores.migrate.latest_version(SCHEMA_MODULES[db].
+    # MIGRATIONS) -- adding the v2 Migration to ops/jobs/knowledge's own
+    # MIGRATIONS tuples is the entire "bump expected versions" step; no
+    # doctor-check code change was needed. platform.db has no v2 migration.
+    # ops (build-v2-polish's ops-v3, rooms; build-v2dash-data's ops-v4,
+    # criterion + feed_post_translation; lane-b-translator's ops-v6, the
+    # translator's gate-verdict columns -- v5 landed independently on
+    # master as FU-14's "ops_v5_meta_kv" while that lane was in flight, so
+    # its own migration was renumbered v5->v6 rather than colliding, see
+    # ops.py's TRIALERROR-DEV-NOTE at _V6; the 2026-09 mining adoptions'
+    # ops-v7, engram-F4's memory_relation table + engram-F5's
+    # memory_item.reviewed_ts) and knowledge (build-v2-summary's
+    # knowledge-v3, the summary table; lane a's knowledge-v4, the web_fetch
+    # table) each independently gained more versions later -- and jobs.db,
+    # which had stayed at 2 for four builds, gained v3 with lane a's
+    # web_fetch/web_extract kinds.
+    #
+    # 8, and MIGRATIONS is contiguous 1..8: the mining lane authored its
+    # migration as v6, renumbered it to v8 on its own branch while lane b held
+    # v6 and orchestrator ruling L-C1 held v7 for lane C, then landed at v7
+    # because it merged BEFORE lane c (L-C1 amended, lane c takes v8) -- and
+    # lane c's own ops_v8_thread_created_by_nullable_and_author is that 8.
+    # Lane a's two numbers (knowledge v4, jobs v3) were reserved by the
+    # orchestrator before that lane started, so they needed no renumber; lane
+    # e's knowledge v5 (the lexicon term store) took the next one after lane a
+    # actually merged, which is what ruling L-E1's ordering rule required of
+    # it ("_V5 follows a real _V4, or lane e lands as v4 and lane a renumbers
+    # -- whoever merges second renumbers").
+    # The check reads BOTH numbers from latest_version(MIGRATIONS) and PRAGMA
+    # user_version, so the numbering history is invisible to it -- what it
+    # asserts is that the two agree.
+    #
+    # The ideation lane then added one to each of ops and knowledge: ops v9
+    # (the control seat, the recipe-card block and the assignment mode) and
+    # knowledge v6 (the idea record's two new statuses and its ten promoted
+    # columns). Both were the next free number at merge time, so neither
+    # needed a renumber. Its second stage added knowledge v7 (the
+    # ``inventory`` source kind the novelty screen's reference set needs),
+    # again the next free number.
+    # Lane FB-4 added ops v10 (``lens_assignment.lens_launch_id``, the lens-launch
+    # link the slice audit and ``lens log`` read), again the next free number.
+    # Lane FB-5 added knowledge v8 (``verdict.label_canonical``) and v9
+    # (``idea.status`` gains ``archived``); lane FB-6 added knowledge v10
+    # (``vec_ideas``, the per-model idea-vector cache the R2 archive is read
+    # through) -- each the next free number at merge time.
+    # Lane FB-7 item 8b added knowledge v11 (``idea.extra``, so a round's own
+    # record can carry the same free block FB-6 item 6 gave a plant -- the
+    # envelope's shape is what keeps the two indistinguishable, and a key one
+    # of them cannot hold is a tell), and item 9 added v12
+    # (``verdict.round_id``/``batch_id``: the one-submission guard was keyed
+    # by subject alone, which is right for a record whose id is unique across
+    # the programme and wrong for a plant whose id is whatever the round's
+    # plants file called it).
+    assert r.details["ops"] == {"current_version": 10, "expected_version": 10, "match": True}
+    assert r.details["jobs"] == {"current_version": 3, "expected_version": 3, "match": True}
+    assert r.details["knowledge"] == {"current_version": 12, "expected_version": 12, "match": True}
+    # platform stayed on v1 from M1 until lane FB-3, whose D-FB-13/D-FB-14
+    # work is the first thing to need a shape change in the money store:
+    # ``launch`` gains the usage split and ``pool_id``, and
+    # ``reconcile_source`` gains ``'event'``.
+    assert r.details["platform"]["expected_version"] == 2
+
+
+def test_store_schema_version_skips_when_db_absent(tmp_path, platform_root):
+    """`platform_root` isolation is required here too (not just
+    program_root) -- otherwise an uninitialized program would still resolve
+    platform.db to the real developer's ~/.trialerror."""
+    empty_program = tmp_path / "never_initialized"
+    results = _run(["store_schema_version"], empty_program)
+    r = results["store_schema_version"]
+    for db_kind in ("platform", "ops", "knowledge", "jobs"):
+        assert r.details[db_kind]["status"] == "skip"
+    assert r.status == "pass"  # nothing to check yet is not a failure
+
+
+def test_xid_dangling_passes_on_clean_store(store, program_root):
+    populate_one_of_everything(store)
+    results = _run(["xid_dangling"], program_root)
+    assert results["xid_dangling"].status == "pass"
+    assert results["xid_dangling"].details["offenders"] == {}
+
+
+def test_xid_dangling_catches_planted_dangling_reference(store, program_root):
+    populate_one_of_everything(store)
+    # bypass the validated write API on purpose -- simulates a legacy
+    # import / a target row deleted after the XID was written.
+    with store.ops:
+        store.ops.execute(
+            "INSERT INTO thread(thread_id, title, created_ts, created_by_launch) VALUES (?,?,?,?)",
+            (new_id("THR"), "planted dangling", now(), "LNCH-does-not-exist"),
+        )
+    results = _run(["xid_dangling"], program_root)
+    r = results["xid_dangling"]
+    assert r.status == "fail"
+    assert any(k.startswith("thread.created_by_launch") for k in r.details["offenders"])
+
+
+def test_anchors_dangling_passes_on_clean_store(store, program_root):
+    populate_one_of_everything(store)
+    results = _run(["anchors_dangling"], program_root)
+    r = results["anchors_dangling"]
+    assert r.status == "pass"
+    assert r.details["doc_sha256_mismatches"] == 0
+
+
+def test_anchors_dangling_catches_planted_stale_anchor(store, program_root):
+    ids = populate_one_of_everything(store)
+    # simulate a document re-normalization: bump document.sha256 without
+    # touching the anchor stamped against the old hash.
+    with store.knowledge:
+        store.knowledge.execute(
+            "UPDATE document SET sha256 = ? WHERE doc_id = ?", ("f" * 64, ids["document"])
+        )
+    results = _run(["anchors_dangling"], program_root)
+    r = results["anchors_dangling"]
+    assert r.status == "warn"  # staleness is informational, not a hard failure
+    assert r.details["doc_sha256_mismatches"] == 1
+
+
+# ---------------------------------------------------------------------------
+# platform.db is shared across an account's programs (first seen live in the e2e,
+# whose smoke and corpus programs share one scratch platform): a launch that belongs
+# to ANOTHER program points at that program's session and must not read as dangling
+# here, while this program's own launch with a missing session still must.
+# ---------------------------------------------------------------------------
+
+
+def _ensure_program_id(program_root, fallback="PROG-xid-test"):
+    from pathlib import Path as _P
+
+    from trialerror.stores.checks import _program_id
+    from trialerror.util.doctor import DoctorContext as _Ctx
+
+    pid = _program_id(_Ctx(program_root=_P(program_root)))
+    if pid:
+        return pid
+    toml = _P(program_root) / "trialerror.toml"
+    existing = toml.read_text(encoding="utf-8") if toml.exists() else ""
+    toml.write_text("[program]" + chr(10) + "id = \"" + fallback + "\"" + chr(10) + existing, encoding="utf-8")
+    return fallback
+
+
+def _clone_launch(store, **overrides):
+    conn = store.platform
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(launch)").fetchall()]
+    row = conn.execute("SELECT * FROM launch LIMIT 1").fetchone()
+    assert row is not None, "populate_one_of_everything left no launch row"
+    values = {c: row[i] for i, c in enumerate(cols)}
+    values.update(overrides)
+    with conn:
+        conn.execute(
+            "INSERT INTO launch (" + ", ".join(cols) + ") VALUES (" + ", ".join("?" for _ in cols) + ")",
+            [values[c] for c in cols],
+        )
+
+
+def test_xid_dangling_ignores_another_programs_launch_on_a_shared_platform(store, program_root):
+    populate_one_of_everything(store)
+    _ensure_program_id(program_root)
+    _clone_launch(
+        store,
+        launch_id=new_id("LNCH"),
+        program_id="PROG-someone-else",
+        session_id="SESS-lives-in-the-other-programs-ops-db",
+    )
+    r = _run(["xid_dangling"], program_root)["xid_dangling"]
+    assert r.status == "pass", r.details
+    assert "launch.session_id" in r.details["scoped_columns"]
+
+
+def test_xid_dangling_still_catches_this_programs_launch_with_a_missing_session(store, program_root):
+    populate_one_of_everything(store)
+    pid = _ensure_program_id(program_root)
+    _clone_launch(store, launch_id=new_id("LNCH"), program_id=pid, session_id="SESS-does-not-exist")
+    r = _run(["xid_dangling"], program_root)["xid_dangling"]
+    assert r.status == "fail"
+    assert r.details["offenders"].get("launch.session_id -> ops.session") == 1

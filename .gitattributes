@@ -1,0 +1,12 @@
+# Line-ending normalization per LANE0_SANDBOX_RELOCATION_DESIGN.md v3 section 3 step 1 (D6/O6).
+# Written by lane L0-B (docs/reviews/lane0/IMPL_L0-B.md), 2026-09-05.
+# A v2-era draft with this same content was already sitting here from a stopped earlier attempt;
+# treated as untrusted input and rewritten (content is unchanged -- D6/O6 did not change from v2
+# to v3, only the transfer/exclude mechanics in the rest of section 3 did).
+# Left UNCOMMITTED here for the orchestrator to review + commit (see IMPL_L0-B.md's impact
+# report -- this repo's core.autocrlf=true has already kept the index at i/lf for everything, so
+# `git add --renormalize .` is measured to touch 0 files here; that's a fact about today's index,
+# not a claim that this file is pointless -- it still pins eol=lf/crlf explicitly going forward).
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf

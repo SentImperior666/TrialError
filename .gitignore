@@ -1,0 +1,32 @@
+# Python bytecode / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtualenvs (Windows and POSIX layouts both land here)
+.venv/
+.venv-*/
+venv/
+env/
+
+# Test / tooling caches
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Local program scaffolds and dashboard state
+stores/*.db
+stores/*.db-wal
+stores/*.db-shm
+.trialerror_dashboard/
+dashboard_logs/
+
+# `trialerror demo seed` default output. The README and GETTING_STARTED both
+# tell you to run it as `--dir ./demo-program`, which from the repo root
+# leaves a whole scaffolded program (stores, its own .platform ledger, raw
+# fixtures) sitting untracked.
+demo-program/

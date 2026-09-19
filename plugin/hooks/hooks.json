@@ -1,0 +1,36 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "trialerror hook session-start" }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^(Task|Agent)$",
+        "hooks": [
+          { "type": "command", "command": "trialerror hook spawn-gate" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^(Task|Agent)$",
+        "hooks": [
+          { "type": "command", "command": "trialerror hook post-task" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "trialerror hook stop-check" }
+        ]
+      }
+    ]
+  }
+}
