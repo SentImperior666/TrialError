@@ -121,9 +121,16 @@ def test_a_loader_failure_is_reported_as_a_warning_with_its_text(store, program_
     store.knowledge.commit()
     model = tmp_path / "m.gguf"
     model.write_bytes(b"GGUF")
+    # as_posix(), because a native Windows path interpolated into a TOML
+    # BASIC string is not the path: every backslash starts an escape, so
+    # "C:\Users\..." is a TOMLDecodeError, the config reads as {}, and the
+    # check then answers about the default backend instead of this one --
+    # a pass, not the warn under test. Forward slashes open the same file
+    # on both platforms.
     _write(
         program_root,
-        _OFFLOAD + f'\n[ingest.embed.query]\nbackend = "{LLAMA_CPP_BACKEND_NAME}"\nmodel_path = "{model}"\nnative_dims = 16\n',
+        _OFFLOAD
+        + f'\n[ingest.embed.query]\nbackend = "{LLAMA_CPP_BACKEND_NAME}"\nmodel_path = "{model.as_posix()}"\nnative_dims = 16\n',
     )
     module = types.ModuleType("llama_cpp")
 
