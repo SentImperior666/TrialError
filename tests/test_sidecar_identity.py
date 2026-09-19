@@ -287,6 +287,7 @@ def test_restart_always_fires_on_a_zombie_corpse(program_root, _reap_everything)
     assert status["previous_pid"] == zombie_pid and status["pid"] != zombie_pid
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGKILL is POSIX; signal.SIGKILL is absent")
 def test_a_pid_sigkill_cannot_clear_is_reported_not_waited_on(program_root, monkeypatch):
     """The bound itself: a pid that never disappears returns
     ``kill_timeout`` and keeps its state file, instead of hanging the verb."""
