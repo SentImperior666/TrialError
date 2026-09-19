@@ -38,6 +38,14 @@ from trialerror.sidecar.supervisor import (
 #: slow. ``sys.executable`` runs it, so there is no dependency on a shell.
 SLEEPER = "import time\nwhile True:\n    time.sleep(0.05)\n"
 
+#: ``sys.executable`` spelled for a TOML BASIC string. A native Windows path
+#: interpolated verbatim is not the path: every backslash starts an escape
+#: sequence, so ``"C:\\Users\\..."`` is a TOMLDecodeError and the config the
+#: test just wrote reads as empty. Forward slashes launch the same
+#: interpreter on both platforms. Only for text that goes INTO a config
+#: file; a command list built in Python keeps plain ``sys.executable``.
+EXECUTABLE_FOR_TOML = Path(sys.executable).as_posix()
+
 #: A child that exits at once -- what "the process died" looks like.
 QUITTER = "raise SystemExit(3)\n"
 
@@ -476,7 +484,7 @@ def test_the_doctor_check_warns_for_a_misconfigured_table(program_root):
 def test_the_doctor_check_passes_for_a_live_sidecar_with_no_health_url(program_root, monkeypatch):
     _write_config(
         program_root,
-        f'[sidecars.embed]\ncommand = ["{sys.executable}", "-c", "import time\\nwhile True: time.sleep(0.05)"]\n',
+        f'[sidecars.embed]\ncommand = ["{EXECUTABLE_FOR_TOML}", "-c", "import time\\nwhile True: time.sleep(0.05)"]\n',
     )
     config = {SIDECARS_TABLE: {"embed": {"command": [sys.executable, "-c", SLEEPER]}}}
     start_sidecar(program_root, "embed", config=config)
@@ -542,7 +550,7 @@ def test_the_group_is_auto_discovered():
 def test_the_cli_starts_status_and_stops(program_root):
     _write_config(
         program_root,
-        f'[sidecars.embed]\ncommand = ["{sys.executable}", "-c", "import time\\nwhile True: time.sleep(0.05)"]\n'
+        f'[sidecars.embed]\ncommand = ["{EXECUTABLE_FOR_TOML}", "-c", "import time\\nwhile True: time.sleep(0.05)"]\n'
         'restart = "always"\n',
     )
     started = _cli(program_root, "start", "embed")
@@ -561,7 +569,7 @@ def test_the_cli_starts_status_and_stops(program_root):
 def test_the_cli_accepts_the_name_as_a_flag_too(program_root):
     _write_config(
         program_root,
-        f'[sidecars.embed]\ncommand = ["{sys.executable}", "-c", "import time\\nwhile True: time.sleep(0.05)"]\n',
+        f'[sidecars.embed]\ncommand = ["{EXECUTABLE_FOR_TOML}", "-c", "import time\\nwhile True: time.sleep(0.05)"]\n',
     )
     started = _cli(program_root, "start", "--name", "embed", "--cmd-from-config")
     assert started["ok"] is True and started["result"]["name"] == "embed"
@@ -590,7 +598,7 @@ def test_the_cli_asks_which_sidecar_when_none_is_named(program_root):
 def test_the_cli_status_no_restart_flag_reports_without_restarting(program_root):
     _write_config(
         program_root,
-        f'[sidecars.embed]\ncommand = ["{sys.executable}", "-c", "raise SystemExit(3)"]\n'
+        f'[sidecars.embed]\ncommand = ["{EXECUTABLE_FOR_TOML}", "-c", "raise SystemExit(3)"]\n'
         'restart = "always"\n',
     )
     started = _cli(program_root, "start", "embed")
@@ -612,7 +620,7 @@ def test_the_cli_status_of_a_program_with_no_table_is_still_ok(program_root):
 def test_the_cli_warns_when_a_started_sidecars_health_is_not_up_yet(program_root):
     _write_config(
         program_root,
-        f'[sidecars.embed]\ncommand = ["{sys.executable}", "-c", "import time\\nwhile True: time.sleep(0.05)"]\n'
+        f'[sidecars.embed]\ncommand = ["{EXECUTABLE_FOR_TOML}", "-c", "import time\\nwhile True: time.sleep(0.05)"]\n'
         'health_url = "http://192.0.2.1:9/health"\nhealth_timeout_s = 0.05\n',
     )
     result = _cli(program_root, "start", "embed")
