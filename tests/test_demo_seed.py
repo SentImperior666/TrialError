@@ -104,9 +104,16 @@ def test_seeds_one_open_and_one_closed_session(seeded):
 
 def test_leaves_exactly_one_dangling_booking(rostore):
     """Backdated at seed time -- a booking made 'now' has an hour of TTL left
-    and is not dangling, however abandoned it looks."""
+    and is not dangling, however abandoned it looks.
+
+    "Dangling" is the narrower of the two past-TTL readings (FB-1 item F2):
+    past TTL with no evidence of life. The seed leaves exactly one of those
+    (under the CLOSED session) and exactly one of the other kind (under the
+    open session, whose hook_alive events say it is still running)."""
     budget = PANEL_BUILDERS["budget"](rostore)
     assert len(budget["dangling_bookings"]) == 1, budget["dangling_bookings"]
+    assert len(budget["past_ttl_session_alive"]) == 1, budget["past_ttl_session_alive"]
+    assert budget["dangling_bookings"][0]["session_id"] != budget["past_ttl_session_alive"][0]["session_id"]
 
 
 def test_budget_pools_are_tracked_with_real_spend(rostore):

@@ -50,8 +50,20 @@ trialerror = "trialerror.cli:main"
 # real-extension code path is exercised in the standard test run; `vec` is
 # the standalone extra for a production install that wants vector search
 # without pulling in pytest.
-dev = ["pytest>=8", "sqlite-vec>=0.1.0"]
+dev = ["pytest>=8", "sqlite-vec>=0.1.0", "numpy>=1.24"]
 vec = ["sqlite-vec>=0.1.0"]
+# numpy: the optional fast path for every brute-force cosine scan
+# (trialerror.util.vecmath, and the resident matrix in
+# trialerror.retrieve.vecmatrix that predates it). OPTIONAL on exactly the
+# sqlite-vec argument above, and for the same reason it is an extra rather
+# than a dependency: the plain-Python path is the DEFINITION of the answer
+# here -- vecmath's own agreement tests compare the two -- so numpy changes
+# the wall clock of an unbounded scan and nothing else, and a core install
+# that never runs one must not pay for it. Turned off in a program's
+# trialerror.toml with `[retrieve] numpy_fastpath = "off"` whatever is
+# installed. In `dev` as well, so the standard test run exercises the fast
+# path rather than only the fallback (same posture as sqlite-vec).
+fast = ["numpy>=1.24"]
 # M12 (trialerror/obs/): OTel GenAI span emission + a local Arize Phoenix trace
 # sink, both OPTIONAL by design (Section 4.5 / Section 12 M12 row's
 # "graceful NO-OP degradation when Phoenix/OTel deps are absent" -- core

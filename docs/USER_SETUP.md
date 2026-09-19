@@ -63,10 +63,25 @@ until you configure a program's `trialerror.toml` to point at them.
 | | `marker_single_exe` | Absolute path to your `marker_single` executable (the marker-pdf CLI). GPU-only — no CPU fallback is attempted; a non-zero exit surfaces as a job failure. |
 | | `marker_version` (optional) | Defaults to `"1.10.2"` |
 | | `marker_extra_args` (optional) | Extra CLI args passed through verbatim |
+| | `max_range_pixels` (optional) | **Page-range chunking.** The pixels of page raster ONE `marker_single` invocation may hold; a document bigger than that is run in ranges (`--page_range A-B`) and the pages are concatenated with absolute numbers. Default `64000000` — A4 at `bounded_dpi` is 3,562,596 px, so with a 1.1 safety factor that is **16 pages per range**; in bytes, `64,000,000 × 3` = 192 MB at 3 bytes per pixel, of which the safety factor reserves about a tenth. `0` means no bound: one invocation for the document, which is the behaviour a 540-page scan measured at ~58 GB of commit. **Every range is another `marker_single` process and another model load**, so a large-format scan at this default can be hundreds of invocations — raise the budget, or lower marker's render DPI, knowingly. **That byte figure is a LOWER bound on one component, not the invocation's memory**: it counts page raster only, and against a real run it under-states the process by two orders of magnitude. **Size it from a measurement.** As one machine's measurement (marker-pdf 1.10.2, a 16 GB-GPU laptop, ~1500 × 2300 pt pages planned at 192 dpi): a fixed **~14.5–16 GB per invocation** (models + CUDA context) plus **~0.22–0.25 GB per page**, whole-machine peak commit **34–35 GB** on 16-page ranges and **32.6 GB** on 8-page ones, at ~7–8 pages a minute including the reload. The procedure: run one small range, read the peak commit off the worker's per-range log line (`range_wall_s`, `peak_rss_bytes`) or the result manifest, derive `pages = (budget − fixed) / per-page`, then set `max_range_pixels = pages × page_pixels_at_planning_dpi`. Below about **30 pages a range the fixed cost dominates**, so very small ranges buy little memory and cost many reloads. See the operator guide's "OCR page-range chunking". |
+| | `bounded_dpi` (optional) | The DPI the planner estimates a page's pixel area at. Default `192`. It is the harness's own arithmetic and is **not** passed to marker, so it must be **at least** the DPI your stack really renders at: marker rasterises every page of a range at `highres_image_dpi` (marker 1.x default **192**, alongside a 96-DPI low-res pass) and holds them all at once. Page area goes as DPI squared, so planning at 96 against a 192 render is four times too generous and the bound stops bounding — which is how a real scan died with a `MemoryError` inside marker's own rasteriser. If you pass `--highres_image_dpi N` in `marker_extra_args` the planner uses `max(bounded_dpi, N)` by itself: raised, never lowered. |
+| | `page_range_numbering` (optional) | Which convention your marker release numbers `--paginate_output`'s `{N}` markers by under the range flag: `"absolute"` (the page's own index in the document — **what marker-pdf 1.10.x does**), `"relative"` (counted from the start of the invocation), or `"auto"` (the default), which resolves it once per document from the ranges' own output and refuses by name rather than guessing. Only needed if a document cannot decide itself, or to pin a release you already know. |
+| | `page_range_flag` (optional) | The flag your `marker_single` takes a page range on. Default `--page_range`. Probed once against `--help` before the first chunked run and refused by name if absent — a range flag that is silently ignored turns each of N ranges into a full-document run. A release that renames it is a one-line change here. |
 | `[ingest.embed]` | `backend = "qwen3-4b"` (or any name — anything other than `"fake"` routes to the real backend) | |
 | | `python_exe` | Absolute path to the Python interpreter **inside the venv that has the embedding model's dependencies installed** (torch/sentence-transformers) — this process itself never needs those installed |
 | | `module_dir` | Directory containing `embed_backend.py` (the `load_backend(name).embed_batch(...)` module this shells out to) |
 | | `dims` (optional) | Defaults to `2048` (the matryoshka-truncated dimension) |
+| | `session` (optional) | Defaults to `true`: ONE driver process per backend, started on the first batch and reused for every later one, so the model loads once instead of once per batch. `false` restores the one-process-per-batch protocol — an escape hatch for a driver that dislikes being long-lived, not a tuning knob. |
+| | `batch_size` (optional) | Defaults to `8` on a single-machine program. With `session = true` this is a GPU batch size, not a model-load budget, so raise it if the card has room. (The two-machine worker has its own `--batch-size`, default `64`.) |
+| `[ingest.embed.query]` | `backend` (optional) | **Only needed if the document side cannot embed HERE** — i.e. `[ingest.embed] backend = "offload"`, where the model runs on another machine. A search still has to embed the query in this process. `"same"` (the default) uses the document backend; **`"llama_server"`** talks to a long-lived `llama-server` sidecar on loopback and is the production choice on a CPU-only machine — it needs `tokenizer_model_path` (the GGUF whose *vocabulary* pre-truncates the input; opened `vocab_only`, so no model weights are loaded in this process) plus optional `url` (`http://127.0.0.1:8871`), `timeout_s` (60), `n_ctx` (**2049** — one wider than the geometry, because the server refuses a request of exactly its context length; the doctor line refuses a sidecar whose own `-c` is narrower than this, since that combination answers short queries and fails long ones mid-run), `native_dims` (2560), `query_prompt`, `sidecar_name` (which `[sidecars.<name>]` serves this URL, so a refusal names the verb that starts yours), and a `[sidecars.<name>]` table to start it with; `"llama_cpp"` runs the same GGUF encoder **in this process** with `model_path` (plus optional `n_ctx`, `n_threads`, `n_threads_batch`, `pooling`, `native_dims`, `query_prompt`) and is the reference path — leave `n_threads_batch` unset unless you know better than `min(n_threads, <cgroup CPU quota>)`, which is what it defaults to and what the difference between a 3-second and a 23-second query turned out to be — a positive value is honoured verbatim, and `0` or a negative one is refused rather than read as "unset" or handed to the library, where a non-positive thread count means "size the pool from every visible CPU"; `"offload"` states "nothing embeds here" explicitly. `model_key`/`dims` are INHERITED from `[ingest.embed]` and refused if you state them differently — a query vector from another key ranks your corpus in an order that means nothing. `trialerror doctor --only query_embed_backend_runnable` tells you whether yours works, and `trialerror query search` says in its envelope's warnings when it had to fall back to the full-text tier. |
+| `[sidecars.<name>]` | `command` (required) | **The argv of a process this program needs RUNNING** (today: the embedding server the `llama_server` query backend talks to). A LIST of strings, never a string — a string would have to be split by a shell, and a config that reaches a shell can reach a pipeline. `trialerror sidecar start <name>` is the only thing that reads it; there is no `--cmd` flag anywhere. |
+| | `env` (optional) | A table of environment variables merged over the current ones — a vendored runtime usually needs `LD_LIBRARY_PATH` here. Only the KEYS are ever reported back. |
+| | `cwd` (optional) | Working directory for the process (default: the program root). |
+| | `health_url` (optional) | Probed by `sidecar status` and the `sidecar_alive` doctor check; a 2xx is healthy. Without it, the only thing either can report is that the pid is alive — which is what they say, rather than calling it healthy. `health_timeout_s` (5) bounds the probe. |
+| | `restart` (optional) | `"never"` (the default) or `"always"`. `"always"` means **`sidecar status` restarts it if it finds it dead** — supervision here is a poll, so the supervisor is whatever already runs on a loop and calls `status`; nothing claims to watch from a process that has exited. |
+| `[ingest.quality]` | the four bounds (all optional) | **Extraction quality — a health signal, not a gate.** `glued_token_rate_max` (0.10), `unusable_chars_max` (200), `terminator_density_min` (1.0), `chars_per_page_cv_max` (1.5) bound the four measures a document's extracted text is scored on; `min_tokens` (200) is the size floor: a document shorter than that is measured and reported (`below_min_tokens`) but never counted `suspect`, because three of the four measures are rates whose denominator is the document's own text and a twelve-token note trips them by arithmetic rather than by bad extraction (`0` turns the floor off; it does not affect `refuse_below`). `worst_n` (10) sizes a report and `sample` (50) / `seed` (0) size and fix the sample the `extraction_quality_suspect` doctor check draws each run (`sample` is clamped to at least 1 -- the check samples by design, and "measure everything" is spelled `trialerror ingest quality --all`, not `sample = 0`/`-1`). Nothing here refuses anything: read the numbers with `trialerror ingest quality --doc-id ...` or `--all --worst 10`. See the operator guide's "Extraction quality" section for each measure's denominator. |
+| | `refuse_below` (optional) | **Absent by default, and the only knob here that can stop an ingest.** An inline table of the same bound names (e.g. `refuse_below = { glued_token_rate_max = 0.35 }`); only the measures you name are compared, and an empty table reads as unconfigured. When a document's text is worse than a stated bound the normalize/OCR stage writes `document.status = 'failed'`, does not enqueue the chunk stage, and records the numbers and reasons (`ingest status --doc-id` reads them back). Its elements and archived text are kept so you can see what was refused, and `ingest rechunk`/`re-embed` are refused for it (they would re-derive exactly what the refusal withheld); relax the bound and re-run the extraction stage, or fix the route and re-ingest. A `trialerror.toml` that cannot be parsed fails the job rather than quietly not refusing, and so does a bound written as something that is not a number (`terminator_density_min = "eight"`) -- this one value is never replaced by a default. |
+| `[budget]` | `quota_max_age_s` (optional) | **How old the plan-quota capture may be before a booking refuses against it.** Default `900` (15 minutes). The capture is written by the statusLine script on a Claude Code UI tick, so the reading goes stale exactly while a session sits idle — which is also when it is most likely to be consulted before sizing a booking. `trialerror budget quota` reports the standing and the age; `trialerror doctor --only quota_capture_stale` warns; and **both booking surfaces refuse** on a stale reading — `trialerror budget book` and the `book_launch` MCP tool — unless `--allow-stale-quota` / `allow_stale_quota` is passed, which books anyway and records the reading it overrode on the launch. Nothing captured is *not* stale: a program that has not wired the statusLine has no reading to be out of date, and refusing its bookings would make an optional feed mandatory by accident (screenshot snapshots remain the ground truth either way). `--fresh-within-s` on `budget quota`/`budget check` overrides this for one reading. |
 
 Example:
 
@@ -90,11 +105,28 @@ module_dir = "/home/you/research/tools/embeddings_local"
 **"Absolute" means absolute for the platform actually running the command.** `pathlib`
 decides that against the host, so a `C:/...` value read on Linux has no drive, reads as
 *relative*, and gets joined onto the program root — a real directory, created without
-complaint, in the wrong place. Every `[paths]` key (`stores_dir`, `archive_dir`,
+complaint, in the wrong place. Every `[paths]` key (`stores_dir`, `index_dir`, `run_dir`, `archive_dir`,
 `law_digest_path`, `handoffs_dir`, `requests_path`, `memory_dir`, `ingest_roots`) now
 raises a `ConfigError` naming the mismatch rather than resolving it silently; the three
 `[ingest.*]` paths above are handed straight to the OS, so a wrong-platform value there
 surfaces as a job failure on a missing executable instead.
+
+**A `handoffs_dir` outside the program root is refused.** `session close` renders the
+handoff AND marks the session closed, so a `[paths].handoffs_dir` that resolves outside
+this program's root would write one program's close into another program's tree. That is
+what a `trialerror.toml` copied from another program gets wrong, so it is an opt-in:
+
+```toml
+[paths]
+handoffs_dir = "/srv/research/closes"   # absolute, outside this program
+
+[session]
+handoffs_dir_outside_root = true        # required for the line above; default false
+```
+
+Without the flag, `session boot` and `session close` both refuse with
+`handoffs_dir_outside_root` and nothing is written. Leave `handoffs_dir` relative (the
+default, `handoffs`) and the key never applies.
 
 **Why "your existing" tools**: the design ports the operator's own already-proven local
 `marker_ocr`/`embeddings_local` tooling rather than reimplementing OCR or embedding —
@@ -103,9 +135,11 @@ module for a local Qwen3 embedding model, that installation is out of scope for 
 harness and needs to happen first, on its own terms.
 
 **Status honestly**: neither real backend has been run against a live GPU on this build —
-`RealMarkerOcrBackend` has a test that self-skips without `marker_single` on PATH;
-`RealQwenEmbedBackend` has no execution coverage beyond argument-construction. The first
-real ingest you run with these configured *is* the live verification.
+`RealMarkerOcrBackend` has a test that self-skips without `marker_single` on PATH.
+`RealQwenEmbedBackend`'s *protocol* is covered end to end against a stand-in driver that
+speaks it (startup count, per-request timeout, crash-then-restart, shutdown), but no test
+here has ever loaded the actual model. The first real ingest you run with these configured
+*is* the live verification of the model half.
 
 ## 1a. Two-machine split — the program on one box, the GPU on another
 
@@ -191,14 +225,31 @@ Host te-offload
 ### Running it
 
 ```powershell
-trialerror offload worker --remote te-offload --program-root C:/path/to/dev-program
+trialerror offload worker --remote te-offload --backend-config-root C:/path/to/dev-program
 ```
 
+`--backend-config-root` is the root whose `trialerror.toml` names your local marker/Qwen3
+installs; the queue comes from `--remote` (or `--queue-root` for a queue on this same box), never
+from that root. `--program-root` is still accepted as a deprecated alias for it.
+
 It claims each queued job, pulls the inputs, runs marker/Qwen3 locally, pushes the outputs,
-publishes, and exits with **"Queue empty - safe to switch DEV off"**. Add `--stay` to keep
+publishes, and exits with **"Queue empty - safe to switch DEV off"**. `trialerror offload doctor
+--program-root <root>` is the pre-flight: it says which root was read, what each stage names, and
+whether it resolves here. Add `--stay` to keep
 polling. A second copy refuses immediately (a single-instance lock — two workers would fight over
 the GPU). Ctrl+C returns the current claim; closing the lid cannot, which is why the queue side
 returns any claim whose heartbeat has been silent for 60 minutes (`trialerror offload reclaim`).
+
+**The worker holds the model.** One embedding-driver process is started on the first batch
+and reused for every batch of every job in the run — the model is loaded once, not once per
+batch. (It used to be once per batch: a 217-chunk document at `--batch-size 8` meant 28
+loads of a multi-gigabyte model to do 28 batches of real work.) So `--batch-size` is now a
+GPU batch size and defaults to **64**; lower it only if the card runs out of VRAM. In
+`--format text` output you should see `driver started` **once** near the top and a
+`ran in <n>s` line per job — that pair is how you confirm from the log alone that the model
+is not being reloaded. A second `driver started` means the driver crashed and the next job
+restarted it; the failure line just above it carries the driver's own stderr. The driver is
+closed when the run ends, so nothing keeps holding the GPU after the queue-empty message.
 
 On the queue side, two commands belong in whatever loop already runs `trialerror jobs tick`:
 
@@ -219,6 +270,16 @@ counted in the marker as `offload_attempts`, and after three of them the job lan
 split is deliberate: an absent machine is not a failure, and a document that crashes marker every
 single time must stop consuming GPU minutes.
 
+Terminal is not permanent, though — it is just *terminal until a human decides otherwise*. Once
+you have fixed whatever the GPU was choking on and deployed it to the worker,
+**`trialerror jobs retry <job_id> --reason "<what was fixed>"`** on the sandbox puts the marker
+back in `pending/` with `offload_attempts` reset and the ledger row back to `pending` with its
+own attempts reset.
+The failed attempt is kept, not deleted: `offload/failed/<job_id>/` moves to
+`offload/failed/_retried/<job_id>.<stamp>/`, which `offload status` counts under `retried` and the
+`offload_failed` doctor check does not fire on. See the operator guide's *Detached jobs* section
+for the refusals and the two-machine recipe.
+
 ### Fail-closed (why `require_real_backends = true` is worth setting)
 
 The failure this guards against is silent. A one-character typo in a table name
@@ -235,6 +296,53 @@ retrieval — and nobody notices until search quality is quietly wrong, months o
   quarantined in `offload/failed/` instead of being folded into the record;
 - `trialerror doctor --only fake_backend_rows` finds fake rows already in a program that declared
   it would not accept them.
+
+**Per stage, since FB-1 item F5.** `[ingest.ocr] require_real` and `[ingest.embed] require_real`
+each default to the global `[ingest] require_real_backends`, so nothing written before these keys
+existed resolves any differently — and a program with a real embedder and no OCR stack (or the
+reverse) no longer has to choose between refusing every ingest and losing the guarantee on the
+stage it *can* run:
+
+```toml
+[ingest]
+require_real_backends = true   # the program-wide declaration
+
+[ingest.ocr]
+backend = "fake"
+require_real = false           # ...except this stage, deliberately
+```
+
+The key lives inside the stage's own table, so a stage whose table is absent cannot be exempted
+that way — an absent table is itself one of the two refused conditions. The query-side
+`[ingest.embed.query]` table follows the EMBED stage's resolved requirement, not the global flag.
+`fake_backend_rows` follows the same resolution: fake embeddings fail only where the embed stage is
+required to be real, fake OCR only where the OCR stage is, and each half of the message names the
+key that decided it.
+
+### `[ingest] fulltext_before_embed` — search before the GPU run
+
+```toml
+[ingest]
+fulltext_before_embed = true    # the DEFAULT; set false for the old chunk -> embed -> index chain
+```
+
+The pipeline runs chunk → embed → index, so on a program whose embed stage is parked for a
+GPU window — `backend = "offload"`, or a queue held until the machine is free — nothing
+ingested since had any full-text search: the text was in the store and the one stage that
+puts it in `chunk_fts` was queued behind a stage that needs hardware.
+
+With this on, the `chunk` handler enqueues a **full-text-only** `index` job
+(`JOB-ingest-<doc>-index-fulltext`) beside the `embed` one. It writes `chunk_fts` and the
+tantivy index and touches no vector table, no `emb` row and no model — which is what makes
+it safe to run before a single embedding exists — and it does **not** advance
+`document.status`, because a row reading `indexed` with no vector would be the exact skew
+the ingest doctor checks exist to catch. The vector side of `index` still runs after
+`embed`, under its own model-keyed job. `trialerror doctor --only fulltext_index_stale` is
+what reports the full-text side; `trialerror ingest reindex-fulltext` is the repair.
+
+Set it `false` only if you want the pre-FB-6 ordering back; there is no cost to leaving it
+on, since the full-text pass is idempotent and the real `index` job re-runs over the same
+chunks without duplicating a row.
 
 ## 2. Optional: local Phoenix trace sink
 
@@ -707,6 +815,213 @@ agent that fetched it.
   are served **unfenced** by the retrieval layer, consistent with the internal-research
   posture. Tag commercial sources with `--license-tier commercial_restricted` and the
   existing ≤20-word excerpt fence applies to them.
+
+## 3g. Optional: the judged novelty screen as a configurable instrument (`[lens.novelty]`)
+
+Skip this section if your rounds judge records against the inventory and the corpus with
+the design's own label vocabularies — that is the default and needs no config at all.
+
+It exists for the other shape. A round that judges a **literature** rather than a mechanic
+wants the judge to see the nearest **archive rows** (prior rounds' candidates and request
+rows) instead of register rows, to label them in its own words, and to seed plants it
+defines. Every knob below has a command-line flag that overrides it, so a one-off round
+needs nothing here; the config is for the rounds a programme runs the same way every time.
+
+```toml
+[lens.novelty]
+judged_sets = ["R2", "R4"]          # which reference sets the judge is shown and labels
+labels_file = "rounds/labels.json"  # this round's own label vocabularies + canonical mapping
+plants_file = "rounds/plants.json"  # the plants this round seeds
+batch_fail_on = ["area"]            # which plant kinds' misses FAIL a batch
+```
+
+| Key | What it means | Default |
+|---|---|---|
+| `judged_sets` | The reference sets the judge is shown and returns a label for. `R2` is the archive of idea rows, `R3` the inventory, `R4` the corpus. R5 is evidence for the R4 label, not a labelled set of its own, and rides inside that bundle. An undeclared set is **absent** from every envelope, not empty, and no verdict row is written for it. | `["R3", "R4"]` |
+| `labels_file` | A JSON file of this round's own label vocabularies and their canonical mapping onto the design's fixed ones. The judge is shown the round's spellings; each verdict row stores the round label **and** `label_canonical` beside it. | none — the design's own vocabularies |
+| `plants_file` | The plants this round seeds, on top of (or instead of) the harness battery. | none |
+| `batch_fail_on` | Which plant kinds' misses fail the batch. A miss on any other kind is reported and counted, never hidden, and does not fail. | `["inventory"]` |
+
+A relative path is read **against the program root**, not the current directory: a config
+row is a property of the program, and a round run from two different shells has to read the
+same file. The matching flags are `--judged-sets`, `--labels-file`, `--plants-file` and
+`--batch-fail-on`; each one wins over its config row.
+
+The labels file, in full — every key optional:
+
+```json
+{
+  "R2": {"labels": ["requested", "variant", "new"],
+         "canonical": {"requested": "same", "variant": "variant", "new": "new-mechanism"}},
+  "R4": {"labels": ["present", "adjacent", "absent"],
+         "canonical": {"present": "stated", "adjacent": "adjacent", "absent": "absent"}},
+  "extra": {"seed": ["on-topic", "off-topic"]},
+  "unscreenable": "unscreenable"
+}
+```
+
+**The canonical mapping must be total over the round's labels, and must land inside the
+design's own vocabulary for that set.** Both are refusals by name. An unmapped label would
+sit in a verdict row and be absent from every report of it; a canonical value no reader has
+a column for defeats the one thing the mapping is for. A declared set the file says nothing
+about keeps the design's vocabulary under an identity mapping, so a round can re-spell one
+set without restating the others. A block for a set the round did **not** declare is a
+refusal by name rather than a block quietly dropped: a set-name typo would otherwise leave
+the judge on the design's words for the set it really is shown. The file is hashed onto the
+batch, and recording labels against a vocabulary whose hash disagrees with the batch's is
+refused — the judge answered in the vocabulary it was shown. The hash is computed over the
+declared sets, so a labels file is resolved against the **batch's** own sets at
+`--record-verdicts` time.
+
+`unscreenable` — the round's word or the design's — is a valid answer for **every declared
+set**, including one whose own `labels` list never offers it: the word says the record states
+no mechanism to compare with anything, which is a fact about the record rather than a claim
+about a reference set. It is scored as a non-catch for a plant, counted in κ as its own
+category, and written with `label_canonical = unscreenable`. What the judge is SHOWN is still
+each set's own list, so no round's envelopes change.
+
+`extra.seed` re-spells the seed-work vocabulary; the **first** label is the on-topic one
+(the same "strongest first" convention the design's own label tuples use). `unscreenable` is
+the round's own word for a record with no statable mechanism, and it is what the seed-count
+report looks for. A round that re-spells it must also **list that word in the `labels` of the
+set it belongs to** (mapped onto `unscreenable`) — the word is only ever read back off an
+answer, so one no declared set offers the judge would be refused at `--record-verdicts` and
+the seed-count report would never fire. That is a refusal when the file loads. The design's
+own spelling stays acceptable whatever the sets offer (the corpus vocabulary never offers it).
+
+The plants file takes one lenient key, `extra`: any keys at all (`literature`, `unlock`,
+`seeds`, …), rendered into a single `record.extra_text` field the judge sees, so a round may
+put its own three fields on a plant in one place instead of folding them into the statement
+by hand. **A round's own intake records take the same key**, rendered by the same function
+into the same one envelope field (`idea.extra`, knowledge schema v11) — the envelope's shape
+is what keeps a plant indistinguishable from a record, and a key one of them could not hold
+was a tell.
+
+A plant also takes two optional bookkeeping keys, neither of which a judge ever sees.
+**`class`** is the round's own class for the plant (a `present`/`adjacent`/`absent` battery,
+say): free text up to 40 characters, which groups the calibration card's `by_class` table.
+It is NOT `kind` — `kind` says how the plant was BUILT and is one of `area`, `paraphrase`,
+`inventory`, `custom`, and a file that spells a class there is refused once, naming every
+offender and the four kinds. **`batch`** seeds a plant into one judged batch only: a plant
+that declares one rides in the batch whose `--batch-id` matches it, one that declares none
+rides in every batch as it always did, and a `--batch-id` no plant declares injects none of
+the batched ones and says so in the batch's `warnings`. `--pair-ratings` is lenient the same way — a `pair_id` or a `why` beside
+`a`/`b`/`human` is ignored and named in the calibration card's `warnings`. And an
+`archived` intake row may omit its `probe` (or pass `null`); a candidate may not.
+
+Bad values are `labels_file_refused` / `plants_file_refused` envelopes naming the offending
+label or plant, before the screen embeds a single statement.
+
+**Two flags with no config row.** `--reembed-archive` re-embeds every R2 archive row instead
+of reading the per-model idea-vector cache (`vec_ideas`, knowledge schema v10): the cache is
+keyed by the statement's hash, so a changed statement is re-embedded anyway and the flag is
+for the case that key cannot see — a backend whose weights or pooling changed under an
+unchanged model key. `--batch-id` names the batch a recording run reads, and that batch's
+own `judged_sets` are then the authority: `--record-verdicts` and `--record-calibration`
+need no `--judged-sets` at all, and one that disagrees with the batch is refused by name.
+
+The full operator-facing model — the plants file's fields, the archive round, and
+calibration mode — is in `docs/OPERATOR_GUIDE.md`, "Ideation rounds".
+
+## 3i. Optional but recommended: the numpy fast path (`[retrieve] numpy_fastpath`)
+
+```bash
+pip install -e ".[fast]"     # or just: pip install numpy
+```
+
+Four places in this codebase score vectors by hand: the retrieval tier's cosine and ranking,
+the lens stratifier's distance and candidate scoring, the document-vector pooler, and the
+novelty screen's corpus, archive and inventory nearest-neighbour passes. Every one of them is
+a Python loop over 2048-dimension vectors — fine on the few hundred rows a full-text
+prefilter hands it, and hopeless on the hundred thousand an unbounded pass does. A 36-subject
+calibration batch over a 108k-chunk corpus ran for more than ten minutes, almost all of it
+spent building per-float Python objects rather than doing arithmetic.
+
+With numpy importable, those scans decode the stored vectors straight out of their BLOBs with
+`numpy.frombuffer` and score them in blocked float64 matmuls. On a 20,000 × 256 fixture the
+whole BLOB → decode → score path measured **17× faster** (1391.7 ms → 81.5 ms); the scan
+alone over an already-resident matrix, 26×.
+
+**Which number applies to which scan, because the gap between them is the whole design
+point.** The 17× belongs to a caller that stays in the buffer from `numpy.frombuffer` onward
+— in this tree that is `lens screen --baseline --corpus-mode vector`, which reads the whole
+vector table once per pass as a matrix, and `search(mode="vector")` through the resident
+matrix cache. A caller that hands the scan a list of Python lists still pays for building the
+array and measures about 3×: the cost of an unbounded scan is not the arithmetic, it is
+materialising two hundred million Python floats to do it with. A bounded scan — anything a
+full-text prefilter has already cut to a few hundred rows — stays on the plain path by
+design and measures nothing either way.
+
+**numpy is not a dependency of this package and is not becoming one.** It is imported lazily,
+every entry point works without it, and the plain-Python path is the DEFINITION of the
+answer — `trialerror/util/vecmath.py`'s own tests compare the two rather than pinning a
+number either of them happens to produce. Where identity actually matters (`top_k`, i.e. any
+ranking), numpy is used only to NARROW: it scores every row, takes a superset of the *k*
+best, and then computes the returned ids, their order and their scores with the plain cosine.
+Same answer, byte for byte, whether or not numpy is installed.
+
+```toml
+[retrieve]
+numpy_fastpath = "auto"   # default when the key is absent: numpy when importable
+numpy_fastpath = "off"    # never numpy, whatever is installed
+```
+
+| Value | What happens |
+|---|---|
+| `auto` (default) | numpy when it imports; the plain path when it does not, or when its import raises |
+| `off` | the plain path, always |
+
+`off` exists so that a program which sees something it cannot explain has one line to turn
+the whole thing off with. `TRIALERROR_NUMPY_FASTPATH` sets the same thing for one process.
+An unrecognised value is noted once on stderr and read as unset — a typo in a performance
+knob must not stop a program answering.
+
+Memory is bounded by construction and does not grow with the corpus: a scan block holds at
+most 20,000 rows AND at most 32 MiB of packed float32 source, whichever is smaller, so a
+three-million-row table is scanned in the same ~64 MB a hundred-row one would need a fraction
+of (41 MB at 256 dimensions). That figure is the SCAN's own scratch, and
+`tests/test_util_vecmath_memory.py` measures it rather than trusting this sentence. What a
+caller then holds is its own: a decoded matrix is `rows × dims × 4` bytes resident by
+definition, which is what a matrix is and still an order of magnitude below the per-float
+Python objects it replaces.
+
+## 3h. Optional: the duplicate-candidate gate (`[lexicon]`)
+
+Skip this section unless your term store has grown past a few thousand names. The gate is
+calibrated to open **hundreds to low thousands** of pending duplicate candidates on a store
+of that size, and every knob below has a default that needs no config at all.
+
+```toml
+[lexicon]
+duplicate_coverage_min = 0.5              # rule 1e: how much of the shorter name the shared rare words must cover
+name_in_text_requires_informative = true  # rule 1e: a contained name needs a rare word of its own
+```
+
+| Key | What it means | Default |
+|---|---|---|
+| `duplicate_bm25_floor` | The first stage's score line — a trigram hit scoring above it is not looked at. | `-0.5` |
+| `duplicate_informative_token_fraction` | A whole word is **informative** when fewer than this share of the store's terms carry it. Computed live from the store at scan time, never a baked word list: what counts as a generic category word is a property of the corpus you imported. | `0.02` |
+| `duplicate_informative_token_min_df` | The floor under that fraction, so it does not degenerate on a small store (2% of 60 terms is 1.2, which no shared word could clear). | `3` |
+| `duplicate_coverage_min` | **Rule 1e.** The shared informative tokens must cover at least this share of the **shorter** name's informative tokens before the pair is opened on the token route. Compared with `>=`, so a two-word name sharing one of its two rare words passes at exactly half. `0.0` turns the rule off and restores the previous behaviour; a value outside `[0, 1]` is a percentage written where a fraction goes and falls back to the default rather than silently closing the route. | `0.5` |
+| `name_in_text_requires_informative` | **Rule 1e.** A name found written whole inside the other side's text qualifies by containment only if it carries an informative token of its own — a name made of a function word plus the family word ("the reading") sits inside half the glosses in any store, which is a fact about prose rather than evidence about two terms. `false` restores the previous behaviour. | `true` |
+| `duplicate_similarity_floor` | The whole-name trigram-similarity line the third route uses — the route that catches a misspelling or a run-together compound, which shares no whole word *because* it is nearly the same string. | `0.5` |
+
+**Both rule-1e keys tighten.** A program that sets neither behaves as it did plus the new
+rule: strictly fewer candidates, never more. Setting the two to `0.0` / `false` reaches the
+old behaviour exactly, which is how a change like this stays auditable against what it
+replaced.
+
+**Changing any of these only affects candidates opened afterwards** unless you re-scan:
+
+```bash
+trialerror term scan --rescan --dry-run --by-launch <LNCH-...>   # reports, writes nothing
+trialerror term scan --rescan --by-launch <LNCH-...>
+```
+
+The dry run reports `withdrawn_count`, `withdrawn_by_coverage` and the values actually in
+force, so a sweep can be read before it is applied. It re-asks the gate only of pending
+system-opened rows nobody has touched — a candidate somebody has ruled on is never taken
+back. See `docs/OPERATOR_GUIDE.md`, "The duplicate-candidate gate".
 
 ## 4. GPU and live-Claude-Code steps — need your real machine
 

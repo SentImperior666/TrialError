@@ -36,8 +36,11 @@ __all__ = [
     "StubOcrBackend",
     "StubEmbedBackend",
     "StubDevBackends",
+    "ClosableStubEmbedBackend",
+    "ControlTransport",
     "write_offload_toml",
     "queue_one",
+    "queue_chunks",
     "publish_stub_result",
 ]
 
@@ -57,11 +60,16 @@ class StubOcrBackend:
     name = STUB_OCR_NAME
     version = STUB_OCR_VERSION
 
-    def __init__(self, *, fail_on: str | None = None):
+    def __init__(self, *, fail_on: str | None = None, before_run: Any = None):
         self.fail_on = fail_on
         self.calls = 0
+        #: The same determinism seam ``StubEmbedBackend.before_batch`` is, for
+        #: the stage whose unit is the whole job (C-0097 D6).
+        self.before_run = before_run
 
     def run(self, *, input_path: Path, work_dir: Path) -> OcrResult:
+        if self.before_run is not None:
+            self.before_run(self.calls)
         self.calls += 1
         raw = input_path.read_text(encoding="utf-8", errors="replace")
         if self.fail_on is not None and self.fail_on in raw:
@@ -77,20 +85,53 @@ class StubOcrBackend:
 
 class StubEmbedBackend:
     """Deterministic ``STUB_DIMS``-dimensional vectors, derived from the
-    text so a wrong-order result is detectable."""
+    text so a wrong-order result is detectable.
 
-    def __init__(self, *, model_key: str = STUB_MODEL_KEY, dims: int = STUB_DIMS):
+    ``before_batch`` is the seam the C-0097 control tests need and the reason
+    they contain no sleeps: a worker's cooperative checkpoint can only act on a
+    control word the heartbeat thread has already seen, so a test that wants a
+    pause to land at a KNOWN batch boundary has to be able to block the model
+    until the word is in. The hook is called with the batch index before each
+    call, exactly like ``FakeEmbedBackend``'s own documented ``delay_s`` test
+    hook -- a seam for determinism, not a behaviour."""
+
+    def __init__(
+        self,
+        *,
+        model_key: str = STUB_MODEL_KEY,
+        dims: int = STUB_DIMS,
+        before_batch: Any = None,
+    ):
         self.model_key = model_key
         self.dims = dims
         self.batches: list[int] = []
+        self.texts_seen: list[str] = []
+        self.before_batch = before_batch
 
     def embed_batch(self, texts: Sequence[str], *, kind: str = "document") -> list[list[float]]:
+        if self.before_batch is not None:
+            self.before_batch(len(self.batches))
         self.batches.append(len(texts))
+        self.texts_seen.extend(texts)
         out = []
         for t in texts:
             seed = float(sum(ord(c) for c in t) % 97) / 97.0
             out.append([seed + i / 100.0 for i in range(self.dims)])
         return out
+
+
+class ClosableStubEmbedBackend(StubEmbedBackend):
+    """A stub with the ``close()`` a resident driver has, so D9's kind-switch
+    unload can be OBSERVED rather than assumed: the real thing's ``close``
+    exits a subprocess and frees VRAM, which a test cannot see, so the thing
+    worth proving is that the policy calls it at the right moment."""
+
+    def __init__(self, **kwargs: Any):
+        super().__init__(**kwargs)
+        self.closes = 0
+
+    def close(self) -> None:
+        self.closes += 1
 
 
 class StubDevBackends:
@@ -110,6 +151,119 @@ class StubDevBackends:
 
     def embed(self) -> Any:
         return self._embed
+
+
+class ControlTransport:
+    """A control-aware fake shell (C-0097 acceptance A): every verb of
+    :class:`trialerror.offload.transport.LocalTransport`, plus a scripted
+    ``heartbeat`` reply.
+
+    Why a wrapper rather than writing ``CONTROL.json`` and letting
+    ``LocalTransport`` read it: the control word's TIMING is the thing under
+    test. A test that wants "paused at the third batch, resumed once the worker
+    has reported ``paused`` once" has to decide the word per beat, and a file
+    on disk can only say what the word is, not when it changes. ``word_for``
+    receives ``(beat_number, job_id, payload_dict_or_None)`` and returns one of
+    ``none``/``pause``/``resume``/``stop``.
+
+    Everything else delegates, so the verb/id gate, the claim semantics and the
+    payload refusals are still the real ones -- including the progress file the
+    real wrapper would write, which is what the dashboard tests then read.
+    """
+
+    def __init__(self, root: Any, *, worker_id: str = "dev", word_for: Any = None):
+        import threading
+
+        from trialerror.offload.transport import LocalTransport
+
+        self.inner = LocalTransport(root, worker_id=worker_id)
+        self.root = self.inner.root
+        self.worker_id = worker_id
+        self.word_for = word_for
+        #: ``(job_id, payload)`` per beat, in order -- the whole observability
+        #: surface a test needs to assert "kept heartbeating while paused".
+        self.beats: list[tuple[str, dict | None]] = []
+        self._cond = threading.Condition()
+
+    # -- the six verbs that are unchanged ---------------------------------
+    def list_jobs(self) -> list[str]:
+        return self.inner.list_jobs()
+
+    def claim(self, job_id: str) -> dict:
+        return self.inner.claim(job_id)
+
+    def pull(self, job_id: str) -> bytes:
+        return self.inner.pull(job_id)
+
+    def push(self, job_id: str, data: bytes) -> None:
+        self.inner.push(job_id, data)
+
+    def publish(self, job_id: str) -> None:
+        self.inner.publish(job_id)
+
+    def return_job(self, job_id: str) -> None:
+        self.inner.return_job(job_id)
+
+    # -- the one that carries the control channel -------------------------
+    def heartbeat(self, job_id: str, *, progress: bytes | None = None) -> str:
+        decoded = json.loads(progress.decode("utf-8")) if progress else None
+        self.inner.heartbeat(job_id, progress=progress)
+        with self._cond:
+            self.beats.append((job_id, decoded))
+            self._cond.notify_all()
+        if self.word_for is None:
+            return "none"
+        return self.word_for(len(self.beats), job_id, decoded)
+
+    # -- assertions a test would otherwise re-derive ----------------------
+    def states(self) -> list[str]:
+        return [(p or {}).get("state") for _job, p in self.beats]
+
+    def beats_for(self, job_id: str) -> list[dict | None]:
+        return [p for jid, p in self.beats if jid == job_id]
+
+    def wait_for_beats(self, job_id: str, count: int, timeout: float = 5.0) -> bool:
+        """Block until ``count`` beats for ``job_id`` have been recorded.
+
+        This is the happens-before a control test needs, and it is why this
+        module contains no sleeps. The worker's heartbeat thread runs
+        ``beat -> observe -> wait -> beat``, strictly in order, so by the time
+        the Nth beat is RECORDED here the (N-1)th word has certainly been
+        applied to the worker's control flag. A test that waits for two beats
+        and then lets the model run is therefore guaranteed to hit its next
+        checkpoint with the first word in hand -- no interval to tune, nothing
+        that gets flakier on a slower machine."""
+        deadline_cond = lambda: len(self.beats_for(job_id)) >= count  # noqa: E731
+        with self._cond:
+            return self._cond.wait_for(deadline_cond, timeout=timeout)
+
+
+def queue_chunks(root: Path, job_id: str = "JOB-embed-1", *, count: int = 12) -> dict:
+    """One pending EMBED marker carrying ``count`` distinct chunks.
+
+    Distinct texts on purpose: the resume acceptance ("no unit repeated, none
+    skipped") is only checkable if every unit is identifiable, and
+    :class:`StubEmbedBackend` records every text it was handed."""
+    from trialerror.offload import protocol
+
+    rows = [{"chunk_id": f"CHK-{i:03d}", "text": f"chunk body {i}"} for i in range(count)]
+    payload = "".join(json.dumps(r) + "\n" for r in rows).encode("utf-8")
+    return protocol.queue_marker(
+        root,
+        job_id=job_id,
+        stage="embed",
+        doc_id="DOC-test",
+        expect={
+            "stage": "embed",
+            "model_key": STUB_MODEL_KEY,
+            "dims": STUB_DIMS,
+            "chunk_count": count,
+            "outputs": ["vectors.jsonl"],
+            "input_name": "chunks.jsonl",
+        },
+        config_hash="cfg-hash",
+        inputs=[("chunks.jsonl", payload)],
+    )
 
 
 def write_offload_toml(

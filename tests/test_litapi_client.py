@@ -96,7 +96,38 @@ def test_lookup_doi_transport_error_from_one_provider_is_recorded_as_a_failure()
 
     assert result.record.title == "T"
     assert result.providers_succeeded == ["semanticscholar"]
+    # a bad-HTTP-status ProviderTransportError (status_code set, host/scheme
+    # left at their None default) keeps the original narrow {provider, error}
+    # shape -- unchanged by the litapi-arxiv-https build's enrichment below.
     assert result.providers_failed == [{"provider": "openalex", "error": "boom"}]
+
+
+def test_lookup_doi_transport_unreachable_failure_is_enriched_with_code_host_scheme():
+    """litapi-arxiv-https build: a GENUINE transport-level unreachability
+    (get_with_retry's own wrapping -- host/scheme set) is recorded with
+    an extra code/host/scheme a CLI caller can key off, distinct from the
+    bad-HTTP-status case above."""
+    a = _StubProvider(
+        "arxiv",
+        doi_error=ProviderTransportError(
+            "arxiv: transport unreachable (https://export.arxiv.org): no route to host",
+            provider="arxiv", status_code=None, host="export.arxiv.org", scheme="https",
+        ),
+    )
+    b = _StubProvider("openalex", doi_record=WorkRecord(title="T", doi="10.1/x"))
+    client = LitApiClient([a, b])
+
+    result = client.lookup_doi("10.1/x")
+
+    assert result.providers_failed == [
+        {
+            "provider": "arxiv",
+            "error": "arxiv: transport unreachable (https://export.arxiv.org): no route to host",
+            "code": "transport_unreachable",
+            "host": "export.arxiv.org",
+            "scheme": "https",
+        }
+    ]
 
 
 def test_lookup_doi_all_providers_failing_raises_with_details():

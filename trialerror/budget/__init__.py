@@ -40,6 +40,7 @@ from trialerror.budget.pools import (
     create_pool,
     list_pools,
     reconcile_launch,
+    reconcile_launch_from_event,
     snapshot_ingest,
     tree_rollup,
 )
@@ -60,6 +61,7 @@ __all__ = [
     "create_pool",
     "list_pools",
     "reconcile_launch",
+    "reconcile_launch_from_event",
     "snapshot_ingest",
     "tree_rollup",
 ]

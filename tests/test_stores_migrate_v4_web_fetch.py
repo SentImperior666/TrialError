@@ -83,10 +83,16 @@ def _insert_fetch(conn: sqlite3.Connection, fetch_id: str, **overrides) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_knowledge_migrations_are_contiguous_one_through_four():
+def test_knowledge_migrations_are_contiguous_and_hold_lane_as_four():
+    """Contiguity is the invariant; ``4`` being lane a's slot inside it is
+    the reservation. The tail is deliberately NOT pinned any more -- lane e
+    added ``5`` (the lexicon term store) on top, and a test that froze the
+    highest number would fail on every additive migration after it while
+    still not checking the thing that matters, which is that no number is
+    skipped or reused."""
     versions = [m.version for m in knowledge.MIGRATIONS]
     assert versions == list(range(1, len(versions) + 1))
-    assert versions[-1] == 4
+    assert 4 in versions
     assert len({m.name for m in knowledge.MIGRATIONS}) == len(knowledge.MIGRATIONS)
 
 

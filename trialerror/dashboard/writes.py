@@ -60,6 +60,27 @@ licence. Authorship is still server-derived and never caller-settable, so the
 guarantee that used to be enforced by "you cannot do this at all" is now
 enforced the same way ``feed-post``'s always was.
 
+**Four lexicon decisions join the table too** (``term-sense-accept``,
+``term-sense-reject``, ``term-relation-decide``, ``term-mark-reviewed`` --
+lane e step E4, design ``docs/reviews/LANE_E_TERM_STORE_DESIGN.md`` section 5).
+Each wraps a ``trialerror.lexicon.api`` function exactly like every action
+above wraps its own subsystem's callable, and each requires a real
+``by_launch`` per ruling L-E4 -- identical to ``gate-send-back``'s L-C2
+posture: an id with no ``platform.launch`` row refuses with
+``XidTargetMissingError``, never a fallback. **Every one of the four does its
+``import trialerror.lexicon`` LAZILY, inside its own handler function, never
+at this module's top level** -- ``trialerror.lexicon``'s package
+``__init__.py`` asserts a minimum SQLite version for the ``term_fts`` trigram
+tokenizer and raises (an :class:`ImportError` subclass) on a build too old to
+host it (module docstring, ``trialerror/lexicon/__init__.py``). A top-level
+import here would mean every OTHER write action in this file -- a room turn,
+a gate verify, nothing to do with the lexicon -- stops working the moment
+THIS FILE is imported, on a machine that will never call a ``term-*`` action
+at all. :func:`_is_lexicon_refusal` mirrors the same lazy-import discipline
+for the catch side (see its own docstring), so :data:`_EXPECTED_ERRORS` --
+built once at THIS module's import time -- never has to name
+``trialerror.lexicon.errors.LexiconError`` directly.
+
 Every function below returns a plain, JSON-serializable ``dict`` -- never an
 :mod:`trialerror.util.envelope` ``AgentEnvelope`` (that shape is CLI/argv
 plumbing this HTTP layer does not share) -- via :func:`dispatch`:
@@ -75,7 +96,7 @@ bug, not a refusal).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from trialerror.artifacts import gates as gates_api
 from trialerror.artifacts.errors import ArtifactsError
@@ -84,6 +105,8 @@ from trialerror.ingest import extract as extract_api
 from trialerror.ingest import requests as ingest_requests
 from trialerror.ingest.errors import IngestError
 from trialerror.jobs import ledger as jobs_ledger
+from trialerror.offload import protocol as offload_protocol
+from trialerror.offload.protocol import OffloadError
 from trialerror.rooms import api as rooms_api
 from trialerror.rooms.errors import RoomsError
 from trialerror.stores.errors import StoreError
@@ -102,8 +125,15 @@ __all__ = ["WRITABLE_ACTIONS", "REQUIRED_FIELDS", "dispatch"]
 #: ...) -- listed here ahead of the actions that raise it (spec §4's
 #: ``prereg-reveal``, C7) so a verify refusal can never reach the HTTP
 #: layer as a 500: a tampered escrow is a finding, not a server fault.
+#: ``OffloadError`` covers ``trialerror.offload.control.ControlError`` -- the
+#: three C-0097 refusals (unknown worker, a request already pending, no launch)
+#: are findings about the queue, not server faults, so a ``worker-control``
+#: refusal must reach the operator as a 200 ``{"ok": false}`` like every other
+#: refusal here. Named at module level rather than lazily (unlike
+#: ``LexiconError``, see :func:`_is_lexicon_refusal`) because
+#: ``trialerror.offload.protocol`` asserts nothing at import time.
 _EXPECTED_ERRORS: tuple[type[Exception], ...] = (
-    ArtifactsError, IngestError, RoomsError, StoreError, VerifyError, ValueError,
+    ArtifactsError, IngestError, OffloadError, RoomsError, StoreError, VerifyError, ValueError,
 )
 
 
@@ -335,6 +365,78 @@ def _do_thread_create(store: Store, body: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Lane e (E4): the four term-store decisions the Lexicon detail pane draws.
+# Design: docs/reviews/LANE_E_TERM_STORE_DESIGN.md section 5; ruling L-E4.
+# ---------------------------------------------------------------------------
+
+
+def _do_term_sense_accept(store: Store, body: dict[str, Any]) -> dict[str, Any]:
+    """``proposed -> current`` -- the evidenced route, and the only one
+    (``trialerror.lexicon.api.accept_sense``'s own module docstring). Refuses
+    (``SenseWithoutEvidenceError``) if every evidence row under the sense has
+    since been retracted, and (``SenseNotDecidableError``) if the sense is not
+    ``proposed`` -- a decided sense is superseded or retired in the open,
+    never silently re-decided."""
+    from trialerror.lexicon import api as lexicon_api
+
+    return lexicon_api.accept_sense(store, body["sense_id"], by_launch=body["by_launch"])
+
+
+def _do_term_sense_reject(store: Store, body: dict[str, Any]) -> dict[str, Any]:
+    """``proposed -> rejected``. The evidence rows are KEPT -- the program
+    looked at this reading and said no, and the material it said no to stays
+    part of that record."""
+    from trialerror.lexicon import api as lexicon_api
+
+    return lexicon_api.reject_sense(
+        store, body["sense_id"], by_launch=body["by_launch"], reason=_clean(body.get("reason")),
+    )
+
+
+def _do_term_relation_decide(store: Store, body: dict[str, Any]) -> dict[str, Any]:
+    """Resolve one pending term/sense judgment -- the artboard's three
+    actions (MERGE = ``same_as``/``variant_of``, SCOPE = ``scoped``, KEEP ONE
+    = ``not_conflict`` with ``into``) plus REJECT.
+
+    ``disambiguators`` (a ``scoped`` decision only) travels as a JSON OBJECT
+    in the request body, ``{sense_id: disambiguator_text, ...}`` -- one entry
+    per member sense a conflict names -- not a string, so it is checked
+    against :data:`_NON_STRING_FIELDS` rather than the string default every
+    other field here gets. ``decide_relation`` itself is what validates
+    every other rule (which decision applies to which relation shape,
+    whether every member got a disambiguator, whether ``into``/``canonical``
+    names a real member) -- this wrapper adds no rule of its own, matching
+    the module docstring's "never a second implementation"."""
+    from trialerror.lexicon import api as lexicon_api
+
+    disambiguators = body.get("disambiguators")
+    if disambiguators is not None and not isinstance(disambiguators, Mapping):
+        raise ValueError(
+            f"term-relation-decide: disambiguators must be an object, got {type(disambiguators).__name__}"
+        )
+    return lexicon_api.decide_relation(
+        store,
+        body["rel_id"],
+        decision=body["decision"],
+        by_launch=body["by_launch"],
+        disambiguators=disambiguators,
+        into=_clean(body.get("into")),
+        canonical=_clean(body.get("canonical")),
+        reason=_clean(body.get("reason")),
+    )
+
+
+def _do_term_mark_reviewed(store: Store, body: dict[str, Any]) -> dict[str, Any]:
+    """"I looked at this and it is still right" -- resets the sense's
+    engram-F5 decay window (MINING §5.7) and changes nothing else. Staleness
+    surfaces a row for a human; reviewing it is cheap, and neither ever
+    decides anything on its own."""
+    from trialerror.lexicon import api as lexicon_api
+
+    return lexicon_api.mark_reviewed(store, body["sense_id"], by_launch=body["by_launch"])
+
+
 def _do_feed_translate(store: Store, body: dict[str, Any]) -> dict[str, Any]:
     """ENQUEUE a plain-English translation job for one post or one thread.
     Never translates inline: the operator's click books work on the M2
@@ -378,6 +480,48 @@ def _do_feed_translate(store: Store, body: dict[str, Any]) -> dict[str, Any]:
     return {"job_id": job["job_id"], "state": job["state"], "kind": job["kind"], "target": post_id or thread_id}
 
 
+def _do_worker_control(store: Store, body: dict[str, Any]) -> dict[str, Any]:
+    """Ask a GPU worker to pause, resume or stop (ruling C-0097 D5).
+
+    Calls ``trialerror.offload.control.request_control_for_launch`` -- the SAME
+    function ``trialerror offload worker-control`` calls -- so the three
+    refusals (unknown worker, a request already pending, no launch) are
+    identical on both surfaces because they are literally the same code, not
+    because two lists happen to agree today. The act appends one
+    ``offload_worker_control`` event, exactly the shape lane e used for
+    ``term_candidate_withdrawn``.
+
+    **No process control anywhere.** This write leaves a small JSON file in the
+    queue; the worker reads it off its next heartbeat reply and complies at its
+    next cooperative checkpoint. The dashboard cannot reach the worker's
+    machine and nothing in this harness kills anything (D8) -- which is why the
+    result says ``requested``, never "paused".
+
+    The queue lives beside the program, so its root comes from
+    ``store.program_root`` and never from the body: a caller-supplied queue
+    path would be an HTTP request choosing which directory to write into."""
+    from trialerror.offload import control as offload_control
+
+    request = _clean(body.get("request"))
+    if request not in ("pause", "resume", "stop"):
+        raise ValueError(f"worker-control: request must be pause, resume or stop, got {request!r}")
+    record = offload_control.request_control_for_launch(
+        store,
+        offload_protocol.offload_root(store.program_root),
+        worker_id=str(_clean(body.get("worker_id"))),
+        request=str(request),
+        by_launch=str(_clean(body.get("by_launch"))),
+        job_id=_clean(body.get("job_id")),
+    )
+    return {
+        "worker_id": record["worker_id"],
+        "requested": record["request"],
+        "by_launch": record["by_launch"],
+        "job_id": record.get("job_id"),
+        "ts": record["ts"],
+    }
+
+
 #: action name -> (handler, required body fields). Required fields are
 #: checked BEFORE opening a store connection (a missing field is a client
 #: bug, not a business refusal -- no write connection should be opened for
@@ -397,6 +541,17 @@ WRITABLE_ACTIONS: dict[str, Callable[[Store, dict[str, Any]], dict[str, Any]]] =
     "memory-resolve": _do_memory_resolve,
     "gate-send-back": _do_gate_send_back,
     "thread-create": _do_thread_create,
+    # lane e (E4): the term-store decisions the Lexicon detail pane draws.
+    "term-sense-accept": _do_term_sense_accept,
+    "term-sense-reject": _do_term_sense_reject,
+    "term-relation-decide": _do_term_relation_decide,
+    "term-mark-reviewed": _do_term_mark_reviewed,
+    # C-0097 (D5): the JOBS card's worker rows get a verb. Named with the
+    # hyphen every other action in this table uses -- the design writes it
+    # `worker_control`, which is the EVENT type's spelling (events are
+    # underscore-keyed); the action namespace has been hyphenated since the
+    # first one.
+    "worker-control": _do_worker_control,
 }
 
 REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
@@ -421,6 +576,20 @@ REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "gate-send-back": ("gate_id", "edit_id", "by_launch", "note"),
     # body is required: an empty thread is a room with nobody in it.
     "thread-create": ("title", "body"),
+    # lane e (E4). "reason" is optional on both accept and reject (unlike
+    # gate-send-back's note): a rejection is legible from the relation/sense
+    # it closes even with nothing further said, and MissingDisambiguatorError
+    # (a real 200 refusal) already names exactly what a bad 'scoped' decision
+    # is missing -- a second flat-table rule here would just repeat it.
+    "term-sense-accept": ("sense_id", "by_launch"),
+    "term-sense-reject": ("sense_id", "by_launch"),
+    "term-relation-decide": ("rel_id", "decision", "by_launch"),
+    "term-mark-reviewed": ("sense_id", "by_launch"),
+    # C-0097 (D5). `by_launch` is required for the same reason every lane e
+    # action requires it (L-E4): a control act with no launch is the machine
+    # deciding on its own. `request` is validated by VALUE in the handler --
+    # this flat table can say "present", not "one of three".
+    "worker-control": ("worker_id", "request", "by_launch"),
 }
 
 
@@ -448,6 +617,11 @@ REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
 #: check is about JSON SHAPE only.
 _NON_STRING_FIELDS: dict[str, tuple[type, ...]] = {
     "agreement_pct": (int, float, str),
+    # lane e (E4): {sense_id: disambiguator_text, ...} on a 'scoped' decision
+    # -- the one field in this table whose JSON type is an OBJECT rather than
+    # a wider scalar set, because it is genuinely structured data, not a
+    # single value read off one form control.
+    "disambiguators": (dict,),
 }
 
 
@@ -486,6 +660,39 @@ def _validate_fields(action: str, body: dict[str, Any]) -> tuple[list[str], list
     return missing, type_errors
 
 
+def _is_lexicon_refusal(exc: BaseException) -> bool:
+    """Whether ``exc`` is a :class:`trialerror.lexicon.errors.LexiconError` --
+    checked with a LAZY import, on purpose, rather than by adding
+    ``LexiconError`` to :data:`_EXPECTED_ERRORS` directly.
+
+    ``trialerror.lexicon``'s package ``__init__.py`` asserts a minimum SQLite
+    version for its ``term_fts`` trigram index and raises on a build too old
+    to host it -- deliberately ALSO an :class:`ImportError`
+    (``trialerror/lexicon/errors.py::UnsupportedSqliteError``'s own
+    docstring). ``_EXPECTED_ERRORS`` is built once, at this module's IMPORT
+    time; naming ``LexiconError`` there would mean importing
+    ``trialerror.lexicon.errors`` right then -- which imports the PACKAGE
+    first, running that assertion whether or not this program ever calls a
+    ``term-*`` action. A machine that cannot host the lexicon would then
+    fail to import this file at all, breaking every OTHER write action
+    (room turns, gate verifies) that has nothing to do with it. Calling this
+    only from inside :func:`dispatch`'s except clause -- after a handler has
+    already run -- means the import is paid only by a caller who actually
+    invoked a lexicon action, the same lazy-import discipline the four
+    ``_do_term_*`` handlers themselves already follow.
+
+    An ``ImportError`` here (the package genuinely is not importable) means
+    "this is not a lexicon refusal" -- ``False``, not a raise -- so an
+    environment where the package cannot even be checked still gets the
+    correct answer for every non-lexicon action, and a genuine bug in one
+    of THOSE still reaches the 500 path unchanged."""
+    try:
+        from trialerror.lexicon.errors import LexiconError
+    except ImportError:
+        return False
+    return isinstance(exc, LexiconError)
+
+
 def dispatch(
     action: str,
     *,
@@ -495,12 +702,14 @@ def dispatch(
 ) -> dict[str, Any]:
     """Validate + execute one write action. Never raises for an EXPECTED
     refusal (unknown action, no program selected, a missing required field,
-    a field of the wrong JSON type, or any :data:`_EXPECTED_ERRORS` the
-    business-logic call itself raises) -- each of those is reported as
-    ``{"ok": False, "message": ...}``. Any OTHER exception propagates
-    (module docstring: a genuine bug must look like one, never a disguised
-    refusal); the HTTP layer turns it into a 500 JSON envelope with the
-    traceback on stderr."""
+    a field of the wrong JSON type, any :data:`_EXPECTED_ERRORS` the
+    business-logic call itself raises, or a lexicon refusal -- see
+    :func:`_is_lexicon_refusal` for why that one is checked separately
+    rather than folded into :data:`_EXPECTED_ERRORS`) -- each of those is
+    reported as ``{"ok": False, "message": ...}``. Any OTHER exception
+    propagates (module docstring: a genuine bug must look like one, never a
+    disguised refusal); the HTTP layer turns it into a 500 JSON envelope with
+    the traceback on stderr."""
     handler = WRITABLE_ACTIONS.get(action)
     if handler is None:
         return {"ok": False, "status": "unknown_action", "message": f"no such write action: {action!r}"}
@@ -526,6 +735,10 @@ def dispatch(
         result = handler(store, body)
     except _EXPECTED_ERRORS as exc:
         return {"ok": False, "status": type(exc).__name__, "message": str(exc)}
+    except Exception as exc:
+        if _is_lexicon_refusal(exc):
+            return {"ok": False, "status": type(exc).__name__, "message": str(exc)}
+        raise
     finally:
         store.close()
     return {"ok": True, "result": result}

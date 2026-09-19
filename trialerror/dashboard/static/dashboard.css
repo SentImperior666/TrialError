@@ -920,6 +920,11 @@ html { scroll-padding-top: calc(var(--topbar-h) + 8px); }
 .tally-row-inline .k { color: var(--ink-3); }
 .tally-row-inline .v { color: var(--ink-hi); }
 
+/* C-0097 D4: a worker row is a tally row about a MACHINE, printed directly
+   above the job counts. Same type; one hairline rule so the eye does not read
+   it as another count. */
+.worker-row { border-left: 2px solid var(--hairline); padding-left: 8px; }
+
 .meter-block { display: flex; flex-direction: column; gap: 3px; }
 .meter__fill--crit { background: var(--crit-fill); }
 .meter-sub, .quota-fresh, .trunc-note {

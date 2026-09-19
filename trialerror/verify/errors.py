@@ -6,6 +6,8 @@ caller that needs to branch on *why* catches the specific subclass.
 
 from __future__ import annotations
 
+from trialerror.retrieve.errors import QUERY_EMBED_UNRUNNABLE_CODE
+
 __all__ = [
     "VerifyError",
     "InvalidProcedureError",
@@ -17,6 +19,7 @@ __all__ = [
     "VerdictNotFoundError",
     "ReproductionRefError",
     "CitecheckError",
+    "QueryEmbedBackendUnrunnableError",
 ]
 
 
@@ -83,3 +86,18 @@ class CitecheckError(VerifyError):
     """A structural refusal in the citecheck pipeline (e.g. an
     unrecognized citation-marker syntax when a caller demands strict
     parsing)."""
+
+
+class QueryEmbedBackendUnrunnableError(VerifyError):
+    """This process cannot embed the hypothesis, so the retrieval a verdict
+    would rest on cannot be performed (lane F-1 item D).
+
+    A REFUSAL, not a degrade, and the reason is C-0096: a hypothesis
+    verification is a status-changing read. A full-text-only retrieval is a
+    different instrument -- narrower recall, no distance stratification, a
+    ``rank_fallback`` split instead of the near/moderate/far one the design
+    names -- and a verdict written from it while the record says
+    ``mode="hybrid"`` would be a verdict about the retrieval's shortcomings.
+    So nothing is written and the caller is told what to fix."""
+
+    code = QUERY_EMBED_UNRUNNABLE_CODE

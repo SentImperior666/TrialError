@@ -186,6 +186,35 @@ def test_book_launch_non_numeric_est_tokens_is_structured_error(store, tools):
     assert env["error"]["code"] == "bad_input"
 
 
+def test_book_launch_assign_ids_as_a_bare_string_is_bad_input_and_books_nothing(store, tools):
+    """Fix pass B-1. ``"ASGN-1"`` used to be comprehended into one id per
+    character; the eight bogus ids then raised AFTER the launch row was
+    written, leaving a dangling PROVISIONAL booking."""
+    seed_account_session(store)
+    before = store.platform.execute("SELECT COUNT(*) AS n FROM launch").fetchone()["n"]
+    env = tools["book_launch"].handler(
+        {"program_id": "PROG-test", "agent_kind": "lens", "model_class": "top",
+         "model": "sonnet", "purpose": "fixture", "est_tokens": 500,
+         "assign_ids": "ASGN-1"}
+    )
+    assert env["ok"] is False
+    assert env["error"]["code"] == "bad_input"
+    assert store.platform.execute("SELECT COUNT(*) AS n FROM launch").fetchone()["n"] == before
+
+
+def test_book_launch_unknown_assign_id_refuses_and_books_nothing(store, tools):
+    seed_account_session(store)
+    before = store.platform.execute("SELECT COUNT(*) AS n FROM launch").fetchone()["n"]
+    env = tools["book_launch"].handler(
+        {"program_id": "PROG-test", "agent_kind": "lens", "model_class": "top",
+         "model": "sonnet", "purpose": "fixture", "est_tokens": 500,
+         "assign_ids": ["ASGN-does-not-exist"]}
+    )
+    assert env["ok"] is False
+    assert env["error"]["code"] == "unknown_assignment"
+    assert store.platform.execute("SELECT COUNT(*) AS n FROM launch").fetchone()["n"] == before
+
+
 def test_book_launch_no_open_session_is_structured_error(store, tools):
     env = tools["book_launch"].handler(
         {"program_id": "PROG-test", "agent_kind": "tester", "model_class": "top",

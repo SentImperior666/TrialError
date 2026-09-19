@@ -1,10 +1,17 @@
 """M9's doctor checks. Design Section 5.2 (doctor row): "framework +
 license-audit in M0; each module registers its own checks."
 
-Both checks stay read-only-connection-only (``trialerror.stores.connection.
-connect(path, read_only=True)``), the same discipline every other module's
-``checks.py`` follows (``trialerror.retrieve.checks``, ``trialerror.ingest.checks``,
-...) — a doctor run must never itself mutate a program's stores.
+Every check here stays read-only-connection-only (``trialerror.stores.
+connection.connect(path, read_only=True)``), the same discipline every other
+module's ``checks.py`` follows (``trialerror.retrieve.checks``,
+``trialerror.ingest.checks``, ...) — a doctor run must never itself mutate a
+program's stores.
+
+A third check arrived with the ideation framework: ``gate_without_prereg``,
+which refuses a ROUND gate that carries no pre-registration. It lives here
+rather than in ``trialerror.artifacts.checks`` because what it is really
+checking is the prereg end of the link, and this module already owns the
+other prereg invariant (``prereg_escrow_integrity``).
 """
 
 from __future__ import annotations
@@ -17,7 +24,11 @@ from trialerror.stores import paths
 from trialerror.stores.connection import connect
 from trialerror.util.doctor import CheckResult, DoctorContext, register_check
 
-__all__ = ["check_verdict_evidence_anchors", "check_prereg_escrow_integrity"]
+__all__ = [
+    "check_verdict_evidence_anchors",
+    "check_prereg_escrow_integrity",
+    "check_gate_without_prereg",
+]
 
 #: How many verdict/prereg rows each check samples per run -- bounded so
 #: doctor stays fast against a large program, same "regression sentinel,
@@ -136,4 +147,139 @@ def check_prereg_escrow_integrity(ctx: DoctorContext) -> CheckResult:
     return CheckResult(
         name="prereg_escrow_integrity", category="verify", status=status, message=message,
         details={"sampled": len(rows), "offenders": offenders},
+    )
+
+
+#: The ``artifact.attrs`` key that marks an artifact as a ROUND artifact and
+#: so brings it under the pre-registration rule. It is the same key
+#: ``lens export`` puts on every bookable row and the screen puts on every
+#: batch record, so a round artifact carries it without anyone adding a
+#: convention for this check's benefit.
+_ROUND_ATTR = "round_id"
+
+#: Where a round artifact's pre-registration can be recorded: on the artifact
+#: itself, or on a verdict row written about it. Both are accepted — the
+#: screen links ``prereg_id`` onto its novelty verdicts, and a synthesis
+#: artifact carries its own.
+_PREREG_ATTR = "prereg_id"
+
+
+@register_check("gate_without_prereg", category="verify")
+def check_gate_without_prereg(ctx: DoctorContext) -> CheckResult:
+    """A gate on a ROUND artifact must name a live pre-registration.
+
+    Blind pre-registration is what makes a round's results reportable at all:
+    the procedure and the parameters are escrowed before any spawn, and
+    ``prereg_compliant`` is recomputed afterwards rather than asserted. A
+    round artifact that reaches a gate with no prereg id is a round whose
+    procedure can still be described to match its results, and the gate is
+    the last place to notice.
+
+    Scope is deliberately narrow: only artifacts whose ``attrs`` declare a
+    ``round_id``. Every other gated artifact in the program — a methods note,
+    a review verdict, an ordinary keystone — is not under this rule, and
+    widening the check to "every gate" would make it noise an operator learns
+    to skip.
+
+    The prereg is looked for in every place one can be recorded: the
+    artifact's own ``attrs.prereg_id``, a ``verdict`` row ABOUT that artifact
+    (``subject_kind='artifact'``), and a verdict about one of the ROUND's own
+    records (``subject_kind='claim'``, resolved through ``idea.round_id``) —
+    which is the shape the novelty screen actually writes: it links
+    ``prereg_id`` onto a verdict per idea per reference set, never onto the
+    artifact. Reading only the artifact-shaped verdicts made the documented
+    linkage unsatisfiable, because nothing in the tree produces one.
+
+    A named prereg that does not resolve to a row, or resolves to a ``voided``
+    one, is reported as its own offender kind — "named a prereg that is not
+    usable" is a different finding from "named none", and the message says
+    which."""
+    name = "gate_without_prereg"
+    if ctx.program_root is None:
+        return _skip(name, "program_root not configured")
+    ops_path = paths.ops_db_path(ctx.program_root)
+    if not ops_path.exists():
+        return _skip(name, "ops.db not found (program not yet initialized)")
+
+    conn = connect(ops_path, read_only=True)
+    try:
+        rows = conn.execute(
+            "SELECT g.gate_id, g.state, a.artifact_id, a.type, a.title, a.attrs "
+            "FROM gate g JOIN artifact a ON g.artifact_id = a.artifact_id"
+        ).fetchall()
+        round_gates: list[dict] = []
+        for row in rows:
+            try:
+                attrs = json.loads(row["attrs"]) if row["attrs"] else {}
+            except (TypeError, ValueError):
+                attrs = {}
+            if not isinstance(attrs, dict) or not attrs.get(_ROUND_ATTR):
+                continue
+            round_gates.append(
+                {
+                    "gate_id": row["gate_id"], "state": row["state"], "artifact_id": row["artifact_id"],
+                    "type": row["type"], "round_id": attrs.get(_ROUND_ATTR), "prereg_id": attrs.get(_PREREG_ATTR),
+                }
+            )
+        if not round_gates:
+            return _skip(name, "no gate belongs to an artifact whose attrs declare a round_id")
+
+        prereg_status = {
+            r["prereg_id"]: r["status"] for r in conn.execute("SELECT prereg_id, status FROM prereg").fetchall()
+        }
+    finally:
+        conn.close()
+
+    knowledge_path = paths.knowledge_db_path(ctx.program_root)
+    verdict_prereg: dict[str, set[str]] = {}
+    round_prereg: dict[str, set[str]] = {}
+    if knowledge_path.exists():
+        knowledge = connect(knowledge_path, read_only=True)
+        try:
+            for row in knowledge.execute(
+                "SELECT subject_id, prereg_id FROM verdict WHERE prereg_id IS NOT NULL AND subject_kind = 'artifact'"
+            ).fetchall():
+                verdict_prereg.setdefault(row["subject_id"], set()).add(row["prereg_id"])
+            # The shape the screen writes: one verdict per idea per reference
+            # set, subject_kind='claim', carrying the round's prereg_id. The
+            # round is on the idea row, so that is where the join goes.
+            for row in knowledge.execute(
+                "SELECT i.round_id AS round_id, v.prereg_id AS prereg_id FROM verdict v "
+                "JOIN idea i ON v.subject_id = i.idea_id "
+                "WHERE v.prereg_id IS NOT NULL AND v.subject_kind = 'claim' AND i.round_id IS NOT NULL"
+            ).fetchall():
+                round_prereg.setdefault(str(row["round_id"]), set()).add(row["prereg_id"])
+        finally:
+            knowledge.close()
+
+    missing: list[dict] = []
+    unusable: list[dict] = []
+    for gate in round_gates:
+        candidates = {gate["prereg_id"]} if gate["prereg_id"] else set()
+        candidates |= verdict_prereg.get(gate["artifact_id"], set())
+        candidates |= round_prereg.get(str(gate["round_id"]), set())
+        candidates = {c for c in candidates if c}
+        if not candidates:
+            missing.append(gate)
+            continue
+        if not any(prereg_status.get(c) in ("committed", "revealed") for c in candidates):
+            unusable.append({**gate, "named": sorted(candidates), "statuses": sorted({str(prereg_status.get(c)) for c in candidates})})
+
+    if missing or unusable:
+        status = "fail"
+        message = (
+            f"{len(missing)} round gate(s) name no pre-registration"
+            + (
+                f"; {len(unusable)} name one that does not resolve or is voided"
+                if unusable
+                else ""
+            )
+            + " -- a round's procedure is escrowed before any spawn, and a gate is the last place to notice"
+        )
+    else:
+        status = "pass"
+        message = f"all {len(round_gates)} round gate(s) name a committed or revealed pre-registration"
+    return CheckResult(
+        name=name, category="verify", status=status, message=message,
+        details={"missing": missing, "unusable": unusable, "round_gates": len(round_gates)},
     )

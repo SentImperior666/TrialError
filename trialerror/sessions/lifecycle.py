@@ -56,7 +56,12 @@ from trialerror.budget.pools import budget_status
 from trialerror.events.api import append_event, read_inbox
 from trialerror.jobs.ledger import list_jobs
 from trialerror.law.service import PinVerifyResult, current_pin, diff_foreign, lookup_rulings, verify_pin
-from trialerror.sessions.handoff import latest_handoff, resolve_handoffs_dir, write_handoff_with_supersession
+from trialerror.sessions.handoff import (
+    HandoffsDirOutsideRootError,
+    latest_handoff,
+    resolve_handoffs_dir,
+    write_handoff_with_supersession,
+)
 from trialerror.stores import get, insert, update
 from trialerror.stores.store import Store
 from trialerror.util.ids import new_id
@@ -65,6 +70,7 @@ from trialerror.util.timeutil import now
 __all__ = [
     "AccountResolution",
     "resolve_account_for_boot",
+    "DEFAULT_ACCOUNT_CONFIG_KEY",
     "BootResult",
     "boot_session",
     "CloseReadiness",
@@ -105,15 +111,57 @@ def _list_accounts(store: Store) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+#: ``[session] default_account`` -- the config key that answers "which
+#: account" for a program that has more than one registered and a boot that
+#: names none (lane F-1 item G). Spelled once, so the refusal message and the
+#: guide cannot drift apart.
+DEFAULT_ACCOUNT_CONFIG_KEY = "[session] default_account"
+
+
+def _configured_default_account(store: Store, config: Mapping[str, Any] | None) -> str | None:
+    """``[session] default_account`` from ``config``, or from the program's
+    own ``trialerror.toml`` when no config was passed.
+
+    The fallback read is what makes the key work for the SessionStart hook,
+    which boots with no arguments at all and therefore has no config to hand
+    in -- and the hook is the caller that matters most here, because it is
+    the one that cannot be given a ``--account`` flag. Best-effort by the
+    same convention every other config read in this codebase follows: a
+    malformed file resolves to "no key", never to an exception out of boot."""
+    if config is not None:
+        section = (config.get("session") or {}) if isinstance(config, Mapping) else {}
+        value = section.get("default_account") if isinstance(section, Mapping) else None
+        return str(value) if value else None
+    try:
+        from trialerror.util.config import CONFIG_FILENAME, load_config
+
+        cfg_path = store.program_root / CONFIG_FILENAME
+        if not cfg_path.is_file():
+            return None
+        raw = load_config(cfg_path).raw
+    except Exception:  # noqa: BLE001 - boot never fails on a config read
+        return None
+    value = (raw.get("session") or {}).get("default_account")
+    return str(value) if value else None
+
+
 def resolve_account_for_boot(
     store: Store,
     *,
     account_id: str | None = None,
     create_account_label: str | None = None,
     now_ts: str | None = None,
+    config: Mapping[str, Any] | None = None,
 ) -> AccountResolution:
     """Design Section 4.3 / review F14. Never guesses across >1 registered
     account; never silently defaults when the caller was explicit.
+
+    ``config`` is the program's ``trialerror.toml`` dict; ``[session]
+    default_account`` in it is the program's standing answer for a boot that
+    names no account (lane F-1 item G). ``None`` means "read it off disk"
+    (:func:`_configured_default_account`), which is what lets the
+    SessionStart hook -- the one caller that can pass no flags at all --
+    inherit the key too.
 
     ``create_account_label`` is a bootstrap convenience: no design section
     assigns any CLI group ownership of ``account`` CRUD (it is absent from
@@ -147,19 +195,57 @@ def resolve_account_for_boot(
             "or --account <id> if one already exists elsewhere",
             accounts=accounts,
         )
+    # Lane F-1 item G: the program's own standing answer to "which account".
+    #
+    # F14's rule is that attribution is never GUESSED, and this does not
+    # guess: the key is a declaration the program made in writing, checked
+    # against the register every time it is read. It is consulted ONLY when
+    # more than one account is registered (lane F-1 brief item G; verifier
+    # finding V-6, orchestrator's call 2026-09-12): a single-account program
+    # keeps its F14 default whatever the key says, so a stale key can never
+    # brick a boot -- including the argument-less SessionStart hook's -- on a
+    # program that is otherwise fine. A stale key on a single-account program
+    # is reported by the message, not by a refusal.
+    configured = _configured_default_account(store, config) if len(accounts) > 1 else None
+    if configured is not None:
+        row = get(store, "account", pk_column="account_id", pk_value=configured)
+        if row is None:
+            return AccountResolution(
+                False,
+                None,
+                "unknown_account",
+                f"{DEFAULT_ACCOUNT_CONFIG_KEY} = {configured!r} in trialerror.toml names no registered "
+                f"account (registered: {[a['account_id'] for a in accounts]!r}) -- fix the key or pass "
+                "--account",
+                accounts=accounts,
+            )
+        return AccountResolution(
+            True,
+            configured,
+            "config_default",
+            f"account taken from {DEFAULT_ACCOUNT_CONFIG_KEY} in trialerror.toml",
+            accounts=accounts,
+        )
+
     if len(accounts) == 1:
+        stale = _configured_default_account(store, config)
+        note = (
+            f" (note: {DEFAULT_ACCOUNT_CONFIG_KEY} = {stale!r} is set but ignored with one account registered)"
+            if stale is not None and stale != accounts[0]["account_id"] else ""
+        )
         return AccountResolution(
             True,
             accounts[0]["account_id"],
             "single_account_default",
-            "single registered account used by default (F14)",
+            "single registered account used by default (F14)" + note,
             accounts=accounts,
         )
     return AccountResolution(
         False,
         None,
         "account_required",
-        f"{len(accounts)} accounts registered; --account is mandatory (F14) -- account attribution is never guessed",
+        f"{len(accounts)} accounts registered; --account is mandatory (F14), or name one standing default "
+        f"as {DEFAULT_ACCOUNT_CONFIG_KEY} in trialerror.toml -- account attribution is never guessed",
         accounts=accounts,
     )
 
@@ -349,6 +435,11 @@ def boot_session(
        per Claude Code session, e.g. on ``/clear``).
     2. Account resolution fails (ambiguous / unknown / none registered,
        see :func:`resolve_account_for_boot`) -> refused.
+    0. ``[paths] handoffs_dir`` resolves outside the program root and
+       ``[session] handoffs_dir_outside_root`` is not set -> refused
+       (``handoffs_dir_outside_root``), BEFORE any write: boot reads the
+       latest handoff out of that directory, and reading another program's
+       close is how a scratch program comes to believe it is that program.
     3. The law ledger's hash chain fails integrity verification (a
        tampered ledger) -> refused (``law_chain_tampered``) — "law-pin at
        boot: spawn gate + session boot verify" (design review Leg 5c). A
@@ -364,6 +455,18 @@ def boot_session(
     Sec 5 knob #3).
     """
     ts = now_ts or now()
+
+    # Rung 0 (fix pass N-4), resolved BEFORE anything is written or read: a
+    # handoffs_dir landing outside the program root is a config this program
+    # must not act on at all, and the bundle READS the latest handoff from
+    # it. The refusal used to come out of `_build_bundle`, i.e. after the
+    # session row had been opened -- so a boot that answered
+    # `handoffs_dir_outside_root` still left an open session behind, which
+    # is not what `docs/USER_SETUP.md` says and not what a refusal is.
+    try:
+        resolve_handoffs_dir(store.program_root, config)
+    except HandoffsDirOutsideRootError as exc:
+        return BootResult(False, "handoffs_dir_outside_root", str(exc))
 
     existing = resolve_open_session(store)
     if existing is not None:
@@ -386,7 +489,9 @@ def boot_session(
             bundle=bundle,
         )
 
-    acct = resolve_account_for_boot(store, account_id=account_id, create_account_label=create_account_label, now_ts=ts)
+    acct = resolve_account_for_boot(
+        store, account_id=account_id, create_account_label=create_account_label, now_ts=ts, config=config
+    )
     if not acct.ok:
         return BootResult(False, acct.code, acct.message)
 
@@ -536,6 +641,9 @@ def close_session(
 
     1. no open session / wrong ``session_id`` -> ``not_open``.
     2. ``course_check`` missing/empty -> ``course_check_required``.
+    2b. ``[paths].handoffs_dir`` resolves outside the program root without
+       ``[session] handoffs_dir_outside_root`` ->
+       ``handoffs_dir_outside_root``, BEFORE any write.
     3. zero ``hook_alive`` events recorded for this session -> refused
        (``hooks_disabled``) UNLESS ``hook_alive_override_ruling_id`` names
        a real ruling (design Section 5.4 SessionStart row: "close refuses
@@ -586,6 +694,17 @@ def close_session(
             "design Section 9.3",
             session_id=session_id,
         )
+
+    # Resolved BEFORE anything is written. A handoff rendered into another
+    # program's tree also marks a live session closed HERE, and the incident
+    # this rung closes was exactly that pair: a scratch program carrying a
+    # copied absolute handoffs_dir wrote its close into the program the
+    # config came from. Checked as early as the ladder allows, because the
+    # only harmless place to fail is before the first mutation.
+    try:
+        resolve_handoffs_dir(store.program_root, config)
+    except HandoffsDirOutsideRootError as exc:
+        return CloseResult(False, "handoffs_dir_outside_root", str(exc), session_id=session_id)
 
     hook_alive_count = store.ops.execute(
         "SELECT COUNT(*) FROM event WHERE session_id = ? AND type = 'hook_alive'", (session_id,)

@@ -346,7 +346,10 @@ def test_argues_reports_the_contracrow_verdict_and_an_honestly_empty_prov_edge(t
     assert v["label"] == "CONTRADICTED", "the label is carried verbatim, never re-worded"
     assert v["prereg_compliant"] == 1
     assert argues["contradicts"] == [] and argues["supports"] == []
-    assert "prov_edge has zero writers" in argues["note"]
+    assert "prov_edge has zero writers outside lexicon lineage edges" in argues["note"], (
+        "ruling L-E5 made the blanket statement false the moment lane e landed; the note\n"
+        "for THIS read is the narrower true one"
+    )
 
 
 def test_argues_reads_prov_edge_when_a_row_is_there(traced, program_root, platform_root):
@@ -703,17 +706,48 @@ def test_index_rows_carry_their_source_and_anchor_count(traced):
 # ---------------------------------------------------------------------------
 
 
-def test_the_term_conflict_region_is_omitted_with_its_reason_stated(traced):
-    """Ruling L-C5: C6 ships the builder WITHOUT the lexicon region, and lane
-    e wires it in behind an import guard. Absent means omitted-and-said-so,
-    never an empty box that reads as "no conflicts"."""
+def test_the_term_conflict_region_answers_now_that_lane_e_has_landed(traced):
+    """Ruling L-C5, second step. C6 shipped the builder with the region
+    behind an import guard; lane e's E1 added
+    ``lexicon.api.conflicts_for_claim``, so on a migrated store the guard
+    now passes and the region carries a real answer. "No conflicts" is a
+    true statement here for the first time -- the store can be asked."""
     rostore, ids = traced
+    panel = data.build_evidence_panel(rostore, claim_id=ids["claim"])
+    assert "term_conflicts_omitted" not in panel
+    assert panel["term_conflicts"] == {"status": "ok", "conflicts": []}
+
+
+def test_the_region_is_still_omitted_and_said_so_when_the_module_is_absent(traced, monkeypatch):
+    """The first half of the guard, kept provable after the module landed:
+    ``None`` in ``sys.modules`` makes the import raise exactly as it did
+    before lane e existed. Absent must still mean omitted-and-said-so, never
+    an empty box that reads as "no conflicts"."""
+    import sys
+
+    rostore, ids = traced
+    monkeypatch.setitem(sys.modules, "trialerror.lexicon.api", None)
+
+    assert data._evidence_lexicon_conflicts(rostore, ids["claim"]) is None
     panel = data.build_evidence_panel(rostore, claim_id=ids["claim"])
     assert "term_conflicts" not in panel
     assert panel["term_conflicts_omitted"]["reason"] == "awaiting_migration"
     assert "conflicts_for_claim" in panel["term_conflicts_omitted"]["message"]
 
 
-def test_the_lexicon_hook_returns_none_while_the_module_is_absent(traced):
+def test_the_region_is_omitted_on_a_store_that_has_not_run_the_migration(traced, monkeypatch):
+    """The middle state a two-step ruling creates: the module is importable
+    but the program's knowledge.db predates knowledge-v5. Lane e's read
+    deliberately lets ``OperationalError`` out rather than returning ``[]``,
+    because this guard is what turns it into an omission -- an empty list
+    would render as "nothing argues with this claim"."""
     rostore, ids = traced
+
+    def _no_such_table(_store, _claim_id):
+        raise sqlite3.OperationalError("no such table: term_sense_evidence")
+
+    monkeypatch.setattr("trialerror.lexicon.api.conflicts_for_claim", _no_such_table)
+
     assert data._evidence_lexicon_conflicts(rostore, ids["claim"]) is None
+    panel = data.build_evidence_panel(rostore, claim_id=ids["claim"])
+    assert panel["term_conflicts_omitted"]["reason"] == "awaiting_migration"

@@ -29,14 +29,20 @@ from tests._store_fixtures import populate_one_of_everything
 # asked to fetch, from enqueue to whatever it finally became) makes it 18 for
 # knowledge -- an additive seam like every one above it, not a design
 # revision.
-EXPECTED_TABLE_COUNT_BY_DB = {"platform": 5, "ops": 23, "knowledge": 18, "jobs": 2}
+# Lane e's knowledge_v5 lexicon term store adds five more --  "term",
+# "term_alias", "term_sense", "term_sense_evidence", "term_relation" -- for
+# 23. Its sixth object, "term_fts", is NOT counted and NOT in TABLES: like
+# "chunk_fts" it is an FTS5 virtual table maintained by its own write API,
+# with no row of its own to round-trip, and TABLE_DB is the validated write
+# API's routing map rather than an inventory of everything in the file.
+EXPECTED_TABLE_COUNT_BY_DB = {"platform": 5, "ops": 23, "knowledge": 23, "jobs": 2}
 
 
 def test_table_counts_match_design_section_4():
     for db_kind, expected in EXPECTED_TABLE_COUNT_BY_DB.items():
         actual = len(SCHEMA_MODULES[db_kind].TABLES)
         assert actual == expected, f"{db_kind}: expected {expected} tables, schema module declares {actual}"
-    assert len(TABLE_DB) == sum(EXPECTED_TABLE_COUNT_BY_DB.values()) == 48
+    assert len(TABLE_DB) == sum(EXPECTED_TABLE_COUNT_BY_DB.values()) == 53
 
 
 def test_round_trip_one_row_per_table(store):

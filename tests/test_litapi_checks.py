@@ -40,6 +40,34 @@ def test_config_present_passes_when_mailto_configured(tmp_path):
     assert result.details["openalex_mailto_set"] is True
 
 
+def test_config_present_warns_on_plaintext_http_override(tmp_path):
+    """C-0093(a): the built-in defaults are all https (pinned in
+    test_litapi_config.test_all_provider_default_base_urls_use_https), so
+    this only fires on an explicit operator override in trialerror.toml --
+    the existing warnings/status='warn' notice path, same one mailto uses
+    above, not a new mechanism."""
+    (tmp_path / "trialerror.toml").write_text(
+        '[program]\nid = "x"\n\n'
+        '[litapi.openalex]\nmailto = "me@example.org"\n\n'
+        '[litapi.arxiv]\nbase_url = "http://export.arxiv.org/api"\n',
+        encoding="utf-8",
+    )
+    result = checks.check_litapi_config_present(DoctorContext(program_root=tmp_path))
+    assert result.status == "warn"
+    assert "litapi.arxiv.base_url is plaintext http" in result.message
+
+
+def test_config_present_does_not_warn_on_https_override(tmp_path):
+    (tmp_path / "trialerror.toml").write_text(
+        '[program]\nid = "x"\n\n'
+        '[litapi.openalex]\nmailto = "me@example.org"\n\n'
+        '[litapi.arxiv]\nbase_url = "https://export.arxiv.org/api"\n',
+        encoding="utf-8",
+    )
+    result = checks.check_litapi_config_present(DoctorContext(program_root=tmp_path))
+    assert result.status == "pass"
+
+
 def test_live_reachable_skips_without_env_flag(monkeypatch):
     monkeypatch.delenv(checks.LIVE_TESTS_ENV_VAR, raising=False)
     result = checks.check_litapi_live_reachable(DoctorContext(program_root=None))

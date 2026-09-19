@@ -63,12 +63,37 @@ id = "{program_id}"
 # Model-policy floor per purpose (design Section 1.11): trialerror.budget.policy
 # refuses a book_launch below the configured minimum model_class for a
 # purpose (the spawn gate) unless an override_ruling_id is cited. Classes,
-# low to high: "small" < "mid" < "top". A purpose not listed here has no
-# floor.
+# low to high: "small" < "mid" < "top". A purpose not listed here has NO
+# floor at all -- meets_minimum(class, None) is True -- so an absent table
+# enforces nothing, which is why a program that intends to enforce floors
+# has to write them down.
+#
+# The eight purposes below are the ideation-round set. Everything that makes
+# a research judgment floors at "top": the keystone work, generation,
+# moderation, room participation, the novelty judge, and every gate. The two
+# that do not still floor at "mid" -- consolidation is formatting, dedupe
+# bookkeeping and ledger-row application, and the mechanical screen is
+# retrieval and counting; but "mechanical" is not "unsupervised", and a
+# screen decides which ideas a judge ever sees, so neither drops to "small".
 # [models]
 # keystone = "top"
 # ideation = "top"
-# mechanical = "small"
+# moderation = "top"
+# room_participant = "top"
+# novelty_judge = "top"
+# gates = "top"
+# consolidation = "mid"
+# screen = "mid"
+
+# Model NAME -> class: the other half of the pair above. [models] says what
+# class a purpose needs; this says what class a model IS, so the spawn gate's
+# agent_model_matches_booking guard can compare the model a subagent was
+# actually spawned with against the class its booking claimed. Optional --
+# trialerror.budget.policy already resolves known model families by name, and
+# entries here extend and override that for anything it has not heard of
+# (the gate's refusal names this table when it meets one).
+# [model_classes]
+# my-local-model = "small"
 
 # License posture (trialerror.util.config.ProgramConfig.license_posture);
 # consulted by trialerror.ingest.pipeline's acquisition-route allowlist.
@@ -89,10 +114,19 @@ id = "{program_id}"
 # index_dir = "index"
 # archive_dir = "archive"
 # law_digest_path = "law/LAW_DIGEST.md"
-# handoffs_dir = "handoffs"
+# handoffs_dir = "handoffs"   # program-root-relative; see [session] below
 # requests_path = "requests/REQUESTS.md"
 # memory_dir = "memory"
 # ingest_roots = ["raw", "inbox"]
+
+# A handoff is a WRITE, and `session close` also marks this session closed.
+# So a handoffs_dir that resolves OUTSIDE this program root is refused
+# unless this program says it means it -- the failure it prevents is a
+# trialerror.toml copied from another program aiming this program's closes
+# at that one's repo root. Leave handoffs_dir relative (the default) and you
+# never need this.
+# [session]
+# handoffs_dir_outside_root = false
 
 # Which engine serves the lexical (keyword/BM25) prefilter tier
 # (trialerror.retrieve.lexical). "tantivy" is the default -- a measured
@@ -104,6 +138,17 @@ id = "{program_id}"
 # is missing, so search never breaks over this knob.
 # [retrieve]
 # fulltext_backend = "tantivy"
+
+# Whether the optional numpy fast path is used for brute-force cosine scans
+# (trialerror.util.vecmath). "auto" -- the default when this key is absent --
+# uses numpy when it imports and the plain-Python path when it does not;
+# numpy is NOT a dependency of this package (install it with the `fast`
+# extra). "off" pins the plain path whatever is installed, which is the one
+# line to reach for if a ranking ever looks different from what it used to.
+# The two paths return the same ids in the same order by construction; the
+# difference is wall clock on an unbounded scan.
+# [retrieve]
+# numpy_fastpath = "auto"
 
 # OCR backend (trialerror.ingest.backends.load_ocr_backend). Defaults to the
 # deterministic FakeOcrBackend (zero-GPU, zero-model) when this table is

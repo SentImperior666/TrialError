@@ -109,6 +109,13 @@ def test_lens_stratify_assign_log_export_end_to_end(cli_program_root, capsys):
     env = _run_cli(capsys, ["lens", "--program-root", str(cli_program_root), "log", "--round-id", "round-1"])
     assert env["ok"] is True
     assert env["result"]["count"] == 5
+    # the per-lens reconciliation rides beside the raw rows: one lens, one
+    # row, and it never posted, so the round has an offender to chase
+    assert env["result"]["n_lenses"] == 1
+    assert env["result"]["rows"][0]["roster_id"] == lens_row["roster_id"]
+    assert env["result"]["rows"][0]["posted"] is False
+    assert len(env["result"]["offenders"]) == 1
+    assert any("export" in " ".join(a["argv"]) for a in env["nextActions"])
 
     env = _run_cli(capsys, ["lens", "--program-root", str(cli_program_root), "export", "--round-id", "round-1"])
     assert env["ok"] is True
@@ -139,3 +146,86 @@ def test_lens_program_root_not_found_error_envelope(tmp_path, capsys, monkeypatc
     env = _run_cli(capsys, ["lens", "roster", "--round-id", "round-1"])
     assert env["ok"] is False
     assert env["error"]["code"] == "program_root_not_found"
+
+
+def test_lens_roster_add_control_seat_with_cards_is_refused(cli_program_root, capsys):
+    env = _run_cli(
+        capsys,
+        [
+            "lens", "--program-root", str(cli_program_root), "roster", "--add",
+            "--round-id", "round-c", "--lens-name", "control-1",
+            "--vantage", "CONTROL:no-recipe", "--model-class", "top",
+            "--seat", "control", "--recipe-card", "MISMATCH",
+        ],
+    )
+    assert env["ok"] is False
+    assert env["error"]["code"] == "roster_refused"
+
+
+def test_lens_arm_per_lens_end_to_end(cli_program_root, capsys):
+    """One arm per lens, whole slice from it, cards recorded, and the
+    export attrs naming both -- through the real argv path."""
+    store = open_store(cli_program_root)
+    pool = build_doc_pool(store, n_docs=61)
+    home_id, *candidate_ids = pool["doc_ids"]
+    store.close()
+
+    seats = [
+        ("standard", ["MISMATCH", "TRANSFER"]),
+        ("standard", ["TRANSFER", "MISMATCH"]),
+        ("standard", ["MISMATCH", "TRANSFER"]),
+        ("standard", ["TRANSFER", "MISMATCH"]),
+        ("assumption_buster", ["NEGATE"]),
+        ("control", []),
+    ]
+    for i, (seat, cards) in enumerate(seats):
+        argv = [
+            "lens", "--program-root", str(cli_program_root), "roster", "--add",
+            "--round-id", "round-apl", "--lens-name", f"lens-{i}", "--vantage", f"v{i}",
+            "--model-class", "top", "--seat", seat,
+        ]
+        for card in cards:
+            argv += ["--recipe-card", card]
+        assert _run_cli(capsys, argv)["ok"] is True
+
+    assign_argv = [
+        "lens", "--program-root", str(cli_program_root), "assign",
+        "--model-key", pool["model_key"], "--home", home_id,
+        "--round-id", "round-apl", "--slices-per-lens", "5", "--seed", "seed-apl",
+        "--arm-per-lens",
+    ]
+    for cid in candidate_ids:
+        assign_argv += ["--candidate", cid]
+    env = _run_cli(capsys, assign_argv)
+    assert env["ok"] is True
+    assert env["result"]["count"] == 30
+    assert env["result"]["arm_mode"] == "per_lens"
+    assert env["result"]["roster_quota"] == {"near": 3, "moderate": 1, "far": 2}
+
+    env = _run_cli(capsys, ["lens", "--program-root", str(cli_program_root), "export", "--round-id", "round-apl"])
+    assert env["ok"] is True
+    attrs = [row["attrs"] for row in env["result"]["bookable"]]
+    assert sorted(a["arm"] for a in attrs) == ["far", "far", "moderate", "near", "near", "near"]
+    buster = next(a for a in attrs if a["seat"] == "assumption_buster")
+    assert buster["arm"] == "far"
+    assert buster["recipe_cards"] == ["NEGATE"]
+
+
+def test_lens_assign_without_the_flag_still_writes_per_slice(cli_program_root, capsys):
+    store = open_store(cli_program_root)
+    pool = build_doc_pool(store, n_docs=12)
+    add_lens(store, round_id="round-ps", lens_name="l", vantage="v", model_class="top")
+    home_id, *candidate_ids = pool["doc_ids"]
+    store.close()
+
+    assign_argv = [
+        "lens", "--program-root", str(cli_program_root), "assign",
+        "--model-key", pool["model_key"], "--home", home_id,
+        "--round-id", "round-ps", "--slices-per-lens", "5", "--seed", "seed-A",
+    ]
+    for cid in candidate_ids:
+        assign_argv += ["--candidate", cid]
+    env = _run_cli(capsys, assign_argv)
+    assert env["ok"] is True
+    assert env["result"]["arm_mode"] == "per_slice"
+    assert env["result"]["roster_quota"] is None

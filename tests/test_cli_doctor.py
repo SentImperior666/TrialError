@@ -55,7 +55,18 @@ def test_cli_doctor_license_audit_passes_on_well_headered_fixture(tmp_path, caps
     assert lic["status"] == "pass"
 
 
-def test_cli_doctor_runs_all_registered_checks_by_default(tmp_path, capsys):
+def test_cli_doctor_runs_all_registered_checks_by_default(tmp_path, monkeypatch, capsys):
+    # Lane FB-3: this ran with NO platform-root isolation, so every
+    # platform.db-reading check (the four in `trialerror.budget.checks`) was
+    # answering about whatever real ~/.trialerror -- or TRIALERROR_PLATFORM_ROOT
+    # -- the developer's machine happened to have. It passed only as long as
+    # that store held nothing any check had an opinion about; `reconcile_provenance`
+    # warns on a hand-reconciled launch, which a real store has plenty of, so
+    # the assertion below was one real booking away from failing for reasons
+    # that have nothing to do with the CLI. Pointed at an empty scratch root:
+    # what this test is about is that the registry is run by default, not what
+    # any one check found.
+    monkeypatch.setenv("TRIALERROR_PLATFORM_ROOT", str(tmp_path / "platform"))
     rc = main(["doctor", "--vendored-root", str(tmp_path / "vendored")])
     out = capsys.readouterr().out.strip()
     env = json.loads(out)

@@ -27,7 +27,7 @@ FakeTransport-free-usable config object)::
     timeout_s = 15.0
 
     [litapi.arxiv]
-    base_url = "http://export.arxiv.org/api"
+    base_url = "https://export.arxiv.org/api"
     min_interval_s = 3.0                # info.arxiv.org ToU: 1 request per 3 seconds (enforced, not a guess)
     retry_attempts = 3
     timeout_s = 15.0
@@ -191,7 +191,12 @@ _DEFAULT_BASE_URLS: dict[str, str] = {
     # export.arxiv.org is arXiv's own documented dedicated API host (distinct
     # from the arxiv.org web host) -- path is completed by the provider's
     # own "/query" suffix, same base_url+path convention openalex/s2 use.
-    "arxiv": "http://export.arxiv.org/api",
+    # https (not arXiv's own historical http:// docs examples): egress
+    # policies that admit only tcp/443 (this harness's own container
+    # included, C-0093(a)) refuse plaintext http outright, and every other
+    # provider default in this table is already https -- there is no
+    # reason for arxiv alone to default to a scheme those policies block.
+    "arxiv": "https://export.arxiv.org/api",
     "unpaywall": "https://api.unpaywall.org/v2",
 }
 _DEFAULT_TIMEOUT_S = 15.0

@@ -526,6 +526,70 @@ def test_determinations_panel_ok_when_knowledge_db_absent(tmp_path, monkeypatch)
         assert panel["status"] == "ok"
         assert panel["counts_by_kind"].get("kg_merge", 0) == 0
         assert panel["counts_by_kind"].get("acquisition", 0) == 0
+        assert panel["counts_by_kind"].get("term_conflict", 0) == 0
+        assert panel["counts_by_kind"].get("term_duplicate", 0) == 0
+    finally:
+        rostore.close()
+
+
+def test_determinations_panel_term_conflict_item(seeded):
+    """The shared fixture's own pending, term-scoped conflicts_with relation
+    (tests/_store_fixtures.py, "lane e" comment) surfaces as one
+    term_conflict determination item -- design §5."""
+    rostore, ids = seeded
+    panel = data.build_determinations_panel(rostore)
+    item = next(i for i in panel["items"] if i["kind"] == "term_conflict")
+    assert item["id"] == ids["term_relation"]
+    assert item["term_id"] == ids["term"]
+    assert item["lemma"] == "Test Term"
+    assert item["member_sense_ids"] == [ids["term_sense"]]
+    assert item["marked_by_kind"] == "system"
+    assert item["blocking"] is False
+    assert "disambiguator" in item["consequence"]
+    assert panel["counts_by_kind"]["term_conflict"] == 1
+
+
+def test_determinations_panel_term_duplicate_item(seeded, program_root, platform_root):
+    """A pending term-to-term same_as candidate (engram-F4's shape) surfaces
+    as one term_duplicate item, distinct from term_conflict."""
+    rostore, ids = seeded
+    store = open_store(program_root, platform_root=platform_root)
+    from trialerror.lexicon.api import open_relation, propose
+
+    other = propose(
+        store,
+        lemma="Test Terms Alt",
+        gloss="a second own-words reading, coined separately",
+        origin_kind="manual",
+        origin_ref=None,
+        evidence=[{"kind": "record", "ref_id": ids["record"], "source_key": "other-register"}],
+        by_launch=ids["launch"],
+        procedure_version="manual-v1",
+    )
+    rel = open_relation(
+        store,
+        src_kind="term",
+        src_id=other["term_id"],
+        dst_kind="term",
+        dst_id=ids["term"],
+        verb="same_as",
+        marked_by_kind="system",
+        marked_by_model="scan-v1",
+    )
+    store.close()
+
+    rostore.close()
+    rostore = _reopen_ro(program_root, platform_root)
+    try:
+        panel = data.build_determinations_panel(rostore)
+        item = next(i for i in panel["items"] if i["kind"] == "term_duplicate" and i["id"] == rel["rel_id"])
+        assert item["src_term_id"] == other["term_id"]
+        assert item["src_lemma"] == "Test Terms Alt"
+        assert item["dst_term_id"] == ids["term"]
+        assert item["dst_lemma"] == "Test Term"
+        assert item["marked_by_kind"] == "system"
+        assert item["blocking"] is False
+        assert "SAME AS" in item["consequence"]
     finally:
         rostore.close()
 
@@ -594,23 +658,47 @@ def test_dossier_panel_not_initialized(empty_rostore):
 
 
 # ---------------------------------------------------------------------------
-# lexicon panel
+# lexicon panel (lane e, E4) -- design docs/reviews/LANE_E_TERM_STORE_DESIGN.md
+# section 5. The pre-E1 proxy version of this panel (entity/definition-claim
+# read, seam_note) is gone; the shared fixture's one term/sense/evidence/
+# relation row (tests/_store_fixtures.py, "lane e" comment) is what these
+# exercise -- a pending, term-scoped conflicts_with relation naming its own
+# term on both sides, exactly the shape the disjoint-source rule produces.
 # ---------------------------------------------------------------------------
-def test_lexicon_panel_ok(seeded):
+def test_lexicon_panel_index_ok(seeded):
     rostore, ids = seeded
     panel = data.build_lexicon_panel(rostore)
     assert panel["status"] == "ok"
-    assert len(panel["entities"]) == 2
-    assert any(e["entity_id"] == ids["entity"] and e["relation_count"] == 1 for e in panel["entities"])
-    assert panel["definition_claims"] == []  # fixture's claim kind='finding'
-    assert panel["claim_kind_counts"] == {"finding": 1}
-    assert len(panel["merge_proposals_draft"]) == 1
-    assert panel["contradiction_edges"] == []  # prov_edge has zero writers / fixture role='supports'
-    assert "term_sense" in panel["seam_note"]
+    assert panel["term"] is None  # no term_id given -- an index to read, not a card to land on
+
+    row = next(t for t in panel["terms"] if t["term_id"] == ids["term"])
+    assert row["lemma"] == "Test Term"
+    assert row["granularity"] == "instance"
+    assert row["tags"] == ["f-test"]
+    assert row["status"] == "active"
+    # the fixture's own pending conflicts_with relation makes this term
+    # "active" but with an open judgment -- split_open, not "stable".
+    assert row["state"] == "split_open"
+    assert row["gloss"] == "one own-words reading of the test term"
+    assert row["sense_count"] == 1
+    assert row["source_count"] == 1
+
+    assert panel["counts"]["total"] == len(panel["terms"])
+    assert panel["counts"]["by_state"]["split_open"] >= 1
+    assert panel["counts"]["by_granularity"]["instance"] >= 1
+    assert panel["counts"]["conflicts_open"] >= 1
+    assert panel["counts"]["needs_review"] == 0  # fixture's review_after is 2099
+    assert panel["counts"]["definition_claims_unprojected"] == 0  # fixture's only claim is kind='finding'
 
 
-def test_lexicon_panel_definition_claim_surfaced(seeded, program_root, platform_root):
+def test_lexicon_panel_definition_claims_unprojected(seeded, program_root, platform_root):
+    """A LIVE definition claim with no term_sense_evidence(kind='claim') row
+    under it counts toward definition_claims_unprojected -- "the migration-
+    from-proxy backlog" (design §5), replacing the old seam_note callout
+    with an actionable count."""
     rostore, ids = seeded
+    before = data.build_lexicon_panel(rostore)["counts"]["definition_claims_unprojected"]
+
     store = open_store(program_root, platform_root=platform_root)
     anchor_id = new_id("ANC")
     store_insert(
@@ -634,15 +722,97 @@ def test_lexicon_panel_definition_claim_surfaced(seeded, program_root, platform_
     rostore = _reopen_ro(program_root, platform_root)
     try:
         panel = data.build_lexicon_panel(rostore)
-        assert len(panel["definition_claims"]) == 1
-        assert panel["definition_claims"][0]["quote_text"] == "a defined term is X"
+        assert panel["counts"]["definition_claims_unprojected"] == before + 1
     finally:
         rostore.close()
+
+
+def test_lexicon_panel_detail_ok(seeded):
+    rostore, ids = seeded
+    panel = data.build_lexicon_panel(rostore, term_id=ids["term"])
+    assert panel["status"] == "ok"
+    assert "not_found" not in panel
+    detail = panel["term"]
+    assert detail is not None
+    assert detail["term"]["term_id"] == ids["term"]
+
+    assert len(detail["senses"]) == 1
+    sense = detail["senses"][0]
+    assert sense["sense_id"] == ids["term_sense"]
+    assert sense["gloss"] == "one own-words reading of the test term"
+    assert sense["disambiguator"] is None
+    assert sense["status"] == "current"
+    assert sense["origin_kind"] == "manual"
+    assert sense["source_keys"] == [ids["source"]]
+    assert sense["needs_review"] is False
+    assert sense["review_after"] == "2099-01-01T00:00:00.000Z"
+
+    assert len(sense["evidence"]) == 1
+    ev = sense["evidence"][0]
+    assert ev["kind"] == "quote_anchor"
+    assert ev["source_key"] == ids["source"]
+    assert ev["anchor_id"] == ids["quote_anchor"]
+    assert ev["page_number"] == 1
+    assert ev["excerpt"] == "hello world"  # fixture source is license_tier='open' -- not fenced
+    assert ev["fenced"] is False
+    assert ev["anchored"] is True
+
+    assert len(detail["relations"]) == 1
+    rel = detail["relations"][0]
+    assert rel["rel_id"] == ids["term_relation"]
+    assert rel["verb"] == "conflicts_with"
+    assert rel["status"] == "pending"
+    assert rel["marked_by_kind"] == "system"
+    assert rel["member_sense_ids"] == [ids["term_sense"]]
+
+    conflict = detail["conflict"]
+    assert conflict is not None
+    assert conflict["rel_id"] == ids["term_relation"]
+    assert conflict["member_sense_ids"] == [ids["term_sense"]]
+    assert conflict["shared_sources"] == []
+    assert conflict["systems_per_sense"] == {ids["term_sense"]: [ids["source"]]}
+
+
+def test_lexicon_panel_term_id_not_found(seeded):
+    rostore, ids = seeded
+    panel = data.build_lexicon_panel(rostore, term_id="TERM-does-not-exist")
+    assert panel["status"] == "ok"  # a selector that misses is a reading, never a 404 (evidence precedent)
+    assert panel["term"] is None
+    assert panel["not_found"] == {"kind": "term_id", "id": "TERM-does-not-exist"}
 
 
 def test_lexicon_panel_not_initialized(empty_rostore):
     panel = data.build_lexicon_panel(empty_rostore)
     assert panel["status"] == "not_initialized"
+
+
+def test_lexicon_panel_awaiting_migration_before_v5(tmp_path, monkeypatch):
+    """The ``course`` panel's exact convention (design §5): the ``term``
+    table doesn't exist yet on a knowledge.db this build's migration hasn't
+    reached -- ``trialerror dashboard`` never migrates a store itself."""
+    from trialerror.stores import paths as store_paths
+    from trialerror.stores.connection import connect
+    from trialerror.stores.migrate import apply_migrations
+    from trialerror.stores.schema import knowledge as knowledge_schema
+
+    platform_root = tmp_path / "platform"
+    monkeypatch.setenv("TRIALERROR_PLATFORM_ROOT", str(platform_root))
+    program_root = tmp_path / "program"
+    program_root.mkdir()
+
+    knowledge_path = store_paths.knowledge_db_path(program_root)
+    knowledge_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = connect(knowledge_path)
+    pre_v5 = tuple(m for m in knowledge_schema.MIGRATIONS if m.version <= 4)
+    apply_migrations(conn, pre_v5)
+    conn.close()
+
+    rostore = open_store_ro(program_root, platform_root=platform_root)
+    try:
+        panel = data.build_lexicon_panel(rostore)
+        assert panel["status"] == "awaiting_migration"
+    finally:
+        rostore.close()
 
 
 # ---------------------------------------------------------------------------
@@ -779,6 +949,66 @@ def test_since_you_left_last_session_close_default(program_root, platform_root):
 def test_since_you_left_not_initialized(empty_rostore):
     panel = data.build_since_you_left_panel(empty_rostore)
     assert panel["status"] == "not_initialized"
+
+
+def test_since_you_left_term_reviewed_event(seeded, program_root, platform_root):
+    """Lane e (E4): the twelve ``term_*`` event types (design §3, plus
+    ``term_evidence_retracted``) join the union this panel builds -- proven
+    here with ``term_reviewed``, the plainest of the twelve; the trickier
+    payload shapes (``term_merged``, the two relation events -- neither
+    carries a ``term_id`` key at all) are pinned directly against
+    :func:`data._term_event_summary` below, without needing a live store for
+    each one."""
+    rostore, ids = seeded
+    store = open_store(program_root, platform_root=platform_root)
+    from trialerror.lexicon.api import mark_reviewed
+
+    mark_reviewed(store, ids["term_sense"], by_launch=ids["launch"])
+    store.close()
+
+    rostore.close()
+    rostore = _reopen_ro(program_root, platform_root)
+    try:
+        panel = data.build_since_you_left_panel(rostore)
+        item = next(i for i in panel["items"] if i["kind"] == "term_reviewed")
+        assert item["ref"]["term_id"] == ids["term"]
+        assert ids["term_sense"] in item["summary"]
+        assert "review" in item["summary"].lower()
+    finally:
+        rostore.close()
+
+
+def test_term_event_summary_payload_shapes_with_no_term_id_key():
+    """``term_merged``/``term_relation_opened``/``term_relation_decided``
+    name their subject through DIFFERENT keys than every other term event
+    (``canonical_term_id``/``merged_term_id``, ``rel_id``) -- a naive
+    ``payload.get("term_id", "?")`` fallback would silently print "Term ?"
+    on exactly the events this panel exists to explain. Pinned directly,
+    with no store, since these three payload shapes are exact copies of
+    what ``lexicon.api``'s own ``append_event`` calls write."""
+    merged = data._term_event_summary(
+        "term_merged",
+        {"canonical_term_id": "TERM-A", "merged_term_id": "TERM-B", "merged_lemma": "old name"},
+    )
+    assert "old name" in merged and "TERM-B" in merged and "TERM-A" in merged
+    assert "?" not in merged
+
+    opened = data._term_event_summary(
+        "term_relation_opened",
+        {"rel_id": "TREL-1", "verb": "same_as", "src": ["term", "TERM-A"], "dst": ["term", "TERM-B"]},
+    )
+    assert "same_as" in opened and "TERM-A" in opened and "TERM-B" in opened
+
+    decided = data._term_event_summary(
+        "term_relation_decided",
+        {"rel_id": "TREL-1", "verb": "conflicts_with", "decision": "scoped"},
+    )
+    assert "TREL-1" in decided and "scoped" in decided
+
+    retracted = data._term_event_summary(
+        "term_evidence_retracted", {"evidence_id": "TSE-1", "sense_id": "SENSE-1", "reason": "wrong anchor"}
+    )
+    assert "SENSE-1" in retracted and "wrong anchor" in retracted
 
 
 # ---------------------------------------------------------------------------

@@ -97,9 +97,16 @@ from trialerror import __version__
 from trialerror.artifacts.errors import GateEntryConditionError, IllegalTransitionError, RegistrationRefusedError
 from trialerror.artifacts.gates import advance_gate
 from trialerror.artifacts.registry import register_artifact as register_artifact_api
-from trialerror.budget.errors import BudgetError, ModelPolicyViolationError, NoOpenSessionError, UnknownOverrideRulingError
-from trialerror.budget.gate import resolve_open_session
+from trialerror.budget.errors import (
+    BudgetError,
+    ModelPolicyViolationError,
+    NoOpenSessionError,
+    UnknownAssignmentError,
+    UnknownOverrideRulingError,
+)
+from trialerror.budget.gate import resolve_booking_identity, resolve_open_session
 from trialerror.budget.pools import book_launch as book_launch_api
+from trialerror.budget.pools import check_booking_preconditions
 from trialerror.budget.pools import budget_status as budget_status_api
 from trialerror.budget.pools import reconcile_launch as reconcile_launch_api
 from trialerror.events.api import append_event as append_event_api
@@ -202,35 +209,121 @@ def _tool_budget_status(args: Mapping[str, Any], *, store: Store) -> dict[str, A
 # ---------------------------------------------------------------------------
 
 
+def _read_assign_ids(value: Any) -> list[str] | None:
+    """Coerce the ``assign_ids`` argument, refusing the shapes that would
+    otherwise book something nobody asked for (fix pass B-1).
+
+    A JSON caller that passes the single id as a string instead of a
+    one-element array used to have it comprehended character by character
+    into eight ids that name no row. Raises ``ValueError``, which this
+    module's wrapper answers as ``bad_input``."""
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)):
+        raise ValueError(
+            f"assign_ids must be an array of assign ids, not a single string ({value!r} would "
+            "read as one id per character); pass [\"<assign_id>\"]"
+        )
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"assign_ids must be an array of assign ids, got {type(value).__name__}")
+    return [str(a) for a in value] or None
+
+
 def _tool_book_launch(args: Mapping[str, Any], *, store: Store) -> dict[str, Any]:
-    session_id, err = _resolve_session_id(store, args.get("session_id"))
-    if err is not None:
-        return error_envelope("book_launch", err["code"], err["message"],
-                               next_actions=[next_action(["trialerror", "session", "boot"], "boot a session")])
-    policy = _load_model_policy(store.program_root)
+    from trialerror.budget.quota import booking_quota_reading, booking_refusal
+
+    # Lane FB-7 item 6: the same defaults `trialerror budget book` takes,
+    # from the same function -- this is the surface an orchestrator actually
+    # books through, and two verbs that resolve "which session, which
+    # program" differently is how a booking lands under the wrong one.
     try:
-        result = book_launch_api(
+        session_id, program_id, resolved_from = resolve_booking_identity(
+            store, session_id=args.get("session_id"), program_id=args.get("program_id")
+        )
+    except NoOpenSessionError as exc:
+        return error_envelope(
+            "book_launch", "no_open_session", str(exc),
+            next_actions=[next_action(["trialerror", "session", "boot"], "boot a session")],
+        )
+    except RuntimeError as exc:
+        return error_envelope(
+            "book_launch", "multiple_open_sessions",
+            f"{exc} -- pass session_id explicitly, or close one",
+        )
+    except ValueError as exc:
+        return error_envelope("book_launch", "program_id_unresolved", str(exc))
+    policy = _load_model_policy(store.program_root)
+    # Fix pass V-2: every argument is read and coerced HERE, before the quota
+    # gate. A bad `est_tokens` raises ValueError/TypeError/KeyError, which
+    # `_wrap` turns into `bad_input` -- the answer the caller needs. Parsing
+    # it after the gate meant a malformed call came back
+    # `stale_quota_capture`, i.e. a diagnosis of the machine for a fault in
+    # the request.
+    booking = {
+        "program_id": program_id,
+        "agent_kind": args["agent_kind"],
+        "model_class": args["model_class"],
+        "model": args["model"],
+        "purpose": args["purpose"],
+        "est_tokens": int(args["est_tokens"]),
+        "booking_ttl_s": int(args["booking_ttl_s"]) if args.get("booking_ttl_s") is not None else 3600,
+        "parent_launch": args.get("parent_launch"),
+        "workpackage": args.get("workpackage"),
+        "override_ruling_id": args.get("override_ruling_id"),
+        # The lens-launch link (lane FB-4 item 5): which lens_assignment rows
+        # this booking covers. Read here with the rest of the arguments, so a
+        # malformed value answers `bad_input` rather than a diagnosis of the
+        # quota capture. Fix pass B-1: a bare string is refused here rather
+        # than comprehended into one id per character.
+        "assign_ids": _read_assign_ids(args.get("assign_ids")),
+    }
+    try:
+        # ... and the session/policy rungs of book_launch's own ladder before
+        # it too, so a booking from a closed session says so.
+        check_booking_preconditions(
             store,
             session_id=session_id,
-            program_id=args["program_id"],
-            agent_kind=args["agent_kind"],
-            model_class=args["model_class"],
-            model=args["model"],
-            purpose=args["purpose"],
-            est_tokens=int(args["est_tokens"]),
-            booking_ttl_s=int(args["booking_ttl_s"]) if args.get("booking_ttl_s") is not None else 3600,
-            parent_launch=args.get("parent_launch"),
-            workpackage=args.get("workpackage"),
-            attrs=args.get("attrs"),
+            purpose=booking["purpose"],
+            model_class=booking["model_class"],
             policy=policy,
-            override_ruling_id=args.get("override_ruling_id"),
+            override_ruling_id=booking["override_ruling_id"],
         )
     except NoOpenSessionError as exc:
         return error_envelope("book_launch", "no_open_session", str(exc))
     except (ModelPolicyViolationError, UnknownOverrideRulingError) as exc:
         return error_envelope("book_launch", "model_policy_violation", str(exc))
+    # Lane FB-3 item 8. The same guard `trialerror budget book` applies, from
+    # the same function: this is the surface an orchestrator actually books
+    # through, and a refusal that fired on only the CLI would be one nothing
+    # ever met.
+    quota_reading = booking_quota_reading(store.program_root)
+    refusal = booking_refusal(quota_reading, flag="allow_stale_quota: true")
+    allow_stale = bool(args.get("allow_stale_quota"))
+    if refusal and not allow_stale:
+        return error_envelope(
+            "book_launch", "stale_quota_capture", refusal, details=quota_reading,
+            next_actions=[next_action(["trialerror", "budget", "quota"], "re-read the capture")],
+        )
+    attrs = dict(args.get("attrs") or {})
+    if refusal and allow_stale:
+        attrs["allowed_stale_quota"] = quota_reading
+    try:
+        result = book_launch_api(
+            store,
+            session_id=session_id,
+            attrs=attrs or None,
+            policy=policy,
+            **booking,
+        )
+    except NoOpenSessionError as exc:
+        return error_envelope("book_launch", "no_open_session", str(exc))
+    except (ModelPolicyViolationError, UnknownOverrideRulingError) as exc:
+        return error_envelope("book_launch", "model_policy_violation", str(exc))
+    except UnknownAssignmentError as exc:
+        return error_envelope("book_launch", "unknown_assignment", str(exc))
 
     payload = result.to_dict()
+    payload["resolved_from"] = resolved_from
     if not result.ok:
         return error_envelope(
             "book_launch", f"book_{result.state.lower()}",
@@ -556,7 +649,12 @@ def build_tools(*, program_root: Path, platform_root: Path | None = None) -> dic
             "book_launch",
             "Create a PROVISIONAL booking -> launch_id token (refuses over-cap); tool #3, wraps "
             "trialerror.budget.pools.book_launch. session_id defaults to the program's one open session; "
-            "account_id is never accepted -- it is derived from that session.",
+            "account_id is never accepted -- it is derived from that session. Refuses when the plan-quota "
+            "capture is older than [budget] quota_max_age_s unless allow_stale_quota is true, which is "
+            "recorded on the launch. assign_ids links a lens booking to the lens_assignment rows it "
+            "covers, which is how the retrieval scope and the citation audit resolve its slice. "
+            "session_id defaults to the program's single OPEN session and program_id to [program] id "
+            "in trialerror.toml; the result says which of them was resolved rather than given.",
             {
                 "type": "object",
                 "properties": {
@@ -571,9 +669,11 @@ def build_tools(*, program_root: Path, platform_root: Path | None = None) -> dic
                     "parent_launch": {"type": "string"},
                     "workpackage": {"type": "string"},
                     "attrs": {"type": "object"},
+                    "assign_ids": {"type": "array", "items": {"type": "string"}},
                     "override_ruling_id": {"type": "string"},
+                    "allow_stale_quota": {"type": "boolean"},
                 },
-                "required": ["program_id", "agent_kind", "model_class", "model", "purpose", "est_tokens"],
+                "required": ["agent_kind", "model_class", "model", "purpose", "est_tokens"],
             },
             _tool_book_launch,
         ),

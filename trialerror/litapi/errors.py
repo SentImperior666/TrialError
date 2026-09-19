@@ -34,12 +34,35 @@ class ProviderTransportError(LitApiError):
     a non-2xx/404 status the provider doesn't treat as "not found", or a
     malformed response body). Carries the provider name and, when known,
     the HTTP status code -- callers that want to branch on 429-vs-5xx etc.
-    can inspect ``status_code`` rather than parsing the message string."""
+    can inspect ``status_code`` rather than parsing the message string.
 
-    def __init__(self, message: str, *, provider: str, status_code: int | None = None):
+    ``host``/``scheme`` (litapi-arxiv-https build) are set ONLY by
+    :func:`trialerror.litapi.providers.base.get_with_retry`'s own wrapping of a
+    genuine transport-level exception (``urllib.error.URLError``, a socket
+    timeout, connection-refused -- all ``OSError`` subclasses; see that
+    function's docstring) -- ``status_code`` stays ``None`` for exactly
+    this case (no HTTP response was ever received to have a status code),
+    which is what distinguishes it from the pre-existing "bad HTTP status"
+    use of this same class (``status_code`` set, ``host``/``scheme``
+    left at their ``None`` default). Callers (``trialerror.litapi.client``,
+    ``trialerror/cli/lit.py``) key off ``host is not None`` to report the
+    more actionable ``transport_unreachable`` code/details instead of a
+    generic one."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str,
+        status_code: int | None = None,
+        host: str | None = None,
+        scheme: str | None = None,
+    ):
         super().__init__(message)
         self.provider = provider
         self.status_code = status_code
+        self.host = host
+        self.scheme = scheme
 
 
 class ProviderNotFoundError(LitApiError):

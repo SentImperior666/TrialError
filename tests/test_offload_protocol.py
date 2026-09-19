@@ -590,6 +590,53 @@ def test_a_job_id_with_a_trailing_newline_is_refused(root):
         protocol.validate_job_id("JOB-a\n")
 
 
+def test_the_claim_directorys_own_file_names_are_not_job_ids(root):
+    """FIX V-11. ``claimed/<worker>/`` holds ``CONTROL.json`` and
+    ``<job>.progress.json`` beside the manifests, so ``find_manifest`` used to
+    answer with a STATUS file for two ids: ``CONTROL`` and anything ending in
+    ``.progress``. Nothing mints such an id, and now nothing can ask for one."""
+    queue_one(root, "JOB-a")
+    protocol.server_claim(root, "JOB-a", worker_id="dev")
+    protocol.write_json(
+        protocol.control_path(root, "dev"),
+        {"schema": protocol.CONTROL_SCHEMA, "request": "pause", "by_launch": "LNCH-1", "ts": None},
+    )
+    protocol.progress_path(root, "dev", "JOB-a").write_text('{"state":"running"}', encoding="utf-8")
+
+    for reserved in ("CONTROL", "JOB-a.progress"):
+        with pytest.raises(protocol.OffloadProtocolError, match="reserved"):
+            protocol.validate_job_id(reserved)
+        with pytest.raises(protocol.OffloadProtocolError, match="reserved"):
+            protocol.find_manifest(root, reserved)
+
+    # …and the real manifest is still found, by its own name
+    state, path = protocol.find_manifest(root, "JOB-a")
+    assert state == "claimed" and path.name == "JOB-a.json"
+
+
+def test_the_range_cache_directory_is_not_a_job_id(root):
+    """FIX V-3. ``<work_root>/_ranges/<job_id>`` holds every chunked OCR
+    job's finished page ranges, and both the worker and the operator guide
+    said this id was already refused while it was still admitted. A job by
+    that name would own ``<work_root>/_ranges`` as its own job directory --
+    which ``_process_one`` wipes at every claim, taking every other job's
+    unpublished GPU hours with it -- and would be skipped by
+    ``_retry_publishes`` forever, stranding its own result.
+
+    Nothing mints such an id. That is the argument for reserving it, not the
+    argument against: it is the same one ``CONTROL`` is refused on."""
+    from trialerror.offload import worker as W
+
+    assert W.OCR_RANGE_CACHE_DIRNAME == protocol.RANGE_CACHE_DIRNAME
+    with pytest.raises(protocol.OffloadProtocolError, match="reserved"):
+        protocol.validate_job_id(protocol.RANGE_CACHE_DIRNAME)
+    with pytest.raises(protocol.OffloadProtocolError, match="reserved"):
+        protocol.find_manifest(root, protocol.RANGE_CACHE_DIRNAME)
+    # An id that merely CONTAINS the name is a normal id: the refusal is the
+    # one directory, not every underscore.
+    assert protocol.validate_job_id("JOB-ocr-_ranges-1") == "JOB-ocr-_ranges-1"
+
+
 def test_reclaim_and_adopt_are_read_only_when_there_is_no_queue(tmp_path):
     """V2: `reclaim`/`kick` run from an unattended loop in every program,
     including the many that offload nothing. Asking the question must not

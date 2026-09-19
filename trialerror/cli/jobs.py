@@ -13,6 +13,13 @@ writes the wake token :func:`trialerror.jobs.worker.run_loop` naps on, so
 poll interval. It is deliberately NOT a spawn -- it wakes workers that
 already exist and does nothing at all when none are running (which is why
 it needs no launch booking).
+
+``abandon`` (lane FB-3) and ``retry`` (lane FB-8a) are the two ends of the
+settled-unsuccessful state: one puts a job there on purpose, the other is
+the sanctioned way back out of it once the thing that broke has been fixed.
+Between them there was no way back at all -- ``resume`` covers ``paused``
+only -- and the alternative an operator actually reached for was editing
+``jobs.db`` by hand.
 """
 
 from __future__ import annotations
@@ -31,7 +38,9 @@ from trialerror.util.config import find_program_root
 from trialerror.util.envelope import error_envelope, next_action, ok_envelope
 
 GROUP_NAME = "jobs"
-HELP = "Durable execution ledger: list/claim/pause/resume/kick jobs; launch detached workers."
+HELP = (
+    "Durable execution ledger: list/claim/pause/resume/retry/kick jobs; launch detached workers."
+)
 
 
 def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
@@ -108,6 +117,57 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     _common(p_resume)
     p_resume.add_argument("job_id")
     p_resume.set_defaults(handler=_cmd_resume)
+
+    p_abandon = sub.add_parser(
+        "abandon",
+        help="settle a job as abandoned with a stated reason (refused while a worker holds it)",
+    )
+    _common(p_abandon)
+    p_abandon.add_argument("job_id")
+    p_abandon.add_argument(
+        "--reason",
+        required=True,
+        help="why this job is being cancelled -- recorded in last_error and on the ledger event, "
+             "because a terminal row with no stated cause is the kind the next person re-runs",
+    )
+    p_abandon.set_defaults(handler=_cmd_abandon)
+
+    p_retry = sub.add_parser(
+        "retry",
+        help="return a failed/abandoned job to the queue with its retry budget restored "
+        "(and its offload marker with it)",
+    )
+    _common(p_retry)
+    p_retry.add_argument("job_id")
+    p_retry.add_argument(
+        "--reason",
+        required=True,
+        help="why this settled job deserves another run -- recorded on the ledger event and, "
+        "for an offloaded job, in the evidence directory the terminal attempt is kept in. "
+        "A row that came back from terminal with no stated cause is one nobody can audit",
+    )
+    p_retry.add_argument(
+        "--by-launch",
+        default=None,
+        dest="by_launch",
+        help="the launch this retry is booked under (recorded on the ledger event)",
+    )
+    p_retry.add_argument(
+        "--max-attempts",
+        type=int,
+        default=None,
+        dest="max_attempts",
+        help=f"give the job a new attempt budget ({ledger.RETRY_MAX_ATTEMPTS_RANGE[0]}-"
+        f"{ledger.RETRY_MAX_ATTEMPTS_RANGE[1]}); unchanged when omitted",
+    )
+    p_retry.add_argument(
+        "--clear-checkpoint",
+        action="store_true",
+        dest="clear_checkpoint",
+        help="drop the job's checkpoint instead of keeping it (use when the cursor itself is "
+        "what was wrong -- by default a retried stage resumes from where it got to)",
+    )
+    p_retry.set_defaults(handler=_cmd_retry)
 
     p_logs = sub.add_parser("logs", help="show a job's ledger event history")
     _common(p_logs)
@@ -205,6 +265,34 @@ def _cmd_pause(args: argparse.Namespace) -> dict:
         store.close()
 
 
+def _cmd_abandon(args: argparse.Namespace) -> dict:
+    """Lane FB-3 item 9. Until now the only route to ``abandoned`` was
+    exhausting ``max_attempts``, so cancelling a job meant letting it run and
+    fail three times, or pausing it and leaving a paused row in the queue
+    forever. ``ingest retract`` uses the same ledger call for the pending
+    work of a document it has just withdrawn."""
+    store, err = _open(args)
+    if err is not None:
+        return err
+    try:
+        row = ledger.abandon(store, args.job_id, reason=args.reason)
+        return ok_envelope("jobs.abandon", result=row)
+    except JobError as exc:
+        return error_envelope(
+            "jobs.abandon",
+            type(exc).__name__,
+            str(exc),
+            next_actions=[
+                next_action(
+                    ["trialerror", "jobs", "pause", args.job_id],
+                    "a worker holds this job: pause it first, then abandon the paused row",
+                )
+            ],
+        )
+    finally:
+        store.close()
+
+
 def _cmd_resume(args: argparse.Namespace) -> dict:
     store, err = _open(args)
     if err is not None:
@@ -223,6 +311,123 @@ def _cmd_resume(args: argparse.Namespace) -> dict:
         )
     except JobError as exc:
         return error_envelope("jobs.resume", type(exc).__name__, str(exc))
+    finally:
+        store.close()
+
+
+def _cmd_retry(args: argparse.Namespace) -> dict:
+    """Lane FB-8a. A tool-side defect was fixed and the documents that met
+    it first were the only ones the fix could not reach: their jobs were
+    ``failed`` (offload attempts spent) or ``abandoned``, ``jobs resume``
+    covers ``paused`` only, and the only other route was editing the jobs
+    store by hand.
+
+    **The order of the two halves is the design.** The state refusals are
+    checked FIRST and read nothing but the ledger row, so a retry aimed at a
+    job a worker is holding is refused before any directory moves. Then the
+    offload queue entry goes back (idempotent, detectable). Then, and only
+    then, the store transaction. A crash in between leaves a queued marker
+    for a still-``failed`` row -- recoverable by running this command again,
+    which finds the queue half done and completes the store half -- rather
+    than a ``pending`` row whose marker is still terminal, which would look
+    like nothing needed doing and would simply re-fail three times."""
+    from trialerror.offload import protocol
+    from trialerror.offload.retry import retry_offload_entry
+    from trialerror.offload.stage import MissingStageInputError
+
+    store, err = _open(args)
+    if err is not None:
+        return err
+    program_root = _resolve_program_root(args)
+    try:
+        # -- half zero: refuse on the row's state, before anything moves ---
+        try:
+            ledger.retry_refusal(store, args.job_id, max_attempts=args.max_attempts)
+        except ValueError as exc:
+            return error_envelope("jobs.retry", "bad_max_attempts", str(exc))
+        except JobError as exc:
+            found = ledger.get_job(store, args.job_id)
+            actions = []
+            if found is not None and found["state"] == "paused":
+                actions.append(
+                    next_action(
+                        ["trialerror", "jobs", "resume", args.job_id],
+                        "a paused job is lifted with `jobs resume`, not retried",
+                    )
+                )
+            if found is not None and found["state"] in ledger.HELD_STATES:
+                actions.append(
+                    next_action(
+                        ["trialerror", "jobs", "pause", args.job_id],
+                        "a worker holds this job: pause it, let it stop, then retry the settled row",
+                    )
+                )
+            return error_envelope("jobs.retry", type(exc).__name__, str(exc), next_actions=actions)
+
+        # -- half one: the offload queue entry ----------------------------
+        root = protocol.offload_root(program_root)
+        try:
+            offload = retry_offload_entry(
+                store, root, args.job_id, reason=args.reason, by_launch=args.by_launch
+            )
+        except MissingStageInputError as exc:
+            return error_envelope("jobs.retry", "offload_input_missing", str(exc))
+        except protocol.OffloadError as exc:
+            return error_envelope("jobs.retry", "offload_retry_refused", str(exc))
+
+        # -- half two: the jobs store -------------------------------------
+        before = ledger.get_job(store, args.job_id)
+        try:
+            row = ledger.retry(
+                store,
+                args.job_id,
+                reason=args.reason,
+                by_launch=args.by_launch,
+                max_attempts=args.max_attempts,
+                clear_checkpoint=args.clear_checkpoint,
+            )
+        except JobError as exc:
+            return error_envelope("jobs.retry", type(exc).__name__, str(exc))
+
+        warnings = list(offload["warnings"])
+        actions = [
+            next_action(
+                ["trialerror", "jobs", "kick"],
+                "wake a napping worker so the retried job is claimed now rather than at the "
+                "next poll",
+            )
+        ]
+        if offload["moved"] or offload["already_retried"]:
+            actions.append(
+                next_action(
+                    ["trialerror", "offload", "status"],
+                    "the marker is back in the queue -- the GPU worker claims it on its next poll",
+                )
+            )
+        return ok_envelope(
+            "jobs.retry",
+            result={
+                "job_id": row["job_id"],
+                "kind": row["kind"],
+                "previous_state": before["state"],
+                "previous_attempts": before["attempts"],
+                "state": row["state"],
+                "max_attempts": row["max_attempts"],
+                "last_error": row["last_error"],
+                "checkpoint_cleared": bool(args.clear_checkpoint),
+                "offload": {
+                    "moved": offload["moved"],
+                    "from": offload["from"],
+                    "to": offload["to"],
+                    "attempts_reset": offload["attempts_reset"],
+                    "state": offload["state"],
+                    "already_retried": offload["already_retried"],
+                },
+                "warnings": warnings,
+            },
+            next_actions=actions,
+            warnings=warnings or None,
+        )
     finally:
         store.close()
 

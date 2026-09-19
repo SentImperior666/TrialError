@@ -32,6 +32,9 @@ from trialerror.util.config import resolve_configured_path
 from trialerror.util.timeutil import now
 
 __all__ = [
+    "HANDOFFS_OUTSIDE_ROOT_KEY",
+    "HandoffsDirOutsideRootError",
+    "handoffs_dir_outside_root_allowed",
     "HANDOFFS_DIR_NAME",
     "resolve_handoffs_dir",
     "list_handoffs",
@@ -50,6 +53,34 @@ _SUPERSESSION_MARK = "> **SUPERSEDED**"
 _DATED_RE = re.compile(r"^HANDOFF_(\d{4}-\d{2}-\d{2})([a-z]?)\.md$")
 
 
+#: The ``[session]`` key that lets a program render its handoffs OUTSIDE
+#: its own root. Off by default; a program that genuinely keeps its closes
+#: elsewhere sets it once, deliberately.
+HANDOFFS_OUTSIDE_ROOT_KEY = "handoffs_dir_outside_root"
+
+
+class HandoffsDirOutsideRootError(ValueError):
+    """``[paths].handoffs_dir`` resolves outside the program root and
+    ``[session] handoffs_dir_outside_root`` is not set.
+
+    The incident: a scratch program was scaffolded by copying another
+    program's ``trialerror.toml``, which carried an ABSOLUTE
+    ``handoffs_dir``. ``session close`` on the scratch program rendered
+    ``HANDOFF_<date>.md`` into the other program's repo root and marked a
+    live session closed there -- a write into an unrelated program, from a
+    config value nobody reread. A path pointing out of the program is
+    exactly what a copied config gets wrong, so it is an opt-in rather than
+    a default.
+
+    A :class:`ValueError` subclass so every existing caller that already
+    handles a bad config value keeps handling this one."""
+
+
+def handoffs_dir_outside_root_allowed(config: Mapping[str, Any] | None) -> bool:
+    session_cfg = (config or {}).get("session", {}) or {}
+    return bool(session_cfg.get(HANDOFFS_OUTSIDE_ROOT_KEY, False))
+
+
 def resolve_handoffs_dir(program_root: Path, config: Mapping[str, Any] | None = None) -> Path:
     """``[paths].handoffs_dir`` (default :data:`HANDOFFS_DIR_NAME`,
     program-root-relative unless the configured value is absolute) --
@@ -58,8 +89,38 @@ def resolve_handoffs_dir(program_root: Path, config: Mapping[str, Any] | None = 
     ONE function both this module and ``trialerror.sessions.lifecycle`` call,
     where before each had its own separate literal (this module's own
     ``HANDOFFS_DIR_NAME`` constant, and a bare
-    ``store.program_root / "handoffs"`` in ``lifecycle._build_bundle``)."""
-    return resolve_configured_path(program_root, config, "handoffs_dir", HANDOFFS_DIR_NAME)
+    ``store.program_root / "handoffs"`` in ``lifecycle._build_bundle``).
+
+    **A directory outside the program root is refused** unless
+    ``[session] handoffs_dir_outside_root = true`` says so
+    (:class:`HandoffsDirOutsideRootError`). See that class for the incident;
+    the short version is that a handoff is a write, and a config copied from
+    another program aims that write at the other program."""
+    resolved = resolve_configured_path(program_root, config, "handoffs_dir", HANDOFFS_DIR_NAME)
+    root = Path(program_root)
+    inside = _is_within(resolved, root)
+    if not inside and not handoffs_dir_outside_root_allowed(config):
+        raise HandoffsDirOutsideRootError(
+            f"[paths].handoffs_dir = {str(resolved)!r} resolves outside the program root "
+            f"({str(root)!r}), so closing this session would render its handoff into another program's "
+            "tree. If that is deliberate, set [session] "
+            f"{HANDOFFS_OUTSIDE_ROOT_KEY} = true in this program's trialerror.toml; if this config was "
+            "copied from another program, point handoffs_dir at a program-root-relative directory "
+            f"(the default is {HANDOFFS_DIR_NAME!r})"
+        )
+    return resolved
+
+
+def _is_within(candidate: Path, root: Path) -> bool:
+    """Is ``candidate`` inside ``root``? Compared on normalised absolute
+    paths WITHOUT resolving symlinks: ``Path.resolve`` would follow a link
+    out of the root and report a legitimate layout as an escape, and would
+    also touch the filesystem for a directory that does not exist yet."""
+    import os
+
+    candidate_abs = os.path.normpath(os.path.abspath(str(candidate)))
+    root_abs = os.path.normpath(os.path.abspath(str(root)))
+    return candidate_abs == root_abs or candidate_abs.startswith(root_abs + os.sep)
 
 
 def _handoffs_dir(program_root: Path, config: Mapping[str, Any] | None = None) -> Path:

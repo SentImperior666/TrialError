@@ -38,6 +38,7 @@ __all__ = [
     "normalize_arxiv_id",
     "arxiv_to_doi",
     "normalize_title",
+    "looks_like_identifier",
 ]
 
 _DOI_PREFIX_RE = re.compile(r"^\s*(doi\s*:\s*|https?://(dx\.)?doi\.org/)", re.IGNORECASE)
@@ -78,6 +79,33 @@ def arxiv_to_doi(arxiv_id: str | None) -> str | None:
     if not normalized:
         return None
     return f"10.48550/arxiv.{normalized}"
+
+
+#: A bare DOI (``10.<registrant>/<suffix>``) or an arXiv id, in either the
+#: modern ``2401.01234`` or the legacy ``math.GT/0309136`` form -- with the
+#: optional ``doi:``/``arXiv:``/``https://doi.org/`` wrappers the two
+#: normalizers above already strip.
+_LOOKS_LIKE_DOI_RE = re.compile(r"^10\.\d{4,9}/\S+$")
+_LOOKS_LIKE_ARXIV_RE = re.compile(r"^(\d{4}\.\d{4,5}|[a-z-]+(\.[A-Z]{2})?/\d{7})$", re.IGNORECASE)
+
+
+def looks_like_identifier(text: str | None) -> bool:
+    """Is ``text`` a DOI or an arXiv id rather than a title/keyword query?
+
+    Lane FB-1 item F10b. Title normalization casefolds and collapses every
+    non-alphanumeric run to a space, which destroys an identifier: a DOI's
+    slashes, dots and case are the identifier. So the normalised-fallback
+    retry has to be able to tell the two apart, and does it here -- one
+    place, tested -- rather than at the call site where "it's a search query,
+    so it can't be an id" would be an assumption rather than a check."""
+    if not text:
+        return False
+    candidate = _DOI_PREFIX_RE.sub("", text.strip()).strip().strip("/")
+    if _LOOKS_LIKE_DOI_RE.match(candidate):
+        return True
+    candidate = _ARXIV_PREFIX_RE.sub("", text.strip()).strip()
+    candidate = _ARXIV_VERSION_RE.sub("", candidate)
+    return bool(_LOOKS_LIKE_ARXIV_RE.match(candidate))
 
 
 def normalize_title(title: str | None) -> str | None:

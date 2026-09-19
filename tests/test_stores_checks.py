@@ -103,14 +103,44 @@ def test_store_schema_version_passes_on_freshly_migrated_store(store, program_ro
     # because it merged BEFORE lane c (L-C1 amended, lane c takes v8) -- and
     # lane c's own ops_v8_thread_created_by_nullable_and_author is that 8.
     # Lane a's two numbers (knowledge v4, jobs v3) were reserved by the
-    # orchestrator before that lane started, so they needed no renumber.
+    # orchestrator before that lane started, so they needed no renumber; lane
+    # e's knowledge v5 (the lexicon term store) took the next one after lane a
+    # actually merged, which is what ruling L-E1's ordering rule required of
+    # it ("_V5 follows a real _V4, or lane e lands as v4 and lane a renumbers
+    # -- whoever merges second renumbers").
     # The check reads BOTH numbers from latest_version(MIGRATIONS) and PRAGMA
     # user_version, so the numbering history is invisible to it -- what it
     # asserts is that the two agree.
-    assert r.details["ops"] == {"current_version": 8, "expected_version": 8, "match": True}
+    #
+    # The ideation lane then added one to each of ops and knowledge: ops v9
+    # (the control seat, the recipe-card block and the assignment mode) and
+    # knowledge v6 (the idea record's two new statuses and its ten promoted
+    # columns). Both were the next free number at merge time, so neither
+    # needed a renumber. Its second stage added knowledge v7 (the
+    # ``inventory`` source kind the novelty screen's reference set needs),
+    # again the next free number.
+    # Lane FB-4 added ops v10 (``lens_assignment.lens_launch_id``, the lens-launch
+    # link the slice audit and ``lens log`` read), again the next free number.
+    # Lane FB-5 added knowledge v8 (``verdict.label_canonical``) and v9
+    # (``idea.status`` gains ``archived``); lane FB-6 added knowledge v10
+    # (``vec_ideas``, the per-model idea-vector cache the R2 archive is read
+    # through) -- each the next free number at merge time.
+    # Lane FB-7 item 8b added knowledge v11 (``idea.extra``, so a round's own
+    # record can carry the same free block FB-6 item 6 gave a plant -- the
+    # envelope's shape is what keeps the two indistinguishable, and a key one
+    # of them cannot hold is a tell), and item 9 added v12
+    # (``verdict.round_id``/``batch_id``: the one-submission guard was keyed
+    # by subject alone, which is right for a record whose id is unique across
+    # the programme and wrong for a plant whose id is whatever the round's
+    # plants file called it).
+    assert r.details["ops"] == {"current_version": 10, "expected_version": 10, "match": True}
     assert r.details["jobs"] == {"current_version": 3, "expected_version": 3, "match": True}
-    assert r.details["knowledge"] == {"current_version": 4, "expected_version": 4, "match": True}
-    assert r.details["platform"]["expected_version"] == 1
+    assert r.details["knowledge"] == {"current_version": 12, "expected_version": 12, "match": True}
+    # platform stayed on v1 from M1 until lane FB-3, whose D-FB-13/D-FB-14
+    # work is the first thing to need a shape change in the money store:
+    # ``launch`` gains the usage split and ``pool_id``, and
+    # ``reconcile_source`` gains ``'event'``.
+    assert r.details["platform"]["expected_version"] == 2
 
 
 def test_store_schema_version_skips_when_db_absent(tmp_path, platform_root):

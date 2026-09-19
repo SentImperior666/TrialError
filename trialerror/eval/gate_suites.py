@@ -54,6 +54,14 @@ enforcement code, zero edits to ``trialerror/artifacts/gates.py`` (out of this
 build's lane; see this build's own scope note) -- reusing infrastructure
 that already exists is the entire integration.
 
+**Three registered suites.** ``citation-grounded`` and ``review-verdict``
+are this module's originals; ``aiif_round`` is the ideation framework's own
+gate class, fourteen checks over one round's artifacts (see that section's
+own header for the subject shape it reads, and for the one posture every
+check there shares: absent data fails closed). It is a pure-function suite
+like the others -- it reads an assembled ``subject`` dict and never opens a
+store.
+
 TRIALERROR-DEV-NOTE (CLI surface deviates from the literal brief): the brief
 names the CLI verb ``trialerror gate eval <gate_id>``. This build's lane owns
 ``trialerror/verify/`` and ``trialerror/eval/`` (new) only -- ``trialerror/cli/gate.py``
@@ -80,6 +88,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from trialerror.budget.policy import meets_minimum
 from trialerror.eval.errors import GateSuiteRunnerError, UnknownGateSuiteError
 from trialerror.stores import get as store_get
 from trialerror.stores import update as store_update
@@ -101,6 +110,26 @@ __all__ = [
     "DEFAULT_DISPOSITIONS",
     "CITATION_GROUNDED_SUITE_ID",
     "REVIEW_VERDICT_SUITE_ID",
+    "AIIF_ROUND_SUITE_ID",
+    "AIIF_MODEL_FLOORS",
+    "IDEA_DISPOSITIONS",
+    "BUNDLE_LABEL_KEYS",
+    "SIGNIFICANCE_TERMS",
+    "MIN_LENS_CELLS_PER_CARD",
+    "prereg_present",
+    "models_table_present",
+    "novelty_bundle_complete",
+    "self_assessment_absent",
+    "plants_caught",
+    "distribution_card_present",
+    "control_arm_present",
+    "arm_mode_declared",
+    "card_cells_ge_2",
+    "admission_order_hash_matches",
+    "lens_log_reconciled",
+    "per_arm_n_disclosed",
+    "no_significance_language",
+    "consolidation_completeness_over_ideas",
     "run_gate_suite",
     "run_gate_suite_for_gate",
 ]
@@ -353,6 +382,714 @@ register_suite(
     )
 )
 
+
+
+# ---------------------------------------------------------------------------
+# The framework round suite (AIIF). Design §6's own `eval/gate_suites.py`
+# row names thirteen checks plus `consolidation_completeness` reused; this
+# section is those fourteen and the suite that composes them.
+#
+# One posture, stated once and applied fourteen times: EVERY check FAILS
+# CLOSED on absent data. A round artifact that carries no prereg section, no
+# models table, no distribution card is not a round that is exempt from
+# those bars -- it is a round that has not met them, and the same reasoning
+# `faithfulness_threshold` already states for itself ("a gate class that
+# includes this check is asserting faithfulness WAS measured") applies to
+# every bar a pre-registered round commits to.
+#
+# The SUBJECT is assembled by the caller from the round's own artifacts and
+# stores (the suite never reads a store -- module docstring). Its sections,
+# each named by the check that reads it:
+#
+#   prereg            {prereg_id, status, params{...}}      prereg_present,
+#                                                           admission_order_hash_matches
+#   models_table      {purpose: class}                      models_table_present
+#   ideas             [{idea_id, status, dossier{...}}]      novelty_bundle_complete,
+#                                                           consolidation_completeness
+#   reference_snapshot {R1..R5 each with sha256/snapshot_id} novelty_bundle_complete
+#   judge_envelopes   [{subject_id, record{statement,...}}]  self_assessment_absent
+#   plants            score_plants()'s own result            plants_caught
+#   distribution      run_mechanical_screen()'s own card     distribution_card_present
+#   roster            [{lens_name, seat, recipe_cards[]}]    control_arm_present,
+#                                                           card_cells_ge_2
+#   assignment        {arm_mode, ...}                        arm_mode_declared
+#   admission_order   {hash, ...}                            admission_order_hash_matches
+#   lens_log          {offenders[]} | [rows]                 lens_log_reconciled
+#   outcomes          [{cell, arm?, n, ...}]                 per_arm_n_disclosed
+#   report_text       the round's own prose                  no_significance_language
+# ---------------------------------------------------------------------------
+
+#: The model floors a framework round requires, purpose by purpose -- the
+#: same eight the program scaffold ships (`trialerror/cli/program.py`'s
+#: commented `[models]` example). `screen` and `consolidation` are `mid` and
+#: not `small`: no small-class model makes a research judgment, and the
+#: screen decides which ideas a judge ever sees.
+AIIF_MODEL_FLOORS: dict[str, str] = {
+    "keystone": "top",
+    "ideation": "top",
+    "moderation": "top",
+    "room_participant": "top",
+    "novelty_judge": "top",
+    "gates": "top",
+    "consolidation": "mid",
+    "screen": "mid",
+}
+
+#: A prereg that has been VOIDED is not a prereg a round may gate on (its
+#: escrow failed its own tamper check); `committed` and `revealed` both are.
+PREREG_USABLE_STATUSES: frozenset[str] = frozenset({"committed", "revealed"})
+
+#: What an idea's disposition may be for the consolidation law to count it
+#: as dispositioned -- the `idea.status` vocabulary minus `raw`, which IS
+#: the undispositioned state.
+IDEA_DISPOSITIONS: frozenset[str] = frozenset({"CONSOLIDATED", "MERGED", "ELIMINATED", "PROMOTED"})
+
+#: The two dossier label keys every consolidated idea's novelty BUNDLE must
+#: carry. Two, not three: the literature vocabulary is ONE judgment made
+#: against the corpus and the external index together, so there is no third
+#: label to require (the screen's own refutation of that finding).
+#:
+#: Named for the bundle rather than for the dossier, because
+#: `trialerror.rooms.api` exports its own dossier-label whitelist for a
+#: different contract -- the keys a room ENVELOPE may carry, which include
+#: `judged`. Two exported names with one spelling and two contents invite
+#: importing the wrong one.
+BUNDLE_LABEL_KEYS: tuple[str, ...] = ("label_inventory", "label_corpus")
+
+#: The reference sets a round's novelty bundle is measured against, each of
+#: which must be snapshot-identified on the round so a verdict can say what
+#: it was compared to AS OF when it was compared.
+REFERENCE_SET_KEYS: tuple[str, ...] = ("R1", "R2", "R3", "R4", "R5")
+
+#: The seat that makes the matched-budget comparison possible. It is a
+#: MEASUREMENT seat: it never counts toward the arm mix or the far floor
+#: (charter AMENDMENT-4 item 1 / design AMENDMENT-5 item 1), which is why
+#: `control_arm_present` checks for it by seat and says so in its message
+#: rather than looking for it among the arms.
+CONTROL_SEAT = "control"
+STANDARD_SEAT = "standard"
+BUSTER_SEAT = "assumption_buster"
+
+#: `card_cells_ge_2`'s bar, and the reason for it: a card held by one lens
+#: cannot be told apart from that lens's vantage, slice and seed, so no
+#: decision rule may act on its cell (design §4.3's own "decision rules act
+#: only on >=2-lens cells").
+MIN_LENS_CELLS_PER_CARD = 2
+
+#: The card that comes with the assumption-buster's seat, held by one lens
+#: by design -- excluded from the cell bar for exactly that reason.
+BUSTER_ONLY_CARD = "NEGATE"
+
+#: Significance vocabulary a directional, single-digit-n round may not use
+#: (design §4.3: "All directional, per-cell n disclosed, no significance
+#: language"). Matched case-insensitively on word boundaries.
+SIGNIFICANCE_TERMS: tuple[str, ...] = (
+    "statistically significant",
+    "statistical significance",
+    "significantly",
+    "significant",
+    "significance",
+    "p-value",
+    "p value",
+    "confidence interval",
+    "null hypothesis",
+)
+
+_SIGNIFICANCE_RE = re.compile(
+    r"(?<![\w-])(?:" + "|".join(t.replace(" ", r"\s+").replace("-", r"[-\s]") for t in SIGNIFICANCE_TERMS) + r")(?![\w-])",
+    re.IGNORECASE,
+)
+
+#: `p < .05`, `p<0.05`, `p = 0.03` -- the form that carries significance
+#: language without using the word.
+_P_VALUE_RE = re.compile(r"(?<![\w])p\s*[<>=]\s*\.?\d", re.IGNORECASE)
+
+
+def _result(name: str, passed: bool, message: str, score: float | None = None) -> MetricResult:
+    return MetricResult(name=name, passed=passed, score=score, message=message)
+
+
+def prereg_present(subject: Mapping[str, Any]) -> MetricResult:
+    """``subject["prereg"]`` must name a ``prereg_id`` whose status is one of
+    :data:`PREREG_USABLE_STATUSES`. A framework round commits its procedure
+    and parameters BLIND before any spawn; a gate with no prereg id is a
+    round whose procedure can still be described after the fact, which is
+    the one thing pre-registration exists to prevent."""
+    prereg = subject.get("prereg") or {}
+    prereg_id = prereg.get("prereg_id")
+    status = prereg.get("status")
+    if not prereg_id:
+        return _result("prereg_present", False, "subject['prereg'] names no prereg_id (nothing was escrowed before the round ran)")
+    if status not in PREREG_USABLE_STATUSES:
+        return _result(
+            "prereg_present", False,
+            f"prereg {prereg_id} has status {status!r}; a round may gate only on {sorted(PREREG_USABLE_STATUSES)} "
+            "(a voided escrow failed its own tamper check)",
+        )
+    return _result("prereg_present", True, f"prereg {prereg_id} is {status}")
+
+
+def models_table_present(subject: Mapping[str, Any]) -> MetricResult:
+    """``subject["models_table"]`` must name every purpose in
+    :data:`AIIF_MODEL_FLOORS` at or above its floor, resolved through
+    ``trialerror.budget.policy.meets_minimum`` so the gate and the booking
+    path cannot disagree about what "at or above" means.
+
+    An absent purpose is NOT a pass: ``meets_minimum(class, None)`` returns
+    True precisely because an unconfigured purpose has no floor, which is
+    the state this check exists to refuse — a round that booked its lenses
+    against no policy at all."""
+    table = subject.get("models_table") or {}
+    if not table:
+        return _result(
+            "models_table_present", False,
+            "subject['models_table'] is empty -- no [models] purpose table, so no booking in this round had a "
+            "floor to meet (meets_minimum(class, None) passes everything)",
+        )
+    missing = sorted(p for p in AIIF_MODEL_FLOORS if p not in table)
+    below = sorted(
+        f"{p}={table[p]!r}<{floor}" for p, floor in AIIF_MODEL_FLOORS.items()
+        if p in table and not meets_minimum(str(table[p]), floor)
+    )
+    if missing or below:
+        return _result(
+            "models_table_present", False,
+            f"[models] is incomplete or below the framework floors -- missing: {missing or 'nothing'}; "
+            f"below floor: {below or 'nothing'}",
+        )
+    return _result("models_table_present", True, f"all {len(AIIF_MODEL_FLOORS)} purposes carry their floor or better")
+
+
+def novelty_bundle_complete(subject: Mapping[str, Any]) -> MetricResult:
+    """Every consolidated idea carries a dossier with both label keys, and
+    the round carries a snapshot id for every reference set
+    (:data:`REFERENCE_SET_KEYS`).
+
+    The labels may be the mechanical pair (``no-close-neighbour`` with
+    ``judged: false``) — that is a complete bundle for an unjudged idea, and
+    requiring a judged label for all of them would require judging all of
+    them, which the design explicitly does not. What is refused is a
+    consolidated idea with NO bundle, and a bundle that cannot say which
+    snapshot of the reference sets it was measured against."""
+    ideas = [i for i in subject.get("ideas", []) if str(i.get("status", "")).lower() == "consolidated"]
+    snapshot = subject.get("reference_snapshot") or {}
+    if not ideas:
+        return _result("novelty_bundle_complete", False, "subject['ideas'] holds no consolidated idea -- nothing reached a room")
+    missing_snapshot = [
+        key for key in REFERENCE_SET_KEYS
+        if not (snapshot.get(key) or {}).get("sha256") and not (snapshot.get(key) or {}).get("snapshot_id")
+    ]
+    without: list[str] = []
+    for idea in ideas:
+        dossier = idea.get("dossier") or {}
+        if not dossier or any(key not in dossier for key in BUNDLE_LABEL_KEYS):
+            without.append(str(idea.get("idea_id") or "<unnamed idea>"))
+    if without or missing_snapshot:
+        return _result(
+            "novelty_bundle_complete", False,
+            f"{len(without)} consolidated idea(s) carry no novelty dossier with both label keys "
+            f"({without[:10]}); reference sets with no snapshot id: {missing_snapshot or 'none'}",
+            score=round((len(ideas) - len(without)) / len(ideas), 6),
+        )
+    return _result(
+        "novelty_bundle_complete", True,
+        f"all {len(ideas)} consolidated idea(s) carry a dossier against snapshot-identified R1-R5",
+        score=1.0,
+    )
+
+
+def self_assessment_absent(subject: Mapping[str, Any]) -> MetricResult:
+    """No judge envelope in ``subject["judge_envelopes"]`` carries a sentence
+    in which a record grades its own novelty — re-run here with
+    ``trialerror.lens.novelty.strip_self_assessment``, the same stripper the
+    screen applies, so the gate measures the rule rather than a restatement
+    of it.
+
+    The honest caveat travels with the check: the stripper is hygiene and is
+    trivially paraphrased ("no register row states this procedure" matches
+    nothing). A pass means the overt form is absent, not that nothing in the
+    envelope is addressed to the judge."""
+    envelopes = subject.get("judge_envelopes") or []
+    if not envelopes:
+        return _result(
+            "self_assessment_absent", False,
+            "subject['judge_envelopes'] is empty -- the judged half's envelopes are what this check reads, and "
+            "a round that ran a judged screen has them",
+        )
+    from trialerror.lens.novelty import strip_self_assessment
+
+    offenders: list[dict[str, Any]] = []
+    for envelope in envelopes:
+        record = envelope.get("record") or {}
+        text = " ".join(str(record.get(f) or "") for f in ("requirements", "statement", "probe"))
+        stripped = strip_self_assessment(text)
+        if stripped["removed"]:
+            offenders.append({"subject_id": envelope.get("subject_id"), "removed": stripped["removed"][:3]})
+    if offenders:
+        return _result(
+            "self_assessment_absent", False,
+            f"{len(offenders)} judge envelope(s) still carry self-assessment sentences: {offenders[:5]} "
+            "(the stripper runs on judge envelopes only; the record and the feed post keep their full text)",
+        )
+    return _result("self_assessment_absent", True, f"none of {len(envelopes)} judge envelope(s) carries an overt self-assessment sentence")
+
+
+def plants_caught(subject: Mapping[str, Any]) -> MetricResult:
+    """``subject["plants"]`` is ``score_plants``'s own result. Every
+    INVENTORY plant must have been caught and the batch must have been
+    auditable at all: a judge handed an existing row verbatim and calling it
+    new cannot be trusted on the rows it was not handed, and a batch with no
+    inventory plants has not been audited however clean it looks.
+
+    A missed PARAPHRASE plant is reported in the message and does not fail —
+    paraphrase detection is the harder task and the design does not stake
+    the batch on it."""
+    plants = subject.get("plants") or {}
+    if not plants:
+        return _result("plants_caught", False, "subject['plants'] is empty -- no seeded-plant battery rode in the judged batch")
+    if plants.get("unauditable") or not (plants.get("n_inventory_plants") or plants.get("failures") is not None):
+        return _result("plants_caught", False, "the judged batch carried no inventory plants -- unauditable, which fails on that ground alone")
+    # `failures` is the set the batch actually turns on -- the misses on the
+    # kinds the round declared (lane FB-5 item 3, `--batch-fail-on`, default
+    # `inventory`). A score written before that key existed carries only
+    # `inventory_failures`, which under the default rule IS the same list, so
+    # the fallback reads an older subject correctly rather than passing it
+    # vacuously.
+    failures = list(
+        plants["failures"] if plants.get("failures") is not None else (plants.get("inventory_failures") or [])
+    )
+    reported_misses = [m for m in plants.get("missed") or [] if m.get("plant_id") not in failures]
+    catch_rate = plants.get("catch_rate")
+    fail_on = list(plants.get("batch_fail_on") or ["inventory"])
+    n_failable = plants.get("n_inventory_plants")
+    if plants.get("by_kind"):
+        n_failable = sum(block["n"] for kind, block in plants["by_kind"].items() if kind in fail_on)
+    if failures:
+        return _result(
+            "plants_caught", False,
+            f"{len(failures)} {'/'.join(fail_on)} plant(s) missed or unlabelled: {failures} -- the batch is "
+            f"reopened with caveat and nothing it judged is consolidated (catch rate {catch_rate})",
+            score=catch_rate,
+        )
+    return _result(
+        "plants_caught", True,
+        f"every one of {n_failable} {'/'.join(fail_on)} plant(s) was caught "
+        f"(catch rate {catch_rate}; {len(reported_misses)} plant(s) of other kinds missed, reported not failed)",
+        score=catch_rate,
+    )
+
+
+def distribution_card_present(subject: Mapping[str, Any]) -> MetricResult:
+    """``subject["distribution"]`` must carry the round's audit card: a
+    declared-operation entropy per axis, the pairwise-similarity
+    distribution, and the template mass.
+
+    A value of ``None`` is acceptable and is NOT a hole — an entropy over
+    one record, or a pairwise median over a single-idea batch, genuinely has
+    no value, and the card says so. What is refused is the KEY being absent:
+    a card that never computed the measure cannot be read as a card that
+    computed it and found nothing."""
+    distribution = subject.get("distribution") or {}
+    if not distribution:
+        return _result("distribution_card_present", False, "subject['distribution'] is empty -- the round published no audit card")
+    holes: list[str] = []
+    declared = distribution.get("declared_operations") or {}
+    for axis in ("opportunity", "method"):
+        axis_card = declared.get(axis)
+        if not isinstance(axis_card, Mapping) or "entropy" not in axis_card:
+            holes.append(f"declared_operations.{axis}.entropy")
+    pairwise = distribution.get("pairwise_similarity")
+    if not isinstance(pairwise, Mapping) or "median" not in pairwise:
+        holes.append("pairwise_similarity.median")
+    template = distribution.get("template_mass")
+    if not isinstance(template, Mapping) or "template_share" not in template:
+        holes.append("template_mass.template_share")
+    if holes:
+        return _result("distribution_card_present", False, f"the audit card is missing {holes}")
+    return _result(
+        "distribution_card_present", True,
+        "the audit card carries entropy per axis, the pairwise-similarity distribution and the template mass",
+    )
+
+
+def control_arm_present(subject: Mapping[str, Any]) -> MetricResult:
+    """``subject["roster"]`` must seat exactly one ``control`` lens, and that
+    lens must hold no recipe card.
+
+    **The CONTROL seat never counts toward the arm mix or the far floor**
+    (charter AMENDMENT-4 item 1, design AMENDMENT-5 item 1). This check
+    therefore looks for it by SEAT and says so in its own message: a reader
+    who went looking for the control among the arms would be looking in the
+    place the amendment removed it from. A control lens holding a card is
+    not a control at all, and the round it sits in reports a comparison it
+    did not run."""
+    roster = subject.get("roster") or []
+    if not roster:
+        return _result("control_arm_present", False, "subject['roster'] is empty -- no seats to check")
+    controls = [r for r in roster if str(r.get("seat")) == CONTROL_SEAT]
+    if not controls:
+        return _result(
+            "control_arm_present", False,
+            "the roster seats no control lens -- the matched-budget comparison (AIIF vs CONTROL on O1) has no "
+            "control arm, and the adoption rule rests on it. The control seat sits on the modal arm and is "
+            "excluded from the arm mix and the far floor, so it is counted here by seat, not among the arms",
+        )
+    if len(controls) > 1:
+        return _result(
+            "control_arm_present", False,
+            f"{len(controls)} control seats are rostered; the comparison is against ONE matched-budget control",
+        )
+    carded = [r.get("lens_name") for r in controls if r.get("recipe_cards")]
+    if carded:
+        return _result(
+            "control_arm_present", False,
+            f"the control lens {carded} holds recipe cards -- a control with a card is not a control",
+        )
+    return _result(
+        "control_arm_present", True,
+        f"one control lens ({controls[0].get('lens_name')}) is seated with no card, excluded from the arm mix "
+        "and from the far floor",
+    )
+
+
+def arm_mode_declared(subject: Mapping[str, Any]) -> MetricResult:
+    """``subject["assignment"]["arm_mode"]`` must be declared, and the
+    prereg's own params must declare the same value.
+
+    Either assignment mode may be run — the interim per-slice mix is a
+    documented, declarable option — but it has to be declared in the
+    escrow, because the mode decides what per-arm n MEANS (lenses per arm
+    under ``per_lens``, slices per arm under ``per_slice``), and a round that
+    reports O4 without saying which is reporting two different numbers under
+    one name."""
+    assignment = subject.get("assignment") or {}
+    mode = assignment.get("arm_mode")
+    declared = ((subject.get("prereg") or {}).get("params") or {}).get("arm_mode")
+    if not mode:
+        return _result("arm_mode_declared", False, "subject['assignment'] declares no arm_mode -- per-arm n has no defined unit")
+    if not declared:
+        return _result(
+            "arm_mode_declared", False,
+            f"the round ran arm_mode={mode!r} but its prereg params declare none -- the mode decides what "
+            "per-arm n means and is escrowed, not chosen afterwards",
+        )
+    if str(declared) != str(mode):
+        return _result(
+            "arm_mode_declared", False,
+            f"the round ran arm_mode={mode!r} but pre-registered {declared!r}",
+        )
+    return _result("arm_mode_declared", True, f"arm_mode={mode!r}, matching the pre-registered params")
+
+
+def card_cells_ge_2(subject: Mapping[str, Any]) -> MetricResult:
+    """Every recipe card in play is held by at least
+    :data:`MIN_LENS_CELLS_PER_CARD` STANDARD lenses.
+
+    A card held by one lens cannot be told apart from that lens's vantage,
+    slice and seed, so O3 has nothing to say about it and no reweighting rule
+    may act on it. Standard seats only: the buster's :data:`BUSTER_ONLY_CARD`
+    comes with its seat and is held by one lens by design, and a control
+    holds none — counting either would fail a correctly assembled round."""
+    roster = subject.get("roster") or []
+    if not roster:
+        return _result("card_cells_ge_2", False, "subject['roster'] is empty -- no card cells to count")
+    holders: dict[str, int] = {}
+    for row in roster:
+        if str(row.get("seat")) != STANDARD_SEAT:
+            continue
+        for card in row.get("recipe_cards") or []:
+            if str(card) == BUSTER_ONLY_CARD:
+                continue
+            holders[str(card)] = holders.get(str(card), 0) + 1
+    if not holders:
+        return _result(
+            "card_cells_ge_2", False,
+            "no standard lens holds a recipe card -- a framework round's standard seats write under cards, and "
+            "O3 (card x survival) has nothing to compare without them",
+        )
+    thin = sorted(f"{card}={n}" for card, n in holders.items() if n < MIN_LENS_CELLS_PER_CARD)
+    if thin:
+        return _result(
+            "card_cells_ge_2", False,
+            f"card cells below {MIN_LENS_CELLS_PER_CARD} standard lenses: {thin} -- a one-lens cell cannot be "
+            "told apart from that lens, and no decision rule may act on it",
+            score=round(min(holders.values()) / MIN_LENS_CELLS_PER_CARD, 6),
+        )
+    return _result(
+        "card_cells_ge_2", True,
+        f"every card in play is held by >= {MIN_LENS_CELLS_PER_CARD} standard lenses ({holders})",
+    )
+
+
+def admission_order_hash_matches(subject: Mapping[str, Any]) -> MetricResult:
+    """The admission order the round RAN must hash to the order it ESCROWED.
+
+    This is the one check standing behind "dossier labels never order
+    admission": the order comes out of a seeded draw, is escrowed, and is
+    then compared — so re-ordering the rooms after seeing the screen's
+    results changes a hash that was written down first.
+
+    **Two escrow places, because the order cannot exist at Phase 0.** The
+    pool it is drawn over is the round's ``consolidated`` ideas, and nothing
+    is consolidated until the judged screen has run (Phase 3b). A round that
+    put the hash in its Phase-0 prereg params either invented it or
+    back-filled the prereg, and back-filling is the one thing the procedure
+    forbids. So the Phase-0 escrow carries the RULE and the SEED
+    (``room_admission``, ``admission_seed``) and a SECOND named escrow,
+    committed after Phase 3b and before the first room opens, carries the
+    order itself. This check reads either — ``prereg.params
+    .admission_order_hash`` for a round that had its order at Phase 0 (a
+    re-run over a closed pool), or ``admission_escrow`` for the ordinary
+    case — and SAYS WHICH ONE it read, because "matched its escrow" means
+    different things about when the order was fixed.
+
+    An ``admission_escrow`` carrying a status outside
+    :data:`PREREG_USABLE_STATUSES` is not an escrow a round may gate on,
+    the same way a voided prereg is not."""
+    ran = (subject.get("admission_order") or {}).get("hash")
+    params = (subject.get("prereg") or {}).get("params") or {}
+    escrow = subject.get("admission_escrow") or {}
+    if not ran:
+        return _result("admission_order_hash_matches", False, "subject['admission_order'] carries no hash -- the order the round ran is unrecorded")
+    if params.get("admission_order_hash"):
+        escrowed = params["admission_order_hash"]
+        source = "the prereg params (admission_order_hash)"
+    elif escrow.get("admission_order_hash") or escrow.get("hash"):
+        escrowed = escrow.get("admission_order_hash") or escrow.get("hash")
+        status = str(escrow.get("status") or "committed")
+        if status not in PREREG_USABLE_STATUSES:
+            return _result(
+                "admission_order_hash_matches", False,
+                f"subject['admission_escrow'] is {status!r} -- an escrow outside "
+                f"{sorted(PREREG_USABLE_STATUSES)} is not one a round may gate on, the same way a voided prereg "
+                "is not",
+            )
+        source = (
+            f"the post-screen admission escrow ({escrow.get('prereg_id') or 'unnamed'}, {status})"
+        )
+    else:
+        return _result(
+            "admission_order_hash_matches", False,
+            "no escrow carries an admission_order_hash -- neither the prereg params nor an "
+            "'admission_escrow' section. The order is drawn over the round's consolidated pool, so it "
+            "is escrowed after the judged screen and before the first room opens; an order nothing was escrowed "
+            "against can be re-derived once the screen's results are in",
+        )
+    if str(ran) != str(escrowed):
+        return _result(
+            "admission_order_hash_matches", False,
+            f"the admission order run ({str(ran)[:12]}...) is not the order escrowed in {source} "
+            f"({str(escrowed)[:12]}...) -- the rooms were ordered by something other than the escrowed seeded draw",
+        )
+    return _result(
+        "admission_order_hash_matches", True,
+        f"the admission order matches the hash escrowed in {source} ({str(ran)[:12]}...)",
+    )
+
+
+def lens_log_reconciled(subject: Mapping[str, Any]) -> MetricResult:
+    """Every booked lens posted: ``subject["lens_log"]`` carries no offender.
+
+    Accepts ``trialerror lens log``'s own shape -- ``rows`` (one per lens,
+    each carrying ``posted``), ``n_lenses`` and ``offenders`` -- or a bare
+    list of those rows. A lens that was assigned a slice and never posted is
+    a dropped launch — budget spent, arm unrepresented — not a quiet skip,
+    and a round that gates with one unreconciled is reporting an arm mix it
+    did not run.
+
+    **A subject carrying neither ``rows`` nor ``offenders`` FAILS** with
+    "log shape unrecognised". The old envelope (``assignments`` + ``count``)
+    is exactly that shape: the check counted its rows, found no offender and
+    returned a vacuous PASS for a round where one lens of three had posted.
+    A check that cannot see the state it exists to check reports that it
+    cannot, never that all is well.
+
+    **A log that reconciles NO lens FAILS too** (fix pass B-2), in the
+    mapping branch as well as the list branch. ``lens log`` returns
+    ``rows: []``/``n_lenses: 0`` for a round id nothing was assigned under —
+    a mistyped ``--round-id``, or a gate run before ``lens assign`` — and
+    "every booked lens posted" said of no lens at all is the same vacuous
+    PASS in a different shape."""
+    log = subject.get("lens_log")
+    if log is None:
+        return _result("lens_log_reconciled", False, "subject['lens_log'] is absent -- nothing reconciled the round's booked lenses against its posts")
+    if isinstance(log, Mapping):
+        rows = log.get("rows")
+        declared = log.get("offenders")
+        if rows is None and declared is None:
+            # The shape `lens log` used to return -- `assignments` and a
+            # count -- carries no per-lens posting state at all. Counting its
+            # rows and finding no offender is not a reconciliation; it is the
+            # check answering a question the subject never contained, and it
+            # PASSED a round in which one lens of three had posted.
+            return _result(
+                "lens_log_reconciled", False,
+                f"log shape unrecognised: subject['lens_log'] carries neither 'rows' nor 'offenders' "
+                f"(keys: {sorted(log)[:8]}) -- run `trialerror lens log --round-id <round>` and pass its "
+                "result, which reports posted per lens",
+            )
+        offenders = [
+            str(o.get("lens_name") or o.get("roster_id") or o) if isinstance(o, Mapping) else str(o)
+            for o in declared or []
+        ]
+        for row in rows or []:
+            if isinstance(row, Mapping) and not row.get("posted"):
+                name = str(row.get("lens_name") or row.get("roster_id") or row)
+                if name not in offenders:
+                    offenders.append(name)
+        total = log.get("n_lenses")
+        if total is None:
+            total = log.get("count")
+        if total is None and rows is not None:
+            total = len(rows)
+        # Fix pass B-2: a mapping whose population is empty (or never
+        # reported) reconciles nothing. The list branch has always failed
+        # `[]`; the mapping branch passed the same emptiness with "count not
+        # reported", which is what `lens log` returns for a round id no
+        # assignment row names.
+        empty_population = not offenders and not total
+    else:
+        rows = list(log)
+        if not rows:
+            return _result("lens_log_reconciled", False, "subject['lens_log'] is empty -- a round has booked lenses to reconcile")
+        offenders = [str(r.get("lens_name") or r.get("roster_id") or r) for r in rows if not r.get("posted")]
+        total = len(rows)
+        empty_population = False
+    if empty_population:
+        return _result(
+            "lens_log_reconciled", False,
+            f"the log reconciles no lens at all (rows: {len(rows or [])}, n_lenses: {total!r}) -- this is what "
+            "`trialerror lens log` returns for a round id no assignment row names (a mistyped --round-id, or a "
+            "gate run before `lens assign`). 'Every booked lens posted' said of no lens is not a reconciliation",
+        )
+    if offenders:
+        return _result(
+            "lens_log_reconciled", False,
+            f"{len(offenders)} booked lens(es) never posted: {offenders[:10]} -- a dropped launch, not a skip",
+        )
+    return _result("lens_log_reconciled", True, f"every booked lens posted ({total if total is not None else 'count not reported'})")
+
+
+def per_arm_n_disclosed(subject: Mapping[str, Any]) -> MetricResult:
+    """Every outcome cell in ``subject["outcomes"]`` discloses its own ``n``,
+    and the CONTROL cell is reported as a control rather than as an arm.
+
+    Per-cell n is single digits for rounds of six to fourteen lenses, so
+    every comparison is directional and a cell without its n reads as a
+    result rather than as a direction. The control's own n is disclosed too —
+    it is the comparison the adoption rule rests on — but never inside the
+    arm cells, because the amendment keeps it out of the arm mix.
+
+    **The control cell is REQUIRED, by seat.** A round that never reported
+    it passed this check before, which contradicted the docstring above it:
+    the adoption rule is "AIIF arm ≥ CONTROL on O1", so a reported analysis
+    with no control cell has not reported the comparison it rests on. A row
+    that names the control in its cell TEXT while carrying no ``seat`` key is
+    read as an undisclosed control, not as an arm cell — that is the shape
+    that let the cell pass as one."""
+    outcomes = subject.get("outcomes") or []
+    if not outcomes:
+        return _result("per_arm_n_disclosed", False, "subject['outcomes'] is empty -- the pre-registered analysis reported no cells")
+    undisclosed = [
+        str(row.get("cell") or row.get("arm") or row.get("card") or "<unnamed cell>")
+        for row in outcomes
+        if not isinstance(row.get("n"), (int, float))
+    ]
+    mixed = [
+        str(row.get("cell") or "<unnamed cell>")
+        for row in outcomes
+        if str(row.get("seat") or "").lower() == CONTROL_SEAT and row.get("arm") in ("near", "moderate", "far")
+    ]
+    unkeyed = [
+        str(row.get("cell") or "<unnamed cell>")
+        for row in outcomes
+        if not str(row.get("seat") or "").strip() and CONTROL_SEAT in str(row.get("cell") or "").lower()
+    ]
+    if undisclosed or mixed or unkeyed:
+        return _result(
+            "per_arm_n_disclosed", False,
+            f"{len(undisclosed)} outcome cell(s) disclose no n ({undisclosed[:10]}); control cells reported "
+            f"inside the arm mix: {mixed or 'none'}; cell(s) naming the control with no seat key, which is an "
+            f"undisclosed control rather than an arm: {unkeyed or 'none'}",
+        )
+    control_cells = [r for r in outcomes if str(r.get("seat") or "").lower() == CONTROL_SEAT]
+    if not control_cells:
+        return _result(
+            "per_arm_n_disclosed", False,
+            f"all {len(outcomes)} outcome cell(s) disclose their n, but no cell carries seat="
+            f"{CONTROL_SEAT!r} -- the adoption rule compares the arms against the matched-budget control, so a "
+            "reported analysis with no control cell has not reported the comparison it rests on. The control is "
+            "named by seat, because the amendment keeps it out of the arm mix",
+        )
+    return _result(
+        "per_arm_n_disclosed", True,
+        f"all {len(outcomes)} outcome cell(s) disclose their n; the control is reported as a control "
+        f"({len(control_cells)} cell(s)) and not as an arm",
+    )
+
+
+def no_significance_language(subject: Mapping[str, Any]) -> MetricResult:
+    """``subject["report_text"]`` carries no significance vocabulary
+    (:data:`SIGNIFICANCE_TERMS`) and no ``p < .05``-shaped claim.
+
+    The round's own limits paragraph says why: n per arm or card is single
+    digits, so every comparison is directional. "Significant" in a report
+    over six cells is a claim the design does not make, whether or not a
+    test was run."""
+    text = subject.get("report_text")
+    if text is None:
+        return _result("no_significance_language", False, "subject['report_text'] is absent -- there is no prose to check")
+    found = sorted({m.group(0).lower() for m in _SIGNIFICANCE_RE.finditer(str(text))})
+    p_values = sorted({m.group(0) for m in _P_VALUE_RE.finditer(str(text))})
+    if found or p_values:
+        return _result(
+            "no_significance_language", False,
+            f"the report uses significance language {found + p_values} -- every comparison in a round of this "
+            "size is directional, with its per-cell n disclosed",
+        )
+    return _result("no_significance_language", True, "the report states its comparisons directionally, with no significance language")
+
+
+def consolidation_completeness_over_ideas(subject: Mapping[str, Any]) -> MetricResult:
+    """The C-0066 consolidation law applied to a round's own records: every
+    raw idea has a disposition. :func:`consolidation_completeness` verbatim,
+    reading the round's ``ideas`` section as its findings list — the law's
+    implementation is not restated here, only pointed at the other subject
+    shape, so the two cannot drift.
+
+    ``raw`` is the one status that is NOT a disposition: it is the state of
+    an idea nothing has decided about yet."""
+    findings = [
+        {"finding": i.get("idea_id") or "<unnamed idea>", "disposition": str(i.get("status") or "").upper()}
+        for i in subject.get("ideas", [])
+    ]
+    return consolidation_completeness({"findings": findings}, valid_dispositions=IDEA_DISPOSITIONS)
+
+
+#: The framework round gate class: design §6's thirteen named checks plus
+#: `consolidation_completeness` reused over the round's own idea rows.
+AIIF_ROUND_SUITE_ID = "aiif_round"
+register_suite(
+    GateSuite(
+        suite_id=AIIF_ROUND_SUITE_ID,
+        checks={
+            "prereg_present": prereg_present,
+            "models_table_present": models_table_present,
+            "novelty_bundle_complete": novelty_bundle_complete,
+            "self_assessment_absent": self_assessment_absent,
+            "plants_caught": plants_caught,
+            "distribution_card_present": distribution_card_present,
+            "control_arm_present": control_arm_present,
+            "arm_mode_declared": arm_mode_declared,
+            "card_cells_ge_2": card_cells_ge_2,
+            "admission_order_hash_matches": admission_order_hash_matches,
+            "lens_log_reconciled": lens_log_reconciled,
+            "per_arm_n_disclosed": per_arm_n_disclosed,
+            "no_significance_language": no_significance_language,
+            "consolidation_completeness": consolidation_completeness_over_ideas,
+        },
+    )
+)
 
 # ---------------------------------------------------------------------------
 # The pytest-subprocess runner.

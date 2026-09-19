@@ -27,11 +27,11 @@ same seed" holds even with duplicate/degenerate scores).
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from trialerror.lens.errors import MissingEmbeddingError
+from trialerror.util import vecmath
 
 __all__ = ["Arm", "ARMS", "StratifiedCandidate", "cosine_distance", "score_candidates", "stratify"]
 
@@ -58,42 +58,48 @@ class StratifiedCandidate:
 
 
 def cosine_distance(a: Sequence[float], b: Sequence[float]) -> float:
-    """``1 - cosine_similarity(a, b)``, plain Python (no numpy — matches
-    ``trialerror.retrieve.vecsearch.cosine_similarity``'s own convention this
-    reimplements rather than imports, to keep this module's distance metric
-    self-contained and independently testable: M8's function returns
-    similarity for RANKING, this one returns distance for STRATIFICATION,
-    and the two must never silently drift against each other by one
-    sharing an edge case fix the other doesn't get). Degenerate (zero-norm
-    or mismatched-length) inputs score a distance of ``1.0`` (maximally far
-    — the same "never crash a ranking pass" posture as M8's
-    ``cosine_similarity``, applied as "never crash a stratify pass" here)."""
-    if not a or not b or len(a) != len(b):
-        return 1.0
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(y * y for y in b))
-    if norm_a == 0.0 or norm_b == 0.0:
-        return 1.0
-    return 1.0 - (dot / (norm_a * norm_b))
+    """``1 - cosine_similarity(a, b)``, plain Python.
+
+    The arithmetic now comes from :func:`trialerror.util.vecmath.cosine_one`
+    rather than being written out a second time here. The note this
+    docstring used to carry — that M8's function returns similarity for
+    RANKING and this one distance for STRATIFICATION, and that the two must
+    never drift by one getting an edge-case fix the other doesn't — is
+    exactly the argument for sharing the body: there is one cosine in this
+    tree, and one place an edge case is decided. The DISTANCE convention
+    stays this module's own.
+
+    Degenerate (zero-norm or mismatched-length) inputs score a distance of
+    ``1.0`` (maximally far — the same "never crash a ranking pass" posture
+    as M8's ``cosine_similarity``, applied as "never crash a stratify pass"
+    here). That is ``1 - 0.0`` and so needs no branch: the shared cosine
+    scores exactly those cases ``0.0``."""
+    return 1.0 - vecmath.cosine_one(a, b)
 
 
 def score_candidates(
-    candidates: Mapping[str, Sequence[float]], home: Mapping[str, Sequence[float]]
+    candidates: Mapping[str, Sequence[float]],
+    home: Mapping[str, Sequence[float]],
+    *,
+    config: Any = None,
 ) -> dict[str, float]:
     """``candidate_id -> mean cosine distance to every vector in `home`.``
     Raises :class:`~trialerror.lens.errors.MissingEmbeddingError` if either
     mapping is empty — an unscoreable pool is a caller data problem (see
-    that error's docstring), not a result this function papers over."""
+    that error's docstring), not a result this function papers over.
+
+    The scan is :func:`trialerror.util.vecmath.score_candidates`: one Python
+    loop for a pool small enough that numpy would cost more than it saves,
+    a blocked float64 matmul for one that isn't. It computes ``1 - cos`` per
+    home vector and then the mean — the same algebraic form this function
+    always used, not the cheaper ``1 - mean(cos)`` — so two candidates that
+    genuinely tie still tie, and :func:`stratify`'s ``(score, id)`` cut
+    lands in the same place either way."""
     if not candidates:
         raise MissingEmbeddingError("score_candidates: empty candidate vector set")
     if not home:
         raise MissingEmbeddingError("score_candidates: empty home/reference vector set")
-    home_vectors = list(home.values())
-    return {
-        cid: sum(cosine_distance(vec, h) for h in home_vectors) / len(home_vectors)
-        for cid, vec in candidates.items()
-    }
+    return vecmath.score_candidates(candidates, home, config=config)
 
 
 def stratify(

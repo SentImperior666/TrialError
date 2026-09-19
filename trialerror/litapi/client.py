@@ -39,8 +39,13 @@ from typing import Any, Sequence, Type
 
 from trialerror.litapi import reconcile
 from trialerror.litapi.config import LitApiConfig
-from trialerror.litapi.errors import AllProvidersFailedError, LitApiError, ProviderNotFoundError
-from trialerror.litapi.models import CitationsPage, WorkRecord
+from trialerror.litapi.errors import (
+    AllProvidersFailedError,
+    LitApiError,
+    ProviderNotFoundError,
+    ProviderTransportError,
+)
+from trialerror.litapi.models import CitationsPage, WorkRecord, looks_like_identifier, normalize_title
 from trialerror.litapi.providers.arxiv import ArxivProvider
 from trialerror.litapi.providers.base import Provider
 from trialerror.litapi.providers.openalex import OpenAlexProvider
@@ -90,13 +95,72 @@ class SearchResult:
     records: list[WorkRecord]
     providers_succeeded: list[str] = field(default_factory=list)
     providers_failed: list[dict[str, Any]] = field(default_factory=list)
+    #: Lane FB-1 item F3: what each provider's search actually matched on
+    #: (``{provider: scope}``), reported beside ``providers_succeeded``
+    #: because the two belong together -- "openalex returned 0" means
+    #: nothing until you know openalex was asked a title-only question. No
+    #: query is rewritten anywhere on the strength of this; it is the scope
+    #: being STATED, not normalised away.
+    provider_query_scope: dict[str, str] = field(default_factory=dict)
+    #: Lane FB-1 item F10b: every normalised-fallback retry that fired, as
+    #: ``{provider, status_code, first_error, retried_query, outcome}``. A
+    #: retry is a different question asked of the same API, so it is recorded
+    #: rather than hidden -- a caller comparing two runs' hit counts needs to
+    #: know that one of them asked twice.
+    provider_retries: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "records": [r.to_dict() for r in self.records],
             "providers_succeeded": list(self.providers_succeeded),
             "providers_failed": list(self.providers_failed),
+            "provider_query_scope": dict(self.provider_query_scope),
+            "provider_retries": list(self.provider_retries),
         }
+
+
+def _failure_entry(provider_name: str, exc: LitApiError) -> dict[str, Any]:
+    """One ``providers_failed``/``metadata_failures`` row. A genuine
+    transport-level unreachability (litapi-arxiv-https build) --
+    :func:`~trialerror.litapi.providers.base.get_with_retry` wraps a raw
+    ``URLError``/socket timeout/``ConnectionError`` into
+    :class:`~trialerror.litapi.errors.ProviderTransportError` with
+    ``host``/``scheme`` set (see that class's own docstring for how this
+    is distinguished from the pre-existing "bad HTTP status" use of the
+    same class) -- is enriched with a ``code``/``host``/``scheme`` a
+    caller (``trialerror/cli/lit.py``) can key off to report the more
+    actionable ``transport_unreachable`` envelope code instead of the
+    generic exception-class-name one, without having to re-parse the
+    ``error`` message string. Every other failure (bad HTTP status,
+    malformed body) keeps the original, narrower ``{provider, error}``
+    shape unchanged."""
+    entry: dict[str, Any] = {"provider": provider_name, "error": str(exc)}
+    if isinstance(exc, ProviderTransportError) and exc.host is not None:
+        entry["code"] = "transport_unreachable"
+        entry["host"] = exc.host
+        entry["scheme"] = exc.scheme
+    return entry
+
+
+def _normalized_retry_query(query: str, exc: LitApiError) -> str | None:
+    """The query to retry ``exc``'s provider with, or ``None`` for "do not
+    retry". See :meth:`LitApiClient.search` for why each condition is here.
+
+    ``status_code`` is the discriminator the transport already records: it is
+    set for "the provider answered with a bad status" and left ``None`` for
+    "no HTTP response was ever received" (see
+    :class:`~trialerror.litapi.errors.ProviderTransportError`), which is the
+    exact line between "maybe the query offended it" and "nothing was
+    reached"."""
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int) or not 400 <= status <= 599:
+        return None
+    if looks_like_identifier(query):
+        return None
+    normalized = normalize_title(query)
+    if not normalized or normalized == query:
+        return None
+    return normalized
 
 
 def build_default_providers(
@@ -144,7 +208,7 @@ class LitApiClient:
             except ProviderNotFoundError:
                 continue
             except LitApiError as exc:
-                failures.append({"provider": provider.name, "error": str(exc)})
+                failures.append(_failure_entry(provider.name, exc))
                 continue
             if record is not None:
                 record.providers = [provider.name]
@@ -163,15 +227,61 @@ class LitApiClient:
     # -- search ----------------------------------------------------------------
 
     def search(self, query: str, *, limit: int = 10) -> SearchResult:
+        """Search every provider with the caller's query VERBATIM, and retry a
+        provider at most once with a normalised query when that provider
+        answered with an HTTP error status (lane FB-1 item F10b).
+
+        The raw query is always the first attempt -- punctuation, case and
+        diacritics are signal to a search API, and rewriting up front would
+        throw away recall nobody asked to lose. But a title pasted out of a
+        PDF (smart quotes, a soft hyphen, a trailing "  (preprint)") is a
+        query some providers answer with a 400 rather than an empty result,
+        and a lookup that dies on a punctuation mark is indistinguishable to
+        the caller from a paper that is not indexed.
+
+        Four bounds, each of them the point:
+
+        - ONLY on that provider's own 4xx/5xx. A provider that answered
+          successfully is never asked twice: its empty result is an answer,
+          and a second query would be inventing recall the provider did not
+          report. A transport-level failure (no HTTP response at all, so no
+          status code) is not retried either -- normalization cannot reach
+          an unreachable host.
+        - ONCE, and only when the normalised form actually DIFFERS from what
+          was already sent.
+        - NEVER for a DOI or an arXiv id (:func:`looks_like_identifier`):
+          title normalization collapses every non-alphanumeric run, which is
+          exactly the part of an identifier that identifies it.
+        - RECORDED in ``provider_retries``, always -- including when the
+          retry fails too.
+        """
         all_records: list[WorkRecord] = []
         succeeded: list[str] = []
         failures: list[dict[str, Any]] = []
+        retries: list[dict[str, Any]] = []
         for provider in self.providers:
             try:
                 records = provider.search(query, limit=limit)
             except LitApiError as exc:
-                failures.append({"provider": provider.name, "error": str(exc)})
-                continue
+                retry_query = _normalized_retry_query(query, exc)
+                if retry_query is None:
+                    failures.append(_failure_entry(provider.name, exc))
+                    continue
+                entry = {
+                    "provider": provider.name,
+                    "status_code": getattr(exc, "status_code", None),
+                    "first_error": str(exc),
+                    "retried_query": retry_query,
+                }
+                try:
+                    records = provider.search(retry_query, limit=limit)
+                except LitApiError as retry_exc:
+                    entry["outcome"] = "failed"
+                    retries.append(entry)
+                    failures.append(_failure_entry(provider.name, retry_exc))
+                    continue
+                entry["outcome"] = "succeeded"
+                retries.append(entry)
             succeeded.append(provider.name)
             for r in records:
                 r.providers = [provider.name]
@@ -181,7 +291,15 @@ class LitApiClient:
                 f"no provider could search for query={query!r}", details={"failures": failures}
             )
         merged = reconcile.reconcile_many(all_records)
-        return SearchResult(records=merged[:limit], providers_succeeded=succeeded, providers_failed=failures)
+        return SearchResult(
+            records=merged[:limit],
+            providers_succeeded=succeeded,
+            providers_failed=failures,
+            provider_query_scope={
+                p.name: getattr(p, "search_scope", "unspecified") for p in self.providers
+            },
+            provider_retries=retries,
+        )
 
     # -- citations --------------------------------------------------------------
 
@@ -201,10 +319,10 @@ class LitApiClient:
             try:
                 return provider.get_citations(identifier, limit=limit, offset=offset)
             except ProviderNotFoundError as exc:
-                failures.append({"provider": provider.name, "error": str(exc)})
+                failures.append(_failure_entry(provider.name, exc))
                 continue
             except LitApiError as exc:
-                failures.append({"provider": provider.name, "error": str(exc)})
+                failures.append(_failure_entry(provider.name, exc))
                 continue
         raise AllProvidersFailedError(
             f"no provider could fetch citations for identifier={identifier!r}", details={"failures": failures}

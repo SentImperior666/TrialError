@@ -346,8 +346,26 @@
         // "no term conflicts".
         body.push(h("div", { "class": "note-strip", text: "TERM-SENSE CONFLICTS: " + omitted.message }));
       } else if (panel.term_conflicts) {
+        // Labels read the keys `lexicon.api.conflicts_for_claim` actually
+        // returns. Lane c wrote `c.term`/`c.reason` before that read existed,
+        // so every row rendered as two empty cells until the lane merge: the
+        // payload carries `lemma`, and there is no `reason` on it at all. The
+        // second column is the disjointness itself -- how many readings over
+        // how many sources -- because that is the sentence that says why this
+        // is a conflict rather than a nuance.
         (panel.term_conflicts.conflicts || []).forEach(function (c) {
-          body.push(rowButton(h, [c.term || "", c.reason || ""], { className: "ev-term-conflict", disabled: true }));
+          var senses = c.senses || [];
+          var keys = {};
+          senses.forEach(function (s) {
+            (s.source_keys || []).forEach(function (k) { keys[k] = true; });
+          });
+          var summary = senses.length
+            ? senses.length + " readings over " + Object.keys(keys).length + " sources"
+            : "no member readings recorded";
+          body.push(rowButton(h, [c.lemma || c.term_id || "", summary], {
+            className: "ev-term-conflict",
+            disabled: "deciding a conflict needs a real launch identity this page cannot supply (ruling L-E4) -- decide it on the Lexicon page or with `trialerror term decide`"
+          }));
         });
       }
       return card("WHAT ARGUES WITH IT", null, body);

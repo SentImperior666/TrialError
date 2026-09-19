@@ -302,23 +302,35 @@ One flat, unioned queue. No selection param — always the whole thing.
       "kind": "memory_conflict", "id": "G1", "key": "some-rule", "version_count": 2,
       "blocking": false,
       "consequence": "Resolving keeps one version of 'some-rule' active and marks the other superseded."
+    },
+    {
+      "kind": "term_conflict", "id": "TREL-...", "term_id": "TERM-...", "lemma": "stress track",
+      "member_sense_ids": ["SENSE-A", "SENSE-B"], "marked_by_kind": "system", "blocking": false,
+      "consequence": "Scoping keeps every sense and requires a disambiguator each; merging supersedes the others into the one you keep; rejecting closes the candidate."
+    },
+    {
+      "kind": "term_duplicate", "id": "TREL-...", "src_term_id": "TERM-...", "src_lemma": "cover system",
+      "dst_term_id": "TERM-...", "dst_lemma": "cover mechanic", "marked_by_kind": "system", "blocking": false,
+      "consequence": "Confirming as SAME AS (or the softer VARIANT OF) merges the newcomer term into the other -- nothing is deleted, its own lemma survives as an alias; rejecting closes the candidate without merging anything."
     }
   ],
-  "counts_by_kind": {"gate_edit": 1, "kg_merge": 1, "acquisition": 1, "prereg_reveal": 1, "room_escalation": 1, "memory_conflict": 1},
+  "counts_by_kind": {"gate_edit": 1, "kg_merge": 1, "acquisition": 1, "prereg_reveal": 1, "room_escalation": 1, "memory_conflict": 1, "term_conflict": 1, "term_duplicate": 1},
   "blocking_count": 2,
-  "total": 6
+  "total": 8
 }
 ```
 
 Notes:
 
-- **Six kinds, not four** — the brief's four (gate edits, KG merges, acquisitions, prereg/room escalations) plus `memory_conflict` (REDESIGN finding S26: "queue kind, not drawn" — surfaced here as data even though no artboard draws it). Every item has `kind`, `id` (unique per item, but its FORMAT differs by kind — don't parse it, just use it as a React/DOM key), `blocking` (bool), and `consequence` (a plain-English sentence naming what resolving THIS item unblocks — pure string derivation over gate/artifact/criterion linkage, never an LLM call).
+- **Six kinds, not four** — the brief's four (gate edits, KG merges, acquisitions, prereg/room escalations) plus `memory_conflict` (REDESIGN finding S26: "queue kind, not drawn" — surfaced here as data even though no artboard draws it). Lane e (E4) adds two more: `term_conflict` and `term_duplicate` — see below. Every item has `kind`, `id` (unique per item, but its FORMAT differs by kind — don't parse it, just use it as a React/DOM key), `blocking` (bool), and `consequence` (a plain-English sentence naming what resolving THIS item unblocks — pure string derivation over gate/artifact/criterion linkage, never an LLM call).
 - `gate_edit` — **one row per unverified BLOCKING edit**, not one row per gate (a gate with 3 blocking edits produces 3 items). `consequence` names either "N more blocking edits remain" or, on the last one, whether reproduction still blocks union_applied or registration is next.
 - `kg_merge` — every `merge_proposal` row at `status='draft'` (`trialerror.ingest.extract.list_pending`). `members` is already parsed to a list of entity ids (not a JSON string).
 - `acquisition` — every `source` row whose `request_state` is `wanted`/`requested`/`delivered`/`verifying` (terminal states `indexed`/`rejected`/`failed` are excluded — nothing to decide on those). `consequence` lists the legal next states from `trialerror.ingest.requests.TRANSITIONS`.
 - `prereg_reveal` — every `prereg` row at `status='committed'` (awaiting the reveal action that unseals its escrowed procedure/params hash).
 - `room_escalation` — every `room` at `state='frozen'`, with its freeze reason resolved from the `room_frozen` event trail.
 - `memory_conflict` — every open (`status='needs_merge'`) memory-sync conflict group, from `trialerror.memory.merge.list_conflicts`. `key` is the memory item's key both sides disagree on; `version_count` is normally 2 (`::left`/`::right`).
+- `term_conflict` (lane e, E4) — every pending, TERM-scoped `term_relation(verb='conflicts_with')` row (design §5): one item per polysemous lemma with disjoint-source senses, never one per pairwise combination. `member_sense_ids` is parsed from the relation's own `evidence` JSON. Tolerant of the same two absences the Evidence route's L-C5 hook already guards on — `ImportError` (the `trialerror.lexicon` package cannot even be imported: an old-SQLite build) and `sqlite3.OperationalError` (the package imports fine but this program's `knowledge.db` has not run the v5 migration yet) both degrade to zero `term_conflict` items, never a broken bundle.
+- `term_duplicate` (lane e, E4) — every pending, term-to-term `term_relation(verb='same_as')` row: engram-F4's save-time surfacing, a manual `trialerror term propose` that happened to name a near-miss, or a hand-opened relation. Same two-absence tolerance as `term_conflict`.
 
 ## 5. Dossier — `GET /dashboard/api/dossier[?artifact_id=ART-...]`
 
@@ -358,35 +370,149 @@ Notes:
 - `verdicts` — every `knowledge.verdict` row with `subject_kind='artifact'` and `subject_id=active_artifact_id`, newest first. **Different verdict procedures (`citecheck`/`contracrow`/`gate`/`reproduction`/`custom`) write completely different `label` vocabularies** (`"PASS"` vs `"match"` vs a bare confidence number as a string) — render each row's `procedure` and `label` together, never assume one shared scale across rows.
 - `version_chain` — every artifact reachable from `active_artifact_id` by walking `supersedes` in EITHER direction (older versions it supersedes, and any newer version that later superseded it), oldest-registered first. This is the only version-chain data the schema carries — there's no separate version-chain table.
 - `context_frame` — **almost always `null` today.** `artifact.context_frame` (REDESIGN §5.3 item 9: goal / prior-state / what-changed / why-it-matters) is not a real column yet — this reads `artifact.attrs.context_frame` best-effort (only non-null if some future producer happens to stash one there under `attrs`). Don't build UI that assumes this is normally populated; treat it exactly like `Dossier.dc.html`'s own "WHERE THIS CAME FROM" block would need to — as an honest empty state until the real column ships.
-- `lineage.note` — **always render this note wherever lineage is shown.** `knowledge.prov_edge` (the general consumed-source provenance graph) has zero writers anywhere in this codebase (confirmed again in this build) — lineage here is assembled ONLY from the launch ledger (`produced_by_launch`/`in_session`), `artifact.supersedes`/reverse-lookup, `record.artifact_id` (`registers_records`, a count — not a list, to keep the payload small; drill into `knowledge.record` separately if a list is ever needed), and the new `criterion.discharged_by_artifact` link (`discharges_criteria`). This is the exact set REDESIGN's own Dossier mockup (`Dossier.dc.html`'s amber "△" lineage-note strip) asks to be stated on the card, verbatim.
+- `lineage.note` — **always render this note wherever lineage is shown.** `knowledge.prov_edge` (the general consumed-source provenance graph) had zero writers anywhere in this codebase when this section was written — **as of lane e (E4), that is no longer true in general, only for THIS builder's own narrower reading.** `lexicon.api` (knowledge v5, step E1) is now the graph's first writer, but scoped to lexicon lineage only (`derived_from` on an accepted sense, `supersedes` on a corrected reading, `contradicts` between two scoped senses — ruling L-E5); it never writes an edge FROM or TO an `artifact`, which is what this builder's own lineage reads. So `build_dossier_panel` still does not read `prov_edge` and the note below is still accurate for what it describes — lineage here is assembled ONLY from the launch ledger (`produced_by_launch`/`in_session`), `artifact.supersedes`/reverse-lookup, `record.artifact_id` (`registers_records`, a count — not a list, to keep the payload small; drill into `knowledge.record` separately if a list is ever needed), and the new `criterion.discharged_by_artifact` link (`discharges_criteria`). This is the exact set REDESIGN's own Dossier mockup (`Dossier.dc.html`'s amber "△" lineage-note strip) asks to be stated on the card, verbatim. (The Evidence route's own `argues.note`, §14.7, carries the precise, no-longer-blanket statement — "zero writers outside lexicon lineage edges" — for the surface that actually reads the table now.)
 
-## 6. Lexicon — `GET /dashboard/api/lexicon`
+## 6. Lexicon — `GET /dashboard/api/lexicon[?term_id=TERM-...]`
 
-No selection param — the honest v1 read is a flat entity/claim listing, not a per-term drill-down route (there's no term store to drill into yet — see `seam_note`).
+<!-- builder: lane e (dashboard completion), step E4.
+     design of record: docs/reviews/LANE_E_TERM_STORE_DESIGN.md section 5 +
+     rulings L-E4 (a decision needs a real by_launch), L-E5 (lexicon may
+     write prov_edge, lineage only). This section REPLACES the pre-E4
+     entity/definition-claim proxy wholesale -- there is no compatibility
+     shim, and no field name below means what the old `entities`/
+     `definition_claims`/`seam_note` shape's namesakes meant.
+     trialerror/dashboard/data.py::build_lexicon_panel +
+     tests/test_dashboard_data_v2.py's lexicon-panel tests are the source of
+     truth if this document and the code disagree. -->
+
+REDESIGN R15's "largest seam" answered: the `term`/`term_sense`/
+`term_sense_evidence`/`term_relation` store (knowledge v5, lane e step E1)
+replaces the old `entity`/definition-`claim` proxy this route used to serve.
+No default selection (unlike `dossier`/`evidence`, which pick a sensible
+default artifact/claim): `?term_id=` omitted means the index alone, `"term":
+null` — an unselected Lexicon is an index to read, not a card to land on.
+
+Index (no `term_id`):
 
 ```json
 {
   "status": "ok",
-  "entities": [
-    {"entity_id": "ENT-...", "name": "Test Entity", "entity_type": "concept", "aliases": null, "summary": null, "resolution": "draft", "merge_group": null, "relation_count": 1}
+  "counts": {
+    "total": 2, "by_state": {"stable": 1, "split_open": 1},
+    "by_granularity": {"instance": 2}, "conflicts_open": 1, "needs_review": 0,
+    "definition_claims_unprojected": 1
+  },
+  "terms": [
+    {"term_id": "TERM-...", "lemma": "stress track", "granularity": "instance", "tags": ["f-fate"],
+     "status": "active", "state": "split_open", "gloss": "a fate-family reading",
+     "sense_count": 2, "source_count": 2, "last_revised": "2026-09-06T00:00:00.000Z"},
+    {"term_id": "TERM-...", "lemma": "cover system", "granularity": "instance", "tags": [],
+     "status": "active", "state": "stable", "gloss": "a stable, single-system reading",
+     "sense_count": 1, "source_count": 1, "last_revised": "2026-09-05T00:00:00.000Z"}
   ],
-  "definition_claims": [],
-  "claim_kind_counts": {"finding": 1},
-  "merge_proposals_draft": [
-    {"prop_id": "MRG-...", "canonical_entity": "ENT-...", "members": "[\"ENT-...\", \"ENT-...\"]", "reason": "test merge", "status": "draft", "proposed_by_launch": "LNCH-...", "decided_by": null, "decided_ts": null}
-  ],
-  "contradiction_edges": [],
-  "seam_note": "No dedicated term/term_sense/term_sense_evidence store exists yet (REDESIGN_V2_RATIONALE.md Section 5.3 item 7). Entities and definition-kind claims are read as a v1 proxy -- they give deduplication signal (entity.aliases, draft merge_proposal rows), not senses. contradiction_edges is always empty today: knowledge.prov_edge has zero writers anywhere in this codebase."
+  "term": null
 }
 ```
 
+With `?term_id=TERM-...` naming a real term, `"term"` becomes:
+
+```json
+{
+  "term": {"term_id": "TERM-...", "lemma": "stress track", "lemma_norm": "stress track",
+           "granularity": "instance", "tags": "[\"f-fate\"]", "entity_id": null, "status": "active",
+           "preferred_sense_id": "SENSE-A", "merged_into": null,
+           "created_by_launch": "LNCH-...", "created_at": "...", "updated_ts": "2026-09-06T00:00:00.000Z"},
+  "senses": [
+    {"sense_id": "SENSE-A", "gloss": "the fate-family reading", "disambiguator": null, "status": "current",
+     "origin_kind": "extract", "origin_ref": "CLM-...", "source_keys": ["SRC-A"],
+     "needs_review": false, "review_after": "2027-03-01T00:00:00.000Z",
+     "evidence": [{"evidence_id": "TSE-...", "kind": "quote_anchor", "source_key": "SRC-A", "cite_raw": null,
+                   "anchor_id": "ANC-...", "page_number": 12, "excerpt": "...", "fenced": false, "anchored": true}]},
+    {"sense_id": "SENSE-B", "gloss": "the pbta-family reading", "disambiguator": null, "status": "proposed",
+     "origin_kind": "extract", "origin_ref": "CLM-...", "source_keys": ["SRC-B"],
+     "needs_review": false, "review_after": null, "evidence": [{"...": "..."}]}
+  ],
+  "relations": [
+    {"rel_id": "TREL-...", "src_kind": "term", "src_id": "TERM-...", "dst_kind": "term", "dst_id": "TERM-...",
+     "verb": "conflicts_with", "decided_verb": null, "status": "pending", "reason": null,
+     "evidence": "{\"sense_ids\": [\"SENSE-A\", \"SENSE-B\"]}", "confidence": null,
+     "marked_by_kind": "system", "marked_by_launch": null, "marked_by_model": "scan-v1", "marked_ts": "...",
+     "decided_by_launch": null, "decided_ts": null, "superseded_by": null,
+     "member_sense_ids": ["SENSE-A", "SENSE-B"]}
+  ],
+  "conflict": {"rel_id": "TREL-...", "opened_ts": "...", "member_sense_ids": ["SENSE-A", "SENSE-B"],
+               "shared_sources": [], "systems_per_sense": {"SENSE-A": ["SRC-A"], "SENSE-B": ["SRC-B"]}}
+}
+```
+
+`term_id` naming no real term is **200 with a reading**, the Evidence route's
+own convention (§14.1), never a 404: `"term": null, "not_found": {"kind":
+"term_id", "id": "TERM-does-not-exist"}`.
+
 Notes:
 
-- `entities` — every `entity` row, alphabetical by name, plus a computed `relation_count` (live relations touching it, either direction).
-- `definition_claims` — every LIVE `claim` with `kind='definition'`, newest first, joined to its grounding anchor (`quote_text`/`page_number`/`doc_id`). **This is the closest thing to a "term definition" today** — there is no `term`/`term_sense` table (see `seam_note`), so a real term-split view (`Lexicon.dc.html`'s "SENSE A vs SENSE B" split) cannot be built from this data alone yet; render what exists (a flat list of quote-grounded definitions) rather than fabricating a two-sense layout.
-- `merge_proposals_draft` — draft `merge_proposal` rows; `members` is the raw JSON STRING here (unlike the determinations panel's `kg_merge` items, which pre-parse it) — parse it client-side if needed.
-- `contradiction_edges` — **always `[]` today, on every real program**, not just this fixture. It reads `knowledge.prov_edge WHERE role='contradicts'`, and that table has zero writers anywhere in the codebase. Do not render "0 conflicts" as if it were a measured finding — render it as an honest "not tracked yet" state, or simply omit the conflict-count chip entirely until a writer exists.
-- `seam_note` — a ready-to-render string explaining the above; safe to show directly in a "this surface needs N new tables" callout (`Lexicon.dc.html`'s own amber panel already sketches exactly this).
+- `status == "awaiting_migration"` — the `term` table itself does not exist
+  yet on this program's `knowledge.db` (the `course` panel's exact
+  convention, §1): a write path (any CLI command) applies knowledge v5
+  automatically; `trialerror dashboard` never migrates a store itself.
+- `terms` — every term, always (`merged`/`retired` rows included — nothing
+  is hidden, matching the store's own "nothing is deleted" posture),
+  sorted by `last_revised` (`term.updated_ts`, or `created_at` if that is
+  unset) newest first. `state` is a DERIVED reading, distinct from the
+  stored `status` column: `proposed`/`split`/`merged`/`retired` mirror
+  `status` directly; an `active` term becomes `split_open` when it has an
+  open (`pending`) `conflicts_with` judgment, `needs_review` when any
+  CURRENT sense's `review_after` has passed and there is no open conflict,
+  else `stable`. `gloss` is the term's PREFERRED sense's gloss (falling
+  back to the first `current` sense if no preference is set) — `null` on a
+  term with no accepted reading yet. `sense_count`/`source_count` count
+  EVERY sense / every distinct non-retracted evidence `source_key` across
+  every sense, regardless of sense status.
+- `counts.conflicts_open` — the number of DISTINCT pending, term-scoped
+  `conflicts_with` relations across every term (one per polysemous lemma,
+  never per pairwise combination of senses — design §3's "one queue item,
+  not thirty-six"). `counts.needs_review` counts TERMS with at least one
+  stale current sense, not senses. `counts.definition_claims_unprojected` —
+  live `claim(kind='definition')` rows with no `term_sense_evidence
+  (evidence_kind='claim')` row under them yet: the migration-from-proxy
+  backlog, replacing the old `seam_note` callout with an actionable count.
+- `term.senses[].evidence[].excerpt`/`.fenced` — recomputed AT READ TIME
+  from whatever the evidence row points at right now, for the two ANCHORED
+  kinds (`quote_anchor`/`claim`): `retrieve/fence.py::citation_quote` with
+  the CURRENT source's `license_tier` — never trusted from the evidence
+  row's own write-time `excerpt` column, because the fence must reflect
+  what is true NOW, not what was true when the row was written. A source
+  that cannot be resolved is served fenced (the conservative direction,
+  not the permissive one). `record`/`idea` evidence has no anchor at all
+  (D31): `anchored: false`, and `excerpt` is exactly the program's own
+  words stored on the row at propose/backfill time, never a quote — render
+  that reading as "cite only — no anchor yet", never as a quote.
+- `term.relations[]` — every relation naming this term OR any of its senses
+  on either side (both a term-scoped conflict candidate AND a term-to-term
+  duplicate candidate are reachable from here), the full raw `term_relation`
+  row plus a derived `member_sense_ids` (parsed from a term-scoped
+  relation's own `evidence` JSON, or the relation's own two endpoints when
+  it is sense-to-sense).
+- `term.conflict` — a convenience summary of the one currently-PENDING
+  `conflicts_with` judgment on this term (`null` if none). The
+  disjointness the artboard draws under "WHY THIS IS A CONFLICT AND NOT A
+  NUANCE" — `systems_per_sense`, one non-retracted source-key list per
+  member sense — is COMPUTED here, never asserted; `shared_sources` (read
+  from the relation's own `evidence` JSON, when a scan populated it) names
+  what a NUANCE would have looked like — i.e. exactly what this conflict is
+  NOT.
+- The frontend (`static/dashboard.html` §11, `renderLexicon`/
+  `renderLexiconDetail`) draws the index as TERM / DEFINITION / SRC / STATE
+  columns with one filter row, ALL · FAMILY · INSTANCE · ▲ SPLIT · NEEDS
+  REVIEW (a single select over granularity OR derived state, the
+  pre-existing chip-row idiom — never two independent axes), and the
+  detail as per-sense evidence rows (✓ ANCHORED / ■ FENCED / CITE ONLY)
+  plus the four decision actions (§17). A control this dashboard labels
+  "SEE IT IN THE EXTENSION PANEL" is drawn only when at least one extension
+  panel is registered (`dashboard/ext.py`; C-0070) — generically, naming no
+  specific panel: the design artboard's own mockup copy names one
+  directly, and this build deliberately does not repeat that name in a
+  shipped file (C-0078's export-hygiene gate).
 
 ## 7. Course — `GET /dashboard/api/course`
 
@@ -438,7 +564,7 @@ Notes — **this is the smallest of the seven seams, read the scope carefully:**
 Notes:
 
 - `since` omitted -> **default is the last CLOSED session's `closed_ts`** (`since_source: "last_session_close"`); if no session has ever closed, falls back to 24 hours before now (`since_source: "24h_fallback"`). Passing an explicit `since` reports `since_source: "given"`.
-- `items` — **newest first** (the brief: "ordered newest-first"), each a `{kind, ts, summary, ref}` tuple. `summary` is a plain factual ONE-LINE template sentence built straight from row data — **no LLM call anywhere in this builder**, by design (the brief's own constraint). Six kinds today: `feed_post` (new posts), `gate_transition` (gate state moves), `room_created`/`room_turn`/`room_dp_scored`/`room_converged`/`room_frozen`/`room_deliverable_registered` (room lifecycle/scoring events — `room_turn`'s summary is intentionally terse, "Room X: room_turn", since a turn's own body text belongs on the Rooms/Feed surfaces, not repeated here), `artifact_registered` (newly-registered artifacts), `ingest_complete` (jobs of kind `ocr`/`embed`/`index`/`extract`/`ingest_batch`/`normalize`/`chunk` that reached `state='complete'`).
+- `items` — **newest first** (the brief: "ordered newest-first"), each a `{kind, ts, summary, ref}` tuple. `summary` is a plain factual ONE-LINE template sentence built straight from row data — **no LLM call anywhere in this builder**, by design (the brief's own constraint). Six kinds before lane e: `feed_post` (new posts), `gate_transition` (gate state moves), `room_created`/`room_turn`/`room_dp_scored`/`room_converged`/`room_frozen`/`room_deliverable_registered` (room lifecycle/scoring events — `room_turn`'s summary is intentionally terse, "Room X: room_turn", since a turn's own body text belongs on the Rooms/Feed surfaces, not repeated here), `artifact_registered` (newly-registered artifacts), `ingest_complete` (jobs of kind `ocr`/`embed`/`index`/`extract`/`ingest_batch`/`normalize`/`chunk` that reached `state='complete'`). Lane e (E4) adds twelve more, every `event.type` `lexicon.api` appends verbatim (design §3, plus `term_evidence_retracted` — one more than that list names): `term_proposed`, `term_sense_proposed`, `term_sense_accepted`, `term_sense_rejected`, `term_sense_superseded`, `term_sense_retired`, `term_reviewed`, `term_relation_opened`, `term_relation_decided`, `term_split`, `term_merged`, `term_evidence_retracted`. Their `ref` carries `{"term_id": ...}` — resolved from the event's own payload, which is `term_id` for nine of the twelve and `canonical_term_id` for `term_merged` (the one event whose payload names no bare `term_id` key at all, since it is about TWO terms folding into one).
 - `ref` — a small object naming the id(s) needed to deep-link to the item's own surface (a `post_id`+`thread_id` for Feed, a `room_id` for Rooms, a `gate_id`/`artifact_id` for Dossier/Determinations, a `job_id` for Console's jobs table). Shape varies by `kind` — switch on `kind` before reading `ref`'s fields.
 - There is deliberately **no `document`/ingest-doc-level completion kind** — `document` carries no timestamp column in the real schema, so "this document finished indexing" cannot be honestly dated; `ingest_complete` (job-level) is the closest honestly-computable proxy and is what's reported instead.
 
@@ -1088,15 +1214,29 @@ card says `N NODES, DRAWN AS A TABLE ONLY`. The table is present either way.
 
 ### 14.7 What is NOT here
 
-- **`prov_edge` is read, and reported empty.** The table has zero writers
-  anywhere in this codebase; `argues.note` says so. `verdict(subject_kind=
-  'claim', procedure='contracrow')` is the live contradiction signal.
-- **Term-sense conflicts are omitted, with the reason stated** (ruling L-C5).
-  Lane e (E4) adds `lexicon.api.conflicts_for_claim` and this builder picks it
-  up behind an import guard. Until then the payload carries
-  `term_conflicts_omitted: {reason: "awaiting_migration", message}` and the
-  renderer prints that message — never an empty box that reads "no conflicts".
-  When lane e lands, the key becomes `term_conflicts: {status, conflicts}`.
+- **`prov_edge` is read here for `role IN ('contradicts','supports')` between
+  two CLAIMS, and reported empty.** That specific query has zero writers
+  (`argues.note` says so, and still correctly): lane e (E1) is the table's
+  first writer overall, but scoped to lexicon lineage only (`derived_from`
+  on an accepted sense, `supersedes` on a corrected reading, `contradicts`
+  between two SCOPED SENSES, never between two claims — ruling L-E5). This
+  builder's own read is therefore still honestly empty on every real
+  program; it is `build_lexicon_panel`'s `term.conflict`/`term.relations`
+  (§6) that reads the lexicon's own edges, not this one.
+  `verdict(subject_kind='claim', procedure='contracrow')` is the live
+  claim-level contradiction signal.
+- **Term-sense conflicts are omitted, with the reason stated** (ruling L-C5)
+  — until lexicon knowledge v5 has actually been migrated on this program.
+  Lane e (E1) landed `lexicon.api.conflicts_for_claim`, and this builder
+  already picks it up behind an import guard: on a migrated program the
+  payload carries `term_conflicts: {status, conflicts}` (empty `conflicts`
+  reads as "nothing argues with this claim", a real statement now, not a
+  placeholder). On a program whose lexicon package is not importable
+  (`ImportError`, an old SQLite build) or whose `knowledge.db` has not run
+  the v5 migration yet (`sqlite3.OperationalError`), the payload still
+  carries `term_conflicts_omitted: {reason: "awaiting_migration", message}`
+  and the renderer prints that message — never an empty box that reads "no
+  conflicts" when what is true is "nothing can answer that yet".
 - **SEND TO DETERMINATIONS / OPEN A ROOM ON IT are drawn disabled**, with their
   reasons in `title` (section 12.11's convention): no callable exists for
   either verb.
@@ -1329,3 +1469,102 @@ listener that submits" keeps holding. The synthetic click is dispatched on
 the button so the submit runs through `wireWriteAction` — required-field
 check, disabled state, message strip and the WA-2 reload included — and it
 is the page's only synthetic click, which a test pins.
+
+---
+
+<!-- builder: lane e (dashboard completion), step E4.
+     design of record: docs/reviews/LANE_E_TERM_STORE_DESIGN.md section 5 +
+     ruling L-E4 (a term decision needs a real by_launch -- the XID
+     refuse-on-missing guard, never a fallback, exactly like merge-accept's
+     own precedent and lane C's L-C2).
+     trialerror/dashboard/writes.py + tests/test_dashboard_writes.py's lane e
+     block are the source of truth if this document and the code disagree. -->
+
+## 17. Writes, part three — the four term-store decisions (lane e, E4)
+
+Section 12's contract is unchanged: same route shape, same token header, same
+`{ok, result}` / `{ok, status, message}` envelope, same `_validate_fields`
+type table. Four actions join the thirteen already there (seventeen live),
+each a thin wrapper over one `trialerror.lexicon.api` function — never a
+second implementation of a rule that module already enforces.
+
+| action | body | module called | refusals (verbatim from the module) | audit |
+|---|---|---|---|---|
+| `term-sense-accept` | `{sense_id, by_launch}` | `lexicon.api.accept_sense` | `SenseNotDecidableError` (not `proposed`), `SenseWithoutEvidenceError` (every evidence row since retracted), `XidTargetMissingError` (unknown launch) | `term_sense_accepted` |
+| `term-sense-reject` | `{sense_id, by_launch}` + optional `reason` | `lexicon.api.reject_sense` | `SenseNotDecidableError` | `term_sense_rejected` |
+| `term-relation-decide` | `{rel_id, decision, by_launch}` + `disambiguators` (object, `scoped` only) / `into` (`not_conflict` only) / `canonical` (`same_as`/`variant_of` only) / `reason` | `lexicon.api.decide_relation` | `RelationNotFoundError`, `RelationNotPendingError` (already decided), `InvalidDecisionError` (wrong decision for this relation's shape), `MissingDisambiguatorError` (a `scoped` decision left a member unnamed) | `term_relation_decided`, plus `term_split`/`term_merged` when the decision moves other rows |
+| `term-mark-reviewed` | `{sense_id, by_launch}` | `lexicon.api.mark_reviewed` | `SenseNotDecidableError` (not `current`) | `term_reviewed` |
+
+### 17.1 `term-sense-accept` / `term-sense-reject`
+
+The evidenced route, and the only one — `accept_sense` refuses a sense whose
+live evidence has all been retracted since it was proposed, the same
+grounding law the propose route itself enforces. Accepting also re-runs the
+disjoint-source conflict scan for the term (a second current sense is exactly
+when a conflict can appear) and writes a `prov_edge(role='derived_from')`
+back to whatever this reading came out of (a claim, a record, an idea) —
+ruling L-E5's lineage writer. Rejecting keeps the evidence rows: the program
+looked at this reading and said no, and the material it said no to is part of
+that record.
+
+### 17.2 `term-relation-decide`
+
+Resolves one PENDING judgment — the artboard's three actions plus REJECT.
+`decision` is one of `same_as` / `variant_of` (a term-to-term duplicate
+candidate: folds one term into the other, `merge_terms` under the hood — the
+folded term's own lemma survives as an alias, nothing is deleted), `scoped`
+(a conflict candidate: keeps every member sense, requires a `disambiguators`
+entry for each, and writes a `prov_edge(role='contradicts')` between every
+pair of members — the lexicon's first honest contradiction edges), `not_conflict`
+(a conflict candidate that turned out to be one reading after all: the other
+members are superseded by the sense named in `into`, their evidence copied
+onto it — no evidence row lost), or `rejected` (the candidate was a false
+positive; the relation closes and nothing else moves, so a later scan sees
+the rejected row and does not reopen the same member set).
+
+`disambiguators` is the one field in this build whose JSON type is an OBJECT,
+`{sense_id: disambiguator_text, ...}` — checked against `_NON_STRING_FIELDS`
+rather than the string default every other field gets; a caller sending the
+wrong shape is refused (`status: "bad_request"`) before any store is opened.
+
+**This REJECT is not ruling L-C6's.** L-C6 keeps `gated -> failed` (a GATE
+verdict) CLI-only, because a destructive verb driven by a free-text launch id
+over an artifact's review state is not auditable. `decide_relation`'s
+`rejected` is a completely different state machine — a `term_relation`, never
+a `gate` — explicitly named in the schema's own closed decision vocabulary
+(`trialerror.lexicon.policy.RELATION_DECISIONS`), and ruling L-E4 gives it the
+same `by_launch`-required, XID-checked posture every other decision here
+already has. Nothing about L-C6 changes; it was never about this table.
+
+### 17.3 `term-mark-reviewed`
+
+"I looked at this and it is still right." Resets the sense's engram-F5 decay
+window (MINING §5.7) and changes nothing else — reviewing is cheap, and
+neither reviewing nor the decay flag it answers ever decides a status on its
+own. Refuses on a sense that is not `current` (a proposed/rejected/retired
+reading carries no review window to reset).
+
+### 17.4 Identity (ruling L-E4)
+
+Every action above requires a real `by_launch` — the interim rule, identical
+to `merge-accept`'s own precedent and to lane C's answer on the same question
+(§15.3's L-C2): until a platform-level operator identity exists
+(UNDERSTANDING_APPLIED P4), a decision needs an existing `platform.launch`
+row; `writer.insert`'s refuse-on-missing XID is the guard, and it is checked
+BEFORE anything is written (the C9 fix pass's §16.1 rule, which these four
+actions follow from day one rather than needing a second pass to reach it).
+An id with no `platform.launch` row fails with `XidTargetMissingError`,
+verbatim — never a silent fallback to some other identity.
+
+### 17.5 Determinations item enrichments (E4)
+
+`term_conflict`/`term_duplicate` (§4) are the two new determination item
+kinds these four actions resolve. Neither is `blocking` — a polysemous term
+nobody has adjudicated yet is a prompt to look, not a gate on anything else
+in the program.
+
+### 17.6 What section 12.12 still says
+
+Every row in section 12.12's table is unchanged by this build. Lane e adds
+no new "drawn disabled" row — all four named actions here are wired, with no
+partial coverage left unwired for a future stage.

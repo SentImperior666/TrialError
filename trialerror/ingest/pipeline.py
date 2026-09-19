@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from trialerror.ingest.errors import (
+    DocumentQualityRefusedError,
+    DocumentRetractedError,
     LicenseRouteRefusedError,
     PathOutOfTreeError,
     SourceNotFoundError,
@@ -37,13 +39,35 @@ __all__ = [
     "resolve_ingest_roots",
     "assert_in_tree",
     "allowed_acquisition_routes",
+    "route_keys",
+    "resolve_stage",
     "register_source",
     "estimate_cost",
     "COST_GATE_PAGE_THRESHOLD",
     "stage_job_kind_and_payload",
+    "REEXTRACTION_STAGES",
     "add_document",
     "requeue_stage",
+    "SOURCE_KINDS",
+    "INVENTORY_SOURCE_KIND",
 ]
+
+#: ``source.kind``'s CHECK domain (``trialerror/stores/schema/knowledge.py``,
+#: widened by schema-v7), transcribed once so the CLI's ``--kind`` choices
+#: and any other caller read the same list instead of each keeping a copy
+#: that can drift from the constraint.
+SOURCE_KINDS: tuple[str, ...] = (
+    "paper", "book", "web", "rulebook", "dataset", "report", "inventory", "other",
+)
+
+#: The kind whose documents are the novelty screen's structured reference
+#: set: one row per entry, chunked one chunk per row
+#: (:func:`trialerror.ingest.chunker.build_row_chunks`) and excluded by
+#: default from every retrieval surface
+#: (``trialerror.retrieve.engine.DEFAULT_EXCLUDED_KINDS``). Named here, in
+#: the module that registers sources, so the writer and the two consumers
+#: cannot drift apart on the spelling.
+INVENTORY_SOURCE_KIND = "inventory"
 
 #: design Section 6: "register refuses paths outside raw/inbox globs" --
 #: default relative roots when a program's trialerror.toml doesn't override
@@ -94,6 +118,17 @@ COST_GATE_PAGE_THRESHOLD = 50
 #: ``ocr`` -- it will never itself become a first-class ``job.kind`` value,
 #: unlike ``normalize``/``chunk`` above which outgrew ``'custom'`` and did).
 _CUSTOM_STAGE_KINDS: frozenset[str] = frozenset({DJVU_STAGE})
+
+#: The stages that RE-DERIVE a document's text and therefore re-measure it:
+#: the normalize tail runs for all three, so each one ends by writing
+#: ``document.status`` from what the text now measures
+#: (``trialerror.ingest.handlers._finish_normalize_stage``). They are the
+#: exception to the quality-refusal guard in :func:`requeue_stage` -- and
+#: the only way a refusal is ever retired, since re-running one after
+#: relaxing ``[ingest.quality] refuse_below`` is exactly the operator
+#: statement "measure this text again". Every OTHER stage consumes the
+#: refused text as given, which is what the refusal exists to prevent.
+REEXTRACTION_STAGES: frozenset[str] = frozenset({"normalize", "ocr", DJVU_STAGE})
 
 
 def stage_job_kind_and_payload(stage: str, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -264,6 +299,47 @@ def estimate_cost(raw_path: Path, media_type: str) -> dict[str, Any]:
     }
 
 
+#: Every route key this pipeline knows, in the order a reader should read
+#: them: what is normalized directly, what goes through OCR, and the one
+#: format that is neither (:mod:`trialerror.ingest.normalize_djvu`).
+def route_keys() -> list[str]:
+    """The accepted ``media_type`` values, sorted -- what a refusal names.
+
+    Computed rather than written down a second time: a route key list that
+    can disagree with the dispatch it describes is worse than none."""
+    return sorted({*MEDIA_TYPES_DIRECT, *MEDIA_TYPES_NEEDING_OCR, MEDIA_TYPE_DJVU})
+
+
+def resolve_stage(media_type: str) -> str:
+    """The first pipeline stage for one media type, or a refusal naming
+    every key that has one (lane FB-6 item 7).
+
+    ``media_type`` here is a ROUTE KEY, not an IANA media type: ``md``, not
+    ``text/markdown``. That distinction is invisible until someone passes
+    the real thing, so the refusal says it outright and points at the
+    extension route that resolves ``.md`` for a caller who would rather not
+    name one at all."""
+    if media_type == MEDIA_TYPE_DJVU:
+        # trialerror.ingest.normalize_djvu: neither a direct format nor an
+        # OCR-needing one -- its own 'djvu' stage converts to PDF first,
+        # then re-enqueues 'normalize'/'ocr' for the derived PDF itself.
+        return DJVU_STAGE
+    if media_type in MEDIA_TYPES_NEEDING_OCR:
+        return "ocr"
+    if media_type in MEDIA_TYPES_DIRECT:
+        return "normalize"
+    from trialerror.ingest.errors import UnsupportedMediaTypeError
+
+    raise UnsupportedMediaTypeError(
+        f"media_type {media_type!r} has no route (normalize or OCR). The accepted route keys are "
+        f"{route_keys()!r} -- they are this pipeline's own names, not IANA media types, so "
+        "'text/markdown' is not one of them. Omit --media-type and the extension route resolves "
+        "'.md' (and '.markdown') to 'md', '.html'/'.htm' to 'html', '.epub' to 'epub', "
+        "'.png'/'.jpg'/'.tif' to 'image', '.djvu' to 'djvu', and '.pdf' to 'pdf-text' or "
+        "'pdf-scan' by its text layer"
+    )
+
+
 def add_document(
     store: Store,
     *,
@@ -281,7 +357,9 @@ def add_document(
     Section 6 stages 3/4).
 
     Returns ``{"document": <row>, "job": <enqueued job row>, "cost_estimate": {...}}``
-    on success. Raises :class:`~trialerror.ingest.errors.PathOutOfTreeError` for
+    on success, plus ``stage_backend`` when the enqueued stage is ``ocr``
+    (lane FB-1 item F10a: which backend will read this document's pages, and
+    whether it is the stand-in). Raises :class:`~trialerror.ingest.errors.PathOutOfTreeError` for
     an out-of-tree ``raw_path``; raises ``ValueError`` (cost-gate refusal)
     when the estimate exceeds the configured page threshold and ``yes`` is
     not set.
@@ -296,6 +374,13 @@ def add_document(
         raise SourceNotFoundError(f"no such source: {source_id!r}")
 
     resolved_media_type = media_type or detect_media_type(raw_path)
+    # Lane FB-6 item 7: the ROUTE is resolved before anything is written.
+    # `--media-type text/markdown` is the shape this caught -- a real media
+    # type, and not one of this pipeline's route keys -- and the refusal used
+    # to come after the document row was inserted, leaving a `registered`
+    # document with no jobs behind it: doctor counted it, `ingest status`
+    # listed it, and nothing would ever move it.
+    stage = resolve_stage(resolved_media_type)
 
     threshold = (config or {}).get("ingest", {}).get("cost_gate_page_threshold", COST_GATE_PAGE_THRESHOLD)
     cost_estimate = estimate_cost(raw_path, resolved_media_type)
@@ -340,20 +425,6 @@ def add_document(
         },
     )
 
-    if resolved_media_type == MEDIA_TYPE_DJVU:
-        # trialerror.ingest.normalize_djvu: neither a direct format nor an
-        # OCR-needing one -- its own 'djvu' stage converts to PDF first,
-        # then re-enqueues 'normalize'/'ocr' for the derived PDF itself.
-        stage = DJVU_STAGE
-    elif resolved_media_type in MEDIA_TYPES_NEEDING_OCR:
-        stage = "ocr"
-    elif resolved_media_type in MEDIA_TYPES_DIRECT:
-        stage = "normalize"
-    else:
-        from trialerror.ingest.errors import UnsupportedMediaTypeError
-
-        raise UnsupportedMediaTypeError(f"media_type {resolved_media_type!r} has no route (normalize or OCR)")
-
     job_kind, job_payload = stage_job_kind_and_payload(
         stage,
         {
@@ -364,7 +435,18 @@ def add_document(
         },
     )
     job = ledger.enqueue(store, kind=job_kind, payload=job_payload, job_id=f"JOB-ingest-{doc_id}")
-    return {"document": doc_row, "job": job, "cost_estimate": cost_estimate}
+    result: dict[str, Any] = {"document": doc_row, "job": job, "cost_estimate": cost_estimate}
+    if stage == "ocr":
+        # FB-1 item F10a: an OCR-routed document is about to have its pages
+        # read by whatever [ingest.ocr] names -- and an absent table names
+        # the deterministic stand-in. The caller is the surface that can say
+        # so while the operator is still looking (the CLI turns this into an
+        # envelope warning); returning it as data keeps this function free of
+        # any opinion about how it is presented.
+        from trialerror.ingest.backends import resolve_stage_backend
+
+        result["stage_backend"] = resolve_stage_backend(config, "ocr")
+    return result
 
 
 def requeue_stage(store: Store, *, doc_id: str, kind: str, created_by_launch: str) -> dict[str, Any]:
@@ -373,7 +455,63 @@ def requeue_stage(store: Store, *, doc_id: str, kind: str, created_by_launch: st
     "rechunk/re-embed fix the first four [doctor counts] as resumable
     jobs") and by a manual resume after a resolved failure. ``kind`` is the
     logical STAGE name (``"chunk"``/``"embed"``/...), mapped to the real
-    ``job.kind`` via :func:`stage_job_kind_and_payload`."""
+    ``job.kind`` via :func:`stage_job_kind_and_payload`.
+
+    Refuses a RETRACTED document
+    (:class:`~trialerror.ingest.errors.DocumentRetractedError`). Every stage
+    reachable from here re-derives, so requeuing one un-retracts by
+    accident: chunk/embed drain to ``status = 'embedded'`` on a row the
+    register says is withdrawn, and normalize rebuilds elements from the raw
+    file retraction deliberately keeps. This guard is a PRECONDITION of the
+    ``document.status = 'retracted'`` migration, not a follow-up to it --
+    the moment :func:`trialerror.ingest.retract.retracted_doc_ids` reads the
+    status column instead of the register, an unguarded ``ingest rechunk``
+    becomes a working un-retract.
+
+    Refuses, for exactly the same reason, a document the normalize stage
+    REFUSED on extraction quality
+    (:class:`~trialerror.ingest.errors.DocumentQualityRefusedError`, fix pass
+    V-1). The refusal's entire content is that nothing downstream chunks,
+    embeds, indexes or cites that text; without this guard ``ingest
+    rechunk`` re-derives all three and walks the document back to
+    ``'indexed'``, so the refusal would hold only against the stage that
+    wrote it. The condition is the refusal record AND
+    ``document.status = 'failed'`` -- the same pair
+    :func:`trialerror.ingest.pipeline_status.document_pipeline` reads, so a
+    program that relaxes ``refuse_below`` and re-runs the normalize stage
+    (which re-measures and writes ``'normalized'``) gets its rechunk back
+    with no flag to clear anywhere. The re-extraction stages themselves
+    (:data:`REEXTRACTION_STAGES`) are deliberately NOT guarded: they are the
+    documented way out, and a crash-resume re-runs one against a refused
+    document already (the refusal write is idempotent). Retraction guards
+    even those, because there the raw file is kept as evidence of something
+    withdrawn on purpose; a refusal is a statement about TEXT, and measuring
+    that text again is how it is retired."""
+    from trialerror.ingest.quality import quality_refusal_record
+    from trialerror.ingest.retract import retracted_doc_ids
+
+    if doc_id in retracted_doc_ids(store.knowledge):
+        raise DocumentRetractedError(
+            f"document {doc_id!r} has been retracted -- refusing to requeue its {kind!r} stage, "
+            "which would re-derive the rows the retraction removed. Re-ingest the raw file with "
+            "`trialerror ingest add` if it should be in the corpus again; that creates a new document "
+            "and leaves the retraction on the record."
+        )
+    doc_row = store.knowledge.execute("SELECT status FROM document WHERE doc_id = ?", (doc_id,)).fetchone()
+    doc_status = doc_row["status"] if doc_row is not None else None
+    if (
+        kind not in REEXTRACTION_STAGES
+        and doc_status == "failed"
+        and quality_refusal_record(store.knowledge, doc_id) is not None
+    ):
+        raise DocumentQualityRefusedError(
+            f"document {doc_id!r} was refused by the normalize stage on extraction quality "
+            f"([ingest.quality] refuse_below) -- refusing to requeue its {kind!r} stage, which would chunk, "
+            "embed and index text this program has declared unusable. Read the numbers with "
+            f"`trialerror ingest quality --doc-id {doc_id}`; then either relax [ingest.quality] refuse_below "
+            "and re-run the normalize stage (it re-measures the text and clears the refusal when the text now "
+            "passes), or fix the extraction route and re-ingest the raw file with `trialerror ingest add`."
+        )
     job_kind, job_payload = stage_job_kind_and_payload(kind, {"doc_id": doc_id, "created_by_launch": created_by_launch})
     job_id = f"JOB-ingest-{doc_id}-{kind}-{new_id('R')}"
     return ledger.enqueue(store, kind=job_kind, payload=job_payload, job_id=job_id)

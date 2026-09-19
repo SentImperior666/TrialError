@@ -175,6 +175,10 @@ def test_embed_handler_skips_already_cached_chunk_sha(store, program_root, raw_d
 
     run_one(store, worker_id="w0")  # normalize
     run_one(store, worker_id="w1")  # chunk
+    # Lane FB-6 item 8: chunk enqueues the full-text-only index job first, so
+    # a queue drained in order makes the document searchable before it is
+    # embedded.
+    run_one(store, worker_id="w1b")  # index (full text only)
     run_one(store, worker_id="w2")  # embed
 
     emb_count_1 = store.knowledge.execute("SELECT COUNT(*) FROM emb").fetchone()[0]
@@ -411,3 +415,87 @@ def test_rerunning_the_index_stage_adds_nothing_to_the_tantivy_index(store, prog
     after = tantivysearch.read_meta(index_dir)
     assert after["chunk_count"] == before["chunk_count"]
     assert after["chunk_fingerprint"] == before["chunk_fingerprint"]
+
+
+# ---------------------------------------------------------------------------
+# the inventory source kind: one chunk per row (framework stage B)
+# ---------------------------------------------------------------------------
+
+
+_INVENTORY_ROWS = [
+    "row alpha: a resource is spent to advance a track by one step",
+    "row beta: initiative passes to the player holding the fewest markers",
+    "row gamma: a contested check is resolved by comparing two hidden bids",
+    "row delta: a shared pool refills at the start of every third phase",
+]
+
+
+def _write_inventory_fixture(path):
+    path.write_text("\n\n".join(_INVENTORY_ROWS) + "\n", encoding="utf-8")
+    return path
+
+
+def _register_and_add_inventory(store, program_root, path):
+    launch_id = bootstrap_launch(store)
+    source = pipeline.register_source(
+        store, kind=pipeline.INVENTORY_SOURCE_KIND, title="Reference Rows", license_tier="open",
+        acquisition_route="web", registered_by_launch=launch_id,
+    )
+    result = pipeline.add_document(
+        store, program_root=program_root, source_id=source["source_id"], raw_path=path,
+        created_by_launch=launch_id, media_type="md",
+    )
+    return launch_id, source, result
+
+
+def test_an_inventory_source_is_chunked_one_chunk_per_row(store, program_root, raw_dir):
+    """The kind on the SOURCE row is what picks the chunker -- nothing in
+    the job payload or the config says so, precisely so a caller cannot set
+    it for retrieval and forget it for chunking."""
+    path = _write_inventory_fixture(raw_dir / "rows.md")
+    _launch_id, _source, result = _register_and_add_inventory(store, program_root, path)
+    _drain(store)
+
+    rows = store.knowledge.execute(
+        "SELECT text, seq, chunker_id FROM chunk WHERE doc_id = ? ORDER BY seq", (result["document"]["doc_id"],)
+    ).fetchall()
+    texts = [r["text"] for r in rows]
+    assert len(texts) == len(_INVENTORY_ROWS)
+    for row_text, chunk_text in zip(_INVENTORY_ROWS, texts):
+        assert chunk_text == row_text
+    assert {r["chunker_id"] for r in rows} == {"trialerror-row-per-element"}
+
+
+def test_the_same_rows_under_a_normal_kind_are_chunked_as_prose(store, program_root, raw_dir):
+    """The control for the test above: identical bytes, a different source
+    kind, and the two-pass chunker groups what the row chunker keeps
+    apart. Without this pairing, the test above could pass because the
+    fixture happens to chunk one-per-row anyway."""
+    path = _write_inventory_fixture(raw_dir / "rows_prose.md")
+    _launch_id, _source, result = _register_and_add(store, program_root, path, media_type="md")
+    _drain(store)
+
+    rows = store.knowledge.execute(
+        "SELECT text, chunker_id FROM chunk WHERE doc_id = ? ORDER BY seq", (result["document"]["doc_id"],)
+    ).fetchall()
+    assert len(rows) < len(_INVENTORY_ROWS)
+    assert {r["chunker_id"] for r in rows} == {"trialerror-two-pass"}
+
+
+def test_inventory_chunks_are_embedded_by_the_same_program_backend(store, program_root, raw_dir):
+    """The reference set has to be comparable with everything else in the
+    corpus, which means it rides the SAME embed stage and lands under the
+    same model_key -- no separate path, no separate model."""
+    path = _write_inventory_fixture(raw_dir / "rows_embedded.md")
+    _launch_id, _source, result = _register_and_add_inventory(store, program_root, path)
+    _drain(store)
+
+    embedded = store.knowledge.execute(
+        "SELECT COUNT(*) AS n FROM chunk c JOIN emb e ON e.chunk_sha256 = c.sha256 WHERE c.doc_id = ?",
+        (result["document"]["doc_id"],),
+    ).fetchone()
+    assert embedded["n"] == len(_INVENTORY_ROWS)
+    doc = store.knowledge.execute(
+        "SELECT status FROM document WHERE doc_id = ?", (result["document"]["doc_id"],)
+    ).fetchone()
+    assert doc["status"] == "indexed"

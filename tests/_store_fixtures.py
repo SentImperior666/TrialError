@@ -704,6 +704,105 @@ def populate_one_of_everything(store: Store) -> dict[str, str]:
         },
     )
 
+    # lane e (knowledge_v5_lexicon_term_store): one row of each of the five
+    # lexicon tables, in dependency order -- term, then its alias, then a
+    # sense of it, then that sense's evidence, then one judgment about it.
+    #
+    # The relation is deliberately the MACHINE-marked shape (``system``,
+    # ``pending``, no launch, ``marked_by_model``), because that is the row
+    # the store's central invariant is about: a machine judgment may exist
+    # and may be pending, and only a launch-attributed decision can move it.
+    # A fixture that only ever built the human-marked shape would leave the
+    # nullable-launch path uncovered for every consumer that reuses this
+    # builder.
+    ids["term"] = new_id("TERM")
+    insert(
+        store,
+        "term",
+        {
+            "term_id": ids["term"],
+            "lemma": "Test Term",
+            "lemma_norm": "test term",
+            "granularity": "instance",
+            "tags": '["f-test"]',
+            "entity_id": ids["entity"],
+            "status": "active",
+            "created_by_launch": ids["launch"],
+            "created_at": now(),
+            "updated_ts": now(),
+        },
+    )
+
+    ids["term_alias"] = new_id("ALIAS")
+    insert(
+        store,
+        "term_alias",
+        {
+            "alias_id": ids["term_alias"],
+            "term_id": ids["term"],
+            "alias": "Test Terms",
+            "alias_norm": "test terms",
+            "kind": "plural",
+            "created_by_launch": ids["launch"],
+            "created_ts": now(),
+        },
+    )
+
+    ids["term_sense"] = new_id("SENSE")
+    insert(
+        store,
+        "term_sense",
+        {
+            "sense_id": ids["term_sense"],
+            "term_id": ids["term"],
+            "gloss": "one own-words reading of the test term",
+            "origin_kind": "manual",
+            "confidence": 0.9,
+            "procedure_version": "manual-v1",
+            "status": "current",
+            "created_at": now(),
+            "proposed_by_launch": ids["launch"],
+            "decided_by_launch": ids["launch"],
+            "decided_ts": now(),
+            "review_after": "2099-01-01T00:00:00.000Z",
+        },
+    )
+
+    ids["term_sense_evidence"] = new_id("TSE")
+    insert(
+        store,
+        "term_sense_evidence",
+        {
+            "evidence_id": ids["term_sense_evidence"],
+            "sense_id": ids["term_sense"],
+            "evidence_kind": "quote_anchor",
+            "anchor_id": ids["quote_anchor"],
+            "source_key": ids["source"],
+            "excerpt": "hello world",
+            "created_by_launch": ids["launch"],
+            "created_ts": now(),
+        },
+    )
+
+    ids["term_relation"] = new_id("TREL")
+    insert(
+        store,
+        "term_relation",
+        {
+            "rel_id": ids["term_relation"],
+            "src_kind": "term",
+            "src_id": ids["term"],
+            "dst_kind": "term",
+            "dst_id": ids["term"],
+            "verb": "conflicts_with",
+            "status": "pending",
+            "evidence": f'{{"sense_ids": ["{ids["term_sense"]}"]}}',
+            "marked_by_kind": "system",
+            "marked_by_model": "scan-v1",
+            "marked_ts": now(),
+        },
+    )
+
     # ---- jobs.db ----------------------------------------------------------
     ids["job"] = new_id("JOB")
     insert(

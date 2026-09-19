@@ -35,14 +35,26 @@ from typing import Any
 __all__ = [
     "CHUNKER_ID",
     "CHUNKER_VERSION",
+    "ROW_CHUNKER_ID",
+    "ROW_CHUNKER_VERSION",
     "MAX_CHUNK_TOKENS",
     "MIN_STANDALONE_TOKENS",
     "estimate_tokens",
     "build_chunks",
+    "build_row_chunks",
 ]
 
 CHUNKER_ID = "trialerror-two-pass"
 CHUNKER_VERSION = "1"
+
+#: The row-per-element chunker (:func:`build_row_chunks`) stamps its OWN
+#: id/version, never the two-pass chunker's. Two documents chunked by
+#: different algorithms that both claimed ``trialerror-two-pass`` would make
+#: ``chunker_outdated``/``chunker_missing`` unable to tell which pass a
+#: chunk actually came from, and a later re-chunk would silently switch
+#: algorithm with nothing on the row to show it.
+ROW_CHUNKER_ID = "trialerror-row-per-element"
+ROW_CHUNKER_VERSION = "1"
 
 MAX_CHUNK_TOKENS = 1024
 #: A group below this many (estimated) tokens is a candidate to recombine
@@ -218,4 +230,62 @@ def build_chunks(
                 "chunker_version": chunker_version,
             }
         )
+    return chunks
+
+
+def build_row_chunks(
+    elements: list[dict[str, Any]],
+    *,
+    max_tokens: int = MAX_CHUNK_TOKENS,
+    chunker_id: str = ROW_CHUNKER_ID,
+    chunker_version: str = ROW_CHUNKER_VERSION,
+) -> list[dict[str, Any]]:
+    """One chunk per ELEMENT, in ``seq`` order -- the chunking a structured
+    reference set needs, and the exact opposite of what
+    :func:`build_chunks` is for.
+
+    :func:`build_chunks` exists to make chunks that read like prose:
+    it groups elements into semantic sections and recombines undersized
+    tails. For a source whose rows ARE the unit of meaning -- one inventory
+    entry per element -- both of those behaviours are damage. A chunk that
+    merged three rows would be retrieved as one "neighbour", and every
+    cosine distance measured against it would be a distance to a blend of
+    three entries that nothing in the corpus actually says. So this
+    function groups nothing and recombines nothing: element ``i`` in, chunk
+    ``i`` out.
+
+    The ONE thing it shares with :func:`build_chunks` is the hard token cap:
+    ``chunk.token_count``'s CHECK constraint is not negotiable, so a row
+    whose own text exceeds ``max_tokens`` is split at word boundaries into
+    consecutive chunks (:func:`_split_text_by_tokens`, the same splitter),
+    each still attributed to that one element. An element with no text is
+    skipped rather than written as an empty chunk -- an empty row is a gap
+    in the source, not a thing to embed.
+
+    Returns the same draft shape :func:`build_chunks` returns, so
+    ``trialerror.ingest.handlers.run_chunk`` writes both through one code
+    path.
+    """
+    ordered = sorted(elements, key=lambda e: e["seq"])
+    chunks: list[dict[str, Any]] = []
+    for el in ordered:
+        text = (el.get("text") or "").strip()
+        if not text:
+            continue
+        pieces = _split_text_by_tokens(text, max_tokens) if estimate_tokens(text) > max_tokens else [text]
+        for piece in pieces:
+            page = el.get("page_number")
+            chunks.append(
+                {
+                    "seq": len(chunks),
+                    "text": piece,
+                    "token_count": min(estimate_tokens(piece), max_tokens),
+                    "element_first": el["element_id"],
+                    "element_last": el["element_id"],
+                    "page_start": page,
+                    "page_end": page,
+                    "chunker_id": chunker_id,
+                    "chunker_version": chunker_version,
+                }
+            )
     return chunks

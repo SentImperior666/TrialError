@@ -65,7 +65,10 @@ __all__ = [
     "configured_backend_name",
     "resolve_backend",
     "lexical_search",
+    "per_term_candidates",
+    "MAX_PER_TERM_CANDIDATES",
     "maintain_index",
+    "prune_index",
     "fulltext_index_dir",
     "note_once",
 ]
@@ -393,6 +396,62 @@ def maintain_index(
         return result
 
 
+def prune_index(
+    store: Any, chunk_ids: Sequence[str], *, config: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """The removal counterpart of :func:`maintain_index` -- called by
+    ``trialerror.ingest.retract`` once a retracted document's ``chunk`` rows
+    are gone from ``knowledge.db``.
+
+    Same backend rules and the same three no-op cases (``fts5`` configured,
+    tantivy-py absent, no ``program_root``) report ``action = "skip"``. One
+    case differs deliberately: where :func:`maintain_index` REBUILDS when
+    no ready index exists, this reports ``"absent"`` and stops. A rebuild
+    on the add side is how an existing program's index becomes complete;
+    on the remove side there is nothing to remove from an index that does
+    not exist, and triggering a full corpus pass as a side effect of a
+    retraction would be a surprise the operator did not ask for.
+
+    Failures are returned as ``action = "failed"``, never raised -- the
+    retraction's own truth (the deleted rows) has already committed by the
+    time this runs, so an index that could not be updated is exactly the
+    "derived state, never truth" skew ``fulltext_index_stale`` reports and
+    ``trialerror ingest reindex-fulltext`` repairs. The caller surfaces it;
+    it must not un-retract a document."""
+    ids = list(chunk_ids)
+    cfg = dict(config) if config is not None else _program_config(store)
+    result: dict[str, Any] = {"backend": configured_backend_name(cfg), "action": "skip", "removed": 0}
+    if not ids or result["backend"] != "tantivy" or not tantivysearch.tantivy_available():
+        return result
+    index_dir = fulltext_index_dir(store, cfg)
+    if index_dir is None:
+        return result
+    try:
+        if tantivysearch.open_fulltext_index(index_dir) is None:
+            result["action"] = "absent"
+            return result
+        outcome = tantivysearch.remove_chunks(index_dir, ids)
+    except Exception as exc:  # noqa: BLE001 -- see the docstring: never un-retract over a cache
+        note_once(
+            f"tantivy_prune_failed:{index_dir}",
+            f"failed to remove retracted chunks from the tantivy full-text index at {index_dir}: {exc} "
+            "-- the knowledge.db deletions already committed, so search may still return the retracted "
+            "document until `trialerror ingest reindex-fulltext` rebuilds the index "
+            "(`trialerror doctor --only fulltext_index_stale` reports the skew)",
+        )
+        result.update({"action": "failed", "error": str(exc)})
+        return result
+    result.update(
+        {
+            "action": "remove",
+            "removed": outcome["removed"],
+            "absent": outcome.get("absent", 0),
+            "chunk_count": outcome["chunk_count"],
+        }
+    )
+    return result
+
+
 def lexical_search(
     store: Any,
     query: str,
@@ -405,3 +464,62 @@ def lexical_search(
     :func:`resolve_backend` picks. Returns ``(rows, backend_name)``."""
     backend = resolve_backend(store, config=config)
     return backend.search(store, query, limit=limit, chunk_id_allowlist=chunk_id_allowlist), backend.name
+
+
+#: Lane FB-1 item F3: at most this many terms are counted individually. A
+#: zero-result diagnosis is for a human or an agent to read, and eight
+#: numbers is already more than anyone acts on; a 200-word pasted paragraph
+#: must not turn one empty search into 200 index probes.
+MAX_PER_TERM_CANDIDATES = 8
+
+
+def per_term_candidates(
+    store: Any,
+    query: str,
+    *,
+    limit: int = DEFAULT_FTS_CANDIDATE_LIMIT,
+    chunk_id_allowlist: Sequence[str] | None = None,
+    config: Mapping[str, Any] | None = None,
+    max_terms: int = MAX_PER_TERM_CANDIDATES,
+) -> tuple[dict[str, int], str]:
+    """How many candidates each term of ``query`` finds ON ITS OWN.
+
+    The diagnosis a zero-result search could never give (lane FB-1 item
+    F3): every backend here treats a multi-token query as an implicit AND
+    (``fts_query_string`` quotes each token and space-joins them; tantivy's
+    query parser conjoins likewise), so ONE unknown term -- a typo, a term
+    of art this corpus does not use, a proper noun spelled another way --
+    returns nothing for a query whose other three terms have hundreds of
+    hits. "0 results" and "0 results because of this one word" are
+    different facts, and only the second one tells the caller what to do.
+
+    Returns ``(counts, backend_name)``, counts keyed by term IN QUERY ORDER
+    (duplicates collapsed, first occurrence kept). Each count is
+    ``len(backend.search(term))`` and is therefore capped by ``limit`` like
+    any other read of this tier -- it is "at least this many candidates",
+    and what matters for the diagnosis is only whether it is zero.
+
+    **Scope.** The counts are as scoped as the search they explain: they are
+    taken through the same ``chunk_id_allowlist``, so under a filter (a
+    ``--source-id``, a launch's declared slice) a zero means "no chunk THE
+    SEARCH WAS ALLOWED TO SEE matches this term", not "no chunk in the
+    corpus". That is the right scope for the diagnosis -- the re-run it feeds
+    carries the same filters -- but it is the reason nothing built on these
+    numbers may say "in this corpus" (fix-accept, V-8).
+
+    Same backend as the search it explains: resolution runs once here, and
+    the resolved name is returned so a caller can record that the
+    explanation and the search came from the same index rather than assume
+    it. A term's count differs between backends exactly where the two
+    analyzers differ (stemming, folding); ZERO does not, because a term no
+    analyzer can match in a corpus is unmatched under both."""
+    backend = resolve_backend(store, config=config)
+    counts: dict[str, int] = {}
+    for term in query.split():
+        if term in counts:
+            continue
+        if len(counts) >= max_terms:
+            break
+        rows = backend.search(store, term, limit=limit, chunk_id_allowlist=chunk_id_allowlist)
+        counts[term] = len(rows)
+    return counts, backend.name

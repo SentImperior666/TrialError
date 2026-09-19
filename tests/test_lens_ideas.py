@@ -54,13 +54,13 @@ def test_write_idea_writes_promoted_columns_directly(store):
     row = write_idea(
         store, round_id="round-1", author_launch=launch_id, body="idea body",
         home="hyp-home-doc", assumed_circle="skeptics", tier="far", set_distance=0.62,
-        provenance={"source": "round-1"},
+        provenance={"source": "round-1", "docs": ["DOC-1"]},
     )
     assert row["home"] == "hyp-home-doc"
     assert row["assumed_circle"] == "skeptics"
     assert row["tier"] == "far"
     assert row["set_distance"] == 0.62
-    assert json.loads(row["provenance"]) == {"source": "round-1"}
+    assert json.loads(row["provenance"]) == {"source": "round-1", "docs": ["DOC-1"]}
 
     from trialerror.stores import get
 

@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from trialerror.offload import protocol
-from trialerror.offload.shell import parse_command
+from trialerror.offload.shell import CONTROL_WORDS, parse_command, progress_payload_refusal
 
 __all__ = ["TransportError", "Transport", "LocalTransport", "SshTransport"]
 
@@ -40,7 +40,13 @@ class TransportError(RuntimeError):
 
 
 class Transport(Protocol):
-    """The seven verbs, and nothing else."""
+    """The seven verbs, and nothing else.
+
+    C-0097 changes ONE signature and adds no verb: ``heartbeat`` may carry a
+    progress payload up and returns the control word the wrapper prints
+    (``none``/``pause``/``resume``/``stop``). That is the whole control
+    channel -- a reply on a verb that already existed, which is why the
+    restricted key's contract is untouched."""
 
     def list_jobs(self) -> list[str]: ...
     def claim(self, job_id: str) -> dict[str, Any]: ...
@@ -48,7 +54,7 @@ class Transport(Protocol):
     def push(self, job_id: str, data: bytes) -> None: ...
     def publish(self, job_id: str) -> None: ...
     def return_job(self, job_id: str) -> None: ...
-    def heartbeat(self, job_id: str) -> None: ...
+    def heartbeat(self, job_id: str, *, progress: bytes | None = None) -> str: ...
 
 
 class LocalTransport:
@@ -67,10 +73,15 @@ class LocalTransport:
         *,
         worker_id: str = "dev",
         max_payload_bytes: int | None = None,
+        control_ttl_s: float | None = None,
     ):
         self.root = protocol.ensure_layout(Path(root))
         self.worker_id = worker_id
         self.max_payload_bytes = max_payload_bytes
+        #: C-0097 D1's ``control_ttl_s``. ``None`` means the module default
+        #: (1 h); the tests set it small to prove a stale request is ignored
+        #: without waiting an hour.
+        self.control_ttl_s = control_ttl_s
 
     # -- gate -------------------------------------------------------------
     def _gate(self, verb: str, job_id: str | None = None) -> None:
@@ -120,10 +131,24 @@ class LocalTransport:
         except protocol.OffloadError as exc:
             raise TransportError(str(exc)) from exc
 
-    def heartbeat(self, job_id: str) -> None:
+    def heartbeat(self, job_id: str, *, progress: bytes | None = None) -> str:
+        """Stamp, store the optional payload, and return the control word.
+
+        The wrapper's own order, mirrored exactly (C-0097 D1/D3): the payload
+        is judged FIRST, so a refused payload leaves the stamp alone -- a
+        status file the sandbox cannot trust must not also cost the job its
+        claim -- then the stamp lands, then the word comes back."""
         self._gate("heartbeat", job_id)
+        refusal = progress_payload_refusal(progress)
+        if refusal is not None:
+            raise TransportError(f"offload-shell would refuse the heartbeat payload: {refusal}")
         try:
-            protocol.server_heartbeat(self.root, job_id, worker_id=self.worker_id)
+            protocol.server_heartbeat(
+                self.root, job_id, worker_id=self.worker_id, progress=progress
+            )
+            return protocol.server_control_word(
+                self.root, self.worker_id, ttl_s=self.control_ttl_s
+            )
         except protocol.OffloadError as exc:
             raise TransportError(str(exc)) from exc
 
@@ -225,5 +250,21 @@ class SshTransport:
     def return_job(self, job_id: str) -> None:
         self._run("return", job_id)
 
-    def heartbeat(self, job_id: str) -> None:
-        self._run("heartbeat", job_id)
+    def heartbeat(self, job_id: str, *, progress: bytes | None = None) -> str:
+        """The one verb that now carries something UP and brings something
+        DOWN (C-0097 D1/D3): the progress payload on stdin, the control word
+        on stdout.
+
+        The payload is checked locally first, for the same reason ``push``
+        checks its own size locally -- a payload the far side will refuse
+        should not spend a round trip learning that. Anything the wrapper
+        prints that is not one of the four words reads as ``none``: a worker
+        must never invent an instruction out of an unexpected reply (a banner,
+        a warning on stdout, a wrapper one version behind this one)."""
+        refusal = progress_payload_refusal(progress)
+        if refusal is not None:
+            raise TransportError(f"offload: {refusal}")
+        out = self._run("heartbeat", job_id, stdin=progress if progress is not None else b"")
+        word = out.decode("utf-8", "replace").strip().splitlines()
+        first = word[-1].strip() if word else ""
+        return first if first in CONTROL_WORDS else "none"

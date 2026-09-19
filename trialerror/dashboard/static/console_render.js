@@ -993,6 +993,30 @@
             " · committed " + fmtCompact(pool.committed_visible_tokens) +
             " · ×" + String(pool.billed_multiplier)));
         });
+        // FB-3 item 3 (D-FB-13 c/d): what this account's settled tokens were
+        // made OF, and where the numbers came from. `attested` rides the line
+        // because a composition drawn from 1 of 8 reconciled launches must
+        // never read as the account's; an account where nothing was measured
+        // renders NO composition rather than four zeros, which would be a
+        // claim. The asserted count is a reading, not an alarm -- the doctor's
+        // reconcile_provenance is what warns -- so it is a plain sub-line.
+        var split = entry.usage_split || {};
+        if (split.totals) {
+          var t = split.totals;
+          body.appendChild(line("meter-sub",
+            "measured · in " + fmtCompact(t.usage_input_tokens) +
+            " · cache-create " + fmtCompact(t.usage_cache_creation_tokens) +
+            " · cache-read " + fmtCompact(t.usage_cache_read_tokens) +
+            " · out " + fmtCompact(t.usage_output_tokens) +
+            " (" + String(split.attested) + " of " + String(split.of_rows) + " reconciled)"));
+        }
+        var sources = entry.reconcile_sources || {};
+        var sourceNames = Object.keys(sources).sort();
+        if (sourceNames.length) {
+          body.appendChild(line("meter-sub", "provenance · " + sourceNames.map(function (name) {
+            return String(sources[name]) + " " + name;
+          }).join(" · ")));
+        }
         (status.defer_advisories || []).forEach(function (adv) {
           body.appendChild(readingRow("DEFER " + String(adv.model_class), String(adv.reason || ""), { kind: "warn" }));
         });
@@ -1017,15 +1041,44 @@
       var provisional = counts.PROVISIONAL || 0;
       var reconciled = counts.RECONCILED || 0;
 
+      // FB-1 item F2: a booking past its TTL whose own session is still open
+      // and still recording hook liveness is a TTL that was set too short,
+      // not a session that died. It is NOT counted as dangling below (the
+      // doctor does not count it either), so it gets its own reading rather
+      // than vanishing from the card.
+      var ttlShort = panel.past_ttl_session_alive || [];
+      // V-11 (FB-1b item 5): the severity the `budget_dangling_launches`
+      // doctor check reports for these same rows, computed once in
+      // `trialerror.budget.dangling.past_ttl_status` and carried on the panel
+      // -- not derived here from a list length, which is how a reader came to
+      // see a settled DANGLING chip beside a doctor `warn` and read it as a
+      // disagreement. The fallback keeps a payload from a build before the key
+      // existed rendering exactly as it did.
+      var pastTtlStatus = panel.past_ttl_status
+        || ((dangling.length || ttlShort.length) ? "warn" : "pass");
+
       // Fixed order, zeros printed. "A dangling booking is the one thing that
       // blocks a close; zero is a reading" (the canvas's own footnote).
       body.appendChild(readingRow("RUNNING", running, { kind: running ? "live" : "pending", pulse: !!running }));
       body.appendChild(readingRow("BOOKED, NOT YET SPAWNED", provisional, { kind: provisional ? "warn" : "settled" }));
       body.appendChild(readingRow("RECONCILED", reconciled, { kind: "settled" }));
       body.appendChild(readingRow("DANGLING", dangling.length, {
+        // DANGLING counts the doctor's own OFFENDER list, so zero is a true
+        // reading of that list rather than a verdict about the past-TTL
+        // question. When the doctor is nonetheless warning, the title says so
+        // and names the row below that carries the severity -- silence there
+        // is what V-11 found.
         kind: dangling.length ? "crit" : "settled",
-        title: "a dangling booking is the one thing that blocks a close; zero is a reading"
+        title: (!dangling.length && pastTtlStatus === "warn")
+          ? "a dangling booking is the one thing that blocks a close; zero is a reading — the doctor's budget_dangling_launches still reports warn here, for the PAST TTL, SESSION ALIVE row below"
+          : "a dangling booking is the one thing that blocks a close; zero is a reading"
       }));
+      if (ttlShort.length) {
+        body.appendChild(readingRow("PAST TTL, SESSION ALIVE", ttlShort.length, {
+          kind: pastTtlStatus === "warn" ? "warn" : "settled",
+          title: "the booking TTL was too short, not a dead session — `trialerror budget heartbeat --launch-id <id>` refreshes it; the doctor reports " + pastTtlStatus + " for exactly these rows"
+        }));
+      }
       ["ABANDONED", "REFUSED", "DEFERRED"].forEach(function (state) {
         if (counts[state]) body.appendChild(readingRow(state, counts[state], { kind: "pending" }));
       });
@@ -1350,6 +1403,96 @@
       ]);
     }
 
+    /** C-0097 D4 -- ONE ROW PER WORKER, above the queue counts.
+     *
+     * The counts say how many jobs are pending/claimed/done. They cannot say
+     * whether the machine holding a claim is grinding through chunk 1,204 of
+     * 4,530, was paused by an operator an hour ago, or had its lid closed --
+     * and those three are the only readings that tell you what to do next. So
+     * the row is: who, what kind, which job, progress, pace, ETA, how long
+     * since it spoke, and the settings that decide all of it.
+     *
+     * `lost` is computed SERVER-SIDE from the heartbeat age (2x the beat
+     * interval + 60s) and drawn, never re-derived here: one clock, one rule.
+     * PAUSED / STOPPING come from the worker's own reported state, and a
+     * pending request the worker has not acted on yet draws as
+     * `<REQUEST> REQUESTED` -- the gap between "asked" and "obeyed" is exactly
+     * what an operator is watching for after they click pause, and collapsing
+     * the two would hide the one failure this card exists to show. */
+    /** The state a pending request is ASKING for. Needed so the row does not
+     * shout "PAUSE REQUESTED" next to "PAUSED" -- once the worker has complied
+     * the request is history, and repeating it would train an operator to
+     * ignore the one case that matters (asked, not yet obeyed). */
+    var CONTROL_TARGET_STATE = { pause: "PAUSED", resume: "RUNNING", stop: "STOPPING" };
+
+    /** Unit counts print in FULL with thousands separators, never compacted:
+     * `1,204 / 4,530` is the reading an operator checks progress against, and
+     * `1k / 5k` rounds both ends of it into uselessness. fmtCompact stays for
+     * corpus-scale totals, where three significant figures is the point. */
+    function fmtCount(n) {
+      if (typeof n !== "number" || isNaN(n)) return "—";
+      return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    }
+
+    function workerRow(w) {
+      w = w || {};
+      var state = String(w.state || "unknown").toUpperCase();
+      var children = [];
+      if (w.lost) children.push(chip("LOST", "crit"));
+      else if (state === "PAUSED") children.push(chip("PAUSED", "warn"));
+      else if (state === "STOPPING") children.push(chip("STOPPING", "warn"));
+      // C-0097 FIX V-9: EXITED is a settled reading like IDLE -- the run has
+      // ended, and the row is only still here because nothing has cleared it
+      // yet. Drawing it as `live` (what any unrecognised state gets) would say a
+      // machine is working when its process is gone.
+      else children.push(statusNode(
+        state === "IDLE" || state === "EXITED" ? "settled" : "live", state,
+        { pulse: state === "RUNNING" }));
+
+      var pending = w.pending_control ? String(w.pending_control).toLowerCase() : null;
+      if (pending && CONTROL_TARGET_STATE[pending] !== state) {
+        children.push(chip(pending.toUpperCase() + " REQUESTED", "warn"));
+      }
+      children.push(span("v", String(w.worker_id || "—")));
+      if (w.kind) { children.push(span("k", "·")); children.push(span("v", String(w.kind))); }
+      if (w.job_id) {
+        children.push(span("k", "·"));
+        children.push(h("span", { "class": "id", text: shortId(w.job_id), title: w.job_id }));
+      }
+      if (typeof w.units_done === "number") {
+        var unit = w.unit ? String(w.unit) : "unit";
+        var progress = typeof w.units_total === "number"
+          ? fmtCount(w.units_done) + " / " + fmtCount(w.units_total) + " " + unit + "s"
+          : fmtCount(w.units_done) + " " + unit + "s";
+        children.push(span("k", "·"));
+        children.push(h("span", { "class": "v", text: progress,
+          title: w.units_done + (typeof w.units_total === "number" ? " of " + w.units_total : "") + " " + unit + "(s)" }));
+      }
+      if (typeof w.pace_s_per_unit === "number") {
+        children.push(span("k", "·"));
+        children.push(span("v", w.pace_s_per_unit.toFixed(2) + " s/unit"));
+      }
+      if (typeof w.eta_s === "number") {
+        children.push(span("k", "·"));
+        children.push(span("v", "ETA " + fmtDuration(w.eta_s)));
+      }
+      children.push(span("k", "·"));
+      children.push(span("v", typeof w.heartbeat_age_s === "number"
+        ? "beat " + fmtDuration(w.heartbeat_age_s) + " ago" : "beat —"));
+
+      var settings = w.settings || {};
+      var bits = [];
+      if (settings.batch_size !== null && settings.batch_size !== undefined) bits.push("batch " + settings.batch_size);
+      if (settings.model_key) bits.push(String(settings.model_key));
+      if (settings.backend) bits.push(String(settings.backend));
+      if (bits.length) { children.push(span("k", "·")); children.push(span("k", bits.join(" "))); }
+      if (w.last_error) {
+        children.push(span("k", "·"));
+        children.push(h("span", { "class": "v status--warn", text: String(w.last_error), title: String(w.last_error) }));
+      }
+      return h("div", { "class": "tally-row-inline worker-row" }, children);
+    }
+
     function renderJobsCard(panel, opts) {
       opts = opts || {};
       var nowMs = nowMsOf(opts);
@@ -1368,6 +1511,11 @@
           [offload.awaiting + " job" + (offload.awaiting === 1 ? "" : "s") +
            " wait" + (offload.awaiting === 1 ? "s" : "") + " for the DEV GPU — run the GPU worker"]));
       }
+
+      // C-0097 D4: the worker rows sit ABOVE the counts, because "who is doing
+      // what right now" is the question an operator opens this card with and
+      // the counts are the context for the answer.
+      (offload.workers || []).forEach(function (w) { body.appendChild(workerRow(w)); });
 
       // The state tally always prints, zeros included -- an empty ledger is a
       // reading ("0 RUNNING"), not a blank card.
@@ -1422,6 +1570,16 @@
       var running = (counts.running || 0) + (counts.claimed || 0);
       var stale = (panel.stale_leases || []).length;
       var children = [statusNode(running ? "live" : "pending", running + " RUNNING", { pulse: !!running })];
+      // C-0097 D4: a paused, stopping or lost worker is visible on the
+      // COLLAPSED card. A pause an operator cannot see from the card head is a
+      // pause they will forget they asked for.
+      (offload.workers || []).forEach(function (w) {
+        var state = String(w.state || "").toUpperCase();
+        if (w.lost) children.push(chip(String(w.worker_id || "worker") + " LOST", "crit"));
+        else if (state === "PAUSED" || state === "STOPPING") {
+          children.push(chip(String(w.worker_id || "worker") + " " + state, "warn"));
+        }
+      });
       if (offload.awaiting) children.push(chip(offload.awaiting + " AWAITING DEV GPU", "warn"));
       children.push(statusNode(stale ? "crit" : "settled", "STALE LEASES " + stale));
       return h("span", { "class": "head-readings" }, children);

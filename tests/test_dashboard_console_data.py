@@ -275,3 +275,179 @@ def test_gates_panel_pending_edits_decoded_with_unverified_count(seeded):
     assert isinstance(entry["edits"], list)
     assert entry["edits"][0]["edit_id"] == "E1"
     assert entry["unverified_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# C-0097 D4 -- worker rows on the JOBS card
+#
+# The queue counts describe JOBS. These describe MACHINES, and they are the
+# half an operator reading "1 claimed" cannot infer: a worker grinding through
+# chunk 1,204 of 4,530, a worker paused an hour ago, and a laptop somebody shut
+# are one identical claim directory without them.
+# ---------------------------------------------------------------------------
+def _queue_with_worker(program_root, *, state="running", age_s=0.0, claim=True, worker_id="dev"):
+    """A queue whose worker has reported once, with the heartbeat stamp aged by
+    ``age_s`` so the lost window is reachable without waiting for it."""
+    from datetime import timedelta
+
+    from trialerror.offload import control as control_api
+    from trialerror.offload import protocol
+    from trialerror.offload.transport import LocalTransport
+    from trialerror.util.timeutil import parse
+    from tests._offload_fixtures import queue_one
+
+    root = protocol.ensure_layout(protocol.offload_root(program_root))
+    target = protocol.idle_job_id(worker_id)
+    payload = {"worker_id": worker_id, "state": state}
+    if claim:
+        queue_one(root, "JOB-a")
+        protocol.server_claim(root, "JOB-a", worker_id=worker_id)
+        target = "JOB-a"
+        payload.update(
+            {
+                "job_id": "JOB-a",
+                "kind": "embed",
+                "unit": "chunk",
+                "units_done": 1204,
+                "units_total": 4530,
+                "pace_s_per_unit": 1.1,
+                "eta_s": 3660.0,
+                "settings": {"batch_size": 4, "model_key": "stub-embed"},
+            }
+        )
+    LocalTransport(root, worker_id=worker_id).heartbeat(
+        target, progress=control_api.encode_progress(payload)
+    )
+    if age_s:
+        stamp = protocol.claimed_dir(root) / worker_id / f"{target}{protocol.HEARTBEAT_SUFFIX}"
+        stamp.write_text(
+            (parse(now()) - timedelta(seconds=age_s)).strftime("%Y-%m-%dT%H:%M:%S.000Z") + "\n",
+            encoding="utf-8",
+        )
+    return root
+
+
+def test_jobs_panel_has_no_worker_rows_before_a_worker_reports(seeded):
+    store, _ids, program_root, platform_root = seeded
+    store.close()
+    assert panel(data.build_jobs_panel, program_root, platform_root)["offload"]["workers"] == []
+
+    from trialerror.offload import protocol
+
+    protocol.ensure_layout(protocol.offload_root(program_root))
+    offload = panel(data.build_jobs_panel, program_root, platform_root)["offload"]
+    assert offload["available"] is True
+    assert offload["workers"] == [], "an empty queue has no workers, not an unknown number of them"
+
+
+def test_jobs_panel_renders_a_worker_row_from_the_progress_file(seeded):
+    store, _ids, program_root, platform_root = seeded
+    store.close()
+    _queue_with_worker(program_root)
+
+    offload = panel(data.build_jobs_panel, program_root, platform_root)["offload"]
+    assert len(offload["workers"]) == 1
+    row = offload["workers"][0]
+    assert row["worker_id"] == "dev"
+    assert row["state"] == "running"
+    assert row["kind"] == "embed"
+    assert row["job_id"] == "JOB-a"
+    assert (row["units_done"], row["units_total"], row["unit"]) == (1204, 4530, "chunk")
+    assert row["pace_s_per_unit"] == 1.1
+    assert row["eta_s"] == 3660.0
+    assert row["settings"] == {"batch_size": 4, "model_key": "stub-embed"}
+    assert row["lost"] is False
+    assert row["pending_control"] is None
+    assert row["heartbeat_age_s"] is not None
+    # the existing readings are untouched
+    assert offload["counts"]["claimed"] == 1
+
+
+def test_jobs_panel_marks_a_worker_lost_past_the_window(seeded):
+    """``lost`` is 2x the beat interval + 60 s, computed at READ time from the
+    stamp the heartbeat verb writes -- one clock and one rule, so the card can
+    draw the chip without re-deriving anything."""
+    store, _ids, program_root, platform_root = seeded
+    store.close()
+    _queue_with_worker(program_root, age_s=400.0)
+    rows = panel(data.build_jobs_panel, program_root, platform_root)["offload"]["workers"]
+    assert rows[0]["lost"] is False, "400s is inside the 660s window"
+
+    _queue_with_worker(program_root, age_s=5_000.0)
+    rows = panel(data.build_jobs_panel, program_root, platform_root)["offload"]["workers"]
+    assert rows[0]["lost"] is True
+    assert rows[0]["lost_after_s"] == 660.0
+
+
+def test_jobs_panel_shows_an_idle_worker_apart_from_no_worker(seeded):
+    """D3's whole reason for the synthetic idle id. The job column stays empty
+    -- printing ``WORKER-dev`` where a job id goes would be a lie about what
+    the worker is running."""
+    store, _ids, program_root, platform_root = seeded
+    store.close()
+    _queue_with_worker(program_root, state="idle", claim=False)
+    rows = panel(data.build_jobs_panel, program_root, platform_root)["offload"]["workers"]
+    assert [r["state"] for r in rows] == ["idle"]
+    assert rows[0]["job_id"] is None
+    assert rows[0]["lost"] is False
+
+
+def test_jobs_panel_shows_a_pending_control_request_beside_the_state(seeded):
+    """The gap between "asked" and "obeyed" is exactly what an operator watches
+    for after they click pause, so both facts travel: the worker's own state and
+    the request it has not acted on yet."""
+    store, _ids, program_root, platform_root = seeded
+    store.close()
+    root = _queue_with_worker(program_root)
+
+    from trialerror.offload import control as control_api
+
+    control_api.request_control(
+        root, worker_id="dev", request="pause", by_launch="LNCH-test", require_worker=False
+    )
+    row = panel(data.build_jobs_panel, program_root, platform_root)["offload"]["workers"][0]
+    assert row["state"] == "running"
+    assert row["pending_control"] == "pause"
+    assert row["control"]["by_launch"] == "LNCH-test"
+
+
+def test_jobs_panel_ignores_a_stale_control_request_on_the_row(seeded):
+    """A request the worker is entitled to ignore must not be drawn as pending:
+    a chip that says PAUSE REQUESTED for something an hour dead would send an
+    operator looking for a bug that is not there."""
+    store, _ids, program_root, platform_root = seeded
+    store.close()
+    root = _queue_with_worker(program_root)
+
+    from trialerror.offload import protocol
+
+    protocol.write_json(
+        protocol.control_path(root, "dev"),
+        {
+            "schema": protocol.CONTROL_SCHEMA,
+            "request": "pause",
+            "by_launch": "LNCH-old",
+            "ts": "2020-01-01T00:00:00.000Z",
+            "job_id": None,
+        },
+    )
+    row = panel(data.build_jobs_panel, program_root, platform_root)["offload"]["workers"][0]
+    assert row["pending_control"] is None
+    assert row["control"]["stale"] is True
+
+
+def test_jobs_panel_reports_an_unreadable_progress_file_rather_than_hiding_it(seeded):
+    """The wrapper writes the bytes it was handed (it has no JSON parser), so
+    "the worker sent something we cannot read" is a real state the card has to
+    be able to say -- not a row that silently vanishes."""
+    store, _ids, program_root, platform_root = seeded
+    store.close()
+    root = _queue_with_worker(program_root)
+
+    from trialerror.offload import protocol
+
+    protocol.progress_path(root, "dev", "JOB-a").write_text("{not json", encoding="utf-8")
+    row = panel(data.build_jobs_panel, program_root, platform_root)["offload"]["workers"][0]
+    assert "unreadable" in row
+    assert row["state"] == "unknown"
+    assert row["worker_id"] == "dev"

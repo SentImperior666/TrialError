@@ -111,7 +111,36 @@ from trialerror.dashboard.writes import WRITABLE_ACTIONS, dispatch as dispatch_w
 from trialerror.stores import paths as store_paths
 from trialerror.util.timeutil import now
 
-__all__ = ["ServerConfig", "make_handler_class", "DashboardServer", "main"]
+__all__ = ["ServerConfig", "make_handler_class", "DashboardServer", "main", "json_text"]
+
+
+def _finite(value: Any) -> Any:
+    """Replace non-finite floats with ``None``, recursively. FIX V-5's last
+    resort: a number that cannot be written as JSON becomes "no number", which
+    is what the card draws for a missing reading anyway."""
+    if isinstance(value, float):
+        return value if value == value and value not in (float("inf"), float("-inf")) else None
+    if isinstance(value, dict):
+        return {k: _finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite(v) for v in value]
+    return value
+
+
+def json_text(payload: Any) -> str:
+    """Every JSON body this server sends, and the only place it is serialised.
+
+    ``allow_nan=False`` is the point (FIX V-5). Python's default emits bare
+    ``Infinity``/``NaN``, which is not JSON and which no browser's
+    ``JSON.parse`` accepts -- so a single non-finite number anywhere in the
+    bundle used to cost the WHOLE console its data, not just the card that
+    carried it. The reader that produced that number is fixed too
+    (``offload.control.read_progress``); this is the layer that makes it
+    impossible to emit whatever the next such reader forgets."""
+    try:
+        return json.dumps(payload, ensure_ascii=False, default=str, allow_nan=False)
+    except ValueError:
+        return json.dumps(_finite(payload), ensure_ascii=False, default=str, allow_nan=False)
 
 HERE = Path(__file__).resolve().parent
 STATIC_DIR = HERE / "static"
@@ -403,6 +432,10 @@ PANEL_QUERY_PARAMS: dict[str, tuple[tuple[str, str], ...]] = {
     # cannot choose between the three -- it hands over whichever are present
     # and build_evidence_panel applies spec section 1.2's order.
     "evidence": (("claim_id", "claim_id"), ("anchor_id", "anchor_id"), ("chunk_id", "chunk_id")),
+    # lane e (E4): selects one term's detail; omitted, the panel is the
+    # index alone (design §5 -- unlike dossier/evidence, lexicon has no
+    # auto-selected default).
+    "lexicon": (("term_id", "term_id"),),
 }
 
 
@@ -800,7 +833,7 @@ def make_handler_class(
             self.wfile.write(body)
 
         def _json_response(self, payload: dict, *, status: int = 200) -> None:
-            body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+            body = json_text(payload).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -831,7 +864,7 @@ def make_handler_class(
                 broadcaster.unsubscribe(q)
 
         def _sse_send(self, event: str, data: dict) -> None:
-            msg = f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+            msg = f"event: {event}\ndata: {json_text(data)}\n\n"
             self.wfile.write(msg.encode("utf-8"))
             self.wfile.flush()
 

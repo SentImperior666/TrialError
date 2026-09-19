@@ -19,6 +19,7 @@ import json
 from pathlib import Path
 
 from trialerror.sessions.handoff import rerender_handoff
+from trialerror.sessions.handoff import HandoffsDirOutsideRootError
 from trialerror.sessions.lifecycle import abandon_session, boot_session, close_session, session_status
 from trialerror.stores.store import Store, open_store
 from trialerror.util.config import find_program_root
@@ -145,6 +146,12 @@ def _cmd_boot(args: argparse.Namespace) -> dict:
             now_ts=args.ts,
             config=_load_program_config(store.program_root),
         )
+    except HandoffsDirOutsideRootError as exc:
+        # Boot READS the latest handoff into its bundle. Reading another
+        # program's close is how a scratch program comes to believe it is
+        # that program, so the same config value is refused at the same
+        # place with the same code.
+        return error_envelope("session boot", "handoffs_dir_outside_root", str(exc))
     finally:
         store.close()
 
@@ -196,6 +203,15 @@ def _cmd_close(args: argparse.Namespace) -> dict:
             next_actions = [next_action(["trialerror", "budget", "reconcile", "--launch-id", "<id>", "--actual-tokens", "<n>"], "reconcile each dangling launch")]
         elif result.code == "unread_checklist":
             next_actions = [next_action(["trialerror", "inbox", "read"], "read the unread inbox items")]
+        elif result.code == "handoffs_dir_outside_root":
+            # Refused BEFORE the close lands (lifecycle rung 2b): a handoff
+            # rendered into another program's tree also marks a live session
+            # closed here, so the only harmless place to stop is before
+            # either write.
+            next_actions = [next_action(
+                ["trialerror", "session", "close", "--course-check", args.course_check],
+                "re-run once trialerror.toml points handoffs_dir inside this program",
+            )]
         elif result.code == "stale_digest":
             next_actions = [next_action(["trialerror", "law", "diff-foreign", "--pin", "<your boot_pin_version>"], "see what was appended since boot")]
         return error_envelope("session close", result.code, result.message, details=result.to_dict(), next_actions=next_actions)
@@ -215,6 +231,8 @@ def _cmd_render_handoff(args: argparse.Namespace) -> dict:
         result = rerender_handoff(
             store, session_id=args.session_id, config=_load_program_config(store.program_root)
         )
+    except HandoffsDirOutsideRootError as exc:
+        return error_envelope("session render-handoff", "handoffs_dir_outside_root", str(exc))
     except ValueError as exc:
         return error_envelope("session render-handoff", "rerender_refused", str(exc))
     finally:

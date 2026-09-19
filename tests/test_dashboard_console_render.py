@@ -555,6 +555,68 @@ def test_ledger_prints_zero_dangling_as_reading():
     assert len(by_class(tree, "dangling-row")) == 1
 
 
+@requires_node
+def test_ledger_renders_the_past_ttl_session_alive_row_only_when_there_is_one():
+    """fix-accept V-10. FB-1 item F2's reading: a booking past its TTL whose
+    own session is still open and still recording hook liveness is a TTL that
+    was set too short, not a session that died. It is not counted as DANGLING
+    (the doctor does not count it either), so without its own row it would
+    vanish from the card -- and until now nothing rendered it, so a future edit
+    to the label or the title would have broken nothing."""
+    def labels(tree):
+        return [one(by_class(r, "k"), "key")["text"] for r in by_class(tree, "reading-row")]
+
+    quiet = run_harness("renderLedgerCard", [budget_panel(), {"nowMs": NOW_MS}])["tree"]
+    assert "PAST TTL, SESSION ALIVE" not in labels(quiet)
+
+    panel = budget_panel(past_ttl_session_alive=[{
+        "launch_id": "LNCH-0000000000000000000002", "agent_kind": "implementer",
+        "purpose": "a booking whose TTL was guessed too short", "state": "RUNNING",
+        "booked_ts": "2026-09-05T00:30:00.000Z", "booking_ttl_s": 60,
+    }])
+    tree = run_harness("renderLedgerCard", [panel, {"nowMs": NOW_MS}])["tree"]
+    row = reading(tree, "PAST TTL, SESSION ALIVE")
+    assert row["text"].endswith("PAST TTL, SESSION ALIVE 1")
+    assert "status--warn" in row["classes"]
+    assert "heartbeat" in row["attrs"]["title"]
+    # It reads BESIDE the dangling count, which stays what the doctor's own
+    # offender list is: this row's launch is not one of them.
+    assert reading(tree, "DANGLING")["text"].endswith("DANGLING 0")
+    assert by_class(tree, "dangling-row") == []
+
+
+@requires_node
+def test_ledger_prints_the_doctors_own_word_beside_the_zero_dangling_chip():
+    """FB-1 V-11, closed (FB-1b item 5). The fixture that raised it: nothing in
+    the offender list, one booking past its TTL under a live session, and the
+    doctor reporting `warn`. DANGLING truthfully reads 0 -- it counts the
+    offender list -- so the card says, on that very chip, that the doctor is
+    still warning and which row carries it, and the alive row's own severity is
+    the word the panel carries rather than one derived here."""
+    panel = budget_panel(
+        past_ttl_session_alive=[{
+            "launch_id": "LNCH-0000000000000000000002", "agent_kind": "implementer",
+            "purpose": "a booking whose TTL was guessed too short", "state": "RUNNING",
+            "booked_ts": "2026-09-05T00:30:00.000Z", "booking_ttl_s": 60,
+        }],
+        past_ttl_status="warn",
+    )
+    tree = run_harness("renderLedgerCard", [panel, {"nowMs": NOW_MS}])["tree"]
+    zero = reading(tree, "DANGLING")
+    assert zero["text"].endswith("DANGLING 0")
+    assert "status--settled" in zero["classes"]
+    assert "budget_dangling_launches" in zero["attrs"]["title"]
+    assert "PAST TTL, SESSION ALIVE" in zero["attrs"]["title"]
+    alive = reading(tree, "PAST TTL, SESSION ALIVE")
+    assert "status--warn" in alive["classes"]
+    assert "the doctor reports warn" in alive["attrs"]["title"]
+
+    # a quiet card says nothing extra: the doctor is passing, so there is no
+    # word to reconcile and the chip keeps its own one-line footnote
+    quiet = run_harness("renderLedgerCard", [budget_panel(past_ttl_status="pass"), {"nowMs": NOW_MS}])["tree"]
+    assert "budget_dangling_launches" not in reading(quiet, "DANGLING")["attrs"]["title"]
+
+
 # ===========================================================================
 # sweep tests 8-13 -- JOBS
 # ===========================================================================
@@ -1087,3 +1149,172 @@ def test_the_one_second_tick_belongs_to_the_console_and_is_cleared_on_the_way_ou
     assert "function tickAges()" in html
     assert "startConsoleTick();" in html
     assert 'if (name !== "console") stopConsoleTick();' in html
+
+
+# ---------------------------------------------------------------------------
+# C-0097 D4 -- worker rows on the JOBS card
+# ---------------------------------------------------------------------------
+def worker(**over) -> dict:
+    row = {
+        "worker_id": "dev", "state": "running", "kind": "embed", "job_id": "JOB-EMBED-1",
+        "units_done": 1204, "units_total": 4530, "unit": "chunk",
+        "pace_s_per_unit": 1.1, "eta_s": 3660.0, "heartbeat_age_s": 4.0,
+        "settings": {"batch_size": 4, "model_key": "qwen-stub"},
+        "lost": False, "lost_after_s": 660.0, "pending_control": None,
+        "control": None, "last_error": None, "started_ts": NOW_ISO,
+        "control_seen": None, "progress_job_id": "JOB-EMBED-1",
+    }
+    row.update(over)
+    return row
+
+
+def jobs_panel_with_workers(workers, rows=None) -> dict:
+    return jobs_panel(rows if rows is not None else [job()], offload={
+        "available": True, "awaiting": 0,
+        "counts": {"pending": 0, "claimed": 1, "done": 0, "failed": 0},
+        "jobs": {}, "workers": workers,
+    })
+
+
+@requires_node
+def test_jobs_worker_row_prints_the_whole_reading():
+    """One row per worker above the queue counts: who, kind, job, progress,
+    pace, ETA, beat age, settings. The compact numbers carry the full integers
+    in `title=`, the house rule for every truncated reading."""
+    tree = run_harness("renderJobsCard", [
+        jobs_panel_with_workers([worker()]), {"nowMs": NOW_MS, "snapshot": None}])["tree"]
+    row = one(by_class(tree, "worker-row"), "worker row")
+    text = row["text"]
+    assert "RUNNING" in text
+    assert "dev" in text and "embed" in text
+    assert "1,204 / 4,530 chunks" in text
+    assert "1.10 s/unit" in text
+    assert "ETA 1h 1m" in text
+    assert "beat 4s ago" in text
+    assert "batch 4" in text and "qwen-stub" in text
+
+
+@requires_node
+def test_jobs_worker_rows_sit_above_the_queue_counts():
+    """Order is the reading: "who is doing what right now" is the question the
+    card is opened with, and the counts are the context for the answer."""
+    tree = run_harness("renderJobsCard", [
+        jobs_panel_with_workers([worker()]), {"nowMs": NOW_MS, "snapshot": None}])["tree"]
+    classes = [c.get("classes", []) for c in tree["children"]]
+    worker_at = next(i for i, cs in enumerate(classes) if "worker-row" in cs)
+    tally_at = next(
+        i for i, cs in enumerate(classes)
+        if "tally-row-inline" in cs and "worker-row" not in cs
+    )
+    assert worker_at < tally_at
+
+
+@requires_node
+@pytest.mark.parametrize(
+    "over,chip_text",
+    [
+        ({"state": "paused"}, "PAUSED"),
+        ({"state": "stopping"}, "STOPPING"),
+        ({"lost": True}, "LOST"),
+    ],
+    ids=["paused", "stopping", "lost"],
+)
+def test_jobs_worker_row_draws_the_state_chips(over, chip_text):
+    panel = jobs_panel_with_workers([worker(**over)])
+    tree = run_harness("renderJobsCard", [panel, {"nowMs": NOW_MS, "snapshot": None}])["tree"]
+    assert chip_text in one(by_class(tree, "worker-row"), "worker row")["text"]
+    # …and again in the card HEAD, so a pause is visible on the collapsed card
+    head = run_harness("jobsHead", [panel])["tree"]
+    assert chip_text in head["text"]
+    assert "dev" in head["text"]
+
+
+@requires_node
+def test_jobs_worker_row_separates_a_request_from_the_state_it_asked_for():
+    """The gap between "asked" and "obeyed" is what an operator watches for
+    after they click pause; collapsing the two would hide the one failure this
+    row exists to show."""
+    tree = run_harness("renderJobsCard", [
+        jobs_panel_with_workers([worker(pending_control="pause")]),
+        {"nowMs": NOW_MS, "snapshot": None}])["tree"]
+    text = one(by_class(tree, "worker-row"), "worker row")["text"]
+    assert "PAUSE REQUESTED" in text
+    assert "RUNNING" in text
+
+    # once the worker HAS paused, the row stops repeating itself
+    tree = run_harness("renderJobsCard", [
+        jobs_panel_with_workers([worker(state="paused", pending_control="pause")]),
+        {"nowMs": NOW_MS, "snapshot": None}])["tree"]
+    text = one(by_class(tree, "worker-row"), "worker row")["text"]
+    assert "PAUSED" in text
+    assert "REQUESTED" not in text
+
+
+@requires_node
+def test_jobs_worker_row_for_an_idle_worker_names_no_job():
+    tree = run_harness("renderJobsCard", [
+        jobs_panel_with_workers([
+            worker(state="idle", kind=None, job_id=None, units_done=0, units_total=None,
+                   unit=None, pace_s_per_unit=None, eta_s=None, settings={})]),
+        {"nowMs": NOW_MS, "snapshot": None}])["tree"]
+    text = one(by_class(tree, "worker-row"), "worker row")["text"]
+    assert "IDLE" in text and "dev" in text
+    assert "JOB-" not in text
+    assert "ETA" not in text
+
+
+@requires_node
+def test_jobs_card_without_worker_rows_is_unchanged():
+    """The rows are additive: a panel from a server that has never seen a
+    worker (or a static export of one) draws exactly the card it used to."""
+    tree = run_harness("renderJobsCard", [jobs_panel([job()]), {"nowMs": NOW_MS, "snapshot": None}])["tree"]
+    assert by_class(tree, "worker-row") == []
+    assert "0 RUNNING" in tree["text"] or "RUNNING" in tree["text"]
+
+
+@requires_node
+def test_jobs_worker_row_surfaces_the_last_error():
+    tree = run_harness("renderJobsCard", [
+        jobs_panel_with_workers([worker(last_error="driver exited with code 1")]),
+        {"nowMs": NOW_MS, "snapshot": None}])["tree"]
+    assert "driver exited with code 1" in one(by_class(tree, "worker-row"), "worker row")["text"]
+
+
+@requires_node
+def test_pools_card_shows_the_measured_composition_and_its_provenance():
+    """FB-3 item 3: the split is only worth a migration if the card can show
+    it -- and `attested` is what stops a composition drawn from one launch
+    reading as the account's."""
+    account = budget_panel()["accounts"][0]
+    account["usage_split"] = {
+        "attested": 1,
+        "of_rows": 2,
+        "totals": {
+            "usage_input_tokens": 2, "usage_cache_creation_tokens": 0,
+            "usage_cache_read_tokens": 11455, "usage_output_tokens": 4,
+        },
+    }
+    account["reconcile_sources"] = {"event": 1, "manual": 1}
+    panel = budget_panel(accounts=[account])
+
+    tree = run_harness("renderPoolsCard", [panel, {"nowMs": NOW_MS}])["tree"]
+    subs = [e["text"] for e in by_class(tree, "meter-sub")]
+    measured = one([s for s in subs if s.startswith("measured ·")], "composition line")
+    assert "cache-read 11k" in measured
+    assert "1 of 2 reconciled" in measured
+    provenance = one([s for s in subs if s.startswith("provenance ·")], "provenance line")
+    assert "1 event" in provenance and "1 manual" in provenance
+
+
+@requires_node
+def test_pools_card_shows_no_composition_when_nothing_was_measured():
+    """Four zeros would be a claim; an absent line is the honest reading."""
+    account = budget_panel()["accounts"][0]
+    account["usage_split"] = {"attested": 0, "of_rows": 3, "totals": None}
+    account["reconcile_sources"] = {"manual": 3}
+    panel = budget_panel(accounts=[account])
+
+    tree = run_harness("renderPoolsCard", [panel, {"nowMs": NOW_MS}])["tree"]
+    subs = [e["text"] for e in by_class(tree, "meter-sub")]
+    assert not [s for s in subs if s.startswith("measured ·")]
+    assert one([s for s in subs if s.startswith("provenance ·")], "provenance line") == "provenance · 3 manual"

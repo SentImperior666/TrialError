@@ -281,9 +281,22 @@ what is still coming. Nothing already shipped depends on any of it.
       carries the suspicion rubric, so a routine or a human can review a day of
       autonomous work and be told only when something needs a look.
 - [ ] A dedicated term store for the lexicon, which is currently proxied from
-      extracted entities.
+      extracted entities. Design and implementation have landed on the
+      `lane-e-merged` branch (schema, a write API with three mutation
+      disciplines, a CLI, nine doctor checks, an MCP lookup tool, and a
+      rebuilt dashboard panel — see `docs/reviews/IMPL_lane-e.md` and
+      `docs/reviews/lane-e/ACCEPTANCE.md`); left unticked because the real
+      corpus backfill and the level-1 family map are still the
+      orchestrator's sandbox runs, and any tick here is the operator's
+      word under C-0078.
 - [ ] Ops polish: a retention doctor check, transactional event rows, idempotent
       Phoenix start.
+- [ ] Per-pool spend to match per-pool commitment. A booking records the pool it was
+      judged against, so committed sums are exact per pool; reconciliation still
+      credits the CURRENT pool's `spent_visible_tokens`, so a launch settled after a
+      period rollover moves this period's spent total rather than the one that judged
+      it. The operator guide's pool-rules section says so; making the two halves
+      symmetrical is a migration-free change to one function and its readers.
 - [x] Linux support and a Linux CI lane. CI now runs the full suite on
       `windows-latest` and `ubuntu-latest`; the plugin's Claude Code hooks go
       through the `trialerror` console script rather than a bare `python`,

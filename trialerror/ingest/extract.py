@@ -48,6 +48,20 @@ the confirmation). The CLI's single ``--id`` accept/reject surface
 dispatches on the id's typed prefix (``RCD-`` -> a candidate,
 ``PROP-`` -> a merge proposal) so both queues share one command.
 
+**Lexicon hand-off at accept time** (lane e, design ``docs/reviews/
+LANE_E_TERM_STORE_DESIGN.md`` §4; rulings L-E5/L-E7): accepting a
+``kind='definition'`` claim also proposes one sense in the term store
+(:func:`_lexicon_hook`). If the judgment carried the optional ``"term"``
+key, the sense lands ``current`` -- the reviewer just accepted this exact
+claim, so a second acceptance of the same judgment is ceremony. Without it,
+a substring heuristic over the same chunk's entity candidates proposes at
+``status='proposed'`` and waits for a decision. The hook is import- and
+failure-guarded and NEVER raises: the claim and its anchor are already
+written by then, and a term store that is absent, unmigrated or that
+refuses a too-long gloss is not a reason to fail an acceptance a human
+made. Every outcome (including "nothing tried") comes back in the accept
+result under ``lexicon``.
+
 **Relation acceptance ordering**: a relation candidate's ``src``/``dst``
 are entity NAMES, resolved against EXISTING ``entity`` rows only at ACCEPT
 time (never auto-created) -- accepting a relation whose endpoint entity
@@ -74,6 +88,7 @@ time rather than all-or-nothing per document.
 from __future__ import annotations
 
 import json
+import sqlite3
 from typing import Any, Callable, Mapping
 
 from trialerror.events.api import append_event
@@ -145,11 +160,23 @@ def build_extraction_judgment_envelope(chunk: Mapping[str, Any], *, doc_title: s
     Expected judge response shape: ``{"entities": [{"name", "entity_type",
     "aliases"?, "summary"?, "attributes"?, "confidence"?}, ...], "relations":
     [{"src", "dst", "rel_type", "fact_text", "quote", "confidence"?}, ...],
-    "claims": [{"text", "kind", "quote", "confidence"?}, ...]}`` --
+    "claims": [{"text", "kind", "quote", "term"?, "confidence"?}, ...]}`` --
     ``src``/``dst`` name an entity from THIS SAME ``entities`` list (or an
     existing entity's name); every relation/claim's ``quote`` MUST be an
     EXACT verbatim substring of ``chunk["text"]`` (:func:`_resolve_quote_anchor_draft`
-    refuses otherwise, per :class:`~trialerror.ingest.errors.GroundingError`)."""
+    refuses otherwise, per :class:`~trialerror.ingest.errors.GroundingError`).
+
+    **The optional ``"term"`` key on a claim** (design ``docs/reviews/
+    LANE_E_TERM_STORE_DESIGN.md`` §4; ruling L-E7) is the lemma a
+    ``kind='definition'`` claim defines -- the NAME of the thing, not the
+    sentence about it. It is optional in both directions: a judgment written
+    before this key existed still validates
+    (:func:`_validate_extraction_response` never required it), and a
+    definition claim that names nothing quotable as a lemma omits it.
+    Supplying it is what lets the accepted claim land as a ``current`` sense
+    in the term store instead of as the fallback heuristic's ``proposed``
+    guess (:func:`_lexicon_hook`) -- the lemma then comes from the judgment
+    a human reviewed, not from a substring match made afterwards."""
     return {
         "kind": "kg_extract",
         "chunk_id": chunk["chunk_id"],
@@ -163,9 +190,13 @@ def build_extraction_judgment_envelope(chunk: Mapping[str, Any], *, doc_title: s
             "{\"entities\": [{\"name\",\"entity_type\",\"aliases\"?,\"summary\"?,\"attributes\"?,"
             "\"confidence\"?}, ...], \"relations\": [{\"src\",\"dst\",\"rel_type\",\"fact_text\","
             "\"quote\",\"confidence\"?}, ...], \"claims\": [{\"text\",\"kind\",\"quote\","
-            "\"confidence\"?}, ...]} -- 'src'/'dst' must each name an entity from THIS SAME "
-            "'entities' list, or an already-known entity by exact name. 'kind' for a claim must "
-            f"be one of {sorted(CLAIM_KINDS)!r}."
+            "\"term\"?,\"confidence\"?}, ...]} -- 'src'/'dst' must each name an entity from THIS "
+            "SAME 'entities' list, or an already-known entity by exact name. 'kind' for a claim "
+            f"must be one of {sorted(CLAIM_KINDS)!r}. On a claim with kind='definition', add "
+            "'term': the lemma being defined, in its own words and shortest form -- the NAME of "
+            "the thing ('interleaved practice'), never the sentence defining it and never a "
+            "verbatim span of the text. Omit 'term' when the claim defines nothing nameable; "
+            "omit it on every other claim kind."
         ),
     }
 
@@ -260,6 +291,35 @@ def _validate_extraction_response(response: Any) -> dict[str, list[Any]]:
     return out
 
 
+def _claim_term(claim: Mapping[str, Any], kind: str, *, chunk_id: str) -> str | None:
+    """The optional lexicon lemma on one claim item, validated (design §4;
+    ruling L-E7).
+
+    Three outcomes, and the middle one is the point: **absent** -> ``None``,
+    and every judgment written before this key existed keeps validating;
+    **present and usable** -> the stripped lemma; **present and malformed**
+    (not a string, or empty/whitespace) -> :class:`~trialerror.ingest.errors.ExtractError`,
+    because a judge that emitted the key meant to name something and a
+    silently dropped field would leave the operator wondering why the term
+    never appeared.
+
+    A ``term`` on a claim that is not a definition is ignored rather than
+    refused -- the key is defined only for definitions, and refusing the
+    whole chunk over a stray field on a ``finding`` would cost more than it
+    protects. It is dropped here, at validation, so nothing downstream has
+    to re-decide whether it applies.
+    """
+    if "term" not in claim or claim.get("term") is None:
+        return None
+    value = claim.get("term")
+    if not isinstance(value, str) or not value.strip():
+        raise ExtractError(
+            f"run_extract_chunk: claim 'term' for chunk {chunk_id!r} must be a non-empty lemma string, "
+            f"got {value!r} -- omit the key entirely when the claim defines nothing nameable"
+        )
+    return value.strip() if kind == "definition" else None
+
+
 def run_extract_chunk(store: Store, chunk_id: str, *, judge: Callable[[Mapping[str, Any]], Any], created_by_launch: str) -> dict[str, Any]:
     """Extract one chunk: build its judgment envelope, call ``judge``,
     validate + ground every candidate's quote, and queue each as one
@@ -346,6 +406,11 @@ def run_extract_chunk(store: Store, chunk_id: str, *, judge: Callable[[Mapping[s
             "claim_kind": kind,
             "confidence": cl.get("confidence"),
             "anchor_draft": anchor_draft,
+            # The optional lexicon lemma (design §4 / ruling L-E7). Carried on
+            # the PENDING row rather than acted on here: extraction queues,
+            # accept decides, and a term proposed at queue time would be a
+            # term proposed for a candidate that may yet be rejected.
+            "term": _claim_term(cl, kind, chunk_id=chunk_id),
         }
         record_ids["claims"].append(_queue_candidate(store, payload, by_launch=created_by_launch)["record_id"])
 
@@ -541,6 +606,146 @@ def _accept_relation_candidate(store: Store, payload: Mapping[str, Any], *, by_l
     }
 
 
+def _heuristic_lemma(store: Store, payload: Mapping[str, Any]) -> str | None:
+    """The fallback route's lemma: the longest name among the entity
+    candidates extracted from THIS SAME chunk that occurs in the claim's own
+    text (design §4).
+
+    Deliberately weak, and deliberately scoped. Same chunk, because an
+    entity named three pages away is not what this sentence is defining;
+    substring of the claim text, because the definition has to actually
+    mention the thing; longest match, because "practice" and "interleaved
+    practice" can both hit and only one of them is the term. Everything it
+    produces lands ``proposed`` -- a guess that reads well is still a guess,
+    and the whole reason the envelope grew a ``term`` key is that a judgment
+    beats this.
+    """
+    chunk_id = payload.get("chunk_id")
+    text = str(payload.get("text") or "")
+    if not chunk_id or not text:
+        return None
+    lowered = text.lower()
+    rows = store.knowledge.execute(
+        "SELECT payload FROM record WHERE register_key = ? AND payload LIKE ? AND payload LIKE ?",
+        (EXTRACT_REGISTER_KEY, f'%"chunk_id": "{chunk_id}"%', '%"kind": "entity"%'),
+    ).fetchall()
+    best: str | None = None
+    for row in rows:
+        try:
+            candidate = json.loads(row["payload"])
+        except (TypeError, ValueError):  # pragma: no cover - the writer is json.dumps
+            continue
+        if candidate.get("kind") != "entity" or candidate.get("chunk_id") != chunk_id:
+            continue
+        name = str(candidate.get("name") or "").strip()
+        if not name or name.lower() not in lowered:
+            continue
+        if best is None or len(name) > len(best):
+            best = name
+    return best
+
+
+def _lexicon_hook(
+    store: Store, payload: Mapping[str, Any], *, claim_id: str, anchor_row: Mapping[str, Any], by_launch: str
+) -> dict[str, Any]:
+    """Propose one lexicon sense for an accepted DEFINITION claim (design §4;
+    rulings L-E5/L-E7). Never raises: the claim is already written.
+
+    Two routes, and which one ran is in the result:
+
+    * the judgment carried a ``term`` -> ``status='current'``,
+      ``procedure_version='extract-term-v1'``. Current because the operator
+      just accepted this exact claim through the merge-review queue -- a
+      second acceptance of the same judgment would be ceremony, not a gate.
+    * it did not -> :func:`_heuristic_lemma`, at ``status='proposed'``,
+      ``procedure_version='extract-heuristic-v1'``. A substring match is a
+      suggestion, so it waits for someone.
+
+    **Import-guarded and failure-guarded, on purpose.** This runs inside an
+    accept that has already written a ``claim``, a ``quote_anchor`` and (a
+    line later) the ``record`` stamp. A store without the knowledge v5
+    migration, a build without the lexicon package, a gloss over the word
+    cap, a lemma another process claimed a microsecond earlier -- none of
+    those are reasons to fail an acceptance the reviewer made, so each comes
+    back as a stated reason in the returned dict, which the caller surfaces.
+    The one thing it must never do is swallow the outcome silently: "no term
+    was proposed" and "nothing tried" are different facts and both are
+    reported.
+
+    ``StoreError`` is in the except arms because "never raises" was not true
+    without it (fix pass, finding F3): a UNIQUE violation arrives as
+    ``trialerror.stores.errors.ValidationError`` and a launch that names no
+    row as ``XidTargetMissingError``, and neither is a ``LexiconError`` or a
+    ``sqlite3.OperationalError``. A concurrent accept would have failed an
+    acceptance a human had already made -- the one thing this guard exists
+    to prevent.
+    """
+    if payload.get("claim_kind") != "definition":
+        return {"status": "skipped", "reason": "the lexicon is fed by definition claims only"}
+    try:
+        from trialerror.lexicon import api as lexicon_api
+        from trialerror.lexicon import policy as lexicon_policy
+        from trialerror.lexicon.errors import LexiconError
+        from trialerror.stores.errors import StoreError
+    except ImportError as exc:  # pragma: no cover - the package ships with the harness
+        return {"status": "unavailable", "reason": f"trialerror.lexicon is not importable: {exc}"}
+
+    lemma = payload.get("term")
+    if lemma:
+        status, procedure = "current", lexicon_policy.EXTRACT_PROCEDURE_VERSION
+        route = "envelope"
+    else:
+        lemma = _heuristic_lemma(store, payload)
+        status, procedure = "proposed", lexicon_policy.EXTRACT_HEURISTIC_PROCEDURE_VERSION
+        route = "heuristic"
+    if not lemma:
+        return {
+            "status": "skipped",
+            "reason": "the judgment named no 'term' and no entity candidate from this chunk "
+            "occurs in the claim text",
+        }
+
+    try:
+        result = lexicon_api.propose(
+            store,
+            lemma=lemma,
+            gloss=str(payload.get("text") or ""),
+            origin_kind="extract",
+            origin_ref=claim_id,
+            evidence=[
+                {
+                    "kind": "quote_anchor",
+                    "anchor_id": anchor_row["anchor_id"],
+                    "excerpt": anchor_row.get("quote_text"),
+                }
+            ],
+            by_launch=by_launch,
+            procedure_version=procedure,
+            status=status,
+        )
+    except (LexiconError, StoreError) as exc:
+        return {
+            "status": "refused",
+            "route": route,
+            "lemma": lemma,
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+    except sqlite3.OperationalError as exc:
+        return {
+            "status": "unavailable",
+            "route": route,
+            "reason": f"the term store tables are absent (knowledge v5 not applied): {exc}",
+        }
+    return {
+        "status": "ok",
+        "route": route,
+        "lemma": lemma,
+        "term_id": result["term_id"],
+        "sense_id": result["sense_id"],
+        "sense_status": result["status"],
+    }
+
+
 def _accept_claim_candidate(store: Store, payload: Mapping[str, Any], *, by_launch: str) -> dict[str, Any]:
     anchor_row = _mint_anchor(store, payload["anchor_draft"], by_launch=by_launch)
     claim_id = new_id("CLM")
@@ -556,10 +761,19 @@ def _accept_claim_candidate(store: Store, payload: Mapping[str, Any], *, by_laun
             "created_by_launch": by_launch,
         },
     )
+    lexicon = _lexicon_hook(store, payload, claim_id=claim_id, anchor_row=anchor_row, by_launch=by_launch)
+    event_extra: dict[str, Any] = {"claim_id": claim_id}
+    if lexicon.get("sense_id"):
+        event_extra["term_id"] = lexicon["term_id"]
+        event_extra["sense_id"] = lexicon["sense_id"]
     return {
-        "record_stamp": {"resolved_claim_id": claim_id, "evidence_anchor": anchor_row["anchor_id"]},
-        "event_extra": {"claim_id": claim_id},
-        "public": {"claim_id": claim_id, "claim": written},
+        "record_stamp": {
+            "resolved_claim_id": claim_id,
+            "evidence_anchor": anchor_row["anchor_id"],
+            "lexicon_sense_id": lexicon.get("sense_id"),
+        },
+        "event_extra": event_extra,
+        "public": {"claim_id": claim_id, "claim": written, "lexicon": lexicon},
     }
 
 

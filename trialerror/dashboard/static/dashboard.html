@@ -244,7 +244,7 @@
         <div class="lexicon-layout">
           <div class="lexicon-index">
             <div class="term-filter-row">
-              <div class="term-search"><span class="prompt" style="font-size:13px;">&gt;</span><input type="text" data-role="lexicon-filter" placeholder="filter terms, definitions, source ids"></div>
+              <div class="term-search"><span class="prompt" style="font-size:13px;">&gt;</span><input type="text" data-role="lexicon-filter" placeholder="filter terms, glosses"></div>
               <div class="term-kind-chips" data-role="lexicon-kind-chips"></div>
             </div>
             <div data-role="lexicon-index-list"><div class="panel-loading">loading&hellip;</div></div>
@@ -388,6 +388,20 @@
           RUN THE CHECK SWEEP moved out of this subbar and into the DIAGNOSTICS
           card head, beside the reading it refreshes: a panel-wide button for
           one card's verb was a leftover from the generic renderer.
+
+          C-0097 (worker control): the JOBS card draws one WORKER ROW per GPU
+          worker ABOVE the queue counts -- state, job, progress, pace, ETA,
+          heartbeat age, settings -- with PAUSED / STOPPING / LOST chips, and
+          repeats the paused/stopping/lost ones in its head slot so a pause is
+          visible on the collapsed card. The rows come from `offload.workers`
+          in the jobs panel. The matching `worker-control` write action
+          (pause/resume/stop, launch-gated) is reachable at
+          /dashboard/api/write/worker-control and from `trialerror offload
+          worker-control`; it kills nothing -- it leaves a request in the queue
+          and the worker complies at its next cooperative checkpoint. A row
+          whose state is EXITED is a run that has ENDED (fix pass V-9): the row
+          survives until a publish/return/reclaim clears it or it ages out, so
+          `idle` means "here, nothing claimed" and `exited` means "gone".
         -->
         <div class="console-grid" data-role="console-grid">
           <div class="card" id="console-card-session"><div class="card-header"><h2 class="title">SESSION</h2><span class="fill"></span><span class="card-head" data-role="console-head-session"></span></div><div class="card-body" data-role="console-body-session"><div class="panel-loading">loading&hellip;</div></div></div>
@@ -487,9 +501,11 @@
     evidenceEdgeSort: null,    // {key, dir} for THE SAME EDGES AS A TABLE
     evidencePanel: null,       // the last payload, so a filter keystroke
                                // re-renders instead of re-fetching
+    // ---- Lexicon (lane e, E4) ----
     lexiconFilterText: "",
-    lexiconKindFilter: "all",
-    lexiconSelected: null,     // {kind:'entity'|'claim'|'merge', id}
+    // one chip row, one filter -- "all" | "family" | "instance" | "split" | "needs_review"
+    lexiconFilter: "all",
+    lexiconTermId: null,       // selects one term's detail (server-side, ?term_id=)
     // sweep §3.6: the DIAGNOSTICS card's status chips and category text are
     // filters, and their state has to outlive the card's own re-render.
     consoleDoctorFilter: { status: null, category: "" },
@@ -3040,10 +3056,61 @@
   }
 
   /* ==========================================================================
-     11. LEXICON
+     11. LEXICON -- lane e (E4). design docs/reviews/LANE_E_TERM_STORE_DESIGN.md
+     section 5: term/term_sense/term_sense_evidence/term_relation (knowledge
+     v5) replace the old entity/definition-claim proxy this panel used to
+     draw. One chip row is ONE filter (state.lexiconFilter) over granularity
+     OR derived state, matching the pre-existing single-select chip-row
+     idiom rather than inventing a second independent axis. The detail pane
+     is server-computed per term_id (the dossier/evidence builders'
+     "optional selector, forwarded by PANEL_QUERY_PARAMS" precedent) --
+     unlike those two, an unselected Lexicon has no auto-picked default.
      ========================================================================== */
-  function loadLexicon() { guardPanelLoad("lexicon", fetchPanel("lexicon").then(renderLexicon), loadLexicon); }
+  function loadLexicon() {
+    guardPanelLoad("lexicon", fetchPanel("lexicon", { term_id: state.lexiconTermId }).then(renderLexicon), loadLexicon);
+  }
   var LEXICON_PANEL_CACHE = null;
+  var LEXICON_FILTERS = [
+    { key: "all", label: "ALL" },
+    { key: "family", label: "FAMILY" },
+    { key: "instance", label: "INSTANCE" },
+    { key: "split", label: "▲ SPLIT" },
+    { key: "needs_review", label: "NEEDS REVIEW" }
+  ];
+
+  function lexiconMatchesFilter(t) {
+    switch (state.lexiconFilter) {
+      case "family": return t.granularity === "family";
+      case "instance": return t.granularity === "instance";
+      // "▲ SPLIT" covers both the OPEN judgment (split_open) and the
+      // already-decided outcome (split) -- a reader hunting for "any term
+      // this program has ever had to disambiguate" wants both.
+      case "split": return t.state === "split_open" || t.state === "split";
+      case "needs_review": return t.state === "needs_review";
+      default: return true;
+    }
+  }
+
+  function lexiconStateBadge(oneState) {
+    switch (oneState) {
+      case "stable": return statusEl("settled", "STABLE");
+      case "proposed": return statusEl("pending", "PROPOSED");
+      // statusEl already draws the "warn" glyph (▲) -- the label here must
+      // not repeat it, unlike the FILTER chip above, which has no separate
+      // glyph of its own. A DECIDED split ("split") is drawn "settled": the
+      // program resolved it, this is not an open question any more (there
+      // is no dedicated status--split rule in dashboard.css, and inventing
+      // a fourth color for "resolved, but by disambiguating rather than by
+      // becoming one thing" would be a distinction no reader asked for).
+      case "split_open": return statusEl("warn", "SPLIT — OPEN");
+      case "split": return statusEl("settled", "SPLIT");
+      case "needs_review": return statusEl("pending", "NEEDS REVIEW");
+      case "merged": return statusEl("stale", "MERGED");
+      case "retired": return statusEl("stale", "RETIRED");
+      default: return statusEl("pending", String(oneState || "").toUpperCase());
+    }
+  }
+
   function renderLexicon(p) {
     LEXICON_PANEL_CACHE = p;
     var idxList = qs('[data-role="lexicon-index-list"]');
@@ -3053,60 +3120,45 @@
     clear(idxList); clear(kindChips); clear(seam); clear(detail);
     if (!p || p.status !== "ok") { idxList.appendChild(el("div", { "class": "warn-callout" }, [el("div", { "class": "body", text: p ? p.message : "no data" })])); return; }
 
-    if (p.seam_note) seam.appendChild(el("div", { "class": "warn-callout" }, [el("div", { "class": "head", text: "▲ THIS SURFACE NEEDS NEW TABLES" }), el("div", { "class": "body", text: p.seam_note })]));
-
-    var kinds = ["all"].concat(Array.from(new Set((p.entities || []).map(function (e) { return e.entity_type; }))));
-    kinds.forEach(function (k) {
-      var c = el("span", { "class": "chip" + (state.lexiconKindFilter === k ? " chip--live" : " chip--neutral"), "style": "cursor:pointer;", text: k.toUpperCase() });
-      c.addEventListener("click", function () { state.lexiconKindFilter = k; renderLexicon(p); });
+    LEXICON_FILTERS.forEach(function (f) {
+      var c = el("span", { "class": "chip" + (state.lexiconFilter === f.key ? " chip--live" : " chip--neutral"), "style": "cursor:pointer;", text: f.label });
+      c.addEventListener("click", function () { state.lexiconFilter = f.key; renderLexicon(p); });
       kindChips.appendChild(c);
     });
 
+    var counts = p.counts || {};
+    seam.appendChild(el("div", { "class": "note-strip" }, [document.createTextNode(
+      counts.total + " term(s) · " + (counts.conflicts_open || 0) + " conflict(s) open · " + (counts.needs_review || 0) + " need review"
+    )]));
+    if (counts.definition_claims_unprojected) {
+      seam.appendChild(el("div", { "class": "warn-callout", "style": "margin-top:8px;" }, [
+        el("div", { "class": "head", text: "DEFINITION CLAIMS AWAITING PROJECTION" }),
+        el("div", { "class": "body", text: counts.definition_claims_unprojected + " live definition claim(s) have no term_sense_evidence row yet -- the migration-from-proxy backlog." })
+      ]));
+    }
+
     var q = state.lexiconFilterText.toLowerCase();
-    var entities = (p.entities || []).filter(function (e) {
-      if (state.lexiconKindFilter !== "all" && e.entity_type !== state.lexiconKindFilter) return false;
+    var terms = (p.terms || []).filter(function (t) {
+      if (!lexiconMatchesFilter(t)) return false;
       if (!q) return true;
-      return (e.name || "").toLowerCase().indexOf(q) !== -1 || (e.summary || "").toLowerCase().indexOf(q) !== -1;
+      return (t.lemma || "").toLowerCase().indexOf(q) !== -1 || (t.gloss || "").toLowerCase().indexOf(q) !== -1;
     });
 
     idxList.appendChild(el("div", { "class": "term-row", "style": "border-left:none; cursor:default;" }, [
-      el("div", { text: "TERM" }), el("div", { text: "SUMMARY" }), el("div", { text: "RELS" }), el("div", { text: "STATE" })
+      el("div", { text: "TERM" }), el("div", { text: "DEFINITION" }), el("div", { text: "SRC" }), el("div", { text: "STATE" })
     ]));
-    entities.forEach(function (e) {
-      var stateBadge = e.resolution === "confirmed" ? statusEl("settled", "") : e.resolution === "rejected" ? statusEl("crit", "") : statusEl("pending", "");
-      var row = el("div", { "class": "term-row" + (state.lexiconSelected && state.lexiconSelected.kind === "entity" && state.lexiconSelected.id === e.entity_id ? " is-active" : "") }, [
-        el("div", { "class": "name", text: e.name }),
-        el("div", { "class": "def", text: e.summary || "(no summary)" }),
-        el("div", { "style": "color:var(--ink-3);", text: String(e.relation_count || 0) }),
-        stateBadge
+    if (!terms.length) idxList.appendChild(el("div", { "class": "empty", text: "no matches" }));
+    // already sorted by last_revised, newest first, server-side.
+    terms.forEach(function (t) {
+      var row = el("div", { "class": "term-row" + (state.lexiconTermId === t.term_id ? " is-active" : "") }, [
+        el("div", { "class": "name", text: t.lemma }),
+        el("div", { "class": "def", text: t.gloss || "(no accepted reading yet)" }),
+        el("div", { "style": "color:var(--ink-3);", text: String(t.source_count) }),
+        lexiconStateBadge(t.state)
       ]);
-      row.addEventListener("click", function () { state.lexiconSelected = { kind: "entity", id: e.entity_id }; renderLexiconDetail(p); });
+      row.addEventListener("click", function () { state.lexiconTermId = t.term_id; loadLexicon(); });
       idxList.appendChild(row);
     });
-
-    var defs = (p.definition_claims || []).filter(function (c) { return !q || (c.text || "").toLowerCase().indexOf(q) !== -1; });
-    if (defs.length) {
-      idxList.appendChild(el("div", { "class": "determ-group-label", text: "DEFINITION CLAIMS · " + defs.length }));
-      defs.forEach(function (c) {
-        var row = el("div", { "class": "term-row", "style": "grid-template-columns: minmax(0,1fr) 84px;" }, [
-          el("div", { "class": "def", text: c.text }),
-          el("div", { "style": "color:var(--ink-3);", text: c.kind || "" })
-        ]);
-        row.addEventListener("click", function () { state.lexiconSelected = { kind: "claim", id: c.claim_id }; renderLexiconDetail(p); });
-        idxList.appendChild(row);
-      });
-    }
-    if (!entities.length && !defs.length) idxList.appendChild(el("div", { "class": "empty", text: "no matches" }));
-
-    if ((p.merge_proposals_draft || []).length) {
-      var mCard = el("div", { "style": "padding:11px 14px; border-top:1px solid var(--hairline-soft);" });
-      mCard.appendChild(el("div", { "style": "font-size:11px; font-weight:700; letter-spacing:0.12em; color:var(--ink-hi); margin-bottom:8px;", text: "DRAFT MERGE PROPOSALS" }));
-      p.merge_proposals_draft.forEach(function (mp) {
-        var members = []; try { members = JSON.parse(mp.members); } catch (e) {}
-        mCard.appendChild(el("div", { "style": "font-family:var(--font-mono); font-size:10.5px; color:var(--ink-2); margin-bottom:6px;", text: mp.prop_id + ": " + members.join(" + ") + " → " + mp.canonical_entity }));
-      });
-      idxList.appendChild(mCard);
-    }
 
     renderLexiconDetail(p);
   }
@@ -3114,29 +3166,240 @@
     state.lexiconFilterText = e.target.value;
     if (LEXICON_PANEL_CACHE) renderLexicon(LEXICON_PANEL_CACHE);
   });
+
+  /** One sense card: gloss, disambiguator, evidence rows (✓ ANCHORED /
+   * FENCED / CITE ONLY per design §5), and its own ACCEPT/REJECT
+   * (`proposed` only) or MARK REVIEWED (`current` only) action -- never
+   * both, a sense is never both at once. `byLaunchInput` is the ONE shared
+   * identity field the whole detail pane uses (a single DOM node cannot be
+   * appended twice, so every action here only ever READS `.value` off it). */
+  function renderLexiconSense(s, byLaunchInput, writable) {
+    var wrap = el("div", { "style": "border:1px solid var(--hairline-soft); border-radius:6px; padding:10px 12px;" });
+    var statusKind = s.status === "current" ? "settled" : s.status === "proposed" ? "pending" : s.status === "rejected" ? "crit" : "stale";
+    wrap.appendChild(el("div", { "style": "display:flex; align-items:baseline; gap:8px; flex-wrap:wrap;" }, [
+      statusEl(statusKind, s.status.toUpperCase()),
+      s.disambiguator ? chip(s.disambiguator, "live") : null,
+      s.needs_review ? statusEl("warn", "STALE — REVIEW") : null
+    ]));
+    wrap.appendChild(el("div", { "style": "font-size:14px; color:var(--ink-hi); line-height:1.5; margin:6px 0;", text: s.gloss }));
+    wrap.appendChild(el("div", { "class": "note-strip" }, [document.createTextNode(
+      s.sense_id + " · " + s.origin_kind + (s.origin_ref ? " (" + s.origin_ref + ")" : "") +
+      " · " + (s.source_keys || []).length + " source(s)" +
+      (s.review_after ? " · review after " + fmtDate(s.review_after) : "")
+    )]));
+
+    var evWrap = el("div", { "style": "margin-top:8px; display:flex; flex-direction:column; gap:5px;" });
+    (s.evidence || []).forEach(function (ev) {
+      // "■ FENCED"/warn matches evidence_render.js's own precedent for a
+      // commercial_restricted excerpt -- the same badge, the same variant.
+      var badge = ev.anchored === false ? chip("CITE ONLY", "neutral") : ev.fenced ? chip("■ FENCED", "warn") : chip("✓ ANCHORED", "live");
+      evWrap.appendChild(el("div", { "style": "display:flex; gap:8px; align-items:baseline; font-size:11px;" }, [
+        badge,
+        el("span", { "style": "color:var(--ink-3); font-family:var(--font-mono);", text: ev.source_key || "" }),
+        el("span", { "style": "color:var(--ink-2); flex-grow:1;", text: ev.excerpt || "(no excerpt)" }),
+        ev.page_number != null ? el("span", { "style": "color:var(--ink-3);", text: "p." + ev.page_number }) : null
+      ]));
+    });
+    if (!(s.evidence || []).length) evWrap.appendChild(el("div", { "class": "empty", text: "no live evidence" }));
+    wrap.appendChild(evWrap);
+
+    var msg = el("div", { "class": "write-form-msg" });
+    var btnRow = el("div", { "class": "btn-row", "style": "margin-top:8px;" });
+    if (s.status === "proposed") {
+      var acceptBtn = el("button", { type: "button", "class": "btn btn--primary", "data-role": "term-sense-accept-btn", text: "ACCEPT" });
+      var rejectBtn = el("button", { type: "button", "class": "btn btn--secondary", "data-role": "term-sense-reject-btn", text: "REJECT" });
+      acceptBtn.disabled = !writable; rejectBtn.disabled = !writable;
+      btnRow.appendChild(acceptBtn); btnRow.appendChild(rejectBtn);
+      wireWriteAction(
+        acceptBtn, msg, "term-sense-accept",
+        function () { return { sense_id: s.sense_id, by_launch: byLaunchInput.value }; },
+        ["sense_id", "by_launch"], { by_launch: byLaunchInput },
+        function () { loadLexicon(); }, loadLexicon
+      );
+      wireWriteAction(
+        rejectBtn, msg, "term-sense-reject",
+        function () { return { sense_id: s.sense_id, by_launch: byLaunchInput.value }; },
+        ["sense_id", "by_launch"], { by_launch: byLaunchInput },
+        function () { loadLexicon(); }, loadLexicon
+      );
+    } else if (s.status === "current") {
+      var reviewBtn = el("button", { type: "button", "class": "btn btn--secondary", "data-role": "term-mark-reviewed-btn", text: "MARK REVIEWED" });
+      reviewBtn.disabled = !writable;
+      btnRow.appendChild(reviewBtn);
+      wireWriteAction(
+        reviewBtn, msg, "term-mark-reviewed",
+        function () { return { sense_id: s.sense_id, by_launch: byLaunchInput.value }; },
+        ["sense_id", "by_launch"], { by_launch: byLaunchInput },
+        function () { loadLexicon(); }, loadLexicon
+      );
+    }
+    if (btnRow.childNodes.length) { wrap.appendChild(btnRow); wrap.appendChild(msg); }
+    return wrap;
+  }
+
+  /** One relation row. A PENDING `conflicts_with` draws the disjointness
+   * line (design §5's "WHY THIS IS A CONFLICT AND NOT A NUANCE" -- computed
+   * server-side in `conflict.systems_per_sense`, never asserted here) plus
+   * the three actions SCOPE / KEEP ONE / REJECT; a pending `same_as`/
+   * `variant_of` draws MERGE / VARIANT OF / REJECT instead. Anything
+   * confirmed/rejected/superseded is drawn read-only -- a decision, once
+   * made, is never re-offered (`lexicon.api.decide_relation`'s own rule). */
+  function renderLexiconRelation(rel, conflict, byLaunchInput, writable) {
+    var wrap = el("div", { "style": "border:1px solid var(--hairline-soft); border-radius:6px; padding:10px 12px;" });
+    var statusKind = rel.status === "pending" ? "pending" : rel.status === "confirmed" ? "settled" : rel.status === "rejected" ? "crit" : "stale";
+    wrap.appendChild(el("div", { "style": "display:flex; gap:8px; align-items:baseline; flex-wrap:wrap;" }, [
+      el("span", { "style": "font-family:var(--font-mono); font-size:11px; color:var(--ink-hi);", text: rel.verb.toUpperCase() }),
+      statusEl(statusKind, rel.status.toUpperCase()),
+      chip(rel.marked_by_kind === "system" ? "SYSTEM" : "LAUNCH", "neutral"),
+      rel.decided_verb ? chip("→ " + rel.decided_verb.toUpperCase(), "live") : null
+    ]));
+    if (rel.reason) wrap.appendChild(el("div", { "style": "font-size:12px; color:var(--ink-2); margin-top:4px;", text: rel.reason }));
+
+    if (rel.status !== "pending") return wrap;
+
+    var members = (rel.member_sense_ids || []).slice();
+    if (rel.verb === "conflicts_with") {
+      if (conflict && conflict.rel_id === rel.rel_id) {
+        var sys = conflict.systems_per_sense || {};
+        var line = Object.keys(sys).map(function (sid) { return sid.slice(-8) + ": " + (sys[sid] || []).length + " source(s)"; }).join("  ·  ");
+        wrap.appendChild(el("div", { "class": "note-strip", "style": "margin-top:6px;" }, [document.createTextNode(
+          "EVERY PAIR OF MEMBER SENSES IS DISJOINT — " + line +
+          ((conflict.shared_sources || []).length ? "  (shared: " + conflict.shared_sources.join(", ") + ")" : "")
+        )]));
+      }
+      var msg = el("div", { "class": "write-form-msg" });
+      var scopeInputs = {};
+      var scopeRow = el("div", { "class": "write-form-row", "style": "flex-wrap:wrap; margin-top:8px;" });
+      members.forEach(function (sid) {
+        scopeRow.appendChild(el("span", { "style": "font-size:10px; color:var(--ink-3); align-self:center;", text: sid.slice(-8) + ":" }));
+        var input = el("input", { type: "text", "class": "write-input", placeholder: "disambiguator", style: "width:180px;" });
+        scopeInputs[sid] = input;
+        scopeRow.appendChild(input);
+      });
+      var intoSelect = el("select", { "class": "write-select" });
+      members.forEach(function (sid) { intoSelect.appendChild(el("option", { value: sid, text: "keep " + sid.slice(-8) })); });
+      var scopeBtn = el("button", { type: "button", "class": "btn btn--primary", "data-role": "term-relation-scope-btn", text: "SCOPE (KEEP BOTH)" });
+      var keepBtn = el("button", { type: "button", "class": "btn btn--secondary", "data-role": "term-relation-keep-one-btn", text: "NOT A CONFLICT" });
+      var rejectBtn = el("button", { type: "button", "class": "btn btn--secondary", "data-role": "term-relation-reject-btn", text: "REJECT" });
+      scopeBtn.disabled = !writable; keepBtn.disabled = !writable; rejectBtn.disabled = !writable;
+      wireWriteAction(
+        scopeBtn, msg, "term-relation-decide",
+        function () {
+          var disambiguators = {};
+          members.forEach(function (sid) { disambiguators[sid] = scopeInputs[sid].value; });
+          return { rel_id: rel.rel_id, decision: "scoped", by_launch: byLaunchInput.value, disambiguators: disambiguators };
+        },
+        ["rel_id", "decision", "by_launch"], { by_launch: byLaunchInput },
+        function () { loadLexicon(); }, loadLexicon
+      );
+      wireWriteAction(
+        keepBtn, msg, "term-relation-decide",
+        function () { return { rel_id: rel.rel_id, decision: "not_conflict", by_launch: byLaunchInput.value, into: intoSelect.value }; },
+        ["rel_id", "decision", "by_launch", "into"], { by_launch: byLaunchInput },
+        function () { loadLexicon(); }, loadLexicon
+      );
+      wireWriteAction(
+        rejectBtn, msg, "term-relation-decide",
+        function () { return { rel_id: rel.rel_id, decision: "rejected", by_launch: byLaunchInput.value }; },
+        ["rel_id", "decision", "by_launch"], { by_launch: byLaunchInput },
+        function () { loadLexicon(); }, loadLexicon
+      );
+      wrap.appendChild(scopeRow);
+      wrap.appendChild(el("div", { "class": "btn-row", "style": "margin-top:6px; flex-wrap:wrap;" }, [scopeBtn, intoSelect, keepBtn, rejectBtn]));
+      wrap.appendChild(el("div", {
+        "class": "note-strip",
+        text: "SCOPING KEEPS EVERY SENSE AND REQUIRES A DISAMBIGUATOR EACH; NOT A CONFLICT SUPERSEDES THE OTHERS INTO THE ONE YOU KEEP; REJECTING CLOSES THE CANDIDATE.",
+      }));
+      wrap.appendChild(msg);
+    } else if (rel.verb === "same_as" || rel.verb === "variant_of") {
+      var msg2 = el("div", { "class": "write-form-msg" });
+      var mergeBtn = el("button", { type: "button", "class": "btn btn--primary", "data-role": "term-relation-merge-btn", text: "SAME AS (MERGE)" });
+      var variantBtn = el("button", { type: "button", "class": "btn btn--secondary", "data-role": "term-relation-variant-btn", text: "VARIANT OF" });
+      var rejectBtn2 = el("button", { type: "button", "class": "btn btn--secondary", "data-role": "term-relation-reject-btn", text: "REJECT" });
+      [mergeBtn, variantBtn, rejectBtn2].forEach(function (b) { b.disabled = !writable; });
+      wireWriteAction(
+        mergeBtn, msg2, "term-relation-decide",
+        function () { return { rel_id: rel.rel_id, decision: "same_as", by_launch: byLaunchInput.value }; },
+        ["rel_id", "decision", "by_launch"], { by_launch: byLaunchInput },
+        function () { loadLexicon(); }, loadLexicon
+      );
+      wireWriteAction(
+        variantBtn, msg2, "term-relation-decide",
+        function () { return { rel_id: rel.rel_id, decision: "variant_of", by_launch: byLaunchInput.value }; },
+        ["rel_id", "decision", "by_launch"], { by_launch: byLaunchInput },
+        function () { loadLexicon(); }, loadLexicon
+      );
+      wireWriteAction(
+        rejectBtn2, msg2, "term-relation-decide",
+        function () { return { rel_id: rel.rel_id, decision: "rejected", by_launch: byLaunchInput.value }; },
+        ["rel_id", "decision", "by_launch"], { by_launch: byLaunchInput },
+        function () { loadLexicon(); }, loadLexicon
+      );
+      wrap.appendChild(el("div", { "class": "btn-row", "style": "margin-top:8px;" }, [mergeBtn, variantBtn, rejectBtn2]));
+      wrap.appendChild(msg2);
+    }
+    return wrap;
+  }
+
   function renderLexiconDetail(p) {
     var detail = qs('[data-role="lexicon-detail"]');
     clear(detail);
-    var sel = state.lexiconSelected;
-    if (!sel) { detail.appendChild(el("div", { "class": "empty", text: "select a term or claim from the index" })); return; }
-    if (sel.kind === "entity") {
-      var e = (p.entities || []).find(function (x) { return x.entity_id === sel.id; });
-      if (!e) { detail.appendChild(el("div", { "class": "empty", text: "not found" })); return; }
-      detail.appendChild(el("div", { "style": "display:flex; align-items:baseline; gap:12px;" }, [
-        el("span", { "style": "font-size:22px; color:var(--ink-hi);", text: e.name }),
-        chip(e.entity_type, "neutral")
-      ]));
-      var card = el("div", { "class": "card" });
-      card.appendChild(el("div", { "class": "card-body" }, [renderObjectG(e)]));
-      detail.appendChild(card);
-    } else if (sel.kind === "claim") {
-      var c = (p.definition_claims || []).find(function (x) { return x.claim_id === sel.id; });
-      if (!c) { detail.appendChild(el("div", { "class": "empty", text: "not found" })); return; }
-      detail.appendChild(el("div", { "style": "font-size:19px; color:var(--ink-hi); line-height:1.4;", text: c.text }));
-      var card = el("div", { "class": "card" });
-      card.appendChild(el("div", { "class": "card-body" }, [renderObjectG(c)]));
-      detail.appendChild(card);
+    if (p.not_found) { detail.appendChild(el("div", { "class": "empty", text: "no such term: " + p.not_found.id })); return; }
+    var d = p.term;
+    if (!d) { detail.appendChild(el("div", { "class": "empty", text: "select a term from the index" })); return; }
+    var t = d.term;
+    var indexRow = (p.terms || []).find(function (x) { return x.term_id === t.term_id; });
+    var writable = writesEnabled();
+
+    var tagChips = (t.tags || []).map(function (tag) { return chip(tag, "neutral"); });
+    detail.appendChild(el("div", { "style": "display:flex; align-items:baseline; gap:10px; flex-wrap:wrap;" }, [
+      el("span", { "style": "font-size:22px; color:var(--ink-hi);", text: t.lemma }),
+      t.granularity ? chip(t.granularity.toUpperCase(), "neutral") : null,
+      lexiconStateBadge(indexRow ? indexRow.state : t.status)
+    ].concat(tagChips)));
+
+    var sourceCount = indexRow ? indexRow.source_count : (function () {
+      var keys = {};
+      (d.senses || []).forEach(function (s) { (s.source_keys || []).forEach(function (k) { keys[k] = true; }); });
+      return Object.keys(keys).length;
+    })();
+    detail.appendChild(el("div", { "class": "note-strip" }, [document.createTextNode(
+      t.term_id + " · " + (d.senses || []).length + " sense(s) · " + sourceCount + " source(s) · last revised " + fmtDate(t.updated_ts || t.created_at)
+    )]));
+
+    // SEE IT IN THE EXTENSION PANEL -- design §5 ("registered", C-0070):
+    // drawn only when at least one extension panel is registered on this
+    // program; no ext panel is assumed by name (min_schema is the panel's
+    // own declared readiness, not this dashboard's business to guess at).
+    var extPanels = (state.meta && state.meta.ext_panels) || [];
+    if (extPanels.length) {
+      var extLink = el("button", { type: "button", "class": "btn btn--secondary", "style": "margin:8px 0;" , text: "SEE IT IN THE EXTENSION PANEL" });
+      extLink.addEventListener("click", function () { location.hash = "ext-" + extPanels[0].name; });
+      detail.appendChild(extLink);
     }
+
+    var byLaunchInput = el("input", { type: "text", "class": "write-input", "data-role": "lexicon-by-launch", placeholder: "your launch_id", style: "width:230px;" });
+    detail.appendChild(el("div", { "class": "write-form-row", "style": "margin:10px 0;" }, [
+      el("span", { "style": "font-size:10px; color:var(--ink-3); letter-spacing:0.08em; align-self:center;", text: "DECIDE AS" }),
+      byLaunchInput
+    ]));
+
+    var sensesCard = el("div", { "class": "card" });
+    sensesCard.appendChild(el("div", { "class": "card-header" }, [el("span", { "class": "title", text: "SENSES" })]));
+    var sensesBody = el("div", { "class": "card-body", "style": "display:flex; flex-direction:column; gap:10px;" });
+    (d.senses || []).forEach(function (s) { sensesBody.appendChild(renderLexiconSense(s, byLaunchInput, writable)); });
+    if (!(d.senses || []).length) sensesBody.appendChild(el("div", { "class": "empty", text: "no senses recorded" }));
+    sensesCard.appendChild(sensesBody);
+    detail.appendChild(sensesCard);
+
+    var relationsCard = el("div", { "class": "card", "style": "margin-top:12px;" });
+    relationsCard.appendChild(el("div", { "class": "card-header" }, [el("span", { "class": "title", text: "RELATIONS" })]));
+    var relationsBody = el("div", { "class": "card-body", "style": "display:flex; flex-direction:column; gap:10px;" });
+    var relations = d.relations || [];
+    if (!relations.length) relationsBody.appendChild(el("div", { "class": "empty", text: "no relations recorded" }));
+    relations.forEach(function (rel) { relationsBody.appendChild(renderLexiconRelation(rel, d.conflict, byLaunchInput, writable)); });
+    relationsCard.appendChild(relationsBody);
+    detail.appendChild(relationsCard);
   }
 
   /* ==========================================================================

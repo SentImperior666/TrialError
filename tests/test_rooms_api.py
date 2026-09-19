@@ -296,7 +296,12 @@ def test_post_message_emits_companion_event(store):
     rows = store.ops.execute("SELECT payload FROM event WHERE type = 'room_turn'").fetchall()
     assert len(rows) == 1
     payload = json.loads(rows[0]["payload"])
-    assert payload == {"room_id": room["room_id"], "dp_id": "DP1", "dp_ref": f"{room['room_id']}::DP1", "seq": 1}
+    # `kind` joined the payload with stage C: room_turn has no kind column,
+    # so the companion event is where a turn's kind lives (api.py item 6).
+    assert payload == {
+        "room_id": room["room_id"], "dp_id": "DP1", "dp_ref": f"{room['room_id']}::DP1",
+        "seq": 1, "kind": "position",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +310,14 @@ def test_post_message_emits_companion_event(store):
 
 
 def test_build_participant_turn_envelope_shape_and_round_number(store):
+    """``round_number`` is the POINT's round, not its turn count.
+
+    It used to be ``len(prior_turns) + 1``, so the second turn of this
+    two-participant room reported "round 2 of 2" while round 1 was still
+    being written — and round 1 versus round 2 is what the closure rule, the
+    blind-first-turn rule and the O7 movement measure are all stated over
+    (stage C). The raw count is still reported, as ``turn_index``.
+    """
     launch_id = bootstrap_launch(store)
     room = _room(store)
     env0 = build_participant_turn_envelope(store, room_id=room["room_id"], dp_id="DP1")
@@ -313,12 +326,22 @@ def test_build_participant_turn_envelope_shape_and_round_number(store):
     assert env0["prompt"] == "does the mechanism generalize?"
     assert env0["prior_turns"] == []
     assert env0["round_number"] == 1
+    assert env0["turn_index"] == 1
     assert env0["rounds_per_dp"] == 2
 
     post_message(store, room_id=room["room_id"], launch_id=launch_id, dp_id="DP1", body="turn one")
     env1 = build_participant_turn_envelope(store, room_id=room["room_id"], dp_id="DP1")
-    assert env1["round_number"] == 2
-    assert env1["prior_turns"] == [{"seq": 1, "author_launch": launch_id, "body": "turn one"}]
+    # Two participants, one turn posted: round 1 is not finished.
+    assert env1["round_number"] == 1
+    assert env1["turn_index"] == 2
+    assert env1["prior_turns"] == [
+        {"seq": 1, "author_launch": launch_id, "body": "turn one", "turn_kind": "position"}
+    ]
+
+    post_message(store, room_id=room["room_id"], launch_id=bootstrap_launch(store), dp_id="DP1", body="turn two")
+    env2 = build_participant_turn_envelope(store, room_id=room["room_id"], dp_id="DP1")
+    assert env2["round_number"] == 2
+    assert env2["turn_index"] == 3
 
 
 def test_build_participant_turn_envelope_unknown_dp_refused(store):
@@ -328,13 +351,19 @@ def test_build_participant_turn_envelope_unknown_dp_refused(store):
 
 
 def test_build_moderator_scoring_envelope_shape(store):
+    """The moderator envelope no longer carries ``author_launch`` (stage C;
+    design §5.2 item 5 — "author_launch is dropped from moderator
+    envelopes"). Its only possible use at scoring time is to treat two
+    identical arguments differently."""
     launch_id = bootstrap_launch(store)
     room = _room(store)
     post_message(store, room_id=room["room_id"], launch_id=launch_id, dp_id="DP1", body="turn one")
     env = build_moderator_scoring_envelope(store, room_id=room["room_id"], dp_id="DP1")
     assert env["kind"] == "room_moderator_score"
     assert env["convergence_bar_pct"] == CONVERGENCE_BAR_PCT
-    assert env["turns"] == [{"seq": 1, "author_launch": launch_id, "body": "turn one"}]
+    assert env["turns"] == [{"seq": 1, "body": "turn one", "turn_kind": "position"}]
+    assert "author_launch" not in env["turns"][0]
+    assert env["extracts_recorded"] is False
 
 
 # ---------------------------------------------------------------------------

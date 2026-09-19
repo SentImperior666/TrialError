@@ -157,7 +157,16 @@ def test_corpus_panel_ok(seeded):
     rostore, ids = seeded
     panel = data.build_corpus_panel(rostore)
     assert panel["status"] == "ok"
-    assert panel["counts"] == {"sources": 1, "documents": 1, "chunks": 1, "quote_anchors": 1}
+    # ``retracted_documents`` is part of the panel now (trialerror.ingest.retract):
+    # "documents" counts the LIVE corpus, and the withdrawn ones are reported
+    # rather than silently vanishing from the totals.
+    assert panel["counts"] == {
+        "sources": 1,
+        "documents": 1,
+        "retracted_documents": 0,
+        "chunks": 1,
+        "quote_anchors": 1,
+    }
     assert panel["license_tier_counts"] == {"open": 1}
     assert panel["request_state_counts"] == {"indexed": 1}
     assert panel["document_status_counts"] == {"indexed": 1}

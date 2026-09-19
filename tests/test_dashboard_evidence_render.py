@@ -281,7 +281,8 @@ def test_an_empty_provenance_graph_reads_as_the_reading_not_a_blank(traced):  # 
     p = data.build_evidence_panel(rostore, claim_id=ids["claim_same_doc"])
     tree = run_harness("renderDetail", [p, {}])["tree"]
     assert "0 EDGES · THE GENERAL PROVENANCE GRAPH IS EMPTY" in texts(by_class(tree, "empty"))
-    assert any("prov_edge has zero writers" in t for t in texts(by_class(tree, "note-strip")))
+    assert any("prov_edge has zero writers outside lexicon lineage edges" in t
+               for t in texts(by_class(tree, "note-strip")))
 
 
 @requires_node
@@ -298,14 +299,83 @@ def test_the_two_unwired_verbs_are_drawn_disabled_with_their_reasons(panel):
 
 
 @requires_node
-def test_the_term_conflict_region_is_a_stated_omission_not_an_empty_box(panel):
-    """L-C5. Lane e adds the read; until then the page says which read is
-    missing rather than drawing a box that reads "no term conflicts"."""
+def test_a_program_that_cannot_answer_gets_a_stated_omission_not_an_empty_box(panel):
+    """L-C5's first arm. On a program with no lexicon module, or with one
+    whose knowledge-v5 tables are absent, the builder omits the region and
+    the page says which read is missing -- rather than drawing a box that
+    reads "no term conflicts" when nothing was asked.
+
+    This one payload IS hand-adjusted, against this file's own rule, because
+    the state it describes is one the real builder can no longer produce on a
+    migrated store. The omission shape is copied from the builder verbatim,
+    and ``tests/test_dashboard_evidence.py`` proves the builder still emits
+    it on both of the two absences."""
     p, _ids = panel
-    tree = run_harness("renderDetail", [p, {}])["tree"]
+    omitted = dict(p)
+    omitted.pop("term_conflicts", None)
+    omitted["term_conflicts_omitted"] = {
+        "reason": "awaiting_migration",
+        "message": (
+            "the per-claim term-sense conflict read (lexicon.api.conflicts_for_claim) is not in "
+            "this program yet -- this region is omitted rather than drawn empty"
+        ),
+    }
+    tree = run_harness("renderDetail", [omitted, {}])["tree"]
     notes = texts(by_class(tree, "note-strip"))
     assert any(t.startswith("TERM-SENSE CONFLICTS:") and "conflicts_for_claim" in t for t in notes)
     assert not by_class(tree, "ev-term-conflict")
+
+
+@requires_node
+def test_a_migrated_program_draws_neither_the_strip_nor_a_row_when_nothing_conflicts(panel):
+    """L-C5's second arm, as the REAL builder now produces it: lane e's read
+    landed, so the region carries ``{"status": "ok", "conflicts": []}`` and
+    the page draws neither the strip (nothing is missing) nor any rows
+    (nothing conflicts). "No term conflicts" is finally a true statement
+    about this claim rather than about the harness."""
+    p, _ids = panel
+    assert p["term_conflicts"] == {"status": "ok", "conflicts": []}
+    tree = run_harness("renderDetail", [p, {}])["tree"]
+    assert not [t for t in texts(by_class(tree, "note-strip")) if t.startswith("TERM-SENSE CONFLICTS:")]
+    assert not by_class(tree, "ev-term-conflict")
+
+
+@requires_node
+def test_one_row_is_drawn_per_conflict_the_read_reports(panel):
+    """One row per conflict, from the shape
+    ``lexicon.api.conflicts_for_claim`` actually returns, WITH its labels.
+
+    Lane c wrote this row against ``c.term``/``c.reason`` before the read
+    existed, and the payload has neither key -- so every row rendered as two
+    empty cells until the lane merge aligned them. The second column is the
+    disjointness, because that is the sentence that says why this is a
+    conflict rather than a nuance, and because there is no ``reason`` on the
+    row to print instead."""
+    p, _ids = panel
+    with_conflict = dict(p)
+    with_conflict["term_conflicts"] = {
+        "status": "ok",
+        "conflicts": [
+            {
+                "term_id": "TERM-1",
+                "lemma": "pressure",
+                "rel_id": "TREL-1",
+                "status": "pending",
+                "member_sense_ids": ["SENSE-1", "SENSE-2"],
+                "senses": [
+                    {"sense_id": "SENSE-1", "gloss": "a spendable resource", "source_keys": ["SRC-1"]},
+                    {"sense_id": "SENSE-2", "gloss": "a countdown", "source_keys": ["SRC-2"]},
+                ],
+            }
+        ],
+    }
+    tree = run_harness("renderDetail", [with_conflict, {}])["tree"]
+    rows = by_class(tree, "ev-term-conflict")
+    assert len(rows) == 1
+    labels = " ".join(texts(rows))
+    assert "pressure" in labels, "the lemma, not an empty cell"
+    assert "2 readings over 2 sources" in labels, "the disjointness, computed and not asserted"
+    assert not [t for t in texts(by_class(tree, "note-strip")) if t.startswith("TERM-SENSE CONFLICTS:")]
 
 
 # ---------------------------------------------------------------------------

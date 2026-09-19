@@ -6,7 +6,13 @@ attempt -- still fully offline, no network anywhere."""
 
 from __future__ import annotations
 
+import socket
+import urllib.error
+
+import pytest
+
 from trialerror.litapi.config import ProviderApiConfig
+from trialerror.litapi.errors import ProviderTransportError
 from trialerror.litapi.providers.base import RateLimiter, build_headers, get_with_retry
 from trialerror.litapi.transport import TransportResponse
 
@@ -109,6 +115,64 @@ def test_get_with_retry_returns_immediately_on_first_success():
         rate_limiter=_limiter(), retry_attempts=5, retry_on_status=(500,),
     )
     assert response.status_code == 200
+    assert transport.calls == 1
+
+
+# ---------------------------------------------------------------------------
+# transport-level failures (litapi-arxiv-https build, C-0093(a) incident):
+# get_with_retry wraps a raw urllib.error.URLError/socket timeout/
+# ConnectionError (all OSError subclasses) into ProviderTransportError
+# (host/scheme parsed from the URL, status_code left None) rather than
+# letting it propagate raw -- see that function's own docstring.
+# ---------------------------------------------------------------------------
+
+
+class _RaisingTransport:
+    def __init__(self, exc: Exception):
+        self._exc = exc
+        self.calls = 0
+
+    def get(self, url, *, headers=None, timeout_s=None):
+        self.calls += 1
+        raise self._exc
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        urllib.error.URLError("no route to host"),
+        socket.timeout("timed out"),
+        ConnectionRefusedError("connection refused"),
+        socket.gaierror("name resolution failed"),
+    ],
+)
+def test_get_with_retry_wraps_transport_level_failures_as_provider_transport_error(exc):
+    transport = _RaisingTransport(exc)
+
+    with pytest.raises(ProviderTransportError) as excinfo:
+        get_with_retry(
+            transport, "https://export.arxiv.org/api/query?id_list=1", provider="arxiv", headers={},
+            timeout_s=1.0, rate_limiter=_limiter(), retry_attempts=3, retry_on_status=(500, 503),
+        )
+
+    err = excinfo.value
+    assert err.provider == "arxiv"
+    assert err.status_code is None
+    assert err.host == "export.arxiv.org"
+    assert err.scheme == "https"
+
+
+def test_get_with_retry_does_not_retry_a_transport_level_failure():
+    transport = _RaisingTransport(urllib.error.URLError("no route to host"))
+
+    with pytest.raises(ProviderTransportError):
+        get_with_retry(
+            transport, "http://x/y", provider="test", headers={}, timeout_s=1.0,
+            rate_limiter=_limiter(), retry_attempts=5, retry_on_status=(500,),
+        )
+
+    # a transport-level failure is NOT a retryable status -- it must
+    # propagate on the very first attempt, never re-tried up to retry_attempts.
     assert transport.calls == 1
 
 

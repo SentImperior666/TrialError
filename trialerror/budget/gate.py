@@ -40,6 +40,7 @@ __all__ = [
     "GateResult",
     "extract_launch_id_token",
     "resolve_open_session",
+    "resolve_booking_identity",
     "evaluate_spawn",
     "evaluate_spawn_for_open_session",
 ]
@@ -116,6 +117,67 @@ def resolve_open_session(store: Store) -> dict | None:
     return dict(rows[0])
 
 
+def resolve_booking_identity(
+    store: Store, *, session_id: str | None = None, program_id: str | None = None
+) -> tuple[str, str, dict[str, str]]:
+    """``(session_id, program_id, resolved_from)`` for a booking. Lane FB-7
+    item 6.
+
+    ``budget status`` and ``budget reconcile`` resolve the open session on
+    their own (lane FB-1's F7 pattern); ``budget book`` refused without
+    ``--session-id`` and ``--program-id``, so the one verb an operator runs
+    most demanded back two values the harness already knows. The session id
+    is bound at ``session boot`` and the program id is
+    ``trialerror.toml``'s ``[program] id`` -- neither is a judgement call.
+
+    ``resolved_from`` names where each value came from (``"flag"``,
+    ``"open_session"``, ``"config"``), so an envelope can say what it
+    assumed rather than leaving an operator to infer it.
+
+    **Explicit always wins**, and nothing is guessed:
+
+    - ``session_id`` given -> used verbatim (the downstream precondition
+      check still refuses a closed one, which is the right place for that).
+    - no open session -> :class:`~trialerror.budget.errors.NoOpenSessionError`,
+      naming the flag AND ``session boot``.
+    - more than one open session -> :func:`resolve_open_session`'s own
+      ``RuntimeError``, surfaced rather than swallowed. Picking one would
+      book against a session nobody named, which is precisely the state
+      that produces bookings nothing can reconcile.
+    - ``program_id`` absent and no readable ``[program] id`` ->
+      :class:`ValueError` naming the flag and the config key.
+    """
+    from trialerror.budget.errors import NoOpenSessionError
+
+    resolved_from: dict[str, str] = {}
+    if session_id:
+        resolved_from["session_id"] = "flag"
+    else:
+        session = resolve_open_session(store)  # RuntimeError for >1, deliberately not caught
+        if session is None:
+            raise NoOpenSessionError(
+                "no --session-id given and no OPEN session in this program's ops.db to read one from: "
+                "pass --session-id, or run `trialerror session boot`"
+            )
+        session_id = str(session["session_id"])
+        resolved_from["session_id"] = "open_session"
+
+    if program_id:
+        resolved_from["program_id"] = "flag"
+    else:
+        from trialerror.util.config import CONFIG_FILENAME, ConfigError, load_config
+
+        try:
+            program_id = load_config(store.program_root / CONFIG_FILENAME).program_id
+        except ConfigError as exc:
+            raise ValueError(
+                f"no --program-id given and this program's {CONFIG_FILENAME} could not supply one "
+                f"([program] id): {exc}"
+            ) from exc
+        resolved_from["program_id"] = "config"
+    return str(session_id), str(program_id), resolved_from
+
+
 def _latest_law_digest_version(store: Store) -> str | None:
     row = store.ops.execute(
         "SELECT version FROM law_digest ORDER BY generated_ts DESC LIMIT 1"
@@ -135,6 +197,17 @@ def _check_law_pin_freshness(store: Store, session: Mapping[str, Any]) -> str | 
         return None
     latest = _latest_law_digest_version(store)
     if latest is None or latest == pin:
+        return None
+    # A session's pin is the law service's ``format_pin`` shape,
+    # ``<version>@<YYYY-MM-DD>``, while ``law_digest.version`` is the bare
+    # ``<version>``: compare the version part (2026-09-16: the dated pin the
+    # SessionStart hook records was refused as stale by this exact-string
+    # compare on every direct Agent spawn, while ``law verify`` called the
+    # same pin current -- the Workflow tool never fires this hook, which is
+    # how the mismatch stayed hidden). A dated pin whose version part is the
+    # latest digest version is fresh; anything else is stale.
+    pin_version = str(pin).split("@", 1)[0]
+    if pin_version == latest:
         return None
     return (
         f"session booted at law pin {pin!r} but the latest law_digest version is "
@@ -192,12 +265,64 @@ def _check_model_policy(
     )
 
 
+def _check_agent_model_matches_booking(
+    launch_row: Mapping[str, Any],
+    agent_model: str | None,
+    model_classes: Mapping[str, str] | None,
+) -> tuple[str, str] | None:
+    """``agent_model_matches_booking``: the model a subagent is actually
+    being SPAWNED with must be at least the class its booking claimed.
+
+    :func:`_check_model_policy` above checks one half -- "does this purpose
+    require a class the booking meets". It structurally cannot see the
+    other: book ``top``, spawn something cheaper, and every check upstream
+    still passes while the work is done on a model the round's own floors
+    ruled out. This is that other half.
+
+    ``agent_model=None`` (the Task call named no model, and no agent file
+    named one either) asserts nothing and cannot be a mismatch -- it passes.
+    A non-empty model that resolves to no class does NOT pass: a spawn whose
+    model cannot be placed is a spawn this gate cannot verify, and the
+    gate's posture for anything it cannot verify is to fail closed. The fix
+    is one line in ``trialerror.toml``'s ``[model_classes]``, which the refusal
+    names in full.
+
+    Returns ``(message, code)`` on refusal, ``None`` on pass."""
+    from trialerror.budget.policy import NO_CLAIM_MODEL_VALUES, classify_model, meets_minimum
+
+    if agent_model is None or str(agent_model).strip() == "":
+        return None
+    spawned_class = classify_model(agent_model, model_classes=dict(model_classes) if model_classes else None)
+    if spawned_class is None:
+        if str(agent_model).strip().lower() in NO_CLAIM_MODEL_VALUES:
+            return None
+        return (
+            f"the spawn names model {agent_model!r}, which resolves to no model class - this gate "
+            "cannot check it against the booking's class and will not guess. Declare it in "
+            "trialerror.toml's [model_classes] table (e.g. "
+            f'{str(agent_model).strip().lower()!r} = "top") and retry',
+            "agent_model_unclassified",
+        )
+    booked_class = launch_row["model_class"]
+    if meets_minimum(spawned_class, booked_class):
+        return None
+    return (
+        f"booking claims model_class {booked_class!r} for purpose {launch_row['purpose']!r}, but the "
+        f"spawn names model {agent_model!r} ({spawned_class!r} class) - booking one class and spawning "
+        f"a cheaper one is the exact failure this guard exists for; book at {spawned_class!r}, or "
+        f"spawn a {booked_class!r} model",
+        "agent_model_below_booking",
+    )
+
+
 def evaluate_spawn(
     store: Store,
     prompt_text: str | None,
     *,
     session_id: str,
     policy: Mapping[str, str] | None = None,
+    agent_model: str | None = None,
+    model_classes: Mapping[str, str] | None = None,
     now_ts: str | None = None,
 ) -> GateResult:
     """The spawn gate's core decision, given an explicit ``session_id``
@@ -273,6 +398,18 @@ def evaluate_spawn(
             next_command=_NO_TOKEN_NEXT_COMMAND,
         )
 
+    agent_model_result = _check_agent_model_matches_booking(row, agent_model, model_classes)
+    if agent_model_result:
+        agent_msg, agent_code = agent_model_result
+        return GateResult(
+            allowed=False,
+            code=agent_code,
+            message=agent_msg,
+            launch_id=token,
+            next_command=_NO_TOKEN_NEXT_COMMAND,
+            details={"agent_model": agent_model, "booked_model_class": row["model_class"]},
+        )
+
     # ---- the atomic claim (F2) ------------------------------------------
     # Single conditional UPDATE: only flips PROVISIONAL -> RUNNING if the
     # row STILL is PROVISIONAL, belongs to this session, and its TTL has
@@ -325,6 +462,8 @@ def evaluate_spawn_for_open_session(
     prompt_text: str | None,
     *,
     policy: Mapping[str, str] | None = None,
+    agent_model: str | None = None,
+    model_classes: Mapping[str, str] | None = None,
     now_ts: str | None = None,
 ) -> GateResult:
     """Convenience wrapper the hook script uses: resolves the program's
@@ -339,4 +478,12 @@ def evaluate_spawn_for_open_session(
             "(`trialerror session boot`)",
             next_command=["trialerror", "session", "boot"],
         )
-    return evaluate_spawn(store, prompt_text, session_id=session["session_id"], policy=policy, now_ts=now_ts)
+    return evaluate_spawn(
+        store,
+        prompt_text,
+        session_id=session["session_id"],
+        policy=policy,
+        agent_model=agent_model,
+        model_classes=model_classes,
+        now_ts=now_ts,
+    )

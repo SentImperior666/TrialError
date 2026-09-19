@@ -85,8 +85,8 @@ here rather than coded around.
 
 ### 3.1 The real workload [measured]
 
-Source: `univestal-tabletop-engine/research/tools/embeddings_local/embed_backend.py` and
-`results/qwen3-4b.json` (the WKP-061 bake-off on this laptop's GPU).
+Source: the operator's local `embeddings_local/embed_backend.py` and its
+`results/qwen3-4b.json` (a backend bake-off measured on that laptop's GPU).
 
 | quantity | value | label |
 |---|---|---|

@@ -153,6 +153,8 @@ def _paper_to_record(data: dict) -> WorkRecord:
 
 class SemanticScholarProvider:
     name = "semanticscholar"
+    #: FB-1 item F3: what this provider's `search` matches on.
+    search_scope = "relevance across the paper-search index"
 
     def __init__(self, transport: ProviderTransport, config: ProviderApiConfig, *, program_root=None):
         self.transport = transport

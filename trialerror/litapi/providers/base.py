@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import time
 from typing import Any, Mapping, Protocol, Sequence
+from urllib.parse import urlsplit
 
 from trialerror.litapi.config import ProviderApiConfig
 from trialerror.litapi.errors import ProviderTransportError
@@ -30,6 +31,15 @@ class Provider(Protocol):
     -- currently ``"openalex"`` or ``"semanticscholar"``."""
 
     name: str
+
+    #: What THIS provider's ``search`` actually matches on, in one phrase
+    #: (lane FB-1 item F3). The three search-capable providers query three
+    #: different things -- a title-only filter, an all-fields query, a
+    #: relevance endpoint -- and a caller comparing their hit counts
+    #: without knowing that is comparing three different questions. Stated
+    #: on the class because the provider is the only place that knows it;
+    #: surfaced beside ``providers_succeeded`` so a result carries it.
+    search_scope: str = "unspecified"
 
     def get_by_doi(self, doi: str) -> WorkRecord | None: ...
 
@@ -96,14 +106,41 @@ def get_with_retry(
     A transport-level exception (network failure, not a non-2xx status --
     :class:`FakeTransport`/:class:`UrllibTransport` both return
     non-2xx as a normal response rather than raising) is NOT retried here
-    and propagates as-is; it is wrapped into
-    :class:`~trialerror.litapi.errors.ProviderTransportError` by the caller.
+    -- it is wrapped into :class:`~trialerror.litapi.errors.ProviderTransportError`
+    right here (``status_code=None``, ``host``/``scheme`` parsed from
+    ``url``) and re-raised immediately, on the FIRST occurrence, rather
+    than propagating the raw ``urllib.error.URLError``/socket
+    timeout/``ConnectionError`` (all ``OSError`` subclasses -- catching
+    the base class here covers all three, plus DNS failures
+    (``socket.gaierror``), with one clause) all the way up as an uncaught
+    exception (litapi-arxiv-https build, C-0093(a) egress-hardening
+    incident: a raw ``URLError`` from one provider used to abort
+    :class:`~trialerror.litapi.client.LitApiClient`'s entire per-provider
+    tolerance loop, discarding already-succeeded records from OTHER
+    providers, and reached the CLI as a bare Python traceback instead of a
+    structured error envelope). Wrapping it into the SAME exception class
+    every other transport failure already uses means every existing
+    ``except LitApiError``/``except ProviderTransportError`` catch site
+    (the per-provider tolerance loops in ``trialerror.litapi.client``, the
+    "a transport hiccup is tolerated silently here" catches in
+    ``trialerror.ingest.acquire._resolve_oa``) now actually catches it, as
+    those call sites' own docstrings already assumed.
     """
     attempts = max(1, retry_attempts)
     last_response: TransportResponse | None = None
     for attempt in range(attempts):
         rate_limiter.wait()
-        response = transport.get(url, headers=headers, timeout_s=timeout_s)
+        try:
+            response = transport.get(url, headers=headers, timeout_s=timeout_s)
+        except OSError as exc:
+            parsed = urlsplit(url)
+            raise ProviderTransportError(
+                f"{provider}: transport unreachable ({parsed.scheme}://{parsed.netloc}): {exc}",
+                provider=provider,
+                status_code=None,
+                host=parsed.hostname,
+                scheme=parsed.scheme,
+            ) from exc
         last_response = response
         if response.ok or response.status_code not in retry_on_status:
             return response

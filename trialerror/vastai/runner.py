@@ -57,7 +57,13 @@ class VastRunRefused(RuntimeError):
 
 
 class _VastBackends:
-    """The ``DevBackends`` shape ``_process_one`` expects; embed only."""
+    """The ``DevBackends`` shape ``_process_one`` expects; embed only.
+
+    ``for_stage``/``resident_kinds`` are how the worker loop resolves a
+    job's backend since the resident-backend work (``ResidentBackends``,
+    C-0097 D9); the per-stage getters stay for anything still calling them.
+    There is nothing to unload on a kind switch here -- this executor
+    serves one stage and holds one remote backend for the whole lease."""
 
     def __init__(self, embed_backend: RemoteEmbedBackend):
         self._embed = embed_backend
@@ -70,6 +76,14 @@ class _VastBackends:
 
     def embed(self) -> Any:
         return self._embed
+
+    def for_stage(self, stage: str) -> Any:
+        if stage != "embed":
+            raise RuntimeError("the vast.ai executor serves embed markers only")
+        return self._embed
+
+    def resident_kinds(self) -> list[str]:
+        return ["embed"]
 
 
 def _job_text_bytes(root: Path, job_id: str) -> int:

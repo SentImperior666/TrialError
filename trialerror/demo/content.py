@@ -197,6 +197,15 @@ FEED_POSTS: list[tuple[str, str]] = [
 #: serve as a real grounding anchor. ``definition`` is deliberately over-
 #: represented: the lexicon's definitions section inner-joins claims to
 #: anchors, so only definition claims with anchors light it up.
+#:
+#: The first column does double duty since lane e: on a ``definition`` row it
+#: is also the ``term`` key the judge puts on the claim (the extraction
+#: envelope's optional lemma, design §4 / ruling L-E7), which is what makes
+#: the accepted claim land as a ``current`` term sense instead of the
+#: accept-time heuristic's ``proposed`` guess. So these strings are lemmas --
+#: names of things, not sentences -- and "Blocked practice" keeps its corpus
+#: capitalization on purpose: ``lemma_norm`` casefolds, so the demo also
+#: shows two spellings keying to one term.
 EXTRACTION_TERMS: list[tuple[str, str, str]] = [
     ("desirable difficulty", "concept", "definition"),
     ("interleaved practice", "concept", "definition"),

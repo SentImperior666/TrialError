@@ -34,6 +34,27 @@ a gated template.
    structural failure here should be fixed and RE-submitted, not carried
    into tier 2 for the critic to also flag.
 
+   **For an ideation round's own artifacts (a synthesis or a probe report),
+   Tier 1 also runs the `aiif_round` suite:**
+
+   ```
+   trialerror eval gate --gate-id <CR-id> --suite aiif_round \
+     --subject-file <round-subject.json> --by-launch <your launch_id>
+   ```
+
+   Assemble the subject file from the round's own artifacts and stores — its
+   prereg row, the program's `[models]` table, its consolidated records with
+   their dossiers, the reference snapshot, the judge envelopes, the plant
+   scores, the distribution card, the roster, the assignment, the admission
+   order **and the `admission_escrow` that order was committed under**, the
+   lens log, the outcome cells and the report text. Every check in
+   that suite **fails closed on a missing section**: a round artifact with no
+   prereg section has not met that bar rather than being exempt from it, so
+   an incomplete subject file reads as a failing round. A FAIL writes
+   `reproduction_status = mismatch` onto the gate row, which blocks
+   `apply-union` until it is fixed and re-run. Fix the round, not the subject
+   file.
+
 4. **Tier 2 — critic, spawned as a genuinely separate, tool-locked
    subagent.** Book and spawn it with a prompt that carries this
    restriction VERBATIM (design's own binding language — do not paraphrase
@@ -48,6 +69,14 @@ a gated template.
    `Edit`/`Write`/`Bash`. If your environment can't enforce that
    structurally, the prompt restriction above is load-bearing; do not spawn
    a critic with broader tools and just "ask nicely."
+
+   **The critic's brief carries this gate's own pre-mortem** — the three
+   letter-vs-spirit answers from the section below, verbatim, with their
+   named mitigations. A critic that has not been told which proxy is
+   gameable, where the harness leaks and how the judge could be steered is a
+   critic reading for polish. For a round's artifacts, that means the round's
+   own `round_premortem` answers travel into the brief too, beside this
+   gate's.
 
 5. **Record the verdict** (this single call both writes the verdict fields
    AND advances the gate — `submitted -> gated` on PASS/PASS_WITH_EDITS, or
@@ -196,7 +225,8 @@ Standing mitigations this skill already carries: the critic is Read-only and
 never sees the generator prompt; the applier applies the edit union and
 nothing else; the candidate is frozen by digest; the verdict is a discrete
 label, not a score anything can climb; this pre-mortem sits in the critic
-brief. The three questions are the same ones AIIF v2 §5.1 asks of every judged
+brief (step 4), which is where it does its work rather than in a file nobody
+hands the critic. The three questions are the same ones AIIF v2 §5.1 asks of every judged
 step (that document's table carries the worked answers for AIIF's own
 instruments). Paper: "AI Finds A Way" (arXiv:2608.23875) §4.1/§4.2 and §7 —
 the exploited proxy, the exploited environment, and the judge that becomes a

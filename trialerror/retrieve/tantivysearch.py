@@ -121,6 +121,7 @@ __all__ = [
     "FulltextIndex",
     "create_fulltext_index",
     "add_chunks",
+    "remove_chunks",
     "chunk_fingerprint",
     "corpus_fingerprint",
     "index_status",
@@ -507,6 +508,52 @@ class FulltextIndex:
         _recache(self.index_dir, self._index)
         return {"added": len(pending), "skipped": len(offered) - len(pending), "chunk_count": total}
 
+    def remove_chunks(self, chunk_ids: Iterable[str]) -> dict[str, Any]:
+        """Delete ``chunk_id``\\ s from the index, commit, and fold them
+        back OUT of the sidecar fingerprint. Returns
+        ``{"removed": n, "absent": m, "chunk_count": total}``.
+
+        The counterpart to :meth:`add_chunks` that nothing needed until
+        documents became retractable (``trialerror ingest retract``). Two
+        properties of the existing design make it a targeted delete rather
+        than the whole-corpus rebuild :func:`reindex` would be:
+
+        - ``chunk_id`` is indexed as a ``raw``/``basic`` term, so tantivy's
+          own ``delete_documents(field, value)`` addresses exactly one
+          document per call, and
+        - the sidecar fingerprint is an XOR fold, and XOR is its own
+          inverse -- ``chunk_fingerprint(removed, base=current)`` is
+          precisely the fingerprint of the remaining set, with no rescan.
+          (The fold's duplicate-cancellation hazard cannot arise: ids are
+          unique, and this only folds out ids the index actually held.)
+
+        Idempotent, like the add side: ids the index does not hold are
+        counted as ``absent`` and change neither the fingerprint nor the
+        commit, so a re-run of a half-finished retraction cannot corrupt
+        the sidecar."""
+        wanted = list(dict.fromkeys(chunk_ids))
+        if not wanted:
+            return {"removed": 0, "absent": 0, "chunk_count": self.num_docs()}
+        present = self.existing_chunk_ids(wanted)
+        doomed = [cid for cid in wanted if cid in present]
+        if not doomed:
+            return {"removed": 0, "absent": len(wanted), "chunk_count": self.num_docs()}
+
+        writer = self._index.writer(heap_size=_WRITER_HEAP_BYTES, num_threads=_WRITER_THREADS)
+        for chunk_id in doomed:
+            writer.delete_documents("chunk_id", chunk_id)
+        writer.commit()
+        writer.wait_merging_threads()
+        self._index.reload()
+
+        meta = read_meta(self.index_dir) or {}
+        base = meta.get("chunk_fingerprint") if isinstance(meta.get("chunk_fingerprint"), str) else None
+        fingerprint = chunk_fingerprint(doomed, base=base)
+        total = self.num_docs()
+        _write_meta(self.index_dir, chunk_count=total, fingerprint=fingerprint)
+        _recache(self.index_dir, self._index)
+        return {"removed": len(doomed), "absent": len(wanted) - len(doomed), "chunk_count": total}
+
 
 def _cache_key(index_dir: Path) -> str:
     return str(Path(index_dir).resolve())
@@ -602,6 +649,18 @@ def add_chunks(index_dir: Path | str, rows: Iterable[tuple[str, str]]) -> dict[s
     """Incremental maintenance -- what ``trialerror.ingest.handlers.run_index``
     calls in the same code path that maintains ``chunk_fts`` today."""
     return create_fulltext_index(index_dir).add_chunks(rows)
+
+
+def remove_chunks(index_dir: Path | str, chunk_ids: Iterable[str]) -> dict[str, Any]:
+    """The removal half of incremental maintenance -- what
+    ``trialerror.ingest.retract`` calls once a retracted document's ``chunk``
+    rows are gone from ``knowledge.db``. A no-op (and no index creation)
+    when the directory holds no usable index: the index is derived state,
+    and there is nothing to remove from one that does not exist."""
+    index = open_fulltext_index(index_dir)
+    if index is None:
+        return {"removed": 0, "absent": 0, "chunk_count": 0, "index": "absent"}
+    return index.remove_chunks(chunk_ids)
 
 
 def _rmtree_released(index_dir: Path) -> None:

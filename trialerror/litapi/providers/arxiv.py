@@ -145,6 +145,8 @@ def _entry_to_record(entry: ET.Element) -> WorkRecord:
 
 class ArxivProvider:
     name = "arxiv"
+    #: FB-1 item F3: what this provider's `search` matches on.
+    search_scope = "all fields (search_query=all:)"
 
     def __init__(self, transport: ProviderTransport, config: ProviderApiConfig, *, program_root=None):
         # program_root accepted (unused) only to keep this provider's

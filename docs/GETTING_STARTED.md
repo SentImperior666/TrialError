@@ -324,6 +324,26 @@ launches, an unread inbox, or a stale law-digest pin. Reconcile your booking fir
 trialerror budget reconcile --launch-id <launch_id> --actual-tokens 4200
 ```
 
+**What `--actual-tokens` counts.** A visible token is the total the HOST reports for the launch —
+the workflow counter, or a single Agent's completion total. Its composition is the host's and is
+unverified here. `billed_multiplier` maps visible tokens onto the plan meter and is learned by
+`trialerror budget calibrate` from screenshot snapshots; `--reconcile-source` is a caller-asserted
+label, not verified provenance. Reconcile from the counter, never from a cache-write proxy — cache
+writes are not the launch's visible total and do not scale to it.
+
+**Or let the host say it.** If the launch was a subagent spawn and the PostToolUse hook was armed,
+the host's own usage object was recorded when the agent returned, and
+
+```console
+trialerror budget reconcile --launch-id <launch_id> --from-event
+```
+
+settles the launch from that number instead — recording `reconcile_source = event`, which no
+caller can type by hand, plus the input / cache-creation / cache-read / output split. It refuses,
+naming this command as the way out, when there is no event on file or the host sent no usage.
+`trialerror doctor --only reconcile_provenance` tells you later how much of a program's spend was
+measured and how much was asserted.
+
 **One more refusal to expect, working from a bare terminal like this walkthrough**: close
 also checks that at least one `hook_alive` event was recorded for the session — proof the
 `SessionStart`/`Stop` hooks were actually armed. Since this walkthrough booted via the

@@ -32,6 +32,15 @@ supplies the value when the group/verb-level one wasn't given. All three
 placements (before the group, between the group and verb, after the verb)
 now resolve to the same ``args.program_root``/``args.platform_root``.
 
+TRIALERROR-DEV-NOTE (lane FB-1, item F12): this file also gained
+:func:`_force_utf8_stdio`, called once at the top of :func:`main` — the
+second deliberate, reviewed exception to "never edited again", on the same
+grounds as FX-12 above: ``main`` is the single choke point every group's
+envelope reaches ``emit()`` through, so a process-wide stdio decision has
+exactly one place it can live without nineteen groups each keeping a copy.
+It is NOT a new group and NOT per-group business logic, and the "no lane
+edits this file to register a group" invariant is unchanged.
+
 Group module contract::
 
     GROUP_NAME = "widget"          # the subcommand name: `trialerror widget ...`
@@ -55,7 +64,7 @@ from types import ModuleType
 from trialerror import __version__
 from trialerror.util.envelope import PROTOCOL_VERSION, emit, error_envelope, next_action, ok_envelope
 
-__all__ = ["discover_groups", "build_parser", "main"]
+__all__ = ["discover_groups", "build_parser", "main", "_force_utf8_stdio"]
 
 
 def discover_groups() -> list[ModuleType]:
@@ -126,7 +135,39 @@ def _version_envelope() -> dict:
     )
 
 
+def _force_utf8_stdio() -> None:
+    """Re-encode this process's stdout/stderr as UTF-8 before anything is
+    written to them (lane FB-1 item F12).
+
+    Every envelope this CLI emits is JSON with ``ensure_ascii=False``
+    (:func:`trialerror.util.envelope.to_json_line`), so a title, an author
+    name or a refusal message can carry any character the corpus does. The
+    host console's encoding is not the harness's choice: a Windows console
+    (or any process whose ``PYTHONIOENCODING`` names a legacy codepage)
+    gives Python a cp1252/cp437 stdout, and ``print`` of a line that
+    codepage cannot represent raises ``UnicodeEncodeError`` from inside
+    ``print`` itself. The write is then discarded WHOLE -- a text stream
+    encodes the string it was handed before touching the buffer, so the
+    caller sees NO line at all, not a truncated one -- and the CLI exits 1
+    with a traceback for a command that had in fact already succeeded.
+
+    ``errors="replace"`` rather than ``"strict"``: a console that genuinely
+    cannot render a glyph should show ``?`` and still hand the agent a
+    parseable line. The guard is the shape
+    ``trialerror/obs/statusline_capture.py`` already uses -- not every host
+    stream is a ``TextIOWrapper`` (a captured ``StringIO`` under pytest has
+    no ``.reconfigure``), and a stream that cannot be reconfigured must
+    leave the CLI working exactly as before.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001 - a stream without .reconfigure is not an error
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _force_utf8_stdio()
     args_list = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(args_list)
