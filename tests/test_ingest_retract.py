@@ -25,6 +25,7 @@ from trialerror.ingest.retract import (
     RETRACTED_DOCUMENT_STATUS,
     RETRACTION_REGISTER_KEY,
     RetractBlockedError,
+    _CHUNK_ID_BATCH,
     _delete_by_chunk_ids,
     is_retracted,
     retract_document,
@@ -614,18 +615,35 @@ def test_retract_handles_nested_elements_whose_parent_is_in_the_same_document(st
 
 
 def test_delete_by_chunk_ids_batches_past_the_sql_variable_ceiling():
-    """One placeholder per chunk_id walks into SQLITE_LIMIT_VARIABLE_NUMBER
-    (32,766 on a current build, 999 on an old one). The resulting
-    ``sqlite3.OperationalError`` is not an ``IngestError`` or a
+    """One placeholder per chunk_id walks into SQLITE_LIMIT_VARIABLE_NUMBER.
+    The resulting ``sqlite3.OperationalError`` is not an ``IngestError`` or a
     ``StoreError``, so it escaped ``_cmd_retract``'s handlers and the CLI
     answered a TRACEBACK instead of an error envelope -- on the one verb
     that exists to clean up an ingest which went wrong at scale.
 
+    The ceiling itself is build-dependent (999 on an old SQLite, 32,766 on a
+    current one, and a distribution is free to compile it higher still), so
+    a fixed id count either out-runs it on one build and not on another, or
+    costs hundreds of thousands of rows to be safe everywhere. This LOWERS
+    the ceiling on the test's own connection instead -- ``setlimit`` only
+    ever lowers, and 999 is the historical default ``_CHUNK_ID_BATCH`` is
+    already chosen to fit under -- so the same two facts are measured on
+    every build, in a fraction of the rows.
+
     The single-statement probe first, so this test cannot pass vacuously:
     it has to be measuring a ceiling that is really there."""
     conn = sqlite3.connect(":memory:")
+    ceiling = 999
+    conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, ceiling)
+    assert conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) == ceiling
+    assert _CHUNK_ID_BATCH <= ceiling, (
+        "the batch size must stay under the oldest SQLite ceiling, or the batched form below "
+        "is not the thing that makes this work"
+    )
+
     conn.execute("CREATE TABLE chunk_fts (chunk_id TEXT)")
-    ids = [f"CHK-{i:06d}" for i in range(40_000)]
+    n_ids = ceiling * 3  # several batches, and comfortably past the ceiling
+    ids = [f"CHK-{i:06d}" for i in range(n_ids)]
     conn.executemany("INSERT INTO chunk_fts (chunk_id) VALUES (?)", [(c,) for c in ids])
 
     one_shot = "SELECT COUNT(*) FROM chunk_fts WHERE chunk_id IN (%s)" % ",".join("?" for _ in ids)
@@ -633,13 +651,14 @@ def test_delete_by_chunk_ids_batches_past_the_sql_variable_ceiling():
         conn.execute(one_shot, ids)
     except sqlite3.OperationalError as exc:
         assert "too many SQL variables" in str(exc)
-    else:  # pragma: no cover - only on a build with a raised limit
+    else:  # pragma: no cover - unreachable while the limit above is honoured
         pytest.fail(
-            "this SQLite build bound 40,000 variables in one statement; raise the count in this "
-            "test so it keeps measuring the ceiling _delete_by_chunk_ids exists for"
+            f"this connection bound {n_ids} variables in one statement despite a "
+            f"SQLITE_LIMIT_VARIABLE_NUMBER of {ceiling}; the ceiling "
+            "_delete_by_chunk_ids exists for is no longer being measured"
         )
 
-    assert _delete_by_chunk_ids(conn, "chunk_fts", ids) == 40_000
+    assert _delete_by_chunk_ids(conn, "chunk_fts", ids) == n_ids
     assert conn.execute("SELECT COUNT(*) FROM chunk_fts").fetchone()[0] == 0
 
 
