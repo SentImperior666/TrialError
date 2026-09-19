@@ -33,6 +33,23 @@ from trialerror.sidecar.supervisor import (
     stop_sidecar,
 )
 
+#: Every test here counts live copies of a tagged process with ``pgrep`` and
+#: the autouse reaper clears them with ``pkill``; neither exists on Windows,
+#: where the count raises FileNotFoundError and the reaper's failure leaves
+#: the spawned sleepers running (holding the temp tree open for the rest of
+#: the run). One test also takes the lock from outside with ``fcntl``.
+#:
+#: The lock ITSELF is not POSIX-only -- ``supervisor._lock_exclusive_
+#: nonblocking`` has an ``msvcrt.locking`` arm for Windows -- so this skip is
+#: about the harness, not the feature: exercising it on Windows needs a
+#: process counter and an out-of-process lock holder that do not use these
+#: tools.
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="the harness needs pgrep/pkill to count and reap the tagged sleepers, and fcntl "
+    "to hold the lock from outside",
+)
+
 #: A sleeper whose argv carries a per-test tag, so the number of live copies
 #: is countable without touching anything else on the machine.
 SLEEPER = "import time\nwhile True:\n    time.sleep(0.05)  # {tag}\n"
