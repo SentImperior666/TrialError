@@ -216,11 +216,22 @@ def test_a_truncated_sidecar_is_a_cache_miss_not_an_error(store, bulk):
 
 @pytest.fixture()
 def unwritable_index_dir(store):
-    """The program's index dir, made read-only for the duration of one test
+    """The program's index dir, made unwritable for the duration of one test
     and restored afterwards (an unwritable dir pytest could not clean up
-    would fail the session, not the test)."""
+    would fail the session, not the test).
+
+    Two blockers, because neither is portable on its own. ``chmod(0o555)``
+    is the real thing on POSIX; on Windows a directory's read-only attribute
+    does not stop its OWNER creating children, so the cache write simply
+    succeeded there and the test measured nothing. A plain FILE standing
+    where the matrix cache directory belongs stops the write's first
+    statement -- ``mkdir(parents=True, exist_ok=True)`` -- with an
+    ``OSError`` on both platforms, which is the same exception from the same
+    line as a read-only volume or a full one. It blocks the matrix cache
+    only; the lexical index lives elsewhere under this directory."""
     index_dir = store.program_root / "index"
     index_dir.mkdir(parents=True, exist_ok=True)
+    (index_dir / vecmatrix.MATRIX_DIRNAME).write_bytes(b"")
     index_dir.chmod(0o555)
     try:
         yield index_dir
