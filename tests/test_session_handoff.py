@@ -145,7 +145,12 @@ def test_an_absolute_handoffs_dir_outside_the_root_is_refused_without_the_flag(t
     with pytest.raises(HandoffsDirOutsideRootError) as excinfo:
         resolve_handoffs_dir(tmp_path / "program", {"paths": {"handoffs_dir": str(external)}})
     assert "handoffs_dir_outside_root = true" in str(excinfo.value)
-    assert str(external) in str(excinfo.value)
+    # The refusal renders the offending directory with ``!r``, so on Windows
+    # the message carries a doubled-backslash repr and the native path string
+    # is not a substring of it. Compare against the same rendering the
+    # product uses -- the claim, that the refusal names the directory, is
+    # unchanged and is now made on both platforms.
+    assert repr(str(external)) in str(excinfo.value)
 
 
 def test_an_absolute_handoffs_dir_INSIDE_the_root_needs_no_flag(tmp_path):
