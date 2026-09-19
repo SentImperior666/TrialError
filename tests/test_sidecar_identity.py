@@ -127,6 +127,7 @@ def _foreign_process(reaper: list) -> subprocess.Popen:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="/proc is the identity source")
 def test_start_records_the_kernels_own_facts_about_the_pid(program_root):
     result = start_sidecar(program_root, "embed", config=_config(), _http=FakeHealth())
     state = read_state(program_root, "embed", _config())
