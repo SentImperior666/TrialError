@@ -51,8 +51,7 @@ per the same bake-off), never plain row fetches against a vec0 table.
 
 from __future__ import annotations
 
-import math
-from typing import Sequence
+from typing import Any, Sequence
 
 from trialerror.stores.store import Store
 from trialerror.stores.vecindex import (
@@ -62,15 +61,27 @@ from trialerror.stores.vecindex import (
     try_load_sqlite_vec,
     vec_table_name,
 )
+from trialerror.util import vecmath
 
 __all__ = [
     "vec_table_exists",
     "fetch_vectors",
+    "fetch_vector_matrix",
     "cosine_similarity",
     "rank_by_query_vector",
     "vec_backend_for",
     "fetch_native_knn",
 ]
+
+#: How many chunk ids ride in one ``IN (...)``. SQLite's compiled-in
+#: parameter ceiling is 32,766 on a current build and 999 on older ones, and
+#: an unbounded caller (``search(mode="vector")`` over a whole corpus,
+#: ``similar()`` with no filters) hands this module every chunk id there is --
+#: which on a 108k-chunk corpus is an ``OperationalError`` from SQLite, not a
+#: slow query. 500 clears both ceilings; the lookup is one indexed probe per
+#: id either way, so the batching costs nothing measurable. Same number
+#: :data:`trialerror.lens.novelty._ID_BIND_CHUNK` uses for the same reason.
+_ID_BIND_CHUNK = 500
 
 
 def _table_exists(store: Store, table: str) -> bool:
@@ -96,35 +107,111 @@ def fetch_vectors(store: Store, model_key: str, chunk_ids: Sequence[str]) -> dic
     under a different model_key) are simply absent from the returned dict
     -- never an error; ``trialerror.retrieve.engine`` treats "no vector" as "this
     candidate doesn't participate in the vector tier", not a failure."""
+    return {
+        chunk_id: deserialize_vector_fallback(blob)
+        for chunk_id, blob in _iter_vector_blobs(store, model_key, chunk_ids)
+    }
+
+
+def _iter_vector_blobs(store: Store, model_key: str, chunk_ids: Sequence[str]):
+    """``(chunk_id, blob)`` for each of ``chunk_ids`` that has a row, in
+    batches of :data:`_ID_BIND_CHUNK` binds. Nothing is decoded here -- the
+    two callers want different shapes out of the same scan."""
     ids = list(dict.fromkeys(chunk_ids))  # dedupe, stable order
     if not ids:
-        return {}
+        return
     try_load_sqlite_vec(store.knowledge)  # per-connection; see module docstring
     table = vec_table_name(model_key)
     if not _table_exists(store, table):
-        return {}
-    placeholders = ",".join("?" for _ in ids)
-    rows = store.knowledge.execute(
-        f"SELECT chunk_id, vector FROM {table} WHERE chunk_id IN ({placeholders})", ids
-    ).fetchall()
-    return {r["chunk_id"]: deserialize_vector_fallback(r["vector"]) for r in rows}
+        return
+    for start in range(0, len(ids), _ID_BIND_CHUNK):
+        window = ids[start : start + _ID_BIND_CHUNK]
+        placeholders = ",".join("?" for _ in window)
+        for row in store.knowledge.execute(
+            f"SELECT chunk_id, vector FROM {table} WHERE chunk_id IN ({placeholders})", window
+        ).fetchall():
+            yield row["chunk_id"], row["vector"]
+
+
+def fetch_vector_matrix(
+    store: Store, model_key: str, chunk_ids: Sequence[str], *, config: Any = None
+) -> tuple[list[str], Any] | None:
+    """``(ids, matrix)`` -- the same rows :func:`fetch_vectors` returns, as a
+    2-D numpy float32 array decoded straight out of the BLOBs with
+    ``numpy.frombuffer``, or ``None`` when that is not available here.
+
+    This is the shape that actually makes an unbounded scan cheap. The cost
+    of ranking a hundred thousand 2048-dimension rows is not the arithmetic,
+    it is building two hundred million Python floats to do it with;
+    :func:`fetch_vectors`'s ``dict[str, list[float]]`` contract cannot avoid
+    them and is left exactly as it was for the callers that want it.
+    A caller that goes straight on to :func:`trialerror.util.vecmath.cosine_many`
+    or ``top_k`` takes this one instead and never leaves the buffer.
+
+    ``None`` -- take the ``fetch_vectors`` path -- when numpy is absent or
+    the knob is ``off``, when no row was found, or when the rows disagree
+    about width (a table with two model keys' widths in it cannot become a
+    matrix, and padding it would be a different corpus).
+
+    The table scan is batched twice over: ``_ID_BIND_CHUNK`` ids per
+    statement, and :func:`~trialerror.util.vecmath.decode_float32_blobs`'s own
+    row block on the decode, so neither the id list nor the BLOBs are ever
+    all resident at once."""
+    np = vecmath.numpy_module(config)
+    if np is None:
+        return None
+    ids: list[str] = []
+    blocks: list[Any] = []
+    pending_ids: list[str] = []
+    pending_blobs: list[bytes] = []
+    width: int | None = None
+
+    def _flush() -> bool:
+        nonlocal pending_ids, pending_blobs
+        if not pending_blobs:
+            return True
+        decoded = vecmath.decode_float32_blobs(pending_blobs, config=config)
+        if decoded is None:
+            return False
+        ids.extend(pending_ids)
+        blocks.append(decoded)
+        pending_ids, pending_blobs = [], []
+        return True
+
+    for chunk_id, blob in _iter_vector_blobs(store, model_key, chunk_ids):
+        if width is None:
+            width = len(blob)
+        elif len(blob) != width:
+            return None
+        pending_ids.append(str(chunk_id))
+        pending_blobs.append(bytes(blob))
+        if len(pending_blobs) >= vecmath.MAX_BLOCK_ROWS:
+            if not _flush():
+                return None
+    if not _flush():
+        return None
+    if not ids:
+        return None
+    matrix = blocks[0] if len(blocks) == 1 else np.concatenate(blocks, axis=0)
+    return ids, matrix
 
 
 def cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
-    """Plain-Python cosine similarity -- no numpy dependency (this build's
-    lane may only touch ``pyproject.toml``'s ``mcp`` dependency line, so no
-    new numerical dependency is available to reach for here even if it
-    were otherwise desirable). Returns ``0.0`` for a zero-length or
-    zero-norm vector pair rather than raising a ``ZeroDivisionError`` --
-    a synthetic/degenerate test vector must never crash a ranking pass."""
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(y * y for y in b))
-    if norm_a == 0.0 or norm_b == 0.0:
-        return 0.0
-    return dot / (norm_a * norm_b)
+    """Plain-Python cosine similarity of ONE pair --
+    :func:`trialerror.util.vecmath.cosine_one` under this module's historical
+    name, kept as the name every caller in the tree already imports.
+
+    Still plain Python, and deliberately so now that a numpy fast path
+    exists: a single pair is far below the row count where numpy pays for
+    itself, and this function is the DEFINITION the fast path's agreement
+    tests check against and the one ``vecmath.top_k`` computes its returned
+    scores with. A "fast" variant of the reference answer would have
+    nothing left to be the reference for.
+
+    Returns ``0.0`` for a zero-length or zero-norm vector pair rather than
+    raising a ``ZeroDivisionError`` -- a synthetic/degenerate test vector
+    must never crash a ranking pass."""
+    return vecmath.cosine_one(a, b)
 
 
 def vec_backend_for(store: Store, model_key: str) -> VecBackend | None:
@@ -192,13 +279,23 @@ def fetch_native_knn(
 
 
 def rank_by_query_vector(
-    query_vector: Sequence[float], vectors: dict[str, list[float]]
+    query_vector: Sequence[float],
+    vectors: dict[str, list[float]] | Any,
+    *,
+    k: int | None = None,
+    config: Any = None,
 ) -> list[tuple[str, float]]:
     """Rank ``vectors`` (``chunk_id -> vector``) by cosine similarity to
     ``query_vector``, best (highest similarity) first. Ties break on
     ``chunk_id`` for deterministic ordering (test reproducibility -- design
     Section 12's own "stratify on fixture corpus reproduces byte-identical
-    arms from same seed" bar, applied here to search ranking)."""
-    scored = [(cid, cosine_similarity(query_vector, vec)) for cid, vec in vectors.items()]
-    scored.sort(key=lambda pair: (-pair[1], pair[0]))
-    return scored
+    arms from same seed" bar, applied here to search ranking).
+
+    ``k`` -- a caller that is going to slice the result anyway says so, and
+    :func:`trialerror.util.vecmath.top_k` narrows with numpy instead of
+    scoring every row in Python. The ids, their order and their scores are
+    identical either way: the narrowing pass only chooses which rows the
+    plain cosine is then run on (see that module's docstring). Left out,
+    the whole ranking is returned and computed exactly as it always was --
+    a full ranking has nothing to narrow to."""
+    return vecmath.top_k(query_vector, vectors, k, config=config)

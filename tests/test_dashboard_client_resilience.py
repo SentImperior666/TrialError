@@ -623,7 +623,9 @@ def test_every_write_action_call_site_passes_a_failure_repaint():
     argument, and it must be a real panel loader."""
     calls = [m.start() for m in re.finditer(r"\bwireWriteAction\(", HTML)]
     assert len(calls) >= 10  # the first hit is the definition itself
-    loaders = ("loadFeed", "loadRooms", "loadDeterminations")
+    # lane e (E4) adds loadLexicon -- the Lexicon detail pane's four write
+    # actions repaint the same way every other panel's do on a refusal.
+    loaders = ("loadFeed", "loadRooms", "loadDeterminations", "loadLexicon")
     for start in calls[1:]:
         call = _call_text(HTML, start)
         arity = _call_arity(HTML, start)
@@ -730,19 +732,41 @@ def test_the_four_lane_c_actions_are_posted_from_the_page():
 
 
 def test_no_reject_verb_is_drawn():
-    """Ruling L-C6. Two buttons used to carry the word: the gate arm's
-    permanently-disabled "SEND BACK / REJECT", and the generic no-action arm's
-    copy of it. C7 replaced the first with a real SEND BACK and the second
-    with a label that names what is true, and added no reject anywhere.
+    """Ruling L-C6, narrowed by lane e (E4) -- read this docstring before
+    adding a third exception.
 
-    Asserted on RENDERED text (``text: "..."``), not on the raw file, because
-    the comments explaining the removal legitimately quote the old label."""
+    Originally: no drawn control anywhere carries the word REJECT, because
+    the only REJECT verb that ever existed here was a GATE verdict
+    rejection (``gated -> failed``), which L-C6 keeps CLI-only -- a
+    destructive verb driven by a free-text launch id is not auditable.
+
+    Lane e (E4) gives the TERM STORE its OWN, unrelated REJECT decision
+    (``lexicon.api.decide_relation``'s ``rejected`` -- design §3: "the
+    candidate was a false positive"): a real, designed, wired action over a
+    COMPLETELY DIFFERENT state machine (a `term_sense`/`term_relation`, never
+    a `gate`), explicitly named in the schema's own closed decision
+    vocabulary. That is not a re-opening of L-C6 -- the invariant this test
+    actually protects, no GATE reject verb ever drawn, is what stays
+    absolute, and it is what the two assertions below check DIRECTLY rather
+    than through the broader substring scan alone.
+
+    Asserted on RENDERED text (``text: "..."``), not on the raw file,
+    because the comments explaining the C7 removal legitimately quote the
+    old label. The scan is restricted to short (button-label-shaped)
+    strings so a long descriptive sentence that happens to contain
+    "rejecting" (e.g. a note-strip explaining what the term-relation REJECT
+    button does) is not mistaken for a second control."""
     drawn = set(re.findall(r'text:\s*"([^"]*)"', HTML))
-    assert not [t for t in drawn if "REJECT" in t and "MERGE" not in t], \
-        f"a reject verb is drawn: {[t for t in drawn if 'REJECT' in t]}"
+    # "REJECT MERGE" (kg_merge, pre-existing) and bare "REJECT" (lane e's
+    # term-sense/term-relation decisions) are the two legitimate, non-gate
+    # verbs this file draws today.
+    allowed_reject_text = {"REJECT MERGE", "REJECT"}
+    stray = [t for t in drawn if "REJECT" in t and len(t) < 40 and t not in allowed_reject_text]
+    assert not stray, f"a reject verb is drawn outside the allowed set: {stray}"
     assert "SEND BACK" in drawn
     assert "NO ACTION WIRED HERE" in drawn
     assert '"gate-reject"' not in HTML
+    assert '"SEND BACK / REJECT"' not in HTML
 
 
 def test_the_prereg_reveal_button_is_a_two_click_confirm():

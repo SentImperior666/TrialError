@@ -40,11 +40,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
+from trialerror.events.api import append_event
+from trialerror.ingest import quality
 from trialerror.ingest.anchors import build_chunk_anchor, sha256_hex
 from trialerror.ingest.backends import load_embed_backend, load_ocr_backend
-from trialerror.ingest.chunker import build_chunks
+from trialerror.ingest.chunker import build_chunks, build_row_chunks
 from trialerror.ingest.errors import InvalidNormalizerOverrideError
 from trialerror.ingest.normalizers import NORMALIZER_ID, NORMALIZER_VERSION, normalize_direct
 from trialerror.ingest.sanitizer import SANITIZER_VERSION, sanitize
@@ -54,13 +56,101 @@ from trialerror.jobs.registry import register_handler
 from trialerror.offload.marker import is_offload_config
 from trialerror.retrieve import lexical
 from trialerror.stores.store import Store
-from trialerror.stores.vecindex import VecBackend, ensure_vec_table, serialize_vector_fallback, vec_table_name
+from trialerror.stores.vecindex import (
+    VecBackend,
+    ensure_vec_table,
+    safe_model_key,
+    serialize_vector_fallback,
+    vec_table_name,
+)
 from trialerror.stores.writer import get, insert, update
 from trialerror.util.atomic import atomic_write_text
 from trialerror.util.ids import new_id
 from trialerror.util.timeutil import now
 
-__all__ = ["run_djvu", "run_normalize", "run_ocr", "run_chunk", "run_embed", "run_index", "run_extract"]
+__all__ = [
+    "index_job_id",
+    "fulltext_index_job_id",
+    "fulltext_before_embed",
+    "FULLTEXT_BEFORE_EMBED_DEFAULT",
+    "run_djvu",
+    "run_normalize",
+    "run_ocr",
+    "run_chunk",
+    "run_embed",
+    "run_index",
+    "run_extract",
+]
+
+
+def index_job_id(doc_id: str, model_key: str) -> str:
+    """The ``index`` stage's job id for one document under one embedding
+    ``model_key``.
+
+    **The defect this shape fixes (live, 2026-09-06/07).** This id used to be
+    ``f"JOB-ingest-{doc_id}-index"`` -- deterministic in the document and
+    BLIND to the model key. :func:`_enqueue_next_stage` skips the create when
+    a job with that id already exists (crash-resume idempotency, see its own
+    docstring), so the FIRST index job a document ever ran permanently
+    absorbed every later hand-off from the embed stage. A program that
+    embedded its corpus under a placeholder key, was then pointed at a real
+    model and re-embedded every document, got ``emb`` rows for the new key
+    and NO vector-index entries for any document that had already been
+    indexed once: the ``index`` job the embed stage handed off to was a row
+    that had settled ``complete`` months of corpus-work earlier. The live
+    arithmetic was exact -- 16,173 chunks, 14,000 of them indexed under the
+    placeholder key, and exactly 16,173 - 14,000 = 2,173 entries in the real
+    key's table, those 2,173 being the chunks of the documents whose FIRST
+    ingest happened after the switch (a fresh id, so a fresh index job).
+    Nothing in ``emb`` was wrong and nothing raised; semantic retrieval just
+    answered from 2,173 of 16,088 vectors.
+
+    The key now rides in the id, so the hand-off is idempotent in exactly
+    the pair the index stage's work depends on (document, model key) and a
+    key change gets its own job. ``safe_model_key`` is the sanitizer the
+    vector TABLE name already uses, so both derived identifiers spell the
+    key the same way."""
+    return f"JOB-ingest-{doc_id}-index-{safe_model_key(model_key)}"
+
+
+#: ``[ingest] fulltext_before_embed``. Lane FB-6 item 8.
+#:
+#: The pipeline runs chunk -> embed -> index, so a program whose embeddings
+#: are parked for a GPU run has NO full-text search over anything ingested
+#: since -- the documents are chunked, the text is in the store, and the one
+#: stage that would put it in ``chunk_fts`` is waiting behind a stage that
+#: needs hardware. A live programme repaired that by hand with
+#: ``ingest reindex-fulltext`` after every batch.
+#:
+#: With this on (the default), the ``chunk`` handler enqueues a
+#: FULL-TEXT-ONLY ``index`` job beside the ``embed`` one. It writes
+#: ``chunk_fts`` and the tantivy index and touches no vector table at all --
+#: which is what makes it safe to run before a single embedding exists. The
+#: vector side of ``index`` still runs after ``embed``, under its own
+#: model-keyed job id, and doctor's ``fulltext_index_stale`` is the check
+#: that says whether the full-text side is current.
+FULLTEXT_BEFORE_EMBED_DEFAULT = True
+
+
+def fulltext_before_embed(config: Mapping[str, Any] | None) -> bool:
+    """Whether the ``chunk`` handler enqueues the full-text-only ``index``
+    job -- :data:`FULLTEXT_BEFORE_EMBED_DEFAULT` unless
+    ``[ingest] fulltext_before_embed`` says otherwise."""
+    value = ((config or {}).get("ingest") or {}).get(
+        "fulltext_before_embed", FULLTEXT_BEFORE_EMBED_DEFAULT
+    )
+    return bool(value)
+
+
+def fulltext_index_job_id(doc_id: str) -> str:
+    """The full-text-only ``index`` job's id.
+
+    Deliberately NOT :func:`index_job_id`: ``ledger.enqueue`` is create-only,
+    so a pre-embed job sharing the post-embed id would swallow the hand-off
+    that fills the vector table, and a program would index its text and
+    never its vectors with nothing raised. Model-key-free because this job
+    reads no model."""
+    return f"JOB-ingest-{doc_id}-index-fulltext"
 
 
 def _enqueue_next_stage(store: Store, *, stage: str, payload: dict[str, Any], job_id: str) -> None:
@@ -74,7 +164,16 @@ def _enqueue_next_stage(store: Store, *, stage: str, payload: dict[str, Any], jo
     it already handed off successfully. ``stage`` is the logical stage name,
     mapped to the real ``job.kind`` via
     ``trialerror.ingest.pipeline.stage_job_kind_and_payload`` (``normalize``/
-    ``chunk`` ride ``kind='custom'`` -- see that function's docstring)."""
+    ``chunk`` ride ``kind='custom'`` -- see that function's docstring).
+
+    **The caller's obligation, learned the expensive way.** Because the skip
+    is keyed on the id alone, that id has to name EVERYTHING the next
+    stage's work depends on -- not just the document. The ``index`` stage's
+    work depends on the embedding model key as well, and for a year its id
+    did not say so, which is the whole of the live vector-index defect
+    :func:`index_job_id` documents: a second hand-off for a DIFFERENT key
+    looked like a resumed hand-off for the same one and was silently
+    dropped."""
     from trialerror.ingest.pipeline import stage_job_kind_and_payload
 
     job_kind, job_payload = stage_job_kind_and_payload(stage, payload)
@@ -118,6 +217,108 @@ def _load_elements(store: Store, doc_id: str) -> list[dict[str, Any]]:
         "SELECT * FROM element WHERE doc_id = ? ORDER BY seq", (doc_id,)
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def _quality_refusal_for(
+    store: Store, doc: dict[str, Any], element_rows: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """``{measures, reasons, thresholds}`` when this program has configured
+    ``[ingest.quality] refuse_below`` AND this document's extracted text is
+    worse than it, otherwise ``None``.
+
+    **Absent by default.** A program that never writes the table gets
+    ``None`` here forever, which is the whole posture of this feature: the
+    measures (:mod:`trialerror.ingest.quality`) are a signal about a corpus,
+    and a threshold that stops an ingest is a choice a program makes on
+    purpose. Only the measures the table actually names are compared.
+
+    Measured from the element rows this stage has just written -- no second
+    read of the store, and no possibility of judging a different text than
+    the one that was stored.
+
+    Config is read through :func:`_load_config`, i.e. FAIL-CLOSED (D13): a
+    trialerror.toml this process cannot parse raises here rather than
+    defaulting to "no refusal configured". Defaulting would be the one
+    behaviour this function must never have -- a program whose operator
+    configured a refusal would silently stop refusing the day a typo landed
+    in an unrelated table, which is exactly the failure mode ``_load_config``
+    was made fail-closed for.
+    """
+    limits = quality.refusal_thresholds_from_config(_load_config(store))
+    if not limits:
+        return None
+    measures = quality.measure_elements(element_rows, page_count=doc.get("page_count"))
+    reasons = quality.refusal_reasons(measures, limits)
+    if not reasons:
+        return None
+    return {"measures": measures, "reasons": reasons, "thresholds": dict(limits)}
+
+
+def _record_quality_refusal(
+    store: Store, doc: dict[str, Any], refusal: dict[str, Any], *, launch_id: str
+) -> dict[str, Any] | None:
+    """Write the refusal's own record row and event -- the numbers, the
+    reasons and the thresholds that produced them.
+
+    The row lands in the generic ``record`` register under
+    :data:`trialerror.ingest.quality.QUALITY_REFUSAL_REGISTER_KEY`, the same
+    table and the same reasoning as ``trialerror.ingest.retract``'s
+    retraction ledger: this lane owns no schema, ``document`` has no
+    ``attrs`` column, and a register row is a real indexed table rather
+    than a provenance column abused as a flag. (The brief said "the four
+    numbers in the document's attrs"; there is no such column on
+    ``document`` and adding one is a migration this lane does not own, so
+    the numbers live here instead -- one query, one register key, and
+    ``ingest status`` reads them back.)
+
+    Idempotent: a normalize job that crashed after writing this row and
+    before settling re-runs the whole stage, and a second row for the same
+    document would make the register's own history a lie. Returns ``None``
+    when a record is already there.
+    """
+    doc_id = doc["doc_id"]
+    if quality.quality_refusal_record(store.knowledge, doc_id) is not None:
+        return None
+
+    ts = now()
+    seq = int(
+        store.knowledge.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM record WHERE register_key = ?",
+            (quality.QUALITY_REFUSAL_REGISTER_KEY,),
+        ).fetchone()[0]
+    )
+    payload = {
+        "doc_id": doc_id,
+        "source_id": doc.get("source_id"),
+        "media_type": doc.get("media_type"),
+        "reasons": refusal["reasons"],
+        "thresholds": refusal["thresholds"],
+        "measures": {key: refusal["measures"].get(key) for key in quality.MEASURE_KEYS},
+        "elements": refusal["measures"].get("elements"),
+        "chars": refusal["measures"].get("chars"),
+        "launch_id": launch_id,
+        "ts": ts,
+    }
+    row = insert(
+        store,
+        "record",
+        {
+            "record_id": new_id("REC"),
+            "register_key": quality.QUALITY_REFUSAL_REGISTER_KEY,
+            "artifact_id": None,
+            "seq": seq,
+            "payload": json.dumps(payload, ensure_ascii=False),
+            "anchors": None,
+            "created_ts": ts,
+        },
+    )
+    append_event(
+        store,
+        event_type="ingest_quality_refused",
+        payload={"doc_id": doc_id, "reasons": refusal["reasons"], "record_id": row["record_id"]},
+        launch_id=launch_id,
+    )
+    return row
 
 
 def _finish_normalize_stage(
@@ -174,9 +375,15 @@ def _finish_normalize_stage(
         element_rows = _load_elements(store, doc_id)
 
     stream_text = stream_v1(element_rows)
+    refusal = _quality_refusal_for(store, doc, element_rows)
     changes: dict[str, Any] = {
         "sha256": sha256_hex(stream_text),
-        "status": "normalized",
+        # 'failed' is the only value document.status's CHECK allows for
+        # "this document did not end in a usable state" -- the same value,
+        # for the same reason, that trialerror.ingest.retract writes, with
+        # the register row (below) as the authoritative explanation. No
+        # migration in this lane.
+        "status": "failed" if refusal is not None else "normalized",
         "normalizer_id": normalizer_id,
         "normalizer_version": normalizer_version,
         "sanitizer_version": SANITIZER_VERSION,
@@ -192,6 +399,15 @@ def _finish_normalize_stage(
     ctx.set_checkpoint({"elements": len(element_rows)})
 
     created_by_launch = ctx.payload["created_by_launch"]
+    if refusal is not None:
+        # The pipeline STOPS here for this document: no chunk job, so
+        # nothing downstream ever chunks, embeds, indexes or cites text
+        # this program has declared unusable. The element rows and the
+        # archived stream text stay on disk deliberately -- the operator
+        # has to be able to LOOK at what was refused, and a refusal that
+        # destroyed its own evidence would be untestable and unarguable.
+        _record_quality_refusal(store, doc, refusal, launch_id=created_by_launch)
+        return
     _enqueue_next_stage(
         store,
         stage="chunk",
@@ -233,13 +449,23 @@ def _resolve_normalizer_override(payload: dict[str, Any]) -> tuple[str, str]:
 def run_djvu(ctx) -> None:
     """design Section 6 stage 3 extension (trialerror.ingest.normalize_djvu's own
     module docstring has the full design): converts a ``.djvu``/``.djv``
-    source to a derived PDF via DjVuLibre's ``ddjvu``, decides the
-    pdf-text/pdf-scan route via ``djvutxt``'s text-layer probe, rewrites
-    THIS document's ``media_type``/``raw_path`` to that derived PDF, then
-    re-enqueues ``normalize`` or ``ocr`` for it -- carrying
-    ``normalizer_id_override``/``normalizer_version_override`` in that
-    job's payload so ``_finish_normalize_stage`` stamps
-    ``NORMALIZER_ID_DJVU`` instead of the generic normalizer id/version.
+    source to a derived PDF via DjVuLibre's ``ddjvu`` and decides where
+    this document's text comes from via ``djvutxt``'s text-layer probe.
+
+    Two routes out (FX-D1):
+
+    - **text layer present** -- the page texts ``djvutxt`` returned ARE the
+      document's elements. They go straight into the shared
+      :func:`_finish_normalize_stage` tail here, in this job, so anchors,
+      ``stream_v1`` and the ``chunk`` hand-off are produced by the same
+      code every other format ends in. No ``normalize`` job is enqueued,
+      because there is nothing left for one to derive: routing the derived
+      PDF through pypdf instead is the bug this fix removes.
+    - **no text layer** -- ``media_type``/``raw_path`` are rewritten to the
+      derived PDF and the ``ocr`` stage is enqueued for it, exactly as a
+      native scanned PDF, carrying ``normalizer_id_override`` /
+      ``normalizer_version_override`` so that stage's own
+      ``_finish_normalize_stage`` stamps ``NORMALIZER_ID_DJVU``.
 
     Rides ``kind='custom'``/``payload['handler']='djvu'``
     (``trialerror.ingest.pipeline._CUSTOM_STAGE_KINDS`` -- a stage that will
@@ -248,20 +474,32 @@ def run_djvu(ctx) -> None:
     exactly like every other stage's first job.
 
     **Restart-safety** (module docstring's "each idempotent ... resumable
-    via the jobs ledger", same as every other handler here): a WORKER
-    crash can land between this handler's document-row rewrite and its own
-    settlement, same as any other stage -- but unlike ``run_normalize``/
-    ``run_ocr`` (which always re-derive from an UNCHANGING ``raw_path``/
-    ``media_type``), a resumed ``run_djvu`` would otherwise try to feed the
-    derived PDF it already produced back into ``ddjvu`` as if it were the
-    original ``.djvu`` source. So this checks ``doc['media_type']`` FIRST:
-    still ``'djvu'`` means convert for real; anything else means a prior
-    attempt at this SAME job already got at least as far as the row
-    rewrite, and this run just re-derives the next stage from what is
-    already on disk/in the ledger (the checkpoint this same prior attempt
-    wrote BEFORE that rewrite -- see the ordering below -- carries the
-    ``normalizer_version`` a bare resume has no other way to recover)."""
-    from trialerror.ingest.normalize_djvu import MEDIA_TYPE_DJVU, NORMALIZER_ID_DJVU, convert_and_route
+    via the jobs ledger", same as every other handler here). A worker crash
+    can land anywhere in here, and unlike ``run_normalize``/``run_ocr``
+    (which re-derive from an UNCHANGING ``raw_path``/``media_type``) a
+    resumed ``run_djvu`` could otherwise feed the derived PDF it already
+    produced back into ``ddjvu`` as if it were the original source. Two
+    guards, in this order:
+
+    1. ``doc['media_type']`` still ``'djvu'`` means nothing was rewritten
+       yet -- convert for real. On the TEXT route the row rewrite is
+       deliberately the LAST thing this handler does, AFTER the elements
+       are committed, precisely so a crash in between leaves ``'djvu'``
+       here and the whole (idempotent) conversion simply re-runs.
+    2. Anything else means a prior attempt got past that rewrite. If the
+       document already HAS elements, they were written by the text route
+       and there is nothing to re-derive: hand off to ``chunk``
+       idempotently and stop. Otherwise it is the OCR route mid-flight, so
+       re-enqueue ``ocr`` from the checkpoint the same prior attempt wrote
+       BEFORE the rewrite (which is what carries the ``normalizer_version``
+       a bare resume has no other way to recover)."""
+    from trialerror.ingest.normalize_djvu import (
+        DETECTION_ORIGIN_DJVUTXT,
+        MEDIA_TYPE_DJVU,
+        NORMALIZER_ID_DJVU,
+        TEXT_SOURCE_DJVUTXT,
+        convert_and_route,
+    )
     from trialerror.ingest.errors import DjVuResumeMediaTypeError
     from trialerror.ingest.pipeline import DEFAULT_ARCHIVE_DIR
 
@@ -295,6 +533,12 @@ def run_djvu(ctx) -> None:
             src_path=raw_path,
             config=djvu_cfg,
             archive_dir=archive_dir_value,
+            # FX-D1: the text-layer route makes one djvutxt call per page,
+            # so a 500-page book is 500 subprocess calls inside one job.
+            # Beating the lease every page is what keeps that from looking
+            # abandoned -- the gap ctx.heartbeat() above cannot cover for
+            # the single blocking ddjvu call, but can cover here.
+            on_progress=lambda _page: ctx.heartbeat(),
         )
 
         # No free-form JSON/notes column exists on `document` (checked
@@ -308,21 +552,86 @@ def run_djvu(ctx) -> None:
         # "Provenance note" says the same). Written BEFORE the document
         # row itself changes, so it survives a crash that lands between
         # the two (the restart-safety note above).
-        ctx.set_checkpoint(
-            {
-                "djvu_pdf_sha256": result["derived_pdf_sha256"],
-                "djvu_text_layer": result["text_layer"],
-                "djvu_text_chars": result["text_chars"],
-                "djvu_route": result["media_type"],
-                "djvu_normalizer_version": result["normalizer_version"],
-            }
-        )
+        djvu_checkpoint = {
+            "djvu_pdf_sha256": result["derived_pdf_sha256"],
+            "djvu_text_layer": result["text_layer"],
+            "djvu_text_chars": result["text_chars"],
+            "djvu_route": result["media_type"],
+            # FX-D1: WHICH source of truth produced this document's text.
+            # Not recoverable from the row afterwards -- both routes leave
+            # media_type='pdf-text'/'pdf-scan' and a derived PDF behind --
+            # and it is the first thing anyone debugging a thin DjVu ingest
+            # needs to know.
+            "djvu_text_source": result["text_source"],
+            "djvu_page_count": result["page_count"],
+            "djvu_pages_with_text": len(result["pages"]),
+            # The old F1 signal, kept as a diagnostic now that it no longer
+            # vetoes the route: "djvutxt found text, the derived PDF did
+            # not" is exactly the discrepancy behind the live bug, and an
+            # operator should be able to see it after the fact.
+            "djvu_derived_pdf_media_type": result["derived_pdf_media_type"],
+            "djvu_normalizer_version": result["normalizer_version"],
+        }
+        ctx.set_checkpoint(djvu_checkpoint)
+
+        if result["text_source"] == TEXT_SOURCE_DJVUTXT:
+            # The text layer IS the document. Finish the normalize stage
+            # here, in this job, through the shared tail -- then rewrite
+            # the row LAST (restart-safety guard 1 in the docstring: a
+            # crash before this update leaves media_type='djvu' and the
+            # whole idempotent conversion simply re-runs).
+            drafts = [
+                {
+                    "seq": i,
+                    "type": "NarrativeText",
+                    "text": text,
+                    "page_number": page_number,
+                    "detection_origin": DETECTION_ORIGIN_DJVUTXT,
+                }
+                for i, (page_number, text) in enumerate(result["pages"])
+            ]
+            _finish_normalize_stage(
+                ctx,
+                doc,
+                drafts,
+                ocr_backend=None,
+                ocr_version=None,
+                normalizer_id=NORMALIZER_ID_DJVU,
+                normalizer_version=result["normalizer_version"],
+            )
+            # ``_finish_normalize_stage`` writes its own ``{"elements": n}``
+            # checkpoint, and ``set_checkpoint`` REPLACES rather than
+            # merges -- so restore the djvu provenance with the element
+            # count folded in, or the conversion's whole record (the
+            # derived PDF's sha256, the text source, the page count) would
+            # be silently overwritten by the stage that consumed it.
+            ctx.set_checkpoint({**djvu_checkpoint, "elements": len(drafts)})
+            update(
+                store,
+                "document",
+                pk_column="doc_id",
+                pk_value=doc_id,
+                changes={
+                    "media_type": result["media_type"],
+                    # The derived PDF is kept for VIEWING -- it is what a
+                    # reader opens to check a citation -- even though it is
+                    # no longer where the text came from.
+                    "raw_path": result["derived_pdf_rel_path"],
+                    "page_count": result["page_count"],
+                },
+            )
+            return
+
         update(
             store,
             "document",
             pk_column="doc_id",
             pk_value=doc_id,
-            changes={"media_type": result["media_type"], "raw_path": result["derived_pdf_rel_path"]},
+            changes={
+                "media_type": result["media_type"],
+                "raw_path": result["derived_pdf_rel_path"],
+                "page_count": result["page_count"] or None,
+            },
         )
         resolved_media_type = result["media_type"]
         normalizer_version = result["normalizer_version"]
@@ -344,6 +653,30 @@ def run_djvu(ctx) -> None:
             )
         normalizer_version = ctx.checkpoint.get("djvu_normalizer_version", "unknown")
 
+        # FX-D1, restart-safety guard 2: elements already present means a
+        # prior attempt's TEXT route finished the normalize stage here and
+        # crashed after. Re-deriving would mean running the derived PDF
+        # through pypdf and overwriting good djvutxt elements with worse
+        # ones -- so hand off to chunk instead, idempotently, and stop.
+        if store.knowledge.execute(
+            "SELECT 1 FROM element WHERE doc_id = ? LIMIT 1", (doc_id,)
+        ).fetchone() is not None:
+            _enqueue_next_stage(
+                store,
+                stage="chunk",
+                payload={"doc_id": doc_id, "created_by_launch": created_by_launch},
+                job_id=f"JOB-ingest-{doc_id}-chunk",
+            )
+            return
+
+    # The OCR route reaches here on a fresh conversion and on a resume.
+    # ``normalize`` is now reachable ONLY by one degraded path: a resumed
+    # job whose row already says 'pdf-text' but whose elements are gone
+    # (they were retracted, or hand-deleted) -- the djvutxt pages cannot be
+    # recovered without re-converting, so deriving what can be derived from
+    # the durable derived PDF is a better answer than failing. It is a
+    # worse element set than the text route's, which is exactly why it is
+    # the fallback and not the route.
     next_stage = "normalize" if resolved_media_type == "pdf-text" else "ocr"
     _enqueue_next_stage(
         store,
@@ -444,6 +777,43 @@ def run_ocr(ctx) -> None:
     )
 
 
+def _chunk_drafts_for(store: Store, doc, elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Pick the chunker this document's SOURCE KIND calls for.
+
+    Every kind but one gets the two-pass boundary-aware chunker, unchanged.
+    An ``inventory`` source gets one chunk per element
+    (:func:`~trialerror.ingest.chunker.build_row_chunks`), because its rows
+    are the unit the novelty screen measures distances against and a chunk
+    spanning several of them would blur exactly the boundary that makes the
+    measurement mean anything (see the schema-v7 note in
+    ``trialerror/stores/schema/knowledge.py``).
+
+    The kind is read from the document's own ``source`` row rather than
+    from config, so it cannot be set for one stage and forgotten for
+    another: the same value that excludes these chunks from retrieval is
+    the value that decided how they were cut. A document whose source row
+    will not resolve (which the FK makes impossible through the write API)
+    falls back to the prose chunker rather than raising -- a chunk stage
+    that refuses to run is a worse failure than one that chunks a table as
+    prose, and ``xid_dangling`` reports the real finding.
+    """
+    # Function-local import, matching this module's own convention for
+    # everything it takes from ``trialerror.ingest.pipeline``
+    # (``stage_job_kind_and_payload``, ``DEFAULT_ARCHIVE_DIR``): handlers is
+    # imported for the side effect of registering job handlers and pipeline
+    # is what enqueues those jobs, so the two are deliberately kept off each
+    # other's module-level import graph.
+    from trialerror.ingest.pipeline import INVENTORY_SOURCE_KIND
+
+    row = store.knowledge.execute(
+        "SELECT kind FROM source WHERE source_id = ?", (doc["source_id"],)
+    ).fetchone()
+    kind = row["kind"] if row is not None else None
+    if kind == INVENTORY_SOURCE_KIND:
+        return build_row_chunks(elements)
+    return build_chunks(elements)
+
+
 @register_handler("chunk")
 def run_chunk(ctx) -> None:
     """design Section 6 stage 5: the two-pass boundary-aware chunker +
@@ -458,7 +828,7 @@ def run_chunk(ctx) -> None:
         raise RuntimeError(f"chunk: no such document {doc_id!r}")
 
     elements = _load_elements(store, doc_id)
-    chunk_drafts = build_chunks(elements)
+    chunk_drafts = _chunk_drafts_for(store, doc, elements)
 
     existing_seqs = {r["seq"] for r in store.knowledge.execute("SELECT seq FROM chunk WHERE doc_id=?", (doc_id,)).fetchall()}
     written = 0
@@ -506,6 +876,21 @@ def run_chunk(ctx) -> None:
         ctx.set_checkpoint({"chunks_written": written, "total": len(chunk_drafts)})
 
     update(store, "document", pk_column="doc_id", pk_value=doc_id, changes={"status": "chunked"})
+    # Lane FB-6 item 8: the full-text side of `index` does not wait for the
+    # GPU. Enqueued BEFORE `embed` so that a worker draining the queue in
+    # order makes this document searchable first, and the document's own
+    # status still advances through `embedded` on the embed job.
+    if fulltext_before_embed(_load_config(store)):
+        _enqueue_next_stage(
+            store,
+            stage="index",
+            payload={
+                "doc_id": doc_id,
+                "created_by_launch": created_by_launch,
+                "fulltext_only": True,
+            },
+            job_id=fulltext_index_job_id(doc_id),
+        )
     _enqueue_next_stage(
         store,
         stage="embed",
@@ -522,7 +907,13 @@ def run_embed(ctx) -> None:
     ``trialerror.ingest.backends.load_embed_backend`` (fake by default; real
     Qwen3-4B per ``trialerror.toml [ingest.embed]``). Per-batch commit +
     DB-state-driven skip (see module docstring) is what makes a
-    kill-mid-batch resume land on byte-identical final ``emb`` rows."""
+    kill-mid-batch resume land on byte-identical final ``emb`` rows.
+
+    FX-S1: the real embed backend now holds a RESIDENT driver subprocess
+    (``RealQwenEmbedBackend`` session mode), so this handler closes it in a
+    ``finally`` -- otherwise a single-machine (non-offload) program would
+    leak one loaded-model process per embed job. Backends with no
+    ``close`` (the fake backend, the offload marker) skip it."""
     payload = ctx.payload
     doc_id = payload["doc_id"]
     created_by_launch = payload["created_by_launch"]
@@ -530,6 +921,19 @@ def run_embed(ctx) -> None:
     config = _load_config(store)
     embed_cfg = config.get("ingest", {}).get("embed", {})
     backend = load_embed_backend(embed_cfg)
+    try:
+        _run_embed_body(ctx, backend, embed_cfg, doc_id=doc_id, created_by_launch=created_by_launch)
+    finally:
+        closer = getattr(backend, "close", None)
+        if callable(closer):
+            closer()
+
+
+def _run_embed_body(ctx, backend, embed_cfg: dict[str, Any], *, doc_id: str, created_by_launch: str) -> None:
+    """:func:`run_embed`'s body, split out only so the backend shutdown can
+    wrap the whole of it in a ``finally`` without re-indenting (and thus
+    obscuring the diff of) stage logic that is otherwise unchanged."""
+    store = ctx.store
     model_key = backend.model_key
     dims = backend.dims
     batch_size = int(embed_cfg.get("batch_size", 8))
@@ -611,11 +1015,14 @@ def run_embed(ctx) -> None:
             ctx.set_checkpoint({"embedded": done, "total_pending": len(pending), "model_key": model_key})
 
     update(store, "document", pk_column="doc_id", pk_value=doc_id, changes={"status": "embedded"})
+    # The hand-off id carries the model key -- see :func:`index_job_id` for
+    # the live defect a key-blind id caused (emb rows adopted, vector index
+    # never filled, nothing raised).
     _enqueue_next_stage(
         store,
         stage="index",
         payload={"doc_id": doc_id, "created_by_launch": created_by_launch, "model_key": model_key},
-        job_id=f"JOB-ingest-{doc_id}-index",
+        job_id=index_job_id(doc_id, model_key),
     )
 
 
@@ -642,8 +1049,17 @@ def run_index(ctx) -> None:
     payload = ctx.payload
     doc_id = payload["doc_id"]
     store = ctx.store
+    # Lane FB-6 item 8: the full-text-only pass. It resolves no model, opens
+    # no vector table and reads no `emb` row -- not as an optimisation, but
+    # because it runs BEFORE any embedding exists, and a pass that touched
+    # the vector side there would create an empty table for whatever key the
+    # config happened to name and leave a reader unable to tell an unindexed
+    # document from an unembedded one.
+    fulltext_only = bool(payload.get("fulltext_only"))
     model_key = payload.get("model_key")
-    if model_key is None:
+    if fulltext_only:
+        dims, backend_kind, table = 0, VecBackend.FALLBACK, None
+    elif model_key is None:
         config = _load_config(store)
         backend = load_embed_backend(config.get("ingest", {}).get("embed", {}))
         model_key = backend.model_key
@@ -652,8 +1068,9 @@ def run_index(ctx) -> None:
         dims_row = store.knowledge.execute("SELECT dims FROM emb WHERE model_key = ? LIMIT 1", (model_key,)).fetchone()
         dims = dims_row["dims"] if dims_row is not None else 0
 
-    backend_kind = ensure_vec_table(store.knowledge, model_key, dims) if dims else VecBackend.FALLBACK
-    table = vec_table_name(model_key)
+    if not fulltext_only:
+        backend_kind = ensure_vec_table(store.knowledge, model_key, dims) if dims else VecBackend.FALLBACK
+        table = vec_table_name(model_key)
 
     chunks = [
         dict(r)
@@ -669,6 +1086,11 @@ def run_index(ctx) -> None:
                 store.knowledge.execute(
                     "INSERT INTO chunk_fts(chunk_id, text) VALUES (?, ?)", (c["chunk_id"], c["text"])
                 )
+
+        if fulltext_only:
+            indexed += 1
+            ctx.set_checkpoint({"indexed": indexed, "total": len(chunks), "fulltext_only": True})
+            continue
 
         emb_row = store.knowledge.execute(
             "SELECT vector, dims FROM emb WHERE chunk_sha256 = ? AND model_key = ?", (c["sha256"], model_key)
@@ -697,10 +1119,21 @@ def run_index(ctx) -> None:
     # tantivy-py is absent or [retrieve] fulltext_backend = "fts5".
     fulltext = lexical.maintain_index(store, [(c["chunk_id"], c["text"]) for c in chunks])
     ctx.set_checkpoint(
-        {"indexed": indexed, "total": len(chunks), "model_key": model_key, "fulltext_index": fulltext}
+        {
+            "indexed": indexed, "total": len(chunks), "model_key": model_key,
+            "fulltext_index": fulltext, "fulltext_only": fulltext_only,
+        }
     )
 
-    update(store, "document", pk_column="doc_id", pk_value=doc_id, changes={"status": "indexed"})
+    # The full-text-only pass does NOT advance the document's status. A row
+    # reading `indexed` with no vector in the active model's table is the
+    # exact lie every doctor count here exists to prevent, and the status
+    # would then run chunked -> indexed -> embedded -> indexed, going
+    # backwards in the middle. The document stays `chunked` until `embed`
+    # moves it, and the full-text side is reported by doctor's
+    # `fulltext_index_stale`, which reads the index rather than the status.
+    if not fulltext_only:
+        update(store, "document", pk_column="doc_id", pk_value=doc_id, changes={"status": "indexed"})
 
 
 @register_handler("extract")

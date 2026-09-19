@@ -52,12 +52,33 @@ class ProgramConfig:
         return self.raw.get("models", {})
 
     @property
+    def model_classes(self) -> dict[str, Any]:
+        """``[model_classes]`` — model NAME to class, the other half of the
+        policy pair. ``[models]`` says which class a purpose needs;
+        ``[model_classes]`` says which class a given model IS, so the spawn
+        gate can compare the model a subagent was actually spawned with
+        against the class its booking claimed. Optional: entries here extend
+        and override ``trialerror.budget.policy``'s built-in family map, which
+        is exactly what a program running a model that map has never heard
+        of needs — and is the escape hatch the gate's refusal names."""
+        return self.raw.get("model_classes", {})
+
+    @property
     def license_posture(self) -> dict[str, Any]:
         return self.raw.get("license", {})
 
     @property
     def paths(self) -> dict[str, Any]:
         return self.raw.get("paths", {})
+
+    @property
+    def budget(self) -> dict[str, Any]:
+        """``[budget]`` — knobs for the money surfaces. Today:
+        ``quota_max_age_s`` (lane FB-3 item 8), the freshness bar the plan-
+        quota capture is judged against by ``budget quota``, the booking gate
+        and the ``quota_capture_stale`` doctor check. Read generically, like
+        every other table here; absence means "the documented default"."""
+        return self.raw.get("budget", {})
 
 
 def load_config(path: str | Path) -> ProgramConfig:

@@ -106,10 +106,17 @@ def _is_demo_owned_platform_root(program_root: Path, platform_root: Path) -> boo
     except OSError:  # pragma: no cover - unresolvable path
         return False
 
-#: Booked launches are all reconciled except one, deliberately left
-#: PROVISIONAL so the budget panel's dangling-booking list (and the CRIT
-#: health chip that reads it) has something real to report.
+#: Booked launches are all reconciled except two, deliberately left
+#: PROVISIONAL and backdated past their TTL so the budget panel's two
+#: past-TTL lists (and the CRIT health chip that reads the first) each have
+#: something real to report.
 _DANGLING_PURPOSE = "abandoned ideation sweep"
+
+#: The OTHER past-TTL reading (FB-1 item F2): a booking whose own session is
+#: still open and still recording hook liveness is a TTL that was set too
+#: short, not a session that died -- the card and the doctor both say so,
+#: and `budget heartbeat` is what clears it.
+_TTL_SHORT_PURPOSE = "long-running synthesis pass"
 
 
 class SeedRefused(Exception):
@@ -175,6 +182,41 @@ def _book(store: Store, *, session_id: str, agent_kind: str, purpose: str,
     if not result.launch_id:
         raise SeedRefused(f"book_launch refused ({result.code}): {result.message}")
     return result.launch_id
+
+
+def _seed_orphaned_booking(
+    store: Store, *, account_id: str, session_id: str, program_id: str
+) -> str:
+    """A past-TTL booking with NO evidence of life behind it -- the state the
+    word "dangling" actually describes.
+
+    Written as a direct row insert rather than through ``book_launch``,
+    deliberately and of necessity: the API refuses to book against a session
+    that is not OPEN, and ``close_session`` refuses to close a session that
+    still holds a live booking. A booking orphaned by a session that died is
+    therefore a state the normal path cannot produce -- which is exactly why
+    it needs seeding, and exactly why this inserts it directly instead of
+    pretending some sequence of legal calls would have arrived here."""
+    launch_id = new_id("LNCH")
+    insert(
+        store,
+        "launch",
+        {
+            "launch_id": launch_id,
+            "account_id": account_id,
+            "program_id": program_id,
+            "session_id": session_id,
+            "agent_kind": "lens",
+            "model_class": "mid",
+            "model": "sonnet",
+            "purpose": _DANGLING_PURPOSE,
+            "est_tokens": 4000,
+            "booked_ts": _ago_ts(hours=5),
+            "booking_ttl_s": 3600,
+            "state": "PROVISIONAL",
+        },
+    )
+    return launch_id
 
 
 def _seed_pools(store: Store, account_id: str) -> None:
@@ -273,7 +315,15 @@ def _extraction_judge(envelope: Any) -> dict[str, list]:
         quote = text[start:end].strip()
         if not quote or quote not in text:
             continue
-        claims.append({"text": quote, "kind": kind, "quote": quote, "confidence": 0.8})
+        claim: dict = {"text": quote, "kind": kind, "quote": quote, "confidence": 0.8}
+        # The optional lexicon lemma (ingest.extract's envelope, design §4 /
+        # ruling L-E7). Only on definitions, and only the NAME -- the demo's
+        # whole point here is to exercise the route a real judge takes, which
+        # is naming the term rather than letting the accept-time heuristic
+        # guess it out of the sentence.
+        if kind == "definition":
+            claim["term"] = term
+        claims.append(claim)
 
     return {"entities": entities, "relations": [], "claims": claims}
 
@@ -289,6 +339,12 @@ def _seed_extraction(store: Store, launch_id: str) -> dict[str, int]:
     kg_merge items in the DECIDE queue, which is the never-silent-auto-merge
     posture the design is built around: extraction candidates land as
     proposals, never straight into the graph.
+
+    Since lane e, accepting a definition claim whose judgment named a
+    ``term`` also lands one ``current`` sense in the term store, anchored to
+    the same quote. That is what puts real, quote-grounded rows behind the
+    Lexicon page instead of the entity/claim proxy -- so the counts returned
+    here carry ``lexicon_terms``/``lexicon_senses`` as well.
     """
     doc_ids = [
         row["doc_id"]
@@ -321,10 +377,16 @@ def _seed_extraction(store: Store, launch_id: str) -> dict[str, int]:
 
     left = list_pending(store, limit=500).get("candidates", [])
     proposals = list_pending(store, limit=500).get("merge_proposals", [])
+    terms = store.knowledge.execute("SELECT count(*) FROM term").fetchone()[0]
+    senses = store.knowledge.execute(
+        "SELECT count(*) FROM term_sense WHERE status = 'current'"
+    ).fetchone()[0]
     return {
         "extract_accepted": accepted,
         "extract_pending": len(left),
         "merge_proposals": len(proposals),
+        "lexicon_terms": terms,
+        "lexicon_senses": senses,
     }
 
 
@@ -669,12 +731,17 @@ def seed_demo_program(
         # ledger while every panel correctly reported zero dangling bookings.
         _book(
             store, session_id=open_session_id, agent_kind="lens",
-            purpose=_DANGLING_PURPOSE, program_id=program_id,
+            purpose=_TTL_SHORT_PURPOSE, program_id=program_id,
             now_ts=_ago_ts(hours=3),
         )
+        _seed_orphaned_booking(
+            store, account_id=account_id, session_id=closed_session_id, program_id=program_id
+        )
         notes.append(
-            "One launch is left PROVISIONAL on purpose, so the budget panel has a "
-            "dangling booking to report."
+            "Two launches are left PROVISIONAL past their TTL on purpose, one per reading the "
+            "budget panel now distinguishes: one under the still-open session (the TTL was too "
+            "short -- `budget heartbeat` clears it) and one under the closed session (no evidence "
+            "of life, which is what 'dangling' now means)."
         )
 
         artifact_ids = _seed_artifacts_and_gate(

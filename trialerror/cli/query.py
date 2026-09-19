@@ -104,6 +104,112 @@ def _run_no_action(_args: argparse.Namespace) -> dict:
     )
 
 
+def _error_code(exc: Exception) -> str:
+    """The envelope code for a retrieval error: the class's own declared
+    ``code`` where it has one (lane F-1 -- the operator-facing name is not
+    always the class name), else the long-standing class-name default."""
+    return getattr(exc, "code", None) or type(exc).__name__
+
+
+def _search_warnings(result: dict) -> list[dict] | None:
+    """The ``warnings`` block for a search that SUCCEEDED with a tier
+    missing.
+
+    A search that silently returns lexical-only results because this
+    process cannot embed a query is the failure mode lane F-1 exists to
+    remove: the results look normal, the recall is a fraction of what was
+    asked for, and nothing in the envelope says so. ``tiers_used`` already
+    reports what ran; this says what did not, why, which doctor check
+    reports it, and which config table changes it."""
+    reason = (result.get("stats") or {}).get("vector_skipped_reason")
+    if not reason:
+        return None
+    return [
+        {
+            "code": engine.QUERY_EMBED_UNRUNNABLE_CODE,
+            "message": (
+                f"the vector tier was skipped: {reason}. These results are the full-text tier only "
+                f"(tiers_used={result.get('tiers_used')})."
+            ),
+            "doctor_check": engine.QUERY_EMBED_DOCTOR_CHECK,
+            "config_table": engine.QUERY_EMBED_TABLE,
+        }
+    ]
+
+
+def _rerun_without_zero_terms(args: argparse.Namespace, result: dict) -> list:
+    """The next action a zero-result search earns: the SAME search with the
+    terms that match nothing dropped (lane FB-1 item F3).
+
+    "Largest-coverage subset" is exactly the terms whose own candidate count
+    is non-zero -- dropping a term can only widen an AND, so the biggest
+    subset that can possibly match is all of them minus the ones that match
+    nothing. Built from numbers the search already computed: this suggests a
+    command, it does not run a second query.
+
+    Every flag the caller gave is carried through unchanged, because a re-run
+    that quietly widened the filters too would be answering a different
+    question. That includes the two that are easiest to forget (fix-accept,
+    V-2): ``--launch-id``, because a launch's declared slice becomes a forced
+    ``doc_ids`` filter (``engine._effective_filters``) and the per-term counts
+    were computed INSIDE that slice, so a re-run without it can return hits
+    for the very term the action says matches nothing; and ``--unfenced``,
+    because a caller who asked past the serving fence is asking a different
+    question from one who did not. ``--program-root``/``--platform-root``
+    travel too, so the suggestion resolves the same stores from the same CWD
+    (the shape ``events tail`` already uses).
+
+    The query goes LAST, behind a ``--`` separator (fix-accept, V-3): a
+    surviving term may begin with ``-``, and argparse would read it as an
+    option -- so item F10c's guarantee ("every emitted action parses") needs
+    the flags first and the positional after the separator, not one token
+    inserted into the old order.
+
+    Returns ``[]`` -- no action at all -- when there is nothing runnable to
+    suggest: no zero-count terms (the emptiness is not one word's fault),
+    or every term counts zero (the corpus has none of this query, and
+    "search for nothing" is not advice)."""
+    stats = result.get("stats") or {}
+    counts = stats.get("per_term_candidates") or {}
+    zero_terms = stats.get("zero_result_terms") or []
+    if not counts or not zero_terms:
+        return []
+    kept = [term for term, n in counts.items() if n > 0]
+    if not kept:
+        return []
+    argv = ["trialerror", "query", "search"]
+    if getattr(args, "program_root", None):
+        argv += ["--program-root", str(args.program_root)]
+    if getattr(args, "platform_root", None):
+        argv += ["--platform-root", str(args.platform_root)]
+    if args.k != engine.DEFAULT_K:
+        argv += ["--k", str(args.k)]
+    if args.mode != "auto":
+        argv += ["--mode", args.mode]
+    for source_id in args.source_ids or []:
+        argv += ["--source-id", source_id]
+    for kind in args.kinds or []:
+        argv += ["--kind", kind]
+    for tier in args.license_tiers or []:
+        argv += ["--license-tier", tier]
+    for year in args.years or []:
+        argv += ["--year", str(year)]
+    if getattr(args, "unfenced", False):
+        argv += ["--unfenced"]
+    if getattr(args, "launch_id", None):
+        argv += ["--launch-id", str(args.launch_id)]
+    # The query is positional and may start with "-": everything above is a
+    # flag, this separator ends the flags, and the terms follow.
+    argv += ["--", " ".join(kept)]
+    dropped = ", ".join(zero_terms)
+    return [
+        next_action(
+            argv,
+            f"re-run without the term(s) no chunk matches under the filters in force ({dropped})",
+        )
+    ]
+
+
 def _run_search(args: argparse.Namespace) -> dict:
     store, err = _open(args, "query.search")
     if err is not None:
@@ -122,9 +228,27 @@ def _run_search(args: argparse.Namespace) -> dict:
             store, query=args.query, k=args.k, mode=args.mode, filters=filters or None,
             unfenced=args.unfenced, launch_id=args.launch_id,
         )
-        return ok_envelope("query.search", result=result)
+        actions = list(_rerun_without_zero_terms(args, result))
+        if (result.get("stats") or {}).get("vector_skipped_reason"):
+            actions.append(
+                next_action(
+                    engine.query_embed_next_action_argv(store.program_root),
+                    "why the vector tier was skipped",
+                )
+            )
+        return ok_envelope(
+            "query.search",
+            result=result,
+            warnings=_search_warnings(result),
+            next_actions=actions or None,
+        )
     except RetrievalError as exc:
-        return error_envelope("query.search", type(exc).__name__, str(exc))
+        return error_envelope(
+            "query.search", _error_code(exc), str(exc),
+            next_actions=[next_action(engine.query_embed_next_action_argv(store.program_root), "check the query-side embed backend")]
+            if getattr(exc, "code", None) == engine.QUERY_EMBED_UNRUNNABLE_CODE
+            else None,
+        )
     finally:
         store.close()
 
@@ -150,9 +274,60 @@ def _run_similar(args: argparse.Namespace) -> dict:
         result = engine.similar(store, args.ref_id, kind=args.kind, k=args.k)
         return ok_envelope("query.similar", result=result)
     except RetrievalError as exc:
-        return error_envelope("query.similar", type(exc).__name__, str(exc))
+        return error_envelope("query.similar", _error_code(exc), str(exc))
     finally:
         store.close()
+
+
+def _stats_next_actions(result: dict) -> list:
+    """The repairs this corpus actually needs, and nothing else (FB-1 item
+    F10c).
+
+    Each one is conditional on a number in the same envelope, and each names
+    the verb that exists for exactly that skew -- a full-text index that does
+    not cover the chunks, or a vector index short of the embeddings a key
+    has. An empty corpus gets the ingest verb; a corpus in good order gets
+    no actions at all."""
+    actions = []
+    fulltext = result.get("fulltext_index") or {}
+    # Only when the backend actually SERVING this corpus is the one whose
+    # index is short. A program pinned to `fulltext_backend = "fts5"` reports
+    # the tantivy index as missing by construction -- suggesting a rebuild
+    # there would be advising an operator to build an index their own config
+    # says not to use.
+    if (
+        result.get("chunks")
+        and result.get("fulltext_backend") == "tantivy"
+        and (fulltext.get("state") != "ready" or fulltext.get("chunks_missing_index"))
+    ):
+        actions.append(
+            next_action(
+                ["trialerror", "ingest", "reindex-fulltext"],
+                "the full-text index this corpus is served from does not cover every chunk: rebuild "
+                "it from the chunk table",
+            )
+        )
+    if result.get("chunks_missing_fts"):
+        actions.append(
+            next_action(
+                ["trialerror", "doctor", "--only", "fulltext_index_stale"],
+                "chunks with no chunk_fts row: the check reports the skew and what repairs it",
+            )
+        )
+    if any((result.get("chunks_missing_vec_by_model_key") or {}).values()):
+        # Deliberately the doctor check and not `ingest reindex-vectors`:
+        # that verb is XID-attributed and needs a booked launch id, and an
+        # emitted action carrying a `<placeholder>` is not a command anyone
+        # can run. The check names the key and the counts, and its own
+        # message names the repair verb.
+        actions.append(
+            next_action(
+                ["trialerror", "doctor", "--only", "vector_index_stale"],
+                "some embedded chunks are missing from a vector index: the check names the key and "
+                "the repair (`ingest reindex-vectors`, which needs a booked launch id)",
+            )
+        )
+    return actions
 
 
 def _run_stats(args: argparse.Namespace) -> dict:
@@ -161,6 +336,6 @@ def _run_stats(args: argparse.Namespace) -> dict:
         return err
     try:
         result = engine.corpus_stats(store)
-        return ok_envelope("query.stats", result=result)
+        return ok_envelope("query.stats", result=result, next_actions=_stats_next_actions(result))
     finally:
         store.close()

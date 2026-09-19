@@ -47,6 +47,7 @@ XID_REGISTRY: dict[tuple[str, str], XidTarget] = {
     ("thread", "created_by_launch"): XidTarget("platform", "launch", "launch_id"),
     ("feed_post", "launch_id"): XidTarget("platform", "launch", "launch_id"),
     ("lens_assignment", "launch_id"): XidTarget("platform", "launch", "launch_id"),
+    ("lens_assignment", "lens_launch_id"): XidTarget("platform", "launch", "launch_id"),
     ("room_turn", "author_launch"): XidTarget("platform", "launch", "launch_id"),
     # knowledge.db referencers
     ("source", "registered_by_launch"): XidTarget("platform", "launch", "launch_id"),
@@ -69,6 +70,31 @@ XID_REGISTRY: dict[tuple[str, str], XidTarget] = {
     # route around. web_fetch.job_id is deliberately NOT here: jobs.db rows
     # are swept, and a fetch record has to outlive the job that produced it.
     ("web_fetch", "launch_id"): XidTarget("platform", "launch", "launch_id"),
+    # lane e (knowledge_v5_lexicon_term_store): the lexicon's seven launch
+    # columns. Registering them is not bookkeeping either -- orchestrator
+    # ruling L-E4 makes "a term decision needs a real platform.launch row"
+    # the interim identity rule until a platform-level operator identity
+    # exists, and `insert`/`update`'s refuse-on-missing is the whole
+    # enforcement of it. The rule has to hold identically whether the
+    # decision arrives from the CLI, from a dashboard write action, or from
+    # a backfill, which is exactly what a registry entry (rather than a
+    # check in each of those three call sites) buys.
+    #
+    # Both DECIDING columns are here beside the proposing ones on purpose:
+    # `term_sense.decided_by_launch` and `term_relation.decided_by_launch`
+    # are the two that carry a status change, so a decision stamped with an
+    # id that names nothing is precisely the audit hole the rule exists to
+    # close. `term_relation.marked_by_launch` is nullable by design (a
+    # system-marked candidate has no launch) -- a nullable XID column is
+    # skipped when empty and validated when present, which is the behavior
+    # this needs.
+    ("term", "created_by_launch"): XidTarget("platform", "launch", "launch_id"),
+    ("term_alias", "created_by_launch"): XidTarget("platform", "launch", "launch_id"),
+    ("term_sense", "proposed_by_launch"): XidTarget("platform", "launch", "launch_id"),
+    ("term_sense", "decided_by_launch"): XidTarget("platform", "launch", "launch_id"),
+    ("term_sense_evidence", "created_by_launch"): XidTarget("platform", "launch", "launch_id"),
+    ("term_relation", "marked_by_launch"): XidTarget("platform", "launch", "launch_id"),
+    ("term_relation", "decided_by_launch"): XidTarget("platform", "launch", "launch_id"),
     # ---- bullet 2: prereg_id referenced from knowledge.db (prereg lives in
     # ops.db). --------------------------------------------------------------
     ("hypothesis", "prereg_id"): XidTarget("ops", "prereg", "prereg_id"),

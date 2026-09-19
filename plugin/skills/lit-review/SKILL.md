@@ -1,6 +1,6 @@
 ---
 name: lit-review
-description: Answer a research question against the ingested corpus, paper-qa-shaped — search, gather evidence with citations, draft an answer, then re-search on any gap before finalizing. Use this whenever the user asks a question that should be answered FROM the corpus (not from general knowledge), or asks for a literature summary/survey over what's already ingested.
+description: Answer a research question against the ingested corpus, paper-qa-shaped — search, gather evidence with citations, draft an answer, then re-search on any gap before finalizing. Two further modes: a prior-art bundle (stratified retrieval returning anchors and excerpts with no answer drafted, feeding a novelty screen) and a bounded hunt (a fixed, logged query list over the external indexes). Use this whenever the user asks a question that should be answered FROM the corpus (not from general knowledge), asks for a literature summary/survey over what's already ingested, asks for the prior art on a record or idea, or asks for a bounded literature hunt on a named topic.
 ---
 
 # /lit-review — search → gather-evidence → answer with citations
@@ -37,7 +37,14 @@ snippet you cannot cite back to an anchor.
    `[[cite:<anchor_id>]]` marker immediately after it, bound to the anchor
    that actually supports it — this is what `/verify-hypothesis` and
    `trialerror verify citecheck` bind against later, so get the marker-to-anchor
-   pairing right the first time rather than citing "close enough."
+   pairing right the first time rather than citing "close enough." **A
+   definition worth pinning** (a term the corpus actually defines, not
+   just uses) goes into the lexicon rather than only into the answer text:
+   `trialerror term propose --lemma "<lemma>" --gloss "<own-words
+   reading>" --evidence anchor:<the same anchor_id> --by-launch <your
+   launch_id>` (design `docs/reviews/LANE_E_TERM_STORE_DESIGN.md` §4,
+   manual route) — own words, never the source sentence verbatim, same
+   grounding discipline as the citation marker beside it.
 
 5. **Re-gather on any gap.** If the draft needs a claim you don't have
    solid evidence for, go back to step 1 with a narrower/rephrased query —
@@ -62,6 +69,59 @@ snippet you cannot cite back to an anchor.
    + deterministic-sampled LLM escalation) before it's trusted upstream —
    see the verify CLI group; `/verify-hypothesis` is the dedicated loop
    when the question IS a hypothesis, not just a question.
+
+## Mode: prior-art bundle (retrieve and anchor; draft nothing)
+
+When the ask is "what is already known near THIS record" rather than "what is
+the answer", the output is a bundle, not prose. Run the same stratified
+retrieval the hypothesis pipeline runs — near/moderate/far terciles over
+embedding distance, 40/40/20 with a far floor of 2 — and return, per
+neighbour: its anchor, its arm (near/moderate/far), and its excerpt under the
+fence (≤20 words for a `commercial_restricted` source, never the raw chunk).
+
+Three rules make a bundle a bundle:
+
+- **Draft no answer.** No synthesis, no "this suggests", no verdict on
+  whether the record is new. A bundle that carries a conclusion has made a
+  judgment the screen's own blind judge is supposed to make later, with
+  different inputs.
+- **Keep the arms.** Report the three arms separately and name empty ones.
+  "Nothing in the far arm" is a finding; silently returning four near hits
+  reads as coverage.
+- **Say what was searched.** The query text, the mode, the k, and the corpus
+  snapshot — a bundle whose provenance is unrecorded cannot be re-measured
+  against a later one.
+
+The bundle feeds a novelty screen's external reference set. It never
+substitutes for one: the screen decides scope and the judge assigns labels.
+
+## Mode: bounded hunt (a query list, fixed up front and logged)
+
+When the ask is "find the literature on X before we commit to a claim about
+X", write the query list FIRST, record it, then run exactly those queries:
+
+```
+trialerror events append --type lit_hunt_queries --payload '{"topic":"<topic>","queries":["...","..."]}'
+trialerror lit search --query "<query>"                      # repeat, once per query on the list
+trialerror lit arxiv-semantic --q "<query>" --k 20           # the same list against the local index
+trialerror lit acquire --doi <doi> --launch-id <your launch_id>   # only by the lawful OA route
+```
+
+- **The list is fixed before the first query runs.** A hunt that grows its
+  own list as it goes is a hunt that stops when it finds something
+  agreeable.
+- **Every query is logged, with its result count** — including the ones that
+  returned nothing. A query list with the empty hits removed is a different
+  instrument from the one that was committed to.
+- **Query text is a literature topic, never content from a record, an idea or
+  an unpublished claim.** What leaves the machine is the subject, not the
+  work.
+- **Outcome per item on the list: corroborated (a second independent source)
+  or still a probe.** Write that down against each one. A hunt that ends
+  without saying which of its targets remain single-source has not finished,
+  and nothing downstream may rest a decision rule on a probe.
+- Paywalled or unavailable material goes on the request list rather than
+  being worked around.
 
 ## Review plan for anything larger than one question (HoH-F4)
 

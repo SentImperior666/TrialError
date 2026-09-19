@@ -8,14 +8,31 @@ elsewhere)."""
 from __future__ import annotations
 
 import argparse
+import urllib.error
 
 import pytest
 
 from trialerror.cli import lit as cli_lit
-from trialerror.litapi.client import LitApiClient, LookupResult, SearchResult
+from trialerror.litapi.client import LitApiClient, LookupResult, SearchResult, build_default_providers
+from trialerror.litapi.config import load_litapi_config
 from trialerror.litapi.errors import AllProvidersFailedError
 from trialerror.litapi.models import CitationEdge, CitationsPage, WorkRecord
 from trialerror.util.envelope import PROTOCOL_VERSION
+
+
+class _UnreachableTransport:
+    """Every ``.get`` call raises the exact class of exception a real
+    ``UrllibTransport`` would surface for a host an egress policy refuses
+    (litapi-arxiv-https build, C-0093(a)): ``urllib.error.URLError``. Records
+    every URL it was asked for so a test can assert which provider(s) were
+    actually attempted."""
+
+    def __init__(self):
+        self.urls: list[str] = []
+
+    def get(self, url, *, headers=None, timeout_s=None):
+        self.urls.append(url)
+        raise urllib.error.URLError("no route to host")
 
 
 class _Args:
@@ -106,6 +123,45 @@ def test_cmd_lookup_arxiv_all_providers_failed_is_error_envelope(monkeypatch):
     assert env["ok"] is False
     assert env["error"]["code"] == "AllProvidersFailedError"
     assert env["error"]["details"] == {"failures": []}
+
+
+def test_cmd_lookup_transport_unreachable_is_structured_no_traceback_envelope(monkeypatch):
+    """litapi-arxiv-https build, task 3: a real ``LitApiClient`` (built via
+    ``build_default_providers``, exercising the REAL get_with_retry wrapping
+    path -- not the hand-written ``_StubClient`` the other tests here use)
+    backed by a transport whose ``.get`` always raises
+    ``urllib.error.URLError`` must turn into a clean ``ok=false,
+    code='transport_unreachable'`` envelope, never an uncaught exception."""
+    transport = _UnreachableTransport()
+    config = load_litapi_config({})
+    providers = build_default_providers(config, transport=transport)  # DEFAULT_CLIENTS: openalex + semanticscholar
+    monkeypatch.setattr(cli_lit, "_build_client", lambda args: LitApiClient(providers))
+    args = _Args(doi="10.1/x", arxiv_id=None)
+
+    env = cli_lit._cmd_lookup(args)
+
+    assert env["ok"] is False
+    assert env["error"]["code"] == "transport_unreachable"
+    failures = env["error"]["details"]["failures"]
+    assert {f["provider"] for f in failures} == {"openalex", "semanticscholar"}
+    assert all(f["code"] == "transport_unreachable" for f in failures)
+    assert all(f["host"] for f in failures)  # host attempted is preserved, not lost
+    assert all(f["scheme"] == "https" for f in failures)
+    # every provider was actually attempted (no traceback aborted the loop early)
+    assert len(transport.urls) == 2
+
+
+def test_cmd_search_transport_unreachable_is_structured_envelope(monkeypatch):
+    transport = _UnreachableTransport()
+    config = load_litapi_config({})
+    providers = build_default_providers(config, transport=transport)
+    monkeypatch.setattr(cli_lit, "_build_client", lambda args: LitApiClient(providers))
+    args = _Args(query="distributed systems", limit=10)
+
+    env = cli_lit._cmd_search(args)
+
+    assert env["ok"] is False
+    assert env["error"]["code"] == "transport_unreachable"
 
 
 def test_cmd_citations_ok(monkeypatch):
@@ -230,9 +286,13 @@ def test_cmd_acquire_ok_acquired(monkeypatch, tmp_path):
 
     assert env["ok"] is True
     assert env["result"]["outcome"] == "acquired"
+    # FB-1 item F4: "acquired" is not "searchable", and the envelope says so
+    # in two actions -- the job to run, and the inline way to run it.
     assert env["nextActions"] == [
         {"kind": "shell", "argv": ["trialerror", "jobs", "start-worker", "--job-id", "JOB-1"],
-         "description": "run the enqueued pipeline job"}
+         "description": "run the enqueued pipeline job (the document is not searchable until it completes)"},
+        {"kind": "shell", "argv": ["trialerror", "jobs", "start-worker", "--foreground", "--job-id", "JOB-1"],
+         "description": "or run it inline in this shell and watch it (one document, one job)"},
     ]
     assert fake_store.closed is True
 
@@ -295,3 +355,74 @@ def test_cmd_acquire_cost_gate_refusal_suggests_yes_flag(monkeypatch, tmp_path):
     assert env["ok"] is False
     assert env["error"]["code"] == "cost_gate_refused"
     assert env["nextActions"][0]["argv"][-1] == "--yes"
+
+
+def test_cmd_acquire_all_metadata_providers_transport_unreachable_overrides_queued(monkeypatch, tmp_path):
+    """litapi-arxiv-https build, task 3: trialerror.ingest.acquire.acquire
+    itself tolerates a total metadata-lookup failure silently and returns a
+    normal 'queued' AcquireResult (its own module docstring; pinned against
+    the real function in tests/test_litapi_acquire.py) -- but when that
+    total failure is EVERY provider being transport-unreachable (not a
+    legitimate 'no record anywhere'), _cmd_acquire must report a hard
+    transport_unreachable error instead of silently filing a request-queue
+    row no human asked for."""
+    import types
+
+    fake_store = _FakeStore()
+    monkeypatch.setattr("trialerror.stores.store.open_store", lambda *a, **kw: fake_store)
+    fake_result = types.SimpleNamespace(
+        outcome="queued",
+        metadata_providers=[],
+        metadata_failures=[
+            {
+                "provider": "arxiv", "error": "arxiv: transport unreachable", "code": "transport_unreachable",
+                "host": "export.arxiv.org", "scheme": "https",
+            },
+            {
+                "provider": "openalex", "error": "openalex: transport unreachable", "code": "transport_unreachable",
+                "host": "api.openalex.org", "scheme": "https",
+            },
+        ],
+    )
+    monkeypatch.setattr("trialerror.ingest.acquire.acquire", lambda *a, **kw: fake_result)
+    args = _Args(program_root=str(tmp_path), doi=None, arxiv_id="2101.00001", launch_id="LNCH-1", yes=False)
+
+    env = cli_lit._cmd_acquire(args)
+
+    assert env["ok"] is False
+    assert env["error"]["code"] == "transport_unreachable"
+    assert len(env["error"]["details"]["failures"]) == 2
+    assert fake_store.closed is True
+
+
+def test_cmd_acquire_queued_with_some_providers_succeeding_is_not_overridden(monkeypatch, tmp_path):
+    """Guards against over-triggering: a genuinely empty request-queue
+    outcome where at least one provider DID succeed at metadata (or where
+    metadata_failures is simply empty) must keep the normal ok='queued'
+    envelope -- only an EMPTY metadata_providers with a non-empty,
+    all-transport_unreachable metadata_failures overrides it (see the
+    existing test_cmd_acquire_ok_queued_suggests_requests_md_rerender above
+    for the plain-stub, no-metadata-fields-at-all case)."""
+    import types
+
+    fake_store = _FakeStore()
+    monkeypatch.setattr("trialerror.stores.store.open_store", lambda *a, **kw: fake_store)
+    fake_result = types.SimpleNamespace(
+        outcome="queued",
+        metadata_providers=["openalex"],
+        metadata_failures=[
+            {"provider": "arxiv", "error": "arxiv: transport unreachable", "code": "transport_unreachable",
+             "host": "export.arxiv.org", "scheme": "https"},
+        ],
+        source={"source_id": "SRC-1", "request_state": "wanted"},
+        document=None,
+        job=None,
+        to_dict=lambda: {"outcome": "queued", "source": {"source_id": "SRC-1", "request_state": "wanted"}},
+    )
+    monkeypatch.setattr("trialerror.ingest.acquire.acquire", lambda *a, **kw: fake_result)
+    args = _Args(program_root=str(tmp_path), doi="10.1/x", arxiv_id=None, launch_id="LNCH-1", yes=False)
+
+    env = cli_lit._cmd_acquire(args)
+
+    assert env["ok"] is True
+    assert env["result"]["outcome"] == "queued"

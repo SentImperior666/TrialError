@@ -118,7 +118,13 @@ def test_tools_call_missing_required_argument_is_a_protocol_error(server):
     )
     assert "result" not in resp
     assert resp["error"]["code"] == -32602
-    assert "program_id" in resp["error"]["message"] or "program_id" in str(resp["error"].get("data"))
+    # `agent_kind` rather than `program_id`: since lane FB-7 item 6 the
+    # program id defaults from [program] id and the session id from the open
+    # session, so neither is required and neither can be missing. The claim
+    # this test makes -- a schema-shape problem is a protocol error and the
+    # handler is never invoked -- is unchanged.
+    assert "agent_kind" in resp["error"]["message"] or "agent_kind" in str(resp["error"].get("data"))
+    assert "program_id" not in resp["error"]["message"]
 
 
 def test_tools_call_unknown_tool_is_a_protocol_error(server):

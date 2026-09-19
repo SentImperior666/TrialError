@@ -89,6 +89,8 @@ def _record_from_response(data: dict) -> WorkRecord:
 
 class UnpaywallProvider:
     name = "unpaywall"
+    #: FB-1 item F3: what this provider's `search` matches on.
+    search_scope = "no search endpoint (DOI lookup and OA locations only)"
 
     def __init__(self, transport: ProviderTransport, config: ProviderApiConfig, *, program_root=None):
         # program_root accepted (unused) for constructor-shape parity with

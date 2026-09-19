@@ -173,7 +173,9 @@ def test_boot_session_bundle_latest_handoff_respects_configured_handoffs_dir(sto
     proof the handoff.py/lifecycle.py duplication fix actually shares one
     resolver rather than merely not crashing."""
     external = tmp_path / "external-handoffs"
-    config = {"paths": {"handoffs_dir": str(external)}}
+    # Outside the program root, so the program says so explicitly -- see
+    # trialerror.sessions.handoff.HandoffsDirOutsideRootError.
+    config = {"paths": {"handoffs_dir": str(external)}, "session": {"handoffs_dir_outside_root": True}}
 
     _, session_id = seed_open_session(store)
     add_hook_alive(store, session_id)
@@ -486,7 +488,9 @@ def test_close_session_success_writes_close_report_and_course_check(store):
 
 def test_close_session_respects_configured_handoffs_dir(store, tmp_path):
     external = tmp_path / "external-handoffs"
-    config = {"paths": {"handoffs_dir": str(external)}}
+    # Outside the program root, so the program says so explicitly -- see
+    # trialerror.sessions.handoff.HandoffsDirOutsideRootError.
+    config = {"paths": {"handoffs_dir": str(external)}, "session": {"handoffs_dir_outside_root": True}}
 
     _, session_id = seed_open_session(store)
     add_hook_alive(store, session_id)

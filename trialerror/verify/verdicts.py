@@ -45,14 +45,38 @@ def record_verdict(
     procedure: str,
     procedure_version: str,
     label: str,
+    label_canonical: str | None = None,
     evidence: Sequence[Mapping[str, Any]] | None = None,
     prereg_id: str | None = None,
     prereg_compliant: bool | None = None,
     reproduction_ref: str | None = None,
+    round_id: str | None = None,
+    batch_id: str | None = None,
     issued_by_launch: str,
     ts: str | None = None,
 ) -> dict[str, Any]:
-    """Insert one ``verdict`` row. ``evidence`` is a list of
+    """Insert one ``verdict`` row.
+
+    ``label_canonical`` (knowledge-v8) is the same label in the DESIGN's own
+    fixed vocabulary, for a procedure whose caller lets a round spell its
+    labels its own way (``trialerror.lens.novelty``'s judged screen is the
+    one that does). It is written in the same composite shape ``label``
+    carries, so a reader that parses one can be pointed at the other and
+    keep working. ``None`` -- the default, and every pre-v8 caller's
+    behaviour -- leaves the column NULL, which says "this procedure has one
+    vocabulary and ``label`` is in it".
+
+    ``round_id``/``batch_id`` (knowledge-v12, lane FB-7 item 9) scope a row
+    to the round and batch that produced it. They matter for a procedure
+    whose SUBJECT ids are not unique across the programme --
+    ``trialerror.lens.novelty``'s plants, whose ``plant_id`` is whatever the
+    round's plants file called it -- where a one-submission guard keyed by
+    subject alone refuses a new battery because an older one happened to
+    reuse a name. ``None``, the default and every pre-v12 caller's
+    behaviour, leaves them NULL, which reads as UNKNOWN rather than "no
+    round": a guard must keep blocking on a row whose round it cannot see.
+
+    ``evidence`` is a list of
     ``{anchor_id?, chunk_id?, stance?, note?}`` dicts (design's own DDL
     comment shape) — serialized to JSON here (the DDL's ``evidence`` column
     is ``TEXT NOT NULL``, so ``None``/omitted becomes ``"[]"``, never a
@@ -92,10 +116,13 @@ def record_verdict(
         "procedure": procedure,
         "procedure_version": procedure_version,
         "label": label,
+        "label_canonical": label_canonical,
         "evidence": json.dumps(list(evidence) if evidence else [], ensure_ascii=False),
         "prereg_id": prereg_id,
         "prereg_compliant": (1 if prereg_compliant else 0) if prereg_compliant is not None else None,
         "reproduction_ref": reproduction_ref,
+        "round_id": round_id,
+        "batch_id": batch_id,
         "ts": ts or now(),
         "issued_by_launch": issued_by_launch,
     }

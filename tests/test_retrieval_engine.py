@@ -249,6 +249,47 @@ def test_get_document_outline_fences_titles_for_restricted_sources(store, corpus
     assert len(titles[0]["text_preview"].split()) <= 20
 
 
+def test_a_fenced_document_is_served_an_outline_with_its_element_ids_and_page_ranges(store, corpus):
+    """Observed: outline-first reading of two commercial_restricted
+    documents was impossible, so the lens fell back to scoped vector search.
+    An outline is structural metadata; the only verbatim bytes in it are the
+    heading texts, which the fence truncates like every other excerpt."""
+    doc_id = corpus["restricted_doc_id"]
+    for seq, (heading, page) in enumerate((("Chapter One " + " ".join(f"w{i}" for i in range(40)), 1),
+                                           ("Chapter Two", 4)), start=100):
+        insert(
+            store, "element",
+            {"element_id": new_id("ELM"), "doc_id": doc_id, "seq": seq, "type": "Title",
+             "text": heading, "page_number": page},
+        )
+    insert(
+        store, "element",
+        {"element_id": new_id("ELM"), "doc_id": doc_id, "seq": 102, "type": "NarrativeText",
+         "text": "body under chapter two", "page_number": 7},
+    )
+
+    outline = engine.get_document_outline(store, doc_id)
+    assert outline["fenced"] is True
+    assert "reason" not in outline
+    titles = [o for o in outline["outline"] if o["type"] == "Title"]
+    assert len(titles) == 2
+    assert all(o["element_id"] for o in titles)
+    assert all(len(o["text_preview"].split()) <= 20 for o in titles)
+    assert titles[0]["page_start"] == 1 and titles[0]["page_end"] == 1
+    # the second heading's section runs through the body element after it
+    assert titles[1]["page_start"] == 4 and titles[1]["page_end"] == 7
+
+
+def test_a_document_with_no_heading_elements_says_so_rather_than_answering_empty(store, corpus):
+    """`outline: []` alone reads as "this call declined to serve one",
+    which is exactly the wrong conclusion about a document whose normalizer
+    emitted no headings."""
+    outline = engine.get_document_outline(store, corpus["open_doc_id"])
+    assert outline["outline"] == []
+    assert outline["reason"] == "no_heading_elements"
+    assert outline["n_elements"] > 0
+
+
 def test_get_document_outline_not_found_raises(store):
     with pytest.raises(DocumentNotFoundError):
         engine.get_document_outline(store, "DOC-does-not-exist")

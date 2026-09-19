@@ -23,6 +23,7 @@ __all__ = [
     "platform_db_path",
     "program_store_dir",
     "program_index_dir",
+    "program_run_dir",
     "knowledge_db_path",
     "ops_db_path",
     "jobs_db_path",
@@ -45,6 +46,15 @@ _DEFAULT_STORES_DIR = "stores"
 #: one tenant is the tantivy full-text index
 #: (:mod:`trialerror.retrieve.tantivysearch`).
 _DEFAULT_INDEX_DIR = "index"
+
+#: ``[paths].run_dir`` -- the home of state that describes THIS MACHINE RIGHT
+#: NOW: pids, heartbeats, the log of a supervised process (lane F-1b item 4's
+#: ``trialerror sidecar``). A third sibling rather than a child of either
+#: existing root, because it is neither source of truth (``stores/``) nor
+#: derived-and-rebuildable (``index/``): it is worthless the moment the
+#: machine reboots, and a copy of it restored onto another host would be
+#: actively wrong. Delete it freely while nothing is running.
+_DEFAULT_RUN_DIR = "run"
 
 
 def platform_root() -> Path:
@@ -85,6 +95,12 @@ def program_index_dir(program_root: Path | str, config: dict[str, Any] | None = 
     :data:`_DEFAULT_INDEX_DIR` for why derived index state gets its own
     root rather than living under ``stores/``."""
     return resolve_configured_path(program_root, config, "index_dir", _DEFAULT_INDEX_DIR)
+
+
+def program_run_dir(program_root: Path | str, config: dict[str, Any] | None = None) -> Path:
+    """``[paths].run_dir`` (default ``"run"``) -- see :data:`_DEFAULT_RUN_DIR`
+    for why this-machine-right-now state gets its own root."""
+    return resolve_configured_path(program_root, config, "run_dir", _DEFAULT_RUN_DIR)
 
 
 def fulltext_index_path(program_root: Path | str, config: dict[str, Any] | None = None) -> Path:

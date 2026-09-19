@@ -29,7 +29,15 @@ import time
 
 from pathlib import Path
 
-from trialerror.retrieve import tantivysearch
+from trialerror.ingest.backends import (
+    QUERY_EMBED_TABLE,
+    embed_backend_runnable,
+    embed_backend_runtime_details,
+    load_query_embed_backend,
+    query_embed_backend_name,
+)
+from trialerror.retrieve import tantivysearch, vecmatrix
+from trialerror.retrieve.engine import QUERY_EMBED_DOCTOR_CHECK
 from trialerror.retrieve.fence import excerpt_words
 from trialerror.retrieve.ftssearch import DEFAULT_FTS_CANDIDATE_LIMIT
 from trialerror.retrieve.lexical import configured_backend_name, lexical_search
@@ -37,7 +45,13 @@ from trialerror.stores import paths
 from trialerror.stores.connection import connect
 from trialerror.util.doctor import CheckResult, DoctorContext, register_check
 
-__all__ = ["check_fence_integrity", "check_retrieval_latency", "check_fulltext_index_stale"]
+__all__ = [
+    "check_fence_integrity",
+    "check_retrieval_latency",
+    "check_fulltext_index_stale",
+    "check_query_embed_backend_runnable",
+    "check_vecmatrix_stale",
+]
 
 #: How many commercial_restricted chunks :func:`check_fence_integrity`
 #: samples per run -- bounded so doctor stays fast even against a large
@@ -272,5 +286,173 @@ def check_fulltext_index_stale(ctx: DoctorContext) -> CheckResult:
     return CheckResult(
         name="fulltext_index_stale", category="retrieve", status="pass",
         message=f"tantivy full-text index is current with all {status['db_chunks']} chunk(s)",
+        details=details,
+    )
+
+
+# ---------------------------------------------------------------------------
+# lane F-1: the query side of retrieval
+# ---------------------------------------------------------------------------
+
+
+@register_check(QUERY_EMBED_DOCTOR_CHECK, category="retrieve")
+def check_query_embed_backend_runnable(ctx: DoctorContext) -> CheckResult:
+    """Can THIS process embed a query?
+
+    The check exists because the answer is routinely no, and used to be
+    invisible. A program whose document embeddings are produced on another
+    machine (``[ingest.embed] backend = "offload"``) has a document backend
+    whose ``embed_batch`` raises by design -- correctly -- and until lane F-1
+    every query-time caller that reached for it raised too, in the middle of
+    a search. The fix is a separate query-side backend
+    (``[ingest.embed.query]``); this check is how an operator finds out
+    whether theirs works, in one line, before an agent finds out by getting
+    lexical-only results all afternoon.
+
+    Statuses:
+
+    - ``skip`` -- no ``knowledge.db``, or a corpus with no embeddings at all
+      under any key. Nothing has been embedded, so there is no vector tier
+      to be unable to serve, and reporting a backend problem would be
+      reporting it for a search that cannot run either way.
+    - ``warn`` -- not runnable here, with the backend's own reason. A warn,
+      not a fail: the corpus is intact, ``search`` still answers out of the
+      full-text tier and says that it did, and on a two-machine program in
+      the middle of delivering a CPU encoder this is the EXPECTED state.
+      What it is not is silent.
+    - ``pass`` -- the query-side backend reports it can compute here.
+
+    Read-only and side-effect-free by construction: it asks
+    :meth:`~trialerror.ingest.backends.EmbedBackend.runnable`, which is
+    allowed to load a model and is not allowed to embed anything.
+    """
+    path = _knowledge_path(ctx)
+    if path is None or not path.exists():
+        return _skip(QUERY_EMBED_DOCTOR_CHECK)
+
+    conn = connect(path, read_only=True)
+    try:
+        row = conn.execute("SELECT COUNT(*) AS n FROM emb").fetchone()
+        embeddings = int(row["n"]) if row is not None else 0
+    except Exception:  # noqa: BLE001 - a store predating the table is "no embeddings"
+        embeddings = 0
+    finally:
+        conn.close()
+
+    config = _program_config(ctx.program_root)
+    embed_config = (config.get("ingest") or {}).get("embed") or {}
+    query_backend_name = query_embed_backend_name(embed_config)
+    details = {
+        "query_backend": query_backend_name,
+        "document_backend": embed_config.get("backend", "fake"),
+        "config_table": QUERY_EMBED_TABLE,
+        "embeddings": embeddings,
+    }
+
+    if embeddings == 0:
+        return CheckResult(
+            name=QUERY_EMBED_DOCTOR_CHECK, category="retrieve", status="skip",
+            message="no embeddings in this program's corpus yet; there is no vector tier to serve",
+            details=details,
+        )
+
+    try:
+        backend = load_query_embed_backend(embed_config)
+    except Exception as exc:  # noqa: BLE001 - a refused/malformed table is exactly what this reports
+        return CheckResult(
+            name=QUERY_EMBED_DOCTOR_CHECK, category="retrieve", status="warn",
+            message=(
+                f"the query-side embed backend could not be resolved ({type(exc).__name__}: {exc}) -- "
+                f"fix [{QUERY_EMBED_TABLE}] in trialerror.toml"
+            ),
+            details=details,
+        )
+
+    details["model_key"] = getattr(backend, "model_key", None)
+    details["dims"] = getattr(backend, "dims", None)
+    runnable, reason = embed_backend_runnable(backend)
+    # Lane F-1b item 5: WHICH runtime, with the numbers that decide whether it
+    # is usable -- the in-process encoder's n_threads/n_threads_batch/cgroup
+    # quota (a wrong batch-thread count is a 7x slowdown and nothing else
+    # reports it), or the sidecar client's URL and last health reading.
+    # Collected AFTER the runnable() probe so the health line is the one the
+    # probe just took, and through the never-raises accessor so a detail field
+    # can never be what breaks a check.
+    runtime = embed_backend_runtime_details(backend)
+    if runtime:
+        details["runtime"] = runtime
+    if not runnable:
+        return CheckResult(
+            name=QUERY_EMBED_DOCTOR_CHECK, category="retrieve", status="warn",
+            message=(
+                f"this process cannot embed a query: {reason}. Searches run the full-text tier only "
+                f"(and say so); `verify hypothesis` and `lens screen` refuse. Configure a runnable "
+                f"query-side backend in [{QUERY_EMBED_TABLE}]"
+            ),
+            details={**details, "reason": reason},
+        )
+    return CheckResult(
+        name=QUERY_EMBED_DOCTOR_CHECK, category="retrieve", status="pass",
+        message=(
+            f"query-side embed backend {query_backend_name!r} is runnable here under model_key "
+            f"{details['model_key']!r} ({details['dims']} dims)"
+        ),
+        details=details,
+    )
+
+
+@register_check("vecmatrix_stale", category="retrieve")
+def check_vecmatrix_stale(ctx: DoctorContext) -> CheckResult:
+    """Whether any cached similarity matrix
+    (:mod:`trialerror.retrieve.vecmatrix`) still describes the table it was
+    built from.
+
+    A stale cache here is not a correctness risk -- the fingerprint is
+    checked on every query and a mismatch rebuilds before ranking, so a
+    stale file can only ever cost the rebuild it is about to trigger. That
+    is precisely why this is a ``warn`` and never a ``fail``: what it
+    reports is a known cost (the next unlucky query pays a full rebuild),
+    not a wrong answer. ``skip`` when no key has a cache at all, which is
+    every program until its first large unbounded ranking call.
+    """
+    path = _knowledge_path(ctx)
+    if path is None or not path.exists():
+        return _skip("vecmatrix_stale")
+
+    conn = connect(path, read_only=True)
+    try:
+        try:
+            registry = [dict(r) for r in conn.execute("SELECT model_key FROM vec_index_registry")]
+        except Exception:  # noqa: BLE001 - fresh program, no registry table
+            registry = []
+        store = _KnowledgeOnlyStore(conn, ctx.program_root)
+        statuses = {}
+        for reg in registry:
+            model_key = reg["model_key"]
+            statuses[model_key] = vecmatrix.matrix_status(store, model_key, _program_config(ctx.program_root))
+    finally:
+        conn.close()
+
+    present = {k: v for k, v in statuses.items() if v["present"]}
+    details = {"model_keys": statuses, "numpy_available": vecmatrix.numpy_available()}
+    if not present:
+        return CheckResult(
+            name="vecmatrix_stale", category="retrieve", status="skip",
+            message="no resident similarity matrix cached for any model key yet", details=details,
+        )
+    stale = sorted(k for k, v in present.items() if v["stale"])
+    if stale:
+        return CheckResult(
+            name="vecmatrix_stale", category="retrieve", status="warn",
+            message=(
+                f"the cached similarity matrix for {', '.join(repr(k) for k in stale)} no longer matches "
+                "its vector table; the next unbounded ranking call rebuilds it (correct, but it pays "
+                "for the rebuild)"
+            ),
+            details=details,
+        )
+    return CheckResult(
+        name="vecmatrix_stale", category="retrieve", status="pass",
+        message=f"the cached similarity matrix is current for {len(present)} model key(s)",
         details=details,
     )

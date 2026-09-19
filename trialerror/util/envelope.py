@@ -73,11 +73,24 @@ def make_envelope(
     error: Mapping[str, Any] | None = None,
     next_actions: Iterable[NextAction | Mapping[str, Any]] | None = None,
     meta: Mapping[str, Any] | None = None,
+    warnings: Sequence[Mapping[str, Any] | str] | None = None,
 ) -> dict:
     """Build an envelope dict. Exactly one of ``result``/``error`` applies,
     selected by ``ok`` — the other must not be supplied (discriminated
     union, enforced at construction so a caller can't accidentally emit a
-    ``ok:true`` envelope carrying an ``error`` block or vice versa)."""
+    ``ok:true`` envelope carrying an ``error`` block or vice versa).
+
+    ``warnings`` (lane F-1) is for the case the envelope shape had no room
+    for: the command SUCCEEDED, and something about how it succeeded is
+    material — a tier that could not run, a degraded path taken. It is
+    strictly ADDITIVE: the key is emitted only when a caller passes a
+    non-empty list, so every envelope this codebase already produces is
+    byte-identical to before and no consumer sees a new key it did not ask
+    for. Each entry is a ``{code, message, ...}`` mapping (a bare string is
+    accepted and wrapped as ``{"message": ...}``) — the same
+    ``code``-plus-prose shape the ``error`` block uses, because an agent
+    parsing one should not have to learn a second convention for the
+    other."""
     if ok and error is not None:
         raise ValueError("ok=True envelopes must not carry an error block")
     if not ok and result is not None:
@@ -96,6 +109,11 @@ def make_envelope(
         env["error"] = dict(error)  # type: ignore[arg-type]
     env["nextActions"] = _coerce_next_actions(next_actions)
     env["meta"] = dict(meta) if meta else {}
+    coerced_warnings = [
+        {"message": w} if isinstance(w, str) else dict(w) for w in (warnings or [])
+    ]
+    if coerced_warnings:
+        env["warnings"] = coerced_warnings
     return env
 
 
@@ -105,10 +123,11 @@ def ok_envelope(
     *,
     next_actions: Iterable[NextAction | Mapping[str, Any]] | None = None,
     meta: Mapping[str, Any] | None = None,
+    warnings: Sequence[Mapping[str, Any] | str] | None = None,
 ) -> dict:
     """Shorthand for ``make_envelope(ok=True, ...)``."""
     return make_envelope(
-        ok=True, command=command, result=result, next_actions=next_actions, meta=meta
+        ok=True, command=command, result=result, next_actions=next_actions, meta=meta, warnings=warnings
     )
 
 
@@ -120,6 +139,7 @@ def error_envelope(
     details: Mapping[str, Any] | None = None,
     next_actions: Iterable[NextAction | Mapping[str, Any]] | None = None,
     meta: Mapping[str, Any] | None = None,
+    warnings: Sequence[Mapping[str, Any] | str] | None = None,
 ) -> dict:
     """Shorthand for ``make_envelope(ok=False, ...)`` with a structured
     ``{code, message, details?}`` error (design Section 5.1 cross-cutting
@@ -128,7 +148,7 @@ def error_envelope(
     if details:
         error["details"] = dict(details)
     return make_envelope(
-        ok=False, command=command, error=error, next_actions=next_actions, meta=meta
+        ok=False, command=command, error=error, next_actions=next_actions, meta=meta, warnings=warnings
     )
 
 
@@ -150,6 +170,9 @@ def render_text(envelope: Mapping[str, Any]) -> str:
         lines.append(f"error [{error.get('code')}]: {error.get('message')}")
         if error.get("details"):
             lines.append(f"details: {json.dumps(error['details'], ensure_ascii=False, indent=2)}")
+    for warning in envelope.get("warnings") or []:
+        code = warning.get("code")
+        lines.append(f"warning [{code}]: {warning.get('message')}" if code else f"warning: {warning.get('message')}")
     next_actions = envelope.get("nextActions") or []
     if next_actions:
         lines.append("next actions:")

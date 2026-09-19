@@ -40,6 +40,7 @@ from trialerror.util.timeutil import parse
 
 __all__ = [
     "launch_span",
+    "span_input_tokens",
     "traced_reconcile_launch",
     "retrieval_span",
     "verification_span",
@@ -156,6 +157,22 @@ def _guarded_manual(start: "Any", end: "Any") -> Iterator[Any]:
 # launch (booked -> reconciled) -> invoke_agent
 # ---------------------------------------------------------------------
 
+#: The platform-v2 launch columns that are INPUT tokens, whatever the
+#: provider billed them at. OTel's ``gen_ai.usage.input_tokens`` is one
+#: number, and dropping the two cache columns would under-report a
+#: cache-heavy launch by three orders of magnitude (the live sample: 2 fresh
+#: input tokens beside 11,455 cache-read ones).
+_INPUT_TOKEN_COLUMNS = ("usage_input_tokens", "usage_cache_creation_tokens", "usage_cache_read_tokens")
+
+
+def span_input_tokens(row: Any) -> int | None:
+    """The span's single input-token number for a launch ``row``, or ``None``
+    when the row carries no split at all (a hand-reconciled launch makes no
+    claim about composition, and a zero here would be one)."""
+    values = [row.get(column) for column in _INPUT_TOKEN_COLUMNS]
+    reported = [v for v in values if isinstance(v, int) and not isinstance(v, bool)]
+    return sum(reported) if reported else None
+
 
 @contextmanager
 def launch_span(
@@ -165,6 +182,8 @@ def launch_span(
     model: str,
     parent_launch: str | None = None,
     actual_tokens: int | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
     program: str | None = None,
     start_ts: str | None = None,
     end_ts: str | None = None,
@@ -178,19 +197,33 @@ def launch_span(
 
     TRIALERROR-DEV-NOTE (usage split): design Section 4.5 names ``gen_ai.usage.
     {input,output}_tokens`` (from reconcile) as the launch span's usage
-    attributes. ``platform.launch`` (Section 4.3 DDL) tracks exactly ONE
-    settled number, ``actual_tokens`` -- there is no input/output split in
-    the schema to draw from. Rather than fabricate a split, this emits
-    ``gen_ai.usage.output_tokens`` only, carrying the schema's one real
-    number; ``gen_ai.usage.input_tokens`` is left unset. A real split would
-    need a schema change outside M12's lane (``trialerror/stores/`` is M1's).
+    attributes. Until platform-v2 (lane FB-3, D-FB-13 (c)) ``platform.launch``
+    tracked exactly ONE settled number, ``actual_tokens``, so this emitted
+    ``gen_ai.usage.output_tokens`` alone -- carrying the schema's one real
+    number rather than fabricating a split -- and left
+    ``gen_ai.usage.input_tokens`` unset.
+
+    The schema now carries the split for a launch reconciled from its own
+    return event, so both attributes are emitted WHEN THE SPLIT IS PRESENT:
+    ``input_tokens`` is the measured input (cache-creation and cache-read
+    tokens are input the provider billed differently, so they are summed
+    into it rather than dropped -- see
+    :func:`traced_reconcile_launch`), and ``output_tokens`` is the measured
+    output. With no split on the row, the old behaviour stands exactly:
+    ``output_tokens = actual_tokens``, ``input_tokens`` unset. A reader of
+    two spans can therefore tell a measured launch from a hand-reconciled
+    one by whether ``input_tokens`` is there at all, which is the same
+    distinction ``reconcile_source`` makes in the store.
     """
     attrs = _attrs(
         **{
             semconv.GEN_AI_OPERATION_NAME: semconv.OP_INVOKE_AGENT,
             semconv.GEN_AI_AGENT_NAME: agent_kind,
             semconv.GEN_AI_REQUEST_MODEL: model,
-            semconv.GEN_AI_USAGE_OUTPUT_TOKENS: actual_tokens,
+            semconv.GEN_AI_USAGE_INPUT_TOKENS: input_tokens,
+            semconv.GEN_AI_USAGE_OUTPUT_TOKENS: (
+                output_tokens if output_tokens is not None else actual_tokens
+            ),
             semconv.TRIALERROR_LAUNCH_ID: launch_id,
             semconv.TRIALERROR_PARENT_LAUNCH: parent_launch,
             semconv.TRIALERROR_PROGRAM: program,
@@ -246,6 +279,8 @@ def traced_reconcile_launch(store: Any, *, launch_id: str, program_root: str | P
         model=row.get("model"),
         parent_launch=row.get("parent_launch"),
         actual_tokens=row.get("actual_tokens"),
+        input_tokens=span_input_tokens(row),
+        output_tokens=row.get("usage_output_tokens"),
         program=row.get("program_id"),
         start_ts=row.get("booked_ts"),
         end_ts=row.get("reconciled_ts"),

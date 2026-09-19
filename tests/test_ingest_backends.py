@@ -181,6 +181,14 @@ def test_marker_backend_page_split_no_markers_falls_back_to_single_page():
 # ``subprocess.run`` call sites -- no mocking of ``subprocess.run`` itself,
 # no marker/Qwen install needed (build brief: "tests must NOT need the
 # GPU"), and no live-GPU skip either.
+#
+# FX-S1 note: the three ``RealQwenEmbedBackend`` cases below pass
+# ``session=False`` on purpose. They are about the ONE-SHOT driver protocol
+# -- one ``subprocess.run`` per batch, ``_DRIVER_SOURCE`` -- which is now
+# the fallback rather than the default, and which they still own the
+# coverage of. The resident-session equivalents (per-request timeout,
+# crash-then-restart, stderr head, shutdown) live in
+# ``tests/test_ingest_embed_session.py``.
 # --------------------------------------------------------------------------
 
 
@@ -245,7 +253,9 @@ def test_real_qwen_embed_backend_timeout_raises_environmental_failure(tmp_path):
     seam, mirrors this module's own ``FakeEmbedBackend.delay_s``
     precedent) to a script that sleeps, so no real embed_backend/torch
     install is needed to prove the timeout path."""
-    backend = RealQwenEmbedBackend(python_exe=sys.executable, module_dir=str(tmp_path), timeout_s=0.3)
+    backend = RealQwenEmbedBackend(
+        python_exe=sys.executable, module_dir=str(tmp_path), timeout_s=0.3, session=False
+    )
     backend._DRIVER_SOURCE = "import time\ntime.sleep(30)\n"
     with pytest.raises(EnvironmentalFailure) as excinfo:
         backend.embed_batch(["hello world"])
@@ -256,7 +266,9 @@ def test_real_qwen_embed_backend_decodes_non_ascii_stderr_as_utf8_not_cp1252(tmp
     """FX-2, embed side: the real embed driver's stderr (a torch/
     transformers traceback) is UTF-8 and can carry non-ASCII; must decode
     correctly, not as cp1252."""
-    backend = RealQwenEmbedBackend(python_exe=sys.executable, module_dir=str(tmp_path), timeout_s=30)
+    backend = RealQwenEmbedBackend(
+        python_exe=sys.executable, module_dir=str(tmp_path), timeout_s=30, session=False
+    )
     backend._DRIVER_SOURCE = (
         "import sys\n"
         "sys.stderr.buffer.write('embed failed on caf\\u00e9 \\u2014 mojibake canary'.encode('utf-8'))\n"
@@ -269,7 +281,9 @@ def test_real_qwen_embed_backend_decodes_non_ascii_stderr_as_utf8_not_cp1252(tmp
 
 def test_real_qwen_embed_backend_invalid_utf8_stderr_does_not_raise_unicode_decode_error(tmp_path):
     """FX-2's ``errors='replace'`` half, embed side."""
-    backend = RealQwenEmbedBackend(python_exe=sys.executable, module_dir=str(tmp_path), timeout_s=30)
+    backend = RealQwenEmbedBackend(
+        python_exe=sys.executable, module_dir=str(tmp_path), timeout_s=30, session=False
+    )
     backend._DRIVER_SOURCE = "import sys\nsys.stderr.buffer.write(b'bad byte follows: \\xff\\xfe garbage')\nsys.exit(1)\n"
     with pytest.raises(RuntimeError):  # NOT UnicodeDecodeError
         backend.embed_batch(["hello world"])

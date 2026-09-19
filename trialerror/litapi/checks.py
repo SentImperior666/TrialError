@@ -93,8 +93,21 @@ def check_litapi_config_present(ctx: DoctorContext) -> CheckResult:
         warnings.append(
             "litapi.openalex.mailto is unset -- requests will land in OpenAlex's default (non-polite) pool"
         )
-    if litapi_cfg.openalex.base_url and litapi_cfg.semanticscholar.base_url:
-        pass  # both resolved (config or built-in default) -- nothing further to check here.
+    # C-0093(a) egress hardening: a program's own trialerror.toml can override
+    # any provider's base_url with a plaintext http:// one (the built-in
+    # defaults are all https -- see test_litapi_config.test_all_provider_default_base_urls_use_https
+    # -- so this only fires on an explicit operator override). An egress
+    # policy admitting only tcp/443 refuses such a call outright
+    # (urllib.error.URLError, not a clean not-found) -- warn here, at
+    # config-inspection time, rather than let the operator discover it via
+    # a transport failure mid-acquisition.
+    for _provider_name in ("openalex", "semanticscholar", "arxiv", "unpaywall"):
+        _base_url = litapi_cfg.provider(_provider_name).base_url
+        if _base_url.startswith("http://"):
+            warnings.append(
+                f"litapi.{_provider_name}.base_url is plaintext http ({_base_url!r}) -- an egress policy "
+                "admitting only tcp/443 will refuse it; use https unless this host is genuinely http-only"
+            )
 
     status = "warn" if warnings else "pass"
     message = "; ".join(warnings) if warnings else "litapi config resolved for both providers"

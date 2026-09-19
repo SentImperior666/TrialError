@@ -38,6 +38,20 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
+# The model boundary, shared with the query side (lane F-1b item 3): the
+# semantics are this path's -- it produced the stored vectors -- but the
+# FUNCTION now lives with the query-side clients that have to apply the same
+# one (theirs kept ``\r`` and passed whitespace-only text through, so they
+# encoded a different string than the corpus was encoded from). Re-exported
+# below under this module's own name (the same object, not a wrapper), so the
+# worker's chunk path and every existing import keep resolving.
+#
+# Import direction: ``trialerror.ingest.backends`` imports
+# ``trialerror.jobs.worker`` (as this module already does) and
+# ``trialerror.offload.marker``, neither of which reaches back here -- so this
+# is not a cycle. ``tests/test_ingest_embeddable_text.py`` imports both
+# modules in both orders to keep it that way.
+from trialerror.ingest.backends import embeddable_text as embeddable_text
 from trialerror.jobs.worker import EnvironmentalFailure
 from trialerror.offload import protocol
 from trialerror.offload.marker import config_hash
@@ -48,9 +62,13 @@ __all__ = [
     "OCR_OUTPUT_NAME",
     "EMBED_INPUT_NAME",
     "EMBED_OUTPUT_NAME",
+    "ChunkPayloadError",
+    "MissingStageInputError",
     "ocr_input_name",
     "build_chunks_payload",
     "read_chunks_payload",
+    "rebuild_inputs",
+    "embeddable_text",
     "offload_ocr_result",
     "offload_embed_vectors",
 ]
@@ -107,29 +125,266 @@ def ocr_input_name(raw_path: Path | str) -> str:
 # ---------------------------------------------------------------------------
 # payload encoding (shared with the DEV worker, which decodes them)
 # ---------------------------------------------------------------------------
+class ChunkPayloadError(protocol.OffloadProtocolError):
+    """A ``chunks.jsonl`` line could not be decoded.
+
+    Named, and carrying the LINE NUMBER and (where it can still be read out
+    of the broken line) the ``chunk_id``, because the bare
+    ``json.JSONDecodeError`` this replaces said only "Unterminated string
+    starting at: line 1 column 69" -- a column in a line the operator never
+    sees, on a job whose error.json named no document and no chunk. Three
+    live documents failed on every DEV attempt behind that message."""
+
+
+#: The characters ``str.splitlines()`` treats as line terminators but
+#: ``json.dumps(..., ensure_ascii=False)`` does NOT escape: U+0085 NEL,
+#: U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR. (``json`` escapes
+#: every C0 control, U+0000-U+001F, so ``\n``/``\r``/``\x0b``/``\x0c``/
+#: ``\x1c``-``\x1e`` are already safe; these three are not C0 and survive.)
+#:
+#: THE DEFECT (live, three documents, every DEV attempt): one chunk whose
+#: text contained one of these produced a single valid JSON line that
+#: ``read_chunks_payload``'s ``str.splitlines()`` then cut in two, so the
+#: worker handed ``json.loads`` a fragment ending mid-string --
+#: ``JSONDecodeError: Unterminated string starting at: line 1 column 69``,
+#: column 69 being exactly where the ``"text"`` value opens. The JSON was
+#: never malformed; the line-splitting disagreed with the JSON grammar
+#: about what a line is.
+_RAW_LINE_BREAKS = {
+    "\u0085": "\\u0085",  # NEL
+    "\u2028": "\\u2028",  # LINE SEPARATOR
+    "\u2029": "\\u2029",  # PARAGRAPH SEPARATOR
+}
+
+
+def _escape_raw_line_breaks(line: str) -> str:
+    """Replace the three raw line-break characters above with their JSON
+    ``\\uXXXX`` escapes. Safe as a blanket replacement: every structural
+    byte of one of these lines is ASCII (the keys are ASCII, the numbers are
+    ASCII), so a match can only ever be inside a string literal, and the
+    escape decodes back to the identical character."""
+    for raw, escaped in _RAW_LINE_BREAKS.items():
+        if raw in line:
+            line = line.replace(raw, escaped)
+    return line
+
+
 def build_chunks_payload(chunks: Sequence[dict[str, Any]]) -> bytes:
     """``chunks.jsonl``: one ``{"chunk_id", "seq", "text"}`` per line, in
     the order the manifest's ``expect.chunk_ids`` lists them. ALL chunks of
     the document travel together (design v3 delta N2: the real backend
     embeds in batches of eight, so batching is the WORKER's business, not
-    the queue's)."""
-    lines = [
-        json.dumps(
-            {"chunk_id": c["chunk_id"], "seq": c.get("seq"), "text": c["text"]},
-            ensure_ascii=False,
+    the queue's).
+
+    ``ensure_ascii=False`` is kept -- the payload is mostly non-ASCII prose
+    and ``\\uXXXX``-escaping all of it would roughly double the bytes on a
+    wire whose payload size is capped -- so the three line-break characters
+    ``json`` leaves raw under that flag are escaped afterwards
+    (:data:`_RAW_LINE_BREAKS`). The assertion below is the law rather than
+    the comment: ONE record is ONE physical line, verified per line, so the
+    next character class somebody's normalizer starts emitting fails here,
+    in the writer, on the machine that owns the record -- not 20 minutes
+    later as an unattributable decode error on the GPU host."""
+    lines = []
+    for c in chunks:
+        line = _escape_raw_line_breaks(
+            json.dumps(
+                {"chunk_id": c["chunk_id"], "seq": c.get("seq"), "text": c["text"]},
+                ensure_ascii=False,
+            )
         )
-        for c in chunks
-    ]
+        if len(line.splitlines()) != 1:
+            raise ChunkPayloadError(
+                f"chunk {c['chunk_id']!r}: its text contains a character that would split the "
+                f"chunks.jsonl line "
+                f"({_describe_line_breaks(line)}) -- refusing to queue a payload the DEV worker "
+                "cannot decode"
+            )
+        lines.append(line)
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
+#: Every character ``str.splitlines()`` treats as a line terminator, spelled
+#: out rather than probed per character: a LONE line-break character's own
+#: ``.splitlines()`` returns ``['']`` -- length 1 -- so "does THIS one
+#: character split a line?" is a question ``splitlines`` cannot be asked.
+_LINE_BREAK_CODEPOINTS = frozenset(
+    "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+)
+
+
+def _describe_line_breaks(text: str) -> str:
+    """``U+2028 at offset 71`` for every character in ``text`` that
+    ``str.splitlines()`` would break on -- the diagnostic both the writer's
+    refusal and the reader's error need."""
+    found = [
+        f"U+{ord(ch):04X} at offset {i}"
+        for i, ch in enumerate(text)
+        if ch in _LINE_BREAK_CODEPOINTS
+    ]
+    return ", ".join(found) if found else "no line-break character found"
+
+
+_CHUNK_ID_PREFIX_RE = re.compile(r'"chunk_id"\s*:\s*"([^"]{1,128})"')
+
+
 def read_chunks_payload(data: bytes) -> list[dict[str, Any]]:
+    """Decode a ``chunks.jsonl`` payload into ``[{"chunk_id", "seq",
+    "text"}, ...]``.
+
+    Split on ``"\\n"`` ONLY -- what :func:`build_chunks_payload` joined with
+    -- never ``str.splitlines()``, whose idea of a line break includes three
+    characters the JSON grammar treats as ordinary string content (see
+    :data:`_RAW_LINE_BREAKS`). That alone makes this reader tolerant of the
+    payloads the old writer produced: a raw U+2028 inside a JSON string is
+    legal JSON, so a job already parked with one decodes correctly here
+    without being re-queued.
+
+    A line that still will not decode raises :class:`ChunkPayloadError`
+    naming the 1-based line number and, when it can be recovered from the
+    broken text, the ``chunk_id`` -- the two facts that turn "this job fails
+    every time" into "this chunk of this document is the problem"."""
     out: list[dict[str, Any]] = []
-    for line in data.decode("utf-8").splitlines():
-        line = line.strip()
-        if line:
-            out.append(json.loads(line))
+    text = data.decode("utf-8")
+    for lineno, line in enumerate(text.split("\n"), start=1):
+        # Only the trailing newline's empty tail, and any stray CR a
+        # transport added, are stripped -- never the payload's own content.
+        line = line.strip("\r").strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except (TypeError, ValueError) as exc:
+            match = _CHUNK_ID_PREFIX_RE.search(line)
+            named = f"chunk {match.group(1)!r}" if match else "chunk (id unreadable)"
+            raise ChunkPayloadError(
+                f"chunks.jsonl line {lineno}: {named} did not decode -- {exc} "
+                f"[{_describe_line_breaks(line)}]"
+            ) from exc
+        if not isinstance(record, dict) or "chunk_id" not in record:
+            raise ChunkPayloadError(
+                f"chunks.jsonl line {lineno}: decoded to {type(record).__name__}, expected an "
+                'object with a "chunk_id"'
+            )
+        out.append(record)
     return out
+
+
+# ---------------------------------------------------------------------------
+# rebuilding a queued job's inputs from the record (lane FB-8a)
+# ---------------------------------------------------------------------------
+class MissingStageInputError(protocol.OffloadProtocolError):
+    """The payload an offloaded stage would send is no longer on the sandbox.
+
+    Raised by :func:`rebuild_inputs`, and the reason ``trialerror jobs
+    retry`` refuses BY NAME rather than queueing a job the GPU worker will
+    claim, fail on, and hand back three times: the document was retracted,
+    its raw file was moved out of the program root, or its chunk rows no
+    longer match the chunk ids the manifest promised the worker."""
+
+
+def _document_row(store, doc_id: str) -> dict[str, Any] | None:
+    row = store.knowledge.execute(
+        "SELECT * FROM document WHERE doc_id = ?", (doc_id,)
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def rebuild_inputs(store, manifest: dict[str, Any]) -> list[tuple[str, bytes]]:
+    """The inputs this manifest's stage would send TODAY, read back out of
+    the record.
+
+    This is :func:`requeue_marker`'s rule ("the store is the durable truth,
+    the queue is a courier") applied to a marker whose input directory no
+    longer exists at all: :func:`~trialerror.offload.protocol.fail_marker`
+    purges ``pending/<job_id>/`` when it makes a marker terminal, so a retry
+    cannot salvage the bytes and must re-derive them from the same two
+    sources ``offload_ocr_result``/``offload_embed_vectors`` build them from.
+
+    Every way that can fail is a NAMED refusal
+    (:class:`MissingStageInputError`), because the alternative -- queueing a
+    job whose payload is absent, truncated, or about a different chunk set
+    than the manifest's ``expect`` block promises -- spends GPU time to
+    arrive back at ``failed/`` with a less informative error than this one.
+    """
+    stage = manifest.get("stage")
+    doc_id = manifest.get("doc_id")
+    expect = manifest.get("expect") or {}
+    job_id = manifest.get("job_id")
+    if not doc_id:
+        raise MissingStageInputError(
+            f"offload retry {job_id}: this marker names no doc_id, so there is no record to "
+            "rebuild its input payload from"
+        )
+    doc = _document_row(store, doc_id)
+    if doc is None:
+        raise MissingStageInputError(
+            f"offload retry {job_id}: document {doc_id!r} is no longer in this program's record "
+            "(retracted, or never registered here) -- nothing to send to the GPU worker"
+        )
+
+    if stage == "ocr":
+        raw_value = doc.get("raw_path")
+        if not raw_value:
+            raise MissingStageInputError(
+                f"offload retry {job_id}: document {doc_id!r} has no raw_path"
+            )
+        raw_path = Path(raw_value)
+        if not raw_path.is_absolute():
+            raw_path = Path(store.program_root) / raw_path
+        if not raw_path.is_file():
+            raise MissingStageInputError(
+                f"offload retry {job_id}: the document's raw file is missing on the sandbox "
+                f"({raw_path}) -- re-acquire the document before retrying the OCR job"
+            )
+        wanted = expect.get("input_name") or ocr_input_name(raw_path)
+        current = ocr_input_name(raw_path)
+        if wanted != current:
+            raise MissingStageInputError(
+                f"offload retry {job_id}: this marker expects an input named {wanted!r} and the "
+                f"document's raw file would now be sent as {current!r} -- marker dispatches on "
+                "that extension, so the raw file behind this document is not the one the job was "
+                "queued for; re-enqueue the stage instead of retrying this marker"
+            )
+        return [(wanted, _read_input_under_program_root(store.program_root, raw_path))]
+
+    if stage == "embed":
+        # Exactly the shape ``_run_embed_body`` hands ``offload_embed_vectors``
+        # (chunk_id + text, ordered by seq, no ``seq`` key), so a retried
+        # payload is byte-identical to a freshly queued one rather than merely
+        # equivalent.
+        rows = [
+            {"chunk_id": r["chunk_id"], "text": r["text"]}
+            for r in store.knowledge.execute(
+                "SELECT chunk_id, text FROM chunk WHERE doc_id = ? ORDER BY seq", (doc_id,)
+            ).fetchall()
+        ]
+        if not rows:
+            raise MissingStageInputError(
+                f"offload retry {job_id}: document {doc_id!r} has no chunk rows left -- the "
+                "chunk stage has to run again before its embeddings can be retried"
+            )
+        wanted_ids = expect.get("chunk_ids")
+        if wanted_ids is not None and [r["chunk_id"] for r in rows] != list(wanted_ids):
+            raise MissingStageInputError(
+                f"offload retry {job_id}: the document's chunk rows no longer match the chunk "
+                f"ids this marker promised the worker ({len(rows)} now, "
+                f"{len(list(wanted_ids))} then) -- it was re-chunked since, so re-enqueue the "
+                "embed stage instead of retrying this marker"
+            )
+        name = expect.get("input_name") or EMBED_INPUT_NAME
+        return [(name, build_chunks_payload(rows))]
+
+    raise MissingStageInputError(
+        f"offload retry {job_id}: unknown offload stage {stage!r} -- this harness can rebuild "
+        "the inputs of 'ocr' and 'embed' jobs only"
+    )
+
+
+# The model boundary (``embeddable_text``) is imported at the top of this
+# module from :mod:`trialerror.ingest.backends`: since lane F-1b item 3 it is
+# ONE function, shared with the query-side clients, and this module re-exports
+# it under the name the worker's chunk path already used.
 
 
 # ---------------------------------------------------------------------------
@@ -281,12 +536,27 @@ def offload_ocr_result(ctx, *, doc: dict[str, Any], raw_path: Path, ocr_cfg: dic
     from trialerror.ingest.backends import OcrPage, OcrResult
 
     input_name = ocr_input_name(raw_path)
+    declared_pages = doc.get("page_count")
     expect = {
         "stage": "ocr",
         "backend": ocr_cfg.get("expect_backend") or None,
         "version": ocr_cfg.get("expect_version") or None,
         "outputs": [OCR_OUTPUT_NAME],
         "input_name": input_name,
+        # Lane e1e Part B: the ``document.page_count`` column, when this
+        # program has one for this document. A worker that chunks the
+        # document into page ranges reads the page tree again to plan them,
+        # and a disagreement means the file over there is not the file the
+        # record is about -- the one check the two sides can make against
+        # each other without shipping the document back.
+        #
+        # FIX V-7, so nobody leans on it harder than it holds: NOTHING counts
+        # pages at registration. The column is written by one route in the
+        # tree (the DjVu -> derived-PDF conversion in ``ingest/handlers.py``),
+        # so a PDF acquired directly declares ``None`` here and the check
+        # never fires for it. An absent number is not checked rather than
+        # checked against zero, in both directions.
+        "page_count": int(declared_pages) if isinstance(declared_pages, int) and declared_pages > 0 else None,
     }
 
     def build_inputs() -> list[tuple[str, bytes]]:

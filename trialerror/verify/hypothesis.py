@@ -87,7 +87,7 @@ from trialerror.retrieve.vecsearch import fetch_vectors
 from trialerror.stores import get as store_get
 from trialerror.stores import update as store_update
 from trialerror.stores.store import Store
-from trialerror.verify.errors import VerifyError
+from trialerror.verify.errors import QueryEmbedBackendUnrunnableError, VerifyError
 from trialerror.verify.independence import independence_stats
 from trialerror.verify.labels import CONTRACROW_LABELS, CONTRACROW_QA_PROMPT, label_polarity
 from trialerror.verify.prereg import check_prereg_compliance, commit_prereg
@@ -127,7 +127,7 @@ def _rank_tercile_pools(rows: Sequence[Mapping[str, Any]]) -> dict[str, list[Map
 
 
 def _distance_tercile_pools(
-    store: Store, *, query: str, rows: Sequence[Mapping[str, Any]]
+    store: Store, *, query: str, rows: Sequence[Mapping[str, Any]], query_vector: Sequence[float] | None = None
 ) -> dict[str, list[Mapping[str, Any]]] | None:
     """Near/moderate/far pools by embedding distance from each candidate
     CHUNK to the hypothesis QUERY embedding -- design Section 8.2 ("over
@@ -145,13 +145,33 @@ def _distance_tercile_pools(
     substituted -- ``fetch_vectors``'s own "missing is absent" contract).
     """
     chunk_ids = [r["chunk_id"] for r in rows]
-    model_key, backend = retrieve_engine._resolve_query_embed_backend(store)
+    # The DOCUMENT side owns the model_key the candidate vectors are stored
+    # under; ``query_vector`` was produced by the QUERY side (lane F-1),
+    # which resolution guarantees answers under the same key.
+    model_key, _document_backend = retrieve_engine._resolve_embed_backend(store)
     candidate_vectors = fetch_vectors(store, model_key, chunk_ids)
     if not candidate_vectors:
         return None
 
-    query_vector = backend.embed_batch([query], kind="query")[0]
-    scores = score_candidates(candidate_vectors, {"__hypothesis_query__": query_vector})
+    if query_vector is None:
+        # Passed in by every caller in this module. Kept as a fallback for a
+        # direct caller, and it goes through the same helper -- never a bare
+        # ``embed_batch``, which is what used to raise straight out of here
+        # on an offload-backed program.
+        query_vector, reason = retrieve_engine.query_vector_or_reason(store, query)
+        if query_vector is None:
+            raise QueryEmbedBackendUnrunnableError(
+                retrieve_engine.query_embed_refusal_message(reason, action="distance stratification")
+            )
+    # The program's own config, not ``None``: ``[retrieve] numpy_fastpath``
+    # is documented as one line that turns the fast path off for the whole
+    # program, and a call site that passes nothing reads the environment
+    # instead of the file (lane FB-7 fix pass, V-1).
+    scores = score_candidates(
+        candidate_vectors,
+        {"__hypothesis_query__": list(query_vector)},
+        config=retrieve_engine._load_program_config(store),
+    )
     stratified = stratify(scores)
 
     row_by_id = {r["chunk_id"]: r for r in rows}
@@ -194,13 +214,39 @@ def stratified_retrieve(
         raise VerifyError(f"stratified_retrieve: weights must be a 3-tuple (near, moderate, far), got {weights!r}")
     total_weight = sum(weights) or 1
     fetch_k = max(k_total * 3, far_floor * 3, 12)
+
+    # Lane F-1 item D: the query embedding is resolved ONCE, here, before any
+    # retrieval runs -- and it is the gate.
+    #
+    # ``mode="fts"`` is the single explicit exception: a caller that asked
+    # for the full-text tier BY NAME asked for a retrieval that needs no
+    # query vector, gets it, and gets ``stratify_method="rank_fallback"`` in
+    # the return value so the record it lands in says which instrument ran.
+    # Every other mode refuses: a hypothesis verification and a novelty
+    # screen are status-changing reads (C-0096), and silently substituting a
+    # narrower instrument is how a verdict ends up describing the
+    # instrument instead of the corpus.
+    query_vector, vector_reason = retrieve_engine.query_vector_or_reason(store, query)
+    if query_vector is None and mode != "fts":
+        raise QueryEmbedBackendUnrunnableError(
+            retrieve_engine.query_embed_refusal_message(
+                vector_reason, action=f"stratified retrieval (mode={mode!r})"
+            )
+            + ' Retrieval can be restricted to the full-text tier with mode="fts"'
+            " (the screen's --corpus-mode fts), which records itself as such."
+        )
+
     result = retrieve_engine.search(store, query=query, k=fetch_k, mode=mode)
     rows = result["results"]
     n = len(rows)
     if n == 0:
         return {"near": [], "moderate": [], "far": [], "all": [], "query_id": result["query_id"], "stratify_method": "empty"}
 
-    pools = _distance_tercile_pools(store, query=query, rows=rows)
+    pools = (
+        _distance_tercile_pools(store, query=query, rows=rows, query_vector=query_vector)
+        if query_vector is not None
+        else None
+    )
     stratify_method = "distance"
     if pools is None:
         pools = _rank_tercile_pools(rows)
@@ -217,12 +263,17 @@ def stratified_retrieve(
         "moderate": moderate_pool[: min(counts["moderate"], len(moderate_pool))],
         "far": far_pool[: min(counts["far"], len(far_pool))],
     }
-    return {
+    out = {
         **arms,
         "all": arms["near"] + arms["moderate"] + arms["far"],
         "query_id": result["query_id"],
         "stratify_method": stratify_method,
     }
+    if vector_reason:
+        # Present ONLY on the degraded path (mode="fts" with no runnable
+        # query-side backend), so nothing changes shape for a normal call.
+        out["query_vector_reason"] = vector_reason
+    return out
 
 
 def build_hypothesis_judgment_envelope(
@@ -359,6 +410,20 @@ def run_hypothesis_verification(
         prereg_id = hyp_row.get("prereg_id")
 
     query = query or hypothesis_text
+
+    # Lane F-1 item D, C-0096: the gate comes FIRST -- before the optional
+    # pre-registration commit, before the judge is called, before any row is
+    # written. ``stratified_retrieve`` refuses too, but it refuses after a
+    # prereg would already have been committed, and a committed
+    # pre-registration for a run that never happened is a record of a
+    # measurement nobody took. Unlike the screen, this pipeline has no
+    # full-text carve-out: a verdict is the status change itself.
+    runnable, reason = retrieve_engine.query_embed_runnable(store)
+    if not runnable:
+        raise QueryEmbedBackendUnrunnableError(
+            retrieve_engine.query_embed_refusal_message(reason, action="verify hypothesis")
+        )
+
     default_params = {"query": query, "k_total": k_total, "weights": list(weights), "far_floor": far_floor, "mode": mode}
     default_procedure = f"trialerror.verify.hypothesis.run_hypothesis_verification:contracrow:v{procedure_version}"
     procedure_used = executed_procedure or default_procedure

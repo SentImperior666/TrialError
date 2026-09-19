@@ -61,16 +61,18 @@ import sqlite3
 import traceback
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from trialerror.artifacts.registry import list_artifacts
-from trialerror.budget.pools import budget_status, list_pools
+from trialerror.budget import dangling
+from trialerror.budget.pools import budget_status, list_pools, usage_split_totals
 from trialerror.dashboard.store_ro import RoStore
 from trialerror.events.api import list_threads, read_inbox
 from trialerror.ingest.extract import EXTRACT_REGISTER_KEY, list_pending
 from trialerror.ingest.requests import TRANSITIONS as REQUEST_TRANSITIONS
 from trialerror.jobs.ledger import list_jobs
 from trialerror.memory.merge import list_conflicts as list_memory_conflicts
+from trialerror.offload import control as offload_control
 from trialerror.offload import protocol as offload_protocol
 from trialerror.offload.dashboard_items import offload_backlog_items
 from trialerror.webfetch.dashboard_items import webfetch_items
@@ -128,17 +130,43 @@ def _decode_json_text(value: Any) -> Any:
         return value
 
 
-def _group_count(conn: sqlite3.Connection, table: str, column: str) -> dict[str, int]:
+def _group_count(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    *,
+    exclude_pk: tuple[str, set[str]] | None = None,
+) -> dict[str, int]:
     """``SELECT <column>, COUNT(*) FROM <table> GROUP BY <column>``, NULLs
     reported under the JSON-friendly key ``"__null__"`` (a bare Python
     ``None`` key round-trips through ``json.dumps`` as the string
     ``"null"``, which is easy to misread as a real value name -- an
-    explicit sentinel string is clearer in the rendered JSON)."""
-    rows = conn.execute(f"SELECT {column}, COUNT(*) AS n FROM {table} GROUP BY {column}").fetchall()
-    out: dict[str, int] = {}
-    for r in rows:
+    explicit sentinel string is clearer in the rendered JSON).
+
+    ``exclude_pk`` is ``(pk_column, ids)``: rows whose primary key is in
+    ``ids`` are left out of the tally. Its one caller is the corpus panel
+    dropping retracted documents; it is a Python-side set rather than a
+    ``NOT IN`` because the ids come from a JSON register, not a column.
+    An EMPTY ``ids`` takes the plain GROUP BY below -- the exclusion path
+    reads one row per record, and the overwhelmingly common case (no
+    document has ever been retracted) should not pay for a feature it is
+    not using on a corpus of any size."""
+    if exclude_pk is None or not exclude_pk[1]:
+        rows = conn.execute(f"SELECT {column}, COUNT(*) AS n FROM {table} GROUP BY {column}").fetchall()
+        out: dict[str, int] = {}
+        for r in rows:
+            key = r[column]
+            out[key if key is not None else "__null__"] = r["n"]
+        return out
+
+    pk_column, excluded = exclude_pk
+    out = {}
+    for r in conn.execute(f"SELECT {pk_column}, {column} FROM {table}").fetchall():
+        if r[pk_column] in excluded:
+            continue
         key = r[column]
-        out[key if key is not None else "__null__"] = r["n"]
+        key = key if key is not None else "__null__"
+        out[key] = out.get(key, 0) + 1
     return out
 
 
@@ -325,11 +353,24 @@ def _offload_summary(rostore: RoStore, jobs: Sequence[dict[str, Any]]) -> dict[s
         if isinstance(last_error, str) and last_error.startswith(OFFLOAD_PARK_PREFIX):
             awaiting_ids.add(job["job_id"])
 
+    # C-0097 D4: one row per worker, from the progress files the heartbeat verb
+    # writes. This is the half the queue directory alone cannot say --
+    # pending/claimed/done describe JOBS, and an operator reading "1 claimed"
+    # cannot tell a worker grinding through chunk 1,204 of 4,530 from one that
+    # was paused an hour ago from a laptop somebody shut.
+    workers: list[dict[str, Any]] = []
+    if program_root is not None and available:
+        try:
+            workers = offload_control.worker_rows(offload_protocol.offload_root(program_root))
+        except OSError:  # pragma: no cover - an unreadable claim dir is "no workers"
+            workers = []
+
     return {
         "available": available,
         "counts": counts,
         "awaiting": len(awaiting_ids),
         "jobs": per_job,
+        "workers": workers,
     }
 
 
@@ -546,19 +587,50 @@ def build_session_panel(rostore: RoStore) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # budget panel
 # ---------------------------------------------------------------------------
-def _dangling_bookings(rostore: RoStore) -> list[dict[str, Any]]:
-    """Same predicate ``trialerror.budget.checks.check_budget_dangling_launches``
-    uses: a PROVISIONAL/RUNNING booking whose TTL has elapsed -- an
-    orphaned booking, most often left by a session that crashed before
-    reconciling/abandoning it."""
-    rows = rostore.platform.execute(
-        "SELECT launch_id, account_id, session_id, agent_kind, model_class, purpose, state, "
-        "booked_ts, booking_ttl_s FROM launch "
-        "WHERE state IN ('PROVISIONAL','RUNNING') "
-        "AND julianday(?) > julianday(booked_ts) + (booking_ttl_s / 86400.0)",
-        (now(),),
-    ).fetchall()
-    return [dict(r) for r in rows]
+def _dangling_bookings(rostore: RoStore) -> dict[str, Any]:
+    """The same TTL arithmetic AND the same liveness split the
+    ``budget_dangling_launches`` doctor check reports, read from the one
+    module that owns both (:mod:`trialerror.budget.dangling`).
+
+    A PROVISIONAL/RUNNING booking past its TTL used to be rendered flatly as
+    "dangling", which asserts a crashed session the TTL cannot evidence. The
+    card now shows the same two lists under the same words as the doctor:
+    ``dangling_bookings`` are the ones with no evidence of life, and
+    ``past_ttl_session_alive`` are the ones whose own session is still OPEN
+    and still recording ``hook_alive`` events -- a TTL that was set too
+    short, which ``budget heartbeat`` clears. Reading the shared module
+    rather than keeping a second copy of the predicate is the point: a card
+    and a doctor check that disagree about the same launch is exactly the
+    confusion this item exists to remove."""
+    rows = dangling.past_ttl_rows(
+        rostore.platform,
+        columns=(
+            "launch_id", "account_id", "session_id", "agent_kind", "model_class",
+            "purpose", "state", "booked_ts", "booking_ttl_s",
+        ),
+        now_ts=now(),
+    )
+    alive_ids = None
+    if rostore.is_available("ops"):
+        try:
+            alive_ids = dangling.sessions_with_hook_liveness(rostore.ops)
+        except Exception:  # noqa: BLE001 - a panel never fails over one derived reading
+            alive_ids = None
+    offenders, alive = dangling.split_by_liveness(rows, alive_ids)
+    return {
+        "offenders": offenders,
+        "past_ttl_session_alive": alive,
+        "message": dangling.dangling_message(offenders, alive),
+        # V-11 (FB-1b item 5): the doctor check's own severity word for these
+        # same rows, from the same function it calls
+        # (``dangling.past_ttl_status``). The card used to carry only the two
+        # lists and the sentence, which left the reader deriving a severity
+        # from `DANGLING 0` -- a true reading of the OFFENDER list -- and
+        # finding it beside a doctor `warn`. Now the word travels with the
+        # rows and the two surfaces cannot say different things about one
+        # fixture.
+        "status": dangling.past_ttl_status(rows),
+    }
 
 
 def build_budget_panel(rostore: RoStore) -> dict[str, Any]:
@@ -587,16 +659,49 @@ def build_budget_panel(rostore: RoStore) -> dict[str, Any]:
                 "account": acc,
                 "budget_status": budget,
                 "launch_state_counts": account_launch_states,
+                # D-FB-13 (c)/(d). What this account's settled tokens were
+                # made OF, and where the numbers came from -- read from the
+                # same function `budget rollup` uses, so the card and the CLI
+                # cannot sum one launch two ways. `attested` says how many of
+                # the reconciled launches carry a split at all, so a card
+                # showing a composition never implies it is the whole
+                # account's.
+                "usage_split": usage_split_totals(
+                    [
+                        dict(r)
+                        for r in rostore.platform.execute(
+                            "SELECT * FROM launch WHERE account_id = ? AND state = 'RECONCILED'",
+                            (account_id,),
+                        ).fetchall()
+                    ]
+                ),
+                "reconcile_sources": {
+                    r["reconcile_source"] or "unrecorded": r["n"]
+                    for r in rostore.platform.execute(
+                        "SELECT reconcile_source, COUNT(*) AS n FROM launch "
+                        "WHERE account_id = ? AND state = 'RECONCILED' GROUP BY reconcile_source",
+                        (account_id,),
+                    ).fetchall()
+                },
             }
         )
 
     from trialerror.budget.quota import quota_status
 
+    ttl_split = _dangling_bookings(rostore)
     return {
         "status": "ok",
         "accounts": per_account,
         "launch_state_counts_total": launch_state_counts,
-        "dangling_bookings": _dangling_bookings(rostore),
+        # The two lists are siblings, not a nesting, so every existing
+        # reader of `dangling_bookings` (the ribbon, the console card, the
+        # client-resilience contract test) keeps reading a LIST of launches
+        # -- one that now excludes the rows whose session is demonstrably
+        # alive, which is exactly the doctor's own `offenders` list.
+        "dangling_bookings": ttl_split["offenders"],
+        "past_ttl_session_alive": ttl_split["past_ttl_session_alive"],
+        "past_ttl_message": ttl_split["message"],
+        "past_ttl_status": ttl_split["status"],
         "plan_quota": quota_status(),
     }
 
@@ -737,16 +842,34 @@ def build_corpus_panel(rostore: RoStore) -> dict[str, Any]:
         return {"status": "not_initialized", "message": "knowledge.db not found"}
 
     conn = rostore.knowledge
+    # A RETRACTED document (trialerror.ingest.retract) is still a row -- the
+    # withdrawal is part of the record -- but it is no longer part of the
+    # CORPUS, and a corpus panel that keeps counting it tells the operator
+    # the garbage they just removed is still there. Counted separately
+    # instead, so the number does not merely vanish.
+    from trialerror.ingest.retract import retracted_doc_ids
+
+    retracted = retracted_doc_ids(conn)
+    live_documents = conn.execute("SELECT COUNT(*) FROM document").fetchone()[0] - len(retracted)
     counts = {
         "sources": conn.execute("SELECT COUNT(*) FROM source").fetchone()[0],
-        "documents": conn.execute("SELECT COUNT(*) FROM document").fetchone()[0],
+        "documents": live_documents,
+        "retracted_documents": len(retracted),
         "chunks": conn.execute("SELECT COUNT(*) FROM chunk").fetchone()[0],
         "quote_anchors": conn.execute("SELECT COUNT(*) FROM quote_anchor").fetchone()[0],
     }
 
     license_tier_counts = _group_count(conn, "source", "license_tier")
     request_state_counts = _group_count(conn, "source", "request_state")
-    document_status_counts = _group_count(conn, "document", "status")
+    document_status_counts = _group_count(
+        conn, "document", "status", exclude_pk=("doc_id", retracted)
+    )
+    if retracted:
+        # Named rather than folded into 'failed' -- which is what a
+        # retracted row's status column reads while the knowledge schema
+        # has no 'retracted' value (see trialerror.ingest.retract's module
+        # docstring); the panel can still tell the operator the truth.
+        document_status_counts["retracted"] = len(retracted)
 
     documents_with_current_summary = conn.execute(
         "SELECT COUNT(DISTINCT subject_id) FROM summary WHERE subject_kind = 'document' AND status = 'current'"
@@ -1595,6 +1718,104 @@ def _memory_conflict_candidate_items(rostore: RoStore) -> list[dict[str, Any]]:
     ]
 
 
+#: Lane e (E4), design §5: "two new item kinds ... term_conflict (pending
+#: conflicts_with; consequence...) and term_duplicate (pending same_as).
+#: Non-blocking, same shape as _kg_merge_items." Both are tolerant of the
+#: SAME two absences ``_evidence_lexicon_conflicts`` already guards
+#: (``dashboard/data.py``'s L-C5 hook): ``ImportError`` when the lexicon
+#: package cannot even be imported on this machine (old SQLite -- module
+#: docstring, ``trialerror/lexicon/__init__.py``), and
+#: ``sqlite3.OperationalError`` when the package imports fine but this
+#: program's ``knowledge.db`` has not run the v5 migration yet -- the
+#: unmigrated-store middle state a two-step ruling always creates.
+def _term_conflict_items(rostore: RoStore) -> list[dict[str, Any]]:
+    """Every pending, TERM-scoped ``conflicts_with`` judgment -- one row per
+    lemma with disjoint-source senses nobody has adjudicated yet, whether the
+    scan opened it (``marked_by_kind='system'``) or a launch did."""
+    if not rostore.is_available("knowledge"):
+        return []
+    try:
+        from trialerror.lexicon.api import get_term
+    except ImportError:
+        return []
+    try:
+        rows = rostore.knowledge.execute(
+            "SELECT * FROM term_relation WHERE verb = 'conflicts_with' AND status = 'pending' "
+            "ORDER BY marked_ts"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        try:
+            payload = json.loads(d.get("evidence") or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        term_id = d["src_id"] if d["src_kind"] == "term" else None
+        term = get_term(rostore, term_id) if term_id else None
+        items.append(
+            {
+                "kind": "term_conflict",
+                "id": d["rel_id"],
+                "term_id": term_id,
+                "lemma": term.get("lemma") if term else None,
+                "member_sense_ids": payload.get("sense_ids") or [],
+                "marked_by_kind": d["marked_by_kind"],
+                "blocking": False,
+                "consequence": (
+                    "Scoping keeps every sense and requires a disambiguator each; merging "
+                    "supersedes the others into the one you keep; rejecting closes the candidate."
+                ),
+            }
+        )
+    return items
+
+
+def _term_duplicate_items(rostore: RoStore) -> list[dict[str, Any]]:
+    """Every pending, term-to-term ``same_as`` candidate -- engram-F4's
+    save-time surfacing (``lexicon.candidates``, step E2), a manual
+    ``trialerror term propose`` that happened to name an existing near-miss,
+    or a hand-opened relation. Tolerant of the same two absences as
+    :func:`_term_conflict_items`."""
+    if not rostore.is_available("knowledge"):
+        return []
+    try:
+        from trialerror.lexicon.api import get_term
+    except ImportError:
+        return []
+    try:
+        rows = rostore.knowledge.execute(
+            "SELECT * FROM term_relation WHERE verb = 'same_as' AND status = 'pending' "
+            "ORDER BY marked_ts"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        src_term = get_term(rostore, d["src_id"]) if d["src_kind"] == "term" else None
+        dst_term = get_term(rostore, d["dst_id"]) if d["dst_kind"] == "term" else None
+        items.append(
+            {
+                "kind": "term_duplicate",
+                "id": d["rel_id"],
+                "src_term_id": d["src_id"],
+                "src_lemma": src_term.get("lemma") if src_term else None,
+                "dst_term_id": d["dst_id"],
+                "dst_lemma": dst_term.get("lemma") if dst_term else None,
+                "marked_by_kind": d["marked_by_kind"],
+                "blocking": False,
+                "consequence": (
+                    "Confirming as SAME AS (or the softer VARIANT OF) merges the newcomer term "
+                    "into the other -- nothing is deleted, its own lemma survives as an alias; "
+                    "rejecting closes the candidate without merging anything."
+                ),
+            }
+        )
+    return items
+
+
 def build_determinations_panel(rostore: RoStore) -> dict[str, Any]:
     """The one determination queue -- REDESIGN S20 (``build_review_panel``
     unioning three existing reads, no new tables) plus S21 (a
@@ -1607,11 +1828,13 @@ def build_determinations_panel(rostore: RoStore) -> dict[str, Any]:
     items past their type-keyed review half-life (engram-F5), and (lane
     L0-C) documents waiting for the DEV GPU worker, and -- lane a --
     web-ingestion hosts awaiting a human's approval and a stopped fetch
-    process with URLs queued behind it. Most of the newer kinds are
-    non-blocking by construction: they are prompts to LOOK at something,
-    never gates on anything. ``webfetch_sidecar_down`` is the exception
-    and says so -- a queued fetch does not move at all while the process
-    that drains it is gone."""
+    process with URLs queued behind it, and -- lane e (E4), design §5 --
+    ``term_conflict`` (a pending disjoint-source sense conflict) and
+    ``term_duplicate`` (a pending term-to-term ``same_as`` candidate). Most
+    of the newer kinds are non-blocking by construction: they are prompts to
+    LOOK at something, never gates on anything. ``webfetch_sidecar_down`` is
+    the exception and says so -- a queued fetch does not move at all while
+    the process that drains it is gone."""
     if not rostore.is_available("ops"):
         return {"status": "not_initialized", "message": "ops.db not found"}
 
@@ -1625,6 +1848,8 @@ def build_determinations_panel(rostore: RoStore) -> dict[str, Any]:
     items.extend(_memory_conflict_items(rostore))
     items.extend(_memory_conflict_candidate_items(rostore))
     items.extend(_memory_stale_items(rostore))
+    items.extend(_term_conflict_items(rostore))
+    items.extend(_term_duplicate_items(rostore))
     items.extend(offload_backlog_items(rostore))
     items.extend(webfetch_items(rostore))
 
@@ -2099,13 +2324,20 @@ def _evidence_resolve_claim(
 
 def _evidence_argues(conn: sqlite3.Connection, claim_id: str) -> dict[str, Any]:
     """WHAT ARGUES WITH IT. Two sources, and the panel is explicit that only
-    one of them has a writer today: ``verdict(subject_kind='claim')`` is the
-    live signal (``procedure='contracrow'`` is the contradiction check), while
-    ``prov_edge`` -- the general provenance graph a "contradicts" edge would
-    live on -- has ZERO writers anywhere in this codebase (the same finding
-    :func:`build_dossier_panel` records in its own ``lineage.note``). Reading
-    it and reporting empty is the honest form; drawing an empty graph as
-    though it meant "nothing contradicts this" is not."""
+    one of them has a writer for what THIS query asks: ``verdict(subject_kind=
+    'claim')`` is the live signal (``procedure='contracrow'`` is the
+    contradiction check), while the ``prov_edge`` rows this query selects
+    (``role IN ('contradicts','supports')`` between two CLAIMS) have ZERO
+    writers -- still true, even though ``trialerror.lexicon`` (knowledge v5,
+    lane e step E1) is now the table's first writer OVERALL: its edges are
+    scoped to lexicon lineage only (``derived_from``/``supersedes``/
+    ``contradicts`` between SENSES, ruling L-E5), never between two claims,
+    so this specific read stays honestly empty. Reading it and reporting
+    empty is the honest form; drawing an empty graph as though it meant
+    "nothing contradicts this" is not. (:func:`build_dossier_panel` records
+    the SAME "empty for what I read" finding in its own ``lineage.note``;
+    :func:`build_lexicon_panel`'s ``term.conflict``/``term.relations`` is
+    where the lexicon's own edges are actually read.)"""
     edges = [
         dict(r)
         for r in conn.execute(
@@ -2135,8 +2367,10 @@ def _evidence_argues(conn: sqlite3.Connection, claim_id: str) -> dict[str, Any]:
         "supports": [e for e in edges if e["role"] == "supports"],
         "verdicts": verdicts,
         "note": (
-            "prov_edge has zero writers; contradiction verdicts (procedure='contracrow') "
-            "are the live signal"
+            "prov_edge has zero writers outside lexicon lineage edges (ruling L-E5: "
+            "derived_from, supersedes, contradicts between two scoped senses); no writer "
+            "puts a claim on either end of one, so contradiction verdicts "
+            "(procedure='contracrow') are still the live signal for THIS read"
         ),
     }
 
@@ -2362,24 +2596,28 @@ def _evidence_neighbourhood(
 def _evidence_lexicon_conflicts(rostore: RoStore, claim_id: str) -> dict[str, Any] | None:
     """Ruling L-C5's import-guarded hook, and nothing more.
 
-    Lane e (E4) is what ADDS ``trialerror.lexicon.api.conflicts_for_claim`` --
-    the disjoint-source sense conflict that belongs under WHAT ARGUES WITH IT.
-    Until it lands, the module is absent and this returns ``None``, which the
-    builder renders as the ``awaiting_migration`` reading the convention calls
-    for: the region is OMITTED with a stated reason, never drawn as an empty
-    box that reads "no term conflicts" when what is true is "nothing can
-    answer that yet".
+    ``trialerror.lexicon.api.conflicts_for_claim`` -- the disjoint-source
+    sense conflict that belongs under WHAT ARGUES WITH IT -- landed with lane
+    e's step E1, so on a migrated program this now returns a real answer.
+    The guard stays, and both of its arms are still reachable:
 
-    ``sqlite3.OperationalError`` is caught beside ``ImportError`` for the
-    middle state a two-step ruling creates -- lane e's module present on a
-    store that has not run its migration -- exactly the shape
-    :func:`_memory_conflict_candidate_items` already handles for the mining
-    lane's own tables."""
-    try:  # pragma: no cover - the module does not exist until lane e (E4)
-        from trialerror.lexicon.api import conflicts_for_claim  # type: ignore[import-not-found]
+    * ``ImportError`` -- the lexicon package is absent from the deployment
+      (or refuses to import on a SQLite too old for its trigram index).
+    * ``sqlite3.OperationalError`` -- the middle state a two-step ruling
+      creates: the module is present, the program's knowledge.db has not run
+      the knowledge-v5 migration. Lane e's read deliberately does NOT
+      swallow this; the same shape :func:`_memory_conflict_candidate_items`
+      already handles for the mining lane's own tables.
+
+    Either way this returns ``None`` and the builder renders the
+    ``awaiting_migration`` reading the convention calls for: the region is
+    OMITTED with a stated reason, never drawn as an empty box that reads "no
+    term conflicts" when what is true is "nothing can answer that yet"."""
+    try:
+        from trialerror.lexicon.api import conflicts_for_claim
     except ImportError:
         return None
-    try:  # pragma: no cover - same
+    try:
         return {"status": "ok", "conflicts": conflicts_for_claim(rostore, claim_id)}
     except sqlite3.OperationalError:
         return None
@@ -2412,10 +2650,11 @@ def build_evidence_panel(
     Every read here already exists and is read-only (spec section 1.1): no new
     table, no new column, no migration.
 
-    The lexicon term-conflict region is deliberately NOT implemented (ruling
-    L-C5): the hook is :func:`_evidence_lexicon_conflicts`, and while lane e's
-    module is absent the region is omitted with its reason stated rather than
-    drawn empty."""
+    The lexicon term-conflict region arrives through
+    :func:`_evidence_lexicon_conflicts` (ruling L-C5's two-step: the hook
+    here, the read in lane e). On a program whose lexicon module or
+    knowledge-v5 tables are absent, the region is omitted with its reason
+    stated rather than drawn empty."""
     if not rostore.is_available("knowledge"):
         return {"status": "not_initialized", "message": "knowledge.db not found"}
 
@@ -2477,7 +2716,7 @@ def build_evidence_panel(
     panel["lineage"] = {"superseded_by": claim_row.get("superseded_by"), "supersedes": supersedes}
 
     term_conflicts = _evidence_lexicon_conflicts(rostore, claim_row["claim_id"])
-    if term_conflicts is not None:  # pragma: no cover - lane e (E4) lands the module
+    if term_conflicts is not None:
         panel["term_conflicts"] = term_conflicts
     else:
         panel["term_conflicts_omitted"] = {
@@ -2493,61 +2732,389 @@ def build_evidence_panel(
 # ---------------------------------------------------------------------------
 # lexicon panel
 # ---------------------------------------------------------------------------
-def build_lexicon_panel(rostore: RoStore) -> dict[str, Any]:
-    """Honest v1 over what exists today -- REDESIGN R15, "the largest
-    seam": no dedicated ``term``/``term_sense``/``term_sense_evidence``
-    store exists. This reads ``knowledge.claim WHERE kind='definition'``
-    (term-ish quote-grounded definitions) and ``knowledge.entity`` (with
-    its ``aliases`` column, the closest thing to dedup today) plus draft
-    ``merge_proposal`` rows as a possible-duplicate signal. Contradiction
-    flags would come from ``knowledge.prov_edge WHERE role='contradicts'``
-    -- that table has zero writers anywhere in this codebase, so this
-    always returns empty today; documented in ``seam_note``, never silently
-    treated as "no conflicts exist"."""
+#: Derived display state for one ``term`` row -- distinct from the raw
+#: ``term.status`` column. ``split_open`` is an ``active`` term with a
+#: pending ``conflicts_with`` candidate (the artboard's "▲ SPLIT" chip,
+#: something still awaiting a decision); ``split`` is a term a decision has
+#: already scoped (every current sense carries a disambiguator). A term can
+#: only ever be in ONE of these at read time -- precedence below runs from
+#: the head-layer status down to the two states that are computed rather
+#: than stored (design §5, §12 ruling L-E4 note on "state" vs "status").
+def _term_state(term: Mapping[str, Any], *, has_open_conflict: bool, any_sense_needs_review: bool) -> str:
+    status = term.get("status")
+    if status in ("merged", "retired", "proposed", "split"):
+        return status
+    # status == "active"
+    if has_open_conflict:
+        return "split_open"
+    if any_sense_needs_review:
+        return "needs_review"
+    return "stable"
+
+
+def _term_evidence_view(conn: sqlite3.Connection, row: Mapping[str, Any]) -> dict[str, Any]:
+    """One ``term_sense_evidence`` row, rendered for the wire.
+
+    ``excerpt``/``fenced`` are recomputed HERE, at read time, from whatever
+    the evidence row points at right now -- never trusted from the row's own
+    (caller-supplied, write-time) ``excerpt`` column for the two anchored
+    kinds, because D-COC-1 fencing has to reflect the source's CURRENT
+    license tier, not whatever was true when the row was written (design §5:
+    "excerpt for anchor evidence goes through retrieve/fence.py::
+    citation_quote with the source's license_tier"). An evidence row whose
+    source cannot be resolved is served FENCED, on purpose -- an unknown
+    source is the conservative direction to fail in, not the permissive one.
+
+    ``record``/``idea`` evidence has no anchor behind it at all (D31): the
+    stored ``excerpt`` column IS the whole answer there -- the program's own
+    words, not a quote -- so nothing is refetched or fenced for those two."""
+    kind = row["evidence_kind"]
+    anchored = kind in ("quote_anchor", "claim")
+    fenced = False
+    excerpt = None
+    page_number = None
+    if kind == "quote_anchor":
+        arow = conn.execute(
+            "SELECT a.quote_text AS quote_text, a.page_number AS page_number, "
+            "d.source_id AS source_id, s.license_tier AS license_tier "
+            "FROM quote_anchor a LEFT JOIN document d ON d.doc_id = a.doc_id "
+            "LEFT JOIN source s ON s.source_id = d.source_id WHERE a.anchor_id = ?",
+            (row["anchor_id"],),
+        ).fetchone()
+        fenced = True if arow is None or arow["source_id"] is None else is_fenced_license(arow["license_tier"])
+        page_number = arow["page_number"] if arow is not None else None
+        excerpt = citation_quote(arow["quote_text"] if arow is not None else None, fenced=fenced)
+    elif kind == "claim":
+        crow = conn.execute(
+            "SELECT c.text AS text, a.page_number AS page_number, "
+            "d.source_id AS source_id, s.license_tier AS license_tier "
+            "FROM claim c LEFT JOIN quote_anchor a ON a.anchor_id = c.anchor_id "
+            "LEFT JOIN document d ON d.doc_id = a.doc_id LEFT JOIN source s ON s.source_id = d.source_id "
+            "WHERE c.claim_id = ?",
+            (row["ref_id"],),
+        ).fetchone()
+        if crow is None:
+            anchored = False  # the claim this evidence names is gone -- nothing to anchor to
+        else:
+            fenced = True if crow["source_id"] is None else is_fenced_license(crow["license_tier"])
+            page_number = crow["page_number"]
+            excerpt = citation_quote(crow["text"], fenced=fenced)
+    else:  # record / idea
+        excerpt = row.get("excerpt")
+    return {
+        "evidence_id": row.get("evidence_id"),
+        "kind": kind,
+        "source_key": row.get("source_key"),
+        "cite_raw": row.get("cite_raw"),
+        "anchor_id": row.get("anchor_id"),
+        "page_number": page_number,
+        "excerpt": excerpt,
+        "fenced": fenced,
+        "anchored": anchored,
+    }
+
+
+def _term_relation_view(rel: Mapping[str, Any]) -> dict[str, Any]:
+    """One ``term_relation`` row plus its parsed member sense ids -- the raw
+    row already carries every ``marked_by_*``/``decided_*`` field the wire
+    shape asks for verbatim (design §5's "with marked_by_*, decided_*"), so
+    this only adds the one derived thing: which senses the relation is
+    actually about, whether it names them in its ``evidence`` JSON (a
+    term-scoped conflict) or IS its own two endpoints (a sense-to-sense
+    relation)."""
+    out = dict(rel)
+    members: list[str] = []
+    raw = rel.get("evidence")
+    if raw:
+        try:
+            payload = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            ids = payload.get("sense_ids")
+            if isinstance(ids, (list, tuple)):
+                members = [str(i) for i in ids]
+    if not members and rel.get("src_kind") == "sense" and rel.get("dst_kind") == "sense":
+        members = [str(rel["src_id"]), str(rel["dst_id"])]
+    out["member_sense_ids"] = members
+    return out
+
+
+def _term_open_conflict(rostore: RoStore, relations: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+    """The one currently-PENDING ``conflicts_with`` judgment on this term, if
+    any -- a convenience summary distinct from the full ``relations`` list
+    (which also carries confirmed/rejected history): the disjointness the
+    artboard draws needs the member senses' own source sets side by side,
+    not just the relation row."""
+    from trialerror.lexicon.api import source_keys_for_sense
+
+    for rel in relations:
+        if rel.get("verb") != "conflicts_with" or rel.get("status") != "pending":
+            continue
+        try:
+            payload = json.loads(rel.get("evidence") or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        members = payload.get("sense_ids") or []
+        return {
+            "rel_id": rel["rel_id"],
+            "opened_ts": rel["marked_ts"],
+            "member_sense_ids": members,
+            "shared_sources": payload.get("shared_sources") or [],
+            "systems_per_sense": {sid: source_keys_for_sense(rostore, sid) for sid in members},
+        }
+    return None
+
+
+def _lexicon_senses_by_term(conn: sqlite3.Connection) -> dict[str, list[dict[str, Any]]]:
+    """Every ``term_sense`` row, grouped by term -- ONE query standing in for
+    one :func:`trialerror.lexicon.api.senses_for_term` call per term.
+
+    The global ``ORDER BY created_at, sense_id`` is that function's own
+    ordering, and grouping a globally-ordered stream preserves it inside
+    each group, so each list here is exactly what ``senses_for_term(store,
+    term_id)`` (no ``statuses`` filter -- this builder never passes one)
+    returns for that term, same rows in the same order."""
+    out: dict[str, list[dict[str, Any]]] = {}
+    for row in conn.execute("SELECT * FROM term_sense ORDER BY created_at, sense_id").fetchall():
+        sense = dict(row)
+        out.setdefault(sense["term_id"], []).append(sense)
+    return out
+
+
+def _lexicon_source_keys_by_sense(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """``{sense_id: [source_key, ...]}`` for every sense -- ONE query
+    standing in for one :func:`trialerror.lexicon.api.source_keys_for_sense`
+    call per sense.
+
+    Same three rules that function applies, moved into the one grouped read:
+    retracted rows excluded (a retraction is a read rule -- the row stays,
+    the audit trail is intact), ``DISTINCT`` on the pair, and sorted by
+    ``source_key`` within a sense (the outer ``sense_id`` key in the ORDER BY
+    only makes the grouping contiguous; it does not change either order)."""
+    out: dict[str, list[str]] = {}
+    rows = conn.execute(
+        "SELECT DISTINCT sense_id, source_key FROM term_sense_evidence "
+        "WHERE retracted_ts IS NULL ORDER BY sense_id, source_key"
+    ).fetchall()
+    for sense_id, source_key in rows:
+        out.setdefault(sense_id, []).append(source_key)
+    return out
+
+
+def _lexicon_pending_relations_by_term(
+    conn: sqlite3.Connection,
+    term_rows: Sequence[Mapping[str, Any]],
+    senses_by_term: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Pending ``term_relation`` rows, grouped by the term(s) each one is
+    about -- ONE query standing in for one
+    :func:`trialerror.lexicon.api.relations_for_term` call (itself two
+    queries) per term.
+
+    That function matches a relation to a term when either endpoint names
+    the term OR any of its senses, so the grouping here inverts exactly that
+    test: an endpoint id resolves through ``owners``, which maps a term id to
+    itself and each sense id to its term. An id that is both (nothing
+    generates that today) would land under both terms, which is what the
+    per-term form does too; an id that is neither -- an endpoint whose row is
+    gone -- belongs to no term, same as a per-term query that simply would
+    not match it. One relation legitimately lands under TWO terms (a
+    term-to-term duplicate candidate), hence the union rather than a single
+    owner.
+
+    Only the columns this builder reads (``rel_id`` for the open-conflict set,
+    ``verb`` for the conflict test, the two endpoints for the grouping) are
+    selected: the index half of the panel never serves a relation row
+    itself -- the ``term`` detail half re-reads full rows through
+    ``relations_for_term``."""
+    owners: dict[str, set[str]] = {}
+    for term in term_rows:
+        owners.setdefault(term["term_id"], set()).add(term["term_id"])
+    for tid, senses in senses_by_term.items():
+        for sense in senses:
+            owners.setdefault(sense["sense_id"], set()).add(tid)
+
+    out: dict[str, list[dict[str, Any]]] = {}
+    rows = conn.execute(
+        "SELECT rel_id, src_id, dst_id, verb FROM term_relation WHERE status = 'pending' "
+        "ORDER BY marked_ts, rel_id"
+    ).fetchall()
+    empty: frozenset[str] = frozenset()
+    for row in rows:
+        rel = dict(row)
+        for tid in owners.get(rel["src_id"], empty) | owners.get(rel["dst_id"], empty):
+            out.setdefault(tid, []).append(rel)
+    return out
+
+
+def build_lexicon_panel(rostore: RoStore, *, term_id: str | None = None) -> dict[str, Any]:
+    """The term store (design ``docs/reviews/LANE_E_TERM_STORE_DESIGN.md``
+    section 5) -- REDESIGN R15's "largest seam" answered: ``term``,
+    ``term_sense``, ``term_sense_evidence`` and ``term_relation`` (knowledge
+    v5, lane e step E1) replace the old entity/definition-claim proxy this
+    builder used to read. The index (``terms``) is every term, always; the
+    detail (``term``) is one term's senses, evidence and relations, `null`
+    until ``term_id`` selects one -- the ``dossier``/``evidence`` builders'
+    own "optional selector, forwarded by ``serve.PANEL_QUERY_PARAMS``"
+    precedent, except this route has no auto-selected default: an unselected
+    Lexicon is an index to read, not a card to land on.
+
+    ``status == "awaiting_migration"`` when the ``term`` table itself does
+    not exist yet -- the ``course`` panel's exact convention
+    (``DASHBOARD_V2_API.md`` §1): a write path (any CLI command that opens
+    the store) applies knowledge v5 automatically, and this dashboard never
+    migrates anything itself (``store_ro.py``'s module docstring)."""
     if not rostore.is_available("knowledge"):
         return {"status": "not_initialized", "message": "knowledge.db not found"}
 
     conn = rostore.knowledge
-    entities: list[dict[str, Any]] = []
-    for r in conn.execute(
-        "SELECT entity_id, name, entity_type, aliases, summary, resolution, merge_group FROM entity ORDER BY name"
-    ).fetchall():
-        d = dict(r)
-        d["relation_count"] = conn.execute(
-            "SELECT COUNT(*) FROM relation WHERE (src_entity = ? OR dst_entity = ?) AND expired_at IS NULL",
-            (d["entity_id"], d["entity_id"]),
-        ).fetchone()[0]
-        entities.append(d)
+    if not _table_exists(conn, "term"):
+        return {
+            "status": "awaiting_migration",
+            "message": (
+                "knowledge.db has not been migrated to schema v5 yet (the term table doesn't "
+                "exist) -- any write path that opens this program's store (e.g. a CLI command) "
+                "picks up the migration automatically; trialerror dashboard never migrates a store "
+                "itself (read-only, see trialerror/dashboard/store_ro.py)."
+            ),
+        }
 
-    definition_claims = [
-        dict(r)
-        for r in conn.execute(
-            "SELECT c.claim_id, c.text, c.confidence, c.created_at, c.created_by_launch, "
-            "qa.quote_text, qa.page_number, qa.doc_id "
-            "FROM claim c JOIN quote_anchor qa ON c.anchor_id = qa.anchor_id "
-            "WHERE c.kind = 'definition' AND c.expired_at IS NULL ORDER BY c.created_at DESC"
-        ).fetchall()
-    ]
+    from trialerror.lexicon.api import (
+        evidence_for_sense,
+        needs_review as sense_needs_review,
+        relations_for_term,
+    )
 
-    claim_kind_counts = _group_count(conn, "claim", "kind")
-    merge_proposals_draft = [dict(r) for r in conn.execute("SELECT * FROM merge_proposal WHERE status = 'draft'").fetchall()]
-    contradiction_edges = [dict(r) for r in conn.execute("SELECT * FROM prov_edge WHERE role = 'contradicts'").fetchall()]
+    # The index below is built from FOUR queries, whatever the term count:
+    # the term rows, then the three grouped reads (senses, per-sense source
+    # keys, pending relations) that replace the per-term
+    # ``senses_for_term``/``relations_for_term``/``source_keys_for_sense``
+    # round trips this loop used to make. That O(terms) cost was deferred to
+    # the orchestrator's own run (design §9 item B) and the deferral has now
+    # EXPIRED -- measured, not estimated: 48.1 s for this panel alone on the
+    # live 7,260-term store, which is GET /dashboard/api/all (every panel)
+    # blowing past the deployment's 5-s status probe while every other panel
+    # builds in under 0.5 s. On the 5,000-term synthetic store of
+    # tests/test_dashboard_lexicon_panel_scale.py: 25,003 statements / 2.36 s
+    # before, 6 / 0.11 s after, same rows and same numbers. That test pins the
+    # statement count (equal at 50 terms and at 5,000), which is the part a
+    # later edit would break first. The detail half (``term_id``, below) stays
+    # per-sense on purpose -- one selected term's senses and evidence is a
+    # bounded read, not an O(terms) one.
+    term_rows = [dict(r) for r in conn.execute("SELECT * FROM term ORDER BY lemma_norm").fetchall()]
+    senses_by_term = _lexicon_senses_by_term(conn)
+    source_keys_by_sense = _lexicon_source_keys_by_sense(conn)
+    pending_relations_by_term = _lexicon_pending_relations_by_term(conn, term_rows, senses_by_term)
 
-    return {
+    by_state: dict[str, int] = {}
+    by_granularity: dict[str, int] = {}
+    open_conflict_rel_ids: set[str] = set()
+    terms_needing_review = 0
+    terms: list[dict[str, Any]] = []
+
+    for term in term_rows:
+        tid = term["term_id"]
+        senses = senses_by_term.get(tid, [])
+        relations = pending_relations_by_term.get(tid, [])
+        open_conflicts = [r for r in relations if r["verb"] == "conflicts_with"]
+        open_conflict_rel_ids.update(r["rel_id"] for r in open_conflicts)
+        any_review = any(sense_needs_review(s) for s in senses)
+        state = _term_state(term, has_open_conflict=bool(open_conflicts), any_sense_needs_review=any_review)
+        by_state[state] = by_state.get(state, 0) + 1
+        gkey = term.get("granularity") or "__null__"
+        by_granularity[gkey] = by_granularity.get(gkey, 0) + 1
+        if any_review:
+            terms_needing_review += 1
+
+        gloss = None
+        preferred = term.get("preferred_sense_id")
+        if preferred:
+            match = next((s for s in senses if s["sense_id"] == preferred), None)
+            gloss = match.get("gloss") if match else None
+        if gloss is None:
+            current = [s for s in senses if s["status"] == "current"]
+            if current:
+                gloss = current[0].get("gloss")
+
+        source_keys: set[str] = set()
+        for s in senses:
+            source_keys.update(source_keys_by_sense.get(s["sense_id"], ()))
+
+        terms.append(
+            {
+                "term_id": tid,
+                "lemma": term["lemma"],
+                "granularity": term.get("granularity"),
+                "tags": _decode_json_text(term.get("tags")) if term.get("tags") else [],
+                "status": term["status"],
+                "state": state,
+                "gloss": gloss,
+                "sense_count": len(senses),
+                "source_count": len(source_keys),
+                "last_revised": term.get("updated_ts") or term.get("created_at"),
+            }
+        )
+
+    terms.sort(key=lambda t: t["last_revised"] or "", reverse=True)
+
+    definition_claims_unprojected = conn.execute(
+        "SELECT COUNT(*) FROM claim c WHERE c.kind = 'definition' AND c.expired_at IS NULL "
+        "AND NOT EXISTS (SELECT 1 FROM term_sense_evidence e WHERE e.evidence_kind = 'claim' "
+        "AND e.ref_id = c.claim_id AND e.retracted_ts IS NULL)"
+    ).fetchone()[0]
+
+    panel: dict[str, Any] = {
         "status": "ok",
-        "entities": entities,
-        "definition_claims": definition_claims,
-        "claim_kind_counts": claim_kind_counts,
-        "merge_proposals_draft": merge_proposals_draft,
-        "contradiction_edges": contradiction_edges,
-        "seam_note": (
-            "No dedicated term/term_sense/term_sense_evidence store exists yet "
-            "(REDESIGN_V2_RATIONALE.md Section 5.3 item 7). Entities and definition-kind claims "
-            "are read as a v1 proxy -- they give deduplication signal (entity.aliases, draft "
-            "merge_proposal rows), not senses. contradiction_edges is always empty today: "
-            "knowledge.prov_edge has zero writers anywhere in this codebase."
-        ),
+        "counts": {
+            "total": len(terms),
+            "by_state": by_state,
+            "by_granularity": by_granularity,
+            "conflicts_open": len(open_conflict_rel_ids),
+            "needs_review": terms_needing_review,
+            "definition_claims_unprojected": definition_claims_unprojected,
+        },
+        "terms": terms,
+        "term": None,
     }
+    if not term_id:
+        return panel
+
+    term = next((t for t in term_rows if t["term_id"] == term_id), None)
+    if term is None:
+        panel["not_found"] = {"kind": "term_id", "id": term_id}
+        return panel
+
+    # Same rows ``senses_for_term``/``source_keys_for_sense`` would return
+    # (identical ORDER BY, identical DISTINCT-and-sorted source keys) --
+    # already in hand from the index reads above, so selecting a term costs
+    # no extra query for either.
+    senses = senses_by_term.get(term_id, [])
+    sense_views = [
+        {
+            "sense_id": s["sense_id"],
+            "gloss": s["gloss"],
+            "disambiguator": s.get("disambiguator"),
+            "status": s["status"],
+            "origin_kind": s["origin_kind"],
+            "origin_ref": s.get("origin_ref"),
+            "source_keys": list(source_keys_by_sense.get(s["sense_id"], ())),
+            "needs_review": sense_needs_review(s),
+            "review_after": s.get("review_after"),
+            "evidence": [_term_evidence_view(conn, e) for e in evidence_for_sense(rostore, s["sense_id"])],
+        }
+        for s in senses
+    ]
+    relations = relations_for_term(rostore, term_id)
+    relation_views = [_term_relation_view(r) for r in relations]
+
+    panel["term"] = {
+        "term": term,
+        "senses": sense_views,
+        "relations": relation_views,
+        "conflict": _term_open_conflict(rostore, relations),
+    }
+    return panel
 
 
 # ---------------------------------------------------------------------------
@@ -2657,6 +3224,71 @@ def _room_event_summary(event_type: str, payload: dict[str, Any]) -> str:
     return f"Room {room_id}: {event_type}"
 
 
+#: Lane e (E4), design §3: every ``event`` type ``lexicon.api`` appends,
+#: verbatim -- ``term_evidence_retracted`` is one MORE than the design §3
+#: list names (``supersede_sense``'s own docstring: the head layer's
+#: retraction needed one too, so it could be rebuilt from the event log the
+#: same as everything else in this table).
+_TERM_EVENT_TYPES = (
+    "term_proposed",
+    "term_sense_proposed",
+    "term_sense_accepted",
+    "term_sense_rejected",
+    "term_sense_superseded",
+    "term_sense_retired",
+    "term_reviewed",
+    "term_relation_opened",
+    "term_relation_decided",
+    "term_split",
+    "term_merged",
+    "term_evidence_retracted",
+)
+
+
+def _term_event_summary(event_type: str, payload: dict[str, Any]) -> str:
+    """A plain factual line per lexicon event -- a template sentence over
+    the exact fields each ``append_event`` call in ``lexicon.api`` writes,
+    never a generic ``term_id`` lookup: ``term_merged`` and the two relation
+    events name their subject through different keys entirely
+    (``canonical_term_id``/``merged_term_id``, ``rel_id``), not ``term_id``,
+    so a one-size fallback would print "Term ?" on exactly the events this
+    panel most wants to explain."""
+    term_id = payload.get("term_id", "?")
+    if event_type == "term_proposed":
+        return f"Term {term_id} ({payload.get('lemma', '?')}) was proposed."
+    if event_type == "term_sense_proposed":
+        return f"A new sense of term {term_id} was proposed ({payload.get('origin_kind', '?')})."
+    if event_type == "term_sense_accepted":
+        return f"Sense {payload.get('sense_id', '?')} of term {term_id} became current."
+    if event_type == "term_sense_rejected":
+        return f"Sense {payload.get('sense_id', '?')} of term {term_id} was rejected."
+    if event_type == "term_sense_superseded":
+        return (
+            f"Sense {payload.get('old_sense_id', '?')} of term {term_id} was superseded by "
+            f"{payload.get('sense_id', '?')}."
+        )
+    if event_type == "term_sense_retired":
+        return f"Sense {payload.get('sense_id', '?')} of term {term_id} was retired."
+    if event_type == "term_reviewed":
+        return f"Sense {payload.get('sense_id', '?')} of term {term_id} was reviewed; its review window was reset."
+    if event_type == "term_relation_opened":
+        src = payload.get("src") or [None, None]
+        dst = payload.get("dst") or [None, None]
+        return f"A {payload.get('verb', '?')} candidate was opened ({src[0]} {src[1]} vs {dst[0]} {dst[1]})."
+    if event_type == "term_relation_decided":
+        return f"Relation {payload.get('rel_id', '?')} ({payload.get('verb', '?')}) was decided: {payload.get('decision', '?')}."
+    if event_type == "term_split":
+        return f"Term {term_id} was split -- every current sense now carries a disambiguator."
+    if event_type == "term_merged":
+        return (
+            f"Term {payload.get('merged_lemma', '?')} ({payload.get('merged_term_id', '?')}) was merged "
+            f"into {payload.get('canonical_term_id', '?')}."
+        )
+    if event_type == "term_evidence_retracted":
+        return f"An evidence row for sense {payload.get('sense_id', '?')} was retracted: {payload.get('reason') or '(no reason recorded)'}"
+    return f"Term {term_id}: {event_type}"
+
+
 def build_since_you_left_panel(rostore: RoStore, *, since: str | None = None) -> dict[str, Any]:
     """Delta builder (REDESIGN Phase 2 "SINCE YOU LEFT"): everything that
     happened after ``since`` (default: the last session close, else 24h),
@@ -2709,6 +3341,24 @@ def build_since_you_left_panel(rostore: RoStore, *, since: str | None = None) ->
                 "ts": r["ts"],
                 "summary": _room_event_summary(r["type"], payload),
                 "ref": {"room_id": payload.get("room_id")},
+            }
+        )
+
+    term_type_placeholders = ",".join("?" for _ in _TERM_EVENT_TYPES)
+    for r in conn.execute(
+        f"SELECT * FROM event WHERE type IN ({term_type_placeholders}) AND ts > ? ORDER BY ts ASC",
+        (*_TERM_EVENT_TYPES, since),
+    ).fetchall():
+        try:
+            payload = json.loads(r["payload"])
+        except (TypeError, ValueError):
+            payload = {}
+        items.append(
+            {
+                "kind": r["type"],
+                "ts": r["ts"],
+                "summary": _term_event_summary(r["type"], payload),
+                "ref": {"term_id": payload.get("term_id") or payload.get("canonical_term_id")},
             }
         )
 

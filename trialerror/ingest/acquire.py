@@ -126,6 +126,38 @@ class AcquireResult:
     oa_provider: str | None = None
     metadata_providers: list[str] = field(default_factory=list)
     metadata_failures: list[dict[str, Any]] = field(default_factory=list)
+    #: FB-1 item F10a: which backend the enqueued OCR stage will run on, when
+    #: the enqueued stage is OCR at all. Passed through from
+    #: ``pipeline.add_document`` so ``lit acquire`` can warn in exactly the
+    #: words ``ingest add`` uses.
+    stage_backend: dict[str, Any] | None = None
+
+    @property
+    def searchable(self) -> bool:
+        """Can a search find this document RIGHT NOW?
+
+        Lane FB-1 item F4. ``outcome == "acquired"`` reads as done, and it is
+        not: acquisition registers a source, writes the raw file, and
+        ENQUEUES the first pipeline stage. Nothing is normalized, chunked,
+        embedded or indexed until a worker runs that job, so a caller who
+        searched for the paper it had just "acquired" got nothing back and
+        had no way to tell an empty corpus from an unrun queue. False
+        whenever a job was enqueued -- and also false when nothing was
+        acquired at all (a queued request has no document to find).
+        """
+        return self.job is None and self.document is not None
+
+    @property
+    def pending_stage(self) -> str | None:
+        """The pipeline stage standing between this document and a search
+        hit, or ``None`` when nothing is pending. Read off the enqueued
+        job's own kind, never guessed from the media type -- the job is what
+        a worker will actually run."""
+        if not self.job:
+            return None
+        from trialerror.ingest.pipeline_status import job_stage
+
+        return job_stage(self.job.get("kind"), self.job.get("payload"))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -136,6 +168,9 @@ class AcquireResult:
             "oa_provider": self.oa_provider,
             "metadata_providers": list(self.metadata_providers),
             "metadata_failures": list(self.metadata_failures),
+            "searchable": self.searchable,
+            "pending_stage": self.pending_stage,
+            "stage_backend": self.stage_backend,
         }
 
 
@@ -338,6 +373,7 @@ def acquire(
         return AcquireResult(
             outcome="acquired", source=source_row, document=add_result["document"], job=add_result["job"],
             oa_provider=oa.source_provider, metadata_providers=metadata_providers, metadata_failures=metadata_failures,
+            stage_backend=add_result.get("stage_backend"),
         )
 
     # 3. not openly available anywhere -- file a `wanted` request-queue row

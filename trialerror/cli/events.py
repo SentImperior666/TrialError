@@ -15,7 +15,7 @@ import json
 from trialerror.events.api import append_event, export_jsonl, tail_events
 from trialerror.events.cli_support import ProgramRootNotFoundError, open_program_store, program_root_argument
 from trialerror.stores.errors import StoreError
-from trialerror.util.envelope import error_envelope, ok_envelope
+from trialerror.util.envelope import error_envelope, next_action, ok_envelope
 
 GROUP_NAME = "events"
 HELP = "Type-keyed event append/tail/export (trialerror.events)."
@@ -95,6 +95,50 @@ def run_append(args: argparse.Namespace) -> dict:
     )
 
 
+def _tail_argv(args: argparse.Namespace, *, limit: int, drop_type: bool = False) -> list[str]:
+    """One ``events tail`` argv, carrying forward exactly the filters this
+    call was given (FB-1 item F10c: a suggested command must parse today AND
+    mean the same thing as the one that produced it)."""
+    argv = ["trialerror", "events", "tail", "--limit", str(limit)]
+    if getattr(args, "program_root", None):
+        argv += ["--program-root", str(args.program_root)]
+    if args.workpackage:
+        argv += ["--workpackage", args.workpackage]
+    if args.session_id:
+        argv += ["--session-id", args.session_id]
+    if args.event_type and not drop_type:
+        argv += ["--type", args.event_type]
+    return argv
+
+
+def _tail_next_actions(args: argparse.Namespace, rows: list) -> list:
+    """State-conditional, never decorative.
+
+    A tail that filled its window is the one case where "there are 20
+    events" and "there are at least 20 events" are different facts, and the
+    caller cannot tell which it got. A tail that matched NOTHING under a
+    ``--type`` filter is the other: the type may be spelled differently in
+    this ledger, and the same query without it is the cheapest way to find
+    out. Every other outcome gets no action at all -- a next action nobody
+    needs is noise the next reader learns to skip."""
+    actions = []
+    if len(rows) >= args.limit > 0:
+        actions.append(
+            next_action(
+                _tail_argv(args, limit=args.limit * 2),
+                f"the window was full at {args.limit}: there may be older matching events",
+            )
+        )
+    elif not rows and args.event_type:
+        actions.append(
+            next_action(
+                _tail_argv(args, limit=args.limit, drop_type=True),
+                f"nothing of type {args.event_type!r} matched: the same tail without the type filter",
+            )
+        )
+    return actions
+
+
 def run_tail(args: argparse.Namespace) -> dict:
     try:
         store = open_program_store(args.program_root)
@@ -110,7 +154,11 @@ def run_tail(args: argparse.Namespace) -> dict:
         )
     finally:
         store.close()
-    return ok_envelope("events tail", result={"events": rows, "count": len(rows)})
+    return ok_envelope(
+        "events tail",
+        result={"events": rows, "count": len(rows)},
+        next_actions=_tail_next_actions(args, rows),
+    )
 
 
 def run_export(args: argparse.Namespace) -> dict:

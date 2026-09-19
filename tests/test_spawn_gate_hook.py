@@ -25,12 +25,21 @@ from trialerror.stores.store import open_store
 from trialerror.util.ids import new_id
 from trialerror.util.timeutil import now
 
-HOOK_PATH = Path(__file__).resolve().parents[1] / "plugin" / "hooks" / "spawn_gate.py"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+HOOK_PATH = REPO_ROOT / "plugin" / "hooks" / "spawn_gate.py"
 
 
 def _run_hook(payload: dict, *, platform_root: Path) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env["TRIALERROR_PLATFORM_ROOT"] = str(platform_root)
+    # A script subprocess puts the SCRIPT's directory on sys.path, never the
+    # caller's cwd, so `import trialerror` would otherwise resolve through
+    # whatever editable install the interpreter happens to carry -- which
+    # can be a different checkout entirely. Pin it to the tree this test
+    # file lives in, or the test silently exercises someone else's code.
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(REPO_ROOT), env.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
     return subprocess.run(
         [sys.executable, str(HOOK_PATH)],
         input=json.dumps(payload),
@@ -367,3 +376,144 @@ def test_hook_unparseable_stdin_passes_through(roots):
         timeout=60,
     )
     assert proc.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# agent_model_matches_booking: the hook's half of the guard is deciding WHAT
+# model this spawn names -- the Task call's own `model`, or, failing that,
+# the model the named subagent definition file pins. Both routes have to
+# work, or "just leave model out of the call" walks around the guard.
+# ---------------------------------------------------------------------------
+
+
+def _top_booked(roots) -> str:
+    platform_root, program_root = roots
+    store = open_store(program_root, platform_root=platform_root)
+    account_id = new_id("ACC")
+    insert(store, "account", {"account_id": account_id, "label": "t", "created_ts": now()})
+    session_id = new_id("SESS")
+    insert(
+        store, "session",
+        {"session_id": session_id, "account_id": account_id, "opened_ts": now(), "status": "open"},
+    )
+    result = book_launch(
+        store, session_id=session_id, program_id="PROG-test", agent_kind="lens",
+        model_class="top", model="opus", purpose="ideation", est_tokens=1000,
+    )
+    store.close()
+    return result.launch_id
+
+
+def test_hook_refuses_a_top_booking_spawned_with_a_cheap_model(roots):
+    platform_root, program_root = roots
+    launch_id = _top_booked(roots)
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Agent",
+        "tool_input": {"prompt": f"you are a lens. launch_id: {launch_id}", "model": "haiku"},
+        "cwd": str(program_root),
+    }
+    proc = _run_hook(payload, platform_root=platform_root)
+    assert proc.returncode == 2
+    assert "agent_model_below_booking" in proc.stderr
+
+
+def test_hook_allows_a_top_booking_spawned_with_a_top_model(roots):
+    platform_root, program_root = roots
+    launch_id = _top_booked(roots)
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Agent",
+        "tool_input": {"prompt": f"you are a lens. launch_id: {launch_id}", "model": "opus"},
+        "cwd": str(program_root),
+    }
+    proc = _run_hook(payload, platform_root=platform_root)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_hook_falls_back_to_the_agent_files_frontmatter_model(roots):
+    """No `model` on the call -- the agent file's pin is what will actually
+    be used, so it is what the guard has to read."""
+    platform_root, program_root = roots
+    (program_root / "plugin" / "agents").mkdir(parents=True)
+    (program_root / "plugin" / "agents" / "cheapskate.md").write_text(
+        "---\nname: cheapskate\ndescription: a test agent\nmodel: haiku\n---\n\n# Cheapskate\n",
+        encoding="utf-8",
+    )
+    launch_id = _top_booked(roots)
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": f"you are a lens. launch_id: {launch_id}",
+            "subagent_type": "cheapskate",
+        },
+        "cwd": str(program_root),
+    }
+    proc = _run_hook(payload, platform_root=platform_root)
+    assert proc.returncode == 2
+    assert "agent_model_below_booking" in proc.stderr
+    assert "haiku" in proc.stderr
+
+
+def test_hook_allows_when_neither_the_call_nor_any_agent_file_names_a_model(roots):
+    platform_root, program_root = roots
+    launch_id = _top_booked(roots)
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": f"you are a lens. launch_id: {launch_id}",
+            "subagent_type": "no-such-agent-anywhere",
+        },
+        "cwd": str(program_root),
+    }
+    proc = _run_hook(payload, platform_root=platform_root)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_frontmatter_model_reader_is_path_safe_and_absence_tolerant(tmp_path):
+    from trialerror.hooks.spawn_gate import _frontmatter_model
+
+    agents = tmp_path / "plugin" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "reader.md").write_text("---\nname: reader\nmodel: 'opus'\n---\n", encoding="utf-8")
+    assert _frontmatter_model("reader", tmp_path) == "opus"
+    assert _frontmatter_model("missing", tmp_path) is None
+    assert _frontmatter_model(None, tmp_path) is None
+    # A traversal-shaped subagent_type never becomes a filesystem read.
+    assert _frontmatter_model("../../etc/passwd", tmp_path) is None
+    assert _frontmatter_model(".hidden", tmp_path) is None
+
+
+def test_only_the_frontmatter_block_can_pin_a_model(tmp_path):
+    """Finding V-8: the pin is read from the ``---`` block, never from the
+    body. A prose line beginning ``model:`` used to be read as the file's
+    pin, and the direction that bites is a FALSE REFUSAL -- an agent file
+    that merely discusses ``model: haiku`` refusing a correct top spawn."""
+    from trialerror.hooks.spawn_gate import _frontmatter_model
+
+    agents = tmp_path / "plugin" / "agents"
+    agents.mkdir(parents=True)
+
+    (agents / "prose.md").write_text(
+        "---\nname: prose\ndescription: an agent\n---\n\n# Prose\n\n"
+        "Your spawn prompt states the model, e.g.\n\nmodel: haiku\n",
+        encoding="utf-8",
+    )
+    assert _frontmatter_model("prose", tmp_path) is None
+
+    # No frontmatter at all: a body line is still not a pin.
+    (agents / "bare.md").write_text("# Bare\n\nmodel: opus\n", encoding="utf-8")
+    assert _frontmatter_model("bare", tmp_path) is None
+
+    # An unterminated fence is not a frontmatter block either.
+    (agents / "unclosed.md").write_text("---\nname: unclosed\nmodel: opus\n", encoding="utf-8")
+    assert _frontmatter_model("unclosed", tmp_path) is None
+
+    # The real shape still reads, body noise and all.
+    (agents / "real.md").write_text(
+        "---\nname: real\nmodel: fable\n---\n\n# Real\n\nmodel: haiku appears here as prose.\n",
+        encoding="utf-8",
+    )
+    assert _frontmatter_model("real", tmp_path) == "fable"

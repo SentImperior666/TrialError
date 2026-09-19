@@ -18,7 +18,7 @@ from trialerror.litapi.providers.arxiv import ArxivProvider
 from trialerror.litapi.transport import FakeTransport, TransportResponse
 from tests._litapi_fixtures import load_text_fixture
 
-ARXIV_BASE = "http://export.arxiv.org/api"
+ARXIV_BASE = "https://export.arxiv.org/api"  # matches config.py's real (https) default
 
 
 def _arxiv_cfg(**overrides) -> ProviderApiConfig:

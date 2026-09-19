@@ -24,6 +24,14 @@ obs {status,start-phoenix,smoke}"):
   kinds (launch/retrieval/verification/job) against the configured
   endpoint, then flush+shutdown -- the manual "did a span really reach
   Phoenix" round trip this build's report uses as its live-Phoenix proof.
+- ``audit-digest`` -- one deterministic, VERDICT-FREE digest of a day of
+  autonomous agent activity (Claude Code transcripts, shell history, the
+  program's event rows, the doctor, previous digests), for the
+  ``/sandbox-audit`` skill's rubric to judge. The digest shape, the classifier
+  tag glossary and the redaction rules live in :mod:`trialerror.obs.audit`;
+  the rubric and the read-only rule live in
+  ``plugin/skills/sandbox-audit/SKILL.md``. This verb decides nothing -- it
+  counts, tags and masks.
 """
 
 from __future__ import annotations
@@ -73,6 +81,46 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     _common(p_smoke)
     p_smoke.add_argument("--endpoint", default=None, help="override the OTLP/HTTP endpoint (default: TRIALERROR_OBS_OTLP_ENDPOINT or localhost:6006)")
     p_smoke.set_defaults(handler=_cmd_smoke)
+
+    p_audit = sub.add_parser(
+        "audit-digest",
+        help="deterministic, verdict-free digest of a day of agent activity (for the sandbox-audit skill)",
+    )
+    _common(p_audit)
+    p_audit.add_argument(
+        "--since", default="24h", help="window start: a relative span (24h, 90m, 7d) or an ISO-8601 instant"
+    )
+    p_audit.add_argument("--until", default=None, help="window end as an ISO-8601 instant (default: now)")
+    p_audit.add_argument(
+        "--transcripts",
+        default=None,
+        help="Claude Code transcripts directory, searched recursively (default: the current user's ~/.claude/projects)",
+    )
+    p_audit.add_argument("--history", default=None, help="shell history file (plain or the ': <epoch>:0;cmd' extended form)")
+    p_audit.add_argument("--previous-dir", default=None, help="directory of earlier digest JSON files, for the volume medians")
+    p_audit.add_argument("--out", default=None, help="write the digest JSON here (mode 600) instead of returning it inline")
+    p_audit.add_argument(
+        "--allowed-write-root",
+        action="append",
+        default=None,
+        metavar="ROOT",
+        help="repeatable: a root writes are expected to stay inside (no roots declared = writes are reported unjudged)",
+    )
+    p_audit.add_argument(
+        "--sensitive-path",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="repeatable: a path fragment or glob that counts as sensitive (default: the audit module's own list)",
+    )
+    p_audit.add_argument(
+        "--allowed-host",
+        action="append",
+        default=None,
+        metavar="HOST",
+        help="repeatable: a host network use is expected to stay within (no hosts declared = network use is reported unjudged)",
+    )
+    p_audit.set_defaults(handler=_cmd_audit_digest)
 
     return parser
 
@@ -216,7 +264,120 @@ def _cmd_smoke(args: argparse.Namespace) -> dict:
     )
 
 
+def _cmd_audit_digest(args: argparse.Namespace) -> dict:
+    from trialerror.obs import audit
+
+    try:
+        opts = audit.AuditOptions(
+            since=args.since,
+            until=args.until,
+            transcripts=args.transcripts,
+            history=args.history,
+            program_root=args.program_root,
+            platform_root=args.platform_root,
+            previous_dir=args.previous_dir,
+            allowed_write_roots=args.allowed_write_root,
+            sensitive_paths=args.sensitive_path,
+            allowed_hosts=args.allowed_host,
+        )
+    except ValueError as exc:
+        return error_envelope("obs.audit-digest", "bad_window", str(exc))
+
+    digest = audit.build_digest(opts)
+    coverage = digest["coverage"]
+    absent = sorted(name for name, row in coverage.items() if not row.get("present"))
+
+    # Verdict-free by construction: counts and coverage only. The rubric that
+    # turns these into NOTIFY/ATTENTION/QUIET lives in the skill, never here.
+    counts = {
+        "sessions": digest["volume"]["total"]["sessions"],
+        "tool_calls": digest["volume"]["total"]["tool_calls"],
+        "shell_commands": digest["volume"]["total"]["shell_commands"],
+        "file_writes": digest["volume"]["total"]["file_writes"],
+        "file_writes_outside_allowed_roots": sum(
+            1 for w in digest["file_writes"] if w.get("inside_allowed_roots") is False
+        ),
+        "sensitive_reads": len(digest["sensitive_reads"]),
+        "network_calls": len(digest["network"]),
+        "network_calls_not_allowed": sum(1 for n in digest["network"] if n.get("allowed") is False),
+        "permission_flags": len(digest["permission_flags"]),
+        "spawns_seen": digest["spawns"]["seen_in_transcripts"],
+        "spawns_without_launch_id": digest["spawns"]["without_launch_id"],
+        "gate_refusals": digest["spawns"]["gate_refusals"],
+        "doctor_fail": digest["doctor"]["counts"].get("fail", 0),
+        "doctor_warn": digest["doctor"]["counts"].get("warn", 0),
+        "tagged_commands": sum(1 for c in digest["shell_commands"] if c.get("tags")),
+    }
+
+    result: dict = {
+        "window": digest["window"],
+        "digest_sha256": digest["digest_sha256"],
+        "counts": counts,
+        "coverage": {name: row.get("present", False) for name, row in coverage.items()},
+        "sources_absent": absent,
+        "out_path": None,
+    }
+
+    if args.out:
+        try:
+            written = audit.write_digest(digest, Path(args.out))
+        except OSError as exc:
+            return error_envelope(
+                "obs.audit-digest", "out_write_failed", f"could not write {args.out}: {exc}",
+                details={"digest_sha256": digest["digest_sha256"]},
+            )
+        result["out_path"] = str(written)
+    else:
+        # No --out: the digest itself rides in the envelope, which is what the
+        # host wrapper reads off stdout.
+        result["digest"] = digest
+
+    next_actions = []
+    if not coverage["transcripts"].get("present"):
+        next_actions.append(
+            next_action(
+                ["trialerror", "obs", "audit-digest", "--since", str(args.since), "--transcripts", "<DIR>"],
+                "no transcripts were found -- point the digest at the right directory (a missing source is itself a finding)",
+            )
+        )
+    if not coverage["history"].get("present"):
+        next_actions.append(
+            next_action(
+                ["trialerror", "obs", "audit-digest", "--since", str(args.since), "--history", "<FILE>"],
+                "no shell history was read -- name the persisted history file",
+            )
+        )
+    elif not coverage["history"].get("windowed", True):
+        # Present but undated: --since could not be applied to a single line of
+        # it, and everything past the tail was dropped. That is a PARTIAL source
+        # and the reader has to know before treating it as coverage.
+        next_actions.append(
+            next_action(
+                ["bash", "-lc", "export HISTTIMEFORMAT='%s '  # zsh: setopt EXTENDED_HISTORY"],
+                "the shell history carries no timestamps, so the window could not be applied to it "
+                "and only its most recent lines are in this digest -- date it on the machine that writes it",
+            )
+        )
+    if not coverage["events"].get("present") or not coverage["doctor"].get("present"):
+        next_actions.append(
+            next_action(
+                ["trialerror", "obs", "audit-digest", "--since", str(args.since), "--program-root", "<DIR>"],
+                "event rows and the doctor need a program root",
+            )
+        )
+    if opts.previous_dir is None:
+        next_actions.append(
+            next_action(
+                ["trialerror", "obs", "audit-digest", "--since", str(args.since), "--previous-dir", "<DIR>"],
+                "supply earlier digests so the volume medians the rubric compares against are populated",
+            )
+        )
+    return ok_envelope("obs.audit-digest", result=result, next_actions=next_actions)
+
+
 def run(args: argparse.Namespace) -> dict:
     """The ``obs`` group's own default handler -- reached only when no
     subcommand was given."""
-    return error_envelope("obs", "no_subcommand", "specify a subcommand: status, start-phoenix, smoke")
+    return error_envelope(
+        "obs", "no_subcommand", "specify a subcommand: status, start-phoenix, smoke, audit-digest"
+    )

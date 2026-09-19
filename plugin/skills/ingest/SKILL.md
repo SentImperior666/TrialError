@@ -88,6 +88,25 @@ another `start-worker` to pick back up.
    indexed`, or `rejected`/`failed`); `trialerror ingest requests-md` renders
    `requests/REQUESTS.md`, the human-facing view the user fulfills against.
 
+9. **Writing extraction judgments** (`trialerror extract run
+   --judgments-file`): each chunk's judgment is `{"entities": [...],
+   "relations": [...], "claims": [...]}`, and every relation/claim needs a
+   `quote` that is a verbatim substring of that chunk. On a claim with
+   `"kind": "definition"`, also supply **`"term"`: the lemma being
+   defined** — the NAME of the thing (`"interleaved practice"`), in its
+   shortest form; never the sentence that defines it, never a verbatim span
+   of the source. Omit the key when a definition names nothing usable as a
+   lemma, and on every other claim kind.
+
+   That key is what routes the accepted claim into the term store as a
+   `current` sense anchored to the same quote. Without it, accept falls
+   back to a substring heuristic over that chunk's own entity candidates
+   and proposes at `status='proposed'` — so naming the term is the
+   difference between a definition that lands and one that queues for a
+   human. Nothing auto-merges either way: an existing lemma gains a second
+   sense, and two readings standing on disjoint sources open a conflict
+   item for review rather than picking a winner.
+
 ## When NOT to apply
 
 - The license tier or acquisition route is unknown and the user is not

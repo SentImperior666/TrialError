@@ -65,12 +65,35 @@ def test_config_provider_lookup_by_name():
 def test_load_litapi_config_arxiv_defaults_grounded_in_external_api_facts():
     cfg = load_litapi_config({})
 
-    assert cfg.arxiv.base_url == "http://export.arxiv.org/api"
+    # https, not arXiv's own historical http:// docs examples -- an egress
+    # policy admitting only tcp/443 (this harness's own container included)
+    # refuses plaintext http outright, and every other provider default in
+    # this module is already https (see test_all_provider_default_base_urls_use_https
+    # below for the pinned, all-providers version of this assertion).
+    assert cfg.arxiv.base_url == "https://export.arxiv.org/api"
     # docs/EXTERNAL_API_FACTS.md quick-confirms: "1 request per 3 seconds",
     # the documented, enforced ToU limit -- not a conservative guess.
     assert cfg.arxiv.min_interval_s == 3.0
     assert cfg.arxiv.retry_attempts == 3
     assert cfg.arxiv.retry_on_status == (500, 503)
+
+
+def test_all_provider_default_base_urls_use_https():
+    """Pin (task litapi-arxiv-https): a container-side egress policy that
+    admits only tcp/443 (C-0093(a)) must never be broken by a provider
+    quietly defaulting to plaintext http -- every one of the four real
+    ``Provider`` base URLs, both as resolved on a :class:`LitApiConfig`
+    and in :data:`trialerror.litapi.config._DEFAULT_BASE_URLS` itself, must
+    be https."""
+    from trialerror.litapi.config import _DEFAULT_BASE_URLS
+
+    cfg = load_litapi_config({})
+    for name in ("openalex", "semanticscholar", "arxiv", "unpaywall"):
+        base_url = cfg.provider(name).base_url
+        assert base_url.startswith("https://"), f"{name}.base_url is not https: {base_url!r}"
+
+    for name, url in _DEFAULT_BASE_URLS.items():
+        assert url.startswith("https://"), f"_DEFAULT_BASE_URLS[{name!r}] is not https: {url!r}"
 
 
 def test_load_litapi_config_unpaywall_defaults():

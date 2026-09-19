@@ -54,6 +54,7 @@ __all__ = [
     "reveal_prereg",
     "prereg_status",
     "check_prereg_compliance",
+    "prereg_compliance_detail",
 ]
 
 
@@ -317,10 +318,46 @@ def check_prereg_compliance(
     Raises :class:`~trialerror.verify.errors.PreregNotFoundError` /
     :class:`~trialerror.verify.errors.PreregVoidedError` exactly like
     :func:`reveal_prereg` — a voided commitment cannot be complied with."""
+    return prereg_compliance_detail(
+        store, prereg_id=prereg_id, executed_procedure=executed_procedure, executed_params=executed_params
+    )["compliant"]
+
+
+def prereg_compliance_detail(
+    store: Store,
+    *,
+    prereg_id: str,
+    executed_procedure: str,
+    executed_params: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """:func:`check_prereg_compliance`, plus WHICH of the two hashes
+    disagreed.
+
+    The bare boolean was unactionable. A round whose procedure file ended
+    with a newline the caller's ``$(cat file)`` stripped came back
+    ``prereg_compliant=false`` for a procedure that was followed exactly,
+    and nothing in the answer said whether the procedure or the parameters
+    were the half that moved. Both hashes, both sides, and a ``mismatched``
+    list naming the axes."""
     row = _require_prereg(store, prereg_id)
     if row["status"] == "voided":
         raise PreregVoidedError(f"prereg {prereg_id!r} is voided; compliance is undefined")
     executed_params = dict(executed_params) if executed_params is not None else {}
     procedure_sha = sha256_hex(executed_procedure)
     params_sha = sha256_hex(canonical_json(executed_params))
-    return procedure_sha == row["procedure_sha256"] and params_sha == row["params_sha256"]
+    procedure_matches = procedure_sha == row["procedure_sha256"]
+    params_matches = params_sha == row["params_sha256"]
+    mismatched = [
+        axis for axis, ok in (("procedure", procedure_matches), ("params", params_matches)) if not ok
+    ]
+    return {
+        "prereg_id": prereg_id,
+        "compliant": procedure_matches and params_matches,
+        "procedure_matches": procedure_matches,
+        "params_matches": params_matches,
+        "mismatched": mismatched,
+        "committed_procedure_sha256": row["procedure_sha256"],
+        "executed_procedure_sha256": procedure_sha,
+        "committed_params_sha256": row["params_sha256"],
+        "executed_params_sha256": params_sha,
+    }

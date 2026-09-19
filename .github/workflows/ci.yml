@@ -26,7 +26,13 @@ jobs:
     # tests/test_posix_detach.py, which SKIPS cleanly on win32, so the
     # Windows leg is unaffected by it.
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # 90, not 45: measured 2026-09-19, the suite needs about an hour on
+    # windows-latest (ubuntu-latest finishes it in ~9.5 minutes) and the
+    # 45-minute limit CANCELLED the Windows leg at 77% of the suite -- so the
+    # run reported no summary and the failures it had already collected were
+    # never named. A cancelled lane is worse than a slow one: it looks like a
+    # test problem and is not.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:

@@ -17,6 +17,15 @@ that just returns them, mirroring ``trialerror verify hypothesis``'s
 ``--judgments-file`` in spirit but scalar (one discussion point's score IS
 one number, unlike hypothesis's per-evidence-chunk table).
 
+Under the framework procedure the scalar moves the other way: ``score``'s
+``--label`` is what a moderator actually produced, and ``--agreement-pct``
+is REFUSED for a point whose participants have filed structured final
+stances (``stance``), because the number is then computed from those
+stances rather than reported by anyone. ``stance`` and ``extracts`` both
+take a FILE for the same reason ``verify hypothesis`` does: what they carry
+is structured output a booked spawn produced out-of-band, and this process
+relays it rather than reading it.
+
 Design Section 5.2 registration rule: "each CLI group lives in its own
 module ``trialerror/cli/<group>.py``, auto-discovered at load — no
 implementation lane ever edits a shared ``cli/__init__.py``." This file is
@@ -30,14 +39,22 @@ import json
 from pathlib import Path
 
 from trialerror.rooms.api import (
+    DEFAULT_IDEAS_PER_ROOM,
+    DEFAULT_ROOMS_PER_BATCH,
+    DP_LABELS,
+    TURN_KINDS,
+    build_admission_order,
     check_room_converged,
+    consolidated_ideas_for_admission,
     converge_room,
     create_room,
     export_room,
     freeze_room,
     get_room,
     list_room_turns,
+    post_final_stance,
     post_message,
+    record_turn_extracts,
     score_dp,
 )
 from trialerror.rooms.errors import RoomsError
@@ -47,7 +64,10 @@ from trialerror.util.config import find_program_root
 from trialerror.util.envelope import error_envelope, next_action, ok_envelope
 
 GROUP_NAME = "room"
-HELP = "Brainstorm-rooms runtime: create, status, post, score, freeze, converge-check, export."
+HELP = (
+    "Brainstorm-rooms runtime: create, status, post, score, stance, extracts, freeze, converge-check, "
+    "export, admission-order."
+)
 
 _PROGRAM_ROOT_HELP = "override the program root (default: discover trialerror.toml upward from CWD)"
 
@@ -78,6 +98,20 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
         "--no-enforce-participant-range", action="store_false", dest="enforce_participant_range",
         help="override the MN-033 2-3 participant soft-enforcement",
     )
+    p_create.add_argument(
+        "--blind-first-turn", action="store_true", dest="blind_first_turn",
+        help="round 1 is simultaneous: no participant envelope carries a prior turn until round 1 is complete",
+    )
+    p_create.add_argument(
+        "--rank-all", action="store_true", dest="rank_all",
+        help="append the procedural RANK-ALL point; every participant files a structured final stance on it "
+             "before the room may converge",
+    )
+    p_create.add_argument(
+        "--buster", default=None,
+        help="which participant holds the assumption-buster seat, so its recorded position is re-injected "
+             "verbatim into its own turn envelopes",
+    )
     p_create.add_argument("--by-launch", default=None, dest="by_launch")
     p_create.set_defaults(handler=_run_create, enforce_participant_range=True)
 
@@ -94,16 +128,75 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     body_group = p_post.add_mutually_exclusive_group(required=True)
     body_group.add_argument("--body", default=None)
     body_group.add_argument("--body-file", default=None, dest="body_file")
+    p_post.add_argument(
+        "--kind", default="position", choices=list(TURN_KINDS),
+        help="the turn's kind; 'closure' is refused in the author's own first round on the point",
+    )
     p_post.set_defaults(handler=_run_post)
 
-    p_score = actions.add_parser("score", help="record a moderator's agreement score for one discussion point")
+    p_score = actions.add_parser("score", help="record a moderator's label (and agreement score) for one discussion point")
     _add_program_root_arg(p_score)
     p_score.add_argument("--id", required=True, dest="room_id")
     p_score.add_argument("--dp", required=True, dest="dp_id")
-    p_score.add_argument("--agreement-pct", required=True, type=float, dest="agreement_pct")
+    p_score.add_argument(
+        "--agreement-pct", default=None, type=float, dest="agreement_pct",
+        help="only for a point with no structured final stances; where stances exist the number is computed "
+             "from them and passing it here is refused",
+    )
+    p_score.add_argument(
+        "--label", default=None, choices=list(DP_LABELS),
+        help="the moderator's discrete verdict, required on the structured-stance path",
+    )
     p_score.add_argument("--note", default=None)
     p_score.add_argument("--by-launch", required=True, dest="by_launch")
+    p_score.add_argument(
+        "--require-extracts", action="store_true", dest="require_extracts",
+        help="refuse to score unless every turn on the point has a recorded neutral extract",
+    )
     p_score.set_defaults(handler=_run_score)
+
+    p_stance = actions.add_parser(
+        "stance", help="file one participant's rank-all final stance record on the room's procedural point"
+    )
+    _add_program_root_arg(p_stance)
+    p_stance.add_argument("--id", required=True, dest="room_id")
+    p_stance.add_argument("--launch-id", required=True, dest="launch_id")
+    p_stance.add_argument("--participant", required=True)
+    p_stance.add_argument(
+        "--file", required=True, dest="stance_file",
+        help='JSON: {"ranking": {"a": [dp_id, ...], "b": [...]}, "stances": {dp_id: {"a": ..., "b": ...}}, "note"?: ...}',
+    )
+    p_stance.set_defaults(handler=_run_stance)
+
+    p_extracts = actions.add_parser(
+        "extracts", help="record the neutral extract pass for one discussion point (one extract per turn)"
+    )
+    _add_program_root_arg(p_extracts)
+    p_extracts.add_argument("--id", required=True, dest="room_id")
+    p_extracts.add_argument("--dp", required=True, dest="dp_id")
+    p_extracts.add_argument(
+        "--file", required=True, dest="extracts_file",
+        help='JSON array: [{"seq": N, "claim": ..., "anchors": [...], "stance_a": ..., "stance_b": ..., '
+             '"residual_disagreement": ...}, ...]',
+    )
+    p_extracts.add_argument("--by-launch", required=True, dest="by_launch")
+    p_extracts.set_defaults(handler=_run_extracts)
+
+    p_admission = actions.add_parser(
+        "admission-order",
+        help="the seeded (arm, card)-stratified order every consolidated idea of a round is roomed in, "
+             "packed into rooms and batches, with its pre-registerable hash",
+    )
+    _add_program_root_arg(p_admission)
+    p_admission.add_argument("--round-id", required=True, dest="round_id")
+    p_admission.add_argument("--seed", required=True, help="the round's own seed (pre-registered)")
+    p_admission.add_argument("--ideas-per-room", type=int, default=DEFAULT_IDEAS_PER_ROOM, dest="ideas_per_room")
+    p_admission.add_argument("--rooms-per-batch", type=int, default=DEFAULT_ROOMS_PER_BATCH, dest="rooms_per_batch")
+    p_admission.add_argument(
+        "--no-enforce-batch-band", action="store_false", dest="enforce_batch_band",
+        help="override the charter's 4-8 rooms-per-batch band with a stated reason",
+    )
+    p_admission.set_defaults(handler=_run_admission_order, enforce_batch_band=True)
 
     p_freeze = actions.add_parser("freeze", help="open -> frozen: moderator escalation with a required reason")
     _add_program_root_arg(p_freeze)
@@ -151,7 +244,7 @@ def _run_no_action(args: argparse.Namespace) -> dict:
     return error_envelope(
         "room",
         "no_action",
-        "specify an action: create|status|post|score|freeze|converge-check|export",
+        "specify an action: create|status|post|score|stance|extracts|freeze|converge-check|export|admission-order",
         next_actions=[next_action(["trialerror", "room", "--help"], "list room actions")],
     )
 
@@ -172,6 +265,9 @@ def _run_create(args: argparse.Namespace) -> dict:
             discussion_points=dps,
             participants=participants,
             enforce_participant_range=args.enforce_participant_range,
+            blind_first_turn=args.blind_first_turn,
+            rank_all=args.rank_all,
+            buster=args.buster,
             by_launch=args.by_launch,
             **kwargs,
         )
@@ -214,23 +310,126 @@ def _run_post(args: argparse.Namespace) -> dict:
         return err
     try:
         body = args.body if args.body is not None else Path(args.body_file).read_text(encoding="utf-8")
-        row = post_message(store, room_id=args.room_id, launch_id=args.launch_id, dp_id=args.dp_id, body=body)
-    except (RoomsError, StoreError, ValueError) as exc:
+        row = post_message(
+            store, room_id=args.room_id, launch_id=args.launch_id, dp_id=args.dp_id, body=body, kind=args.kind
+        )
+    except (RoomsError, StoreError, ValueError, OSError) as exc:
         return error_envelope("room post", "post_refused", str(exc))
     finally:
         store.close()
     return ok_envelope("room post", result=row)
 
 
+def _run_stance(args: argparse.Namespace) -> dict:
+    store, err = _open_store(args)
+    if err is not None:
+        return err
+    try:
+        payload = json.loads(Path(args.stance_file).read_text(encoding="utf-8"))
+        row = post_final_stance(
+            store,
+            room_id=args.room_id,
+            launch_id=args.launch_id,
+            participant=args.participant,
+            ranking=payload.get("ranking") or {},
+            stances=payload.get("stances") or {},
+            note=payload.get("note"),
+        )
+    except (RoomsError, StoreError, ValueError, OSError, json.JSONDecodeError) as exc:
+        return error_envelope("room stance", "stance_refused", str(exc))
+    finally:
+        store.close()
+    return ok_envelope(
+        "room stance", result=row,
+        next_actions=[next_action(["trialerror", "room", "converge-check", "--id", args.room_id], "check overall convergence")],
+    )
+
+
+def _run_extracts(args: argparse.Namespace) -> dict:
+    store, err = _open_store(args)
+    if err is not None:
+        return err
+    try:
+        extracts = json.loads(Path(args.extracts_file).read_text(encoding="utf-8"))
+        row = record_turn_extracts(
+            store, room_id=args.room_id, dp_id=args.dp_id, extracts=extracts, by_launch=args.by_launch
+        )
+    except (RoomsError, StoreError, ValueError, OSError, json.JSONDecodeError) as exc:
+        return error_envelope("room extracts", "extracts_refused", str(exc))
+    finally:
+        store.close()
+    return ok_envelope(
+        "room extracts", result=row,
+        next_actions=[next_action(
+            ["trialerror", "room", "score", "--id", args.room_id, "--dp", args.dp_id, "--require-extracts"],
+            "score the point on its extracts rather than its prose",
+        )],
+    )
+
+
+def _run_admission_order(args: argparse.Namespace) -> dict:
+    store, err = _open_store(args)
+    if err is not None:
+        return err
+    try:
+        ideas = consolidated_ideas_for_admission(store, round_id=args.round_id)
+        if not ideas:
+            return error_envelope(
+                "room admission-order", "no_consolidated_ideas",
+                f"round {args.round_id!r} has no consolidated ideas to room — run the novelty screen first",
+                next_actions=[next_action(
+                    ["trialerror", "lens", "screen", "--round-id", args.round_id, "--mechanical"],
+                    "screen the round's raw records",
+                )],
+            )
+        result = build_admission_order(
+            ideas,
+            seed=args.seed,
+            ideas_per_room=args.ideas_per_room,
+            rooms_per_batch=args.rooms_per_batch,
+            enforce_batch_band=args.enforce_batch_band,
+        )
+    except (RoomsError, StoreError, ValueError) as exc:
+        return error_envelope("room admission-order", "admission_order_refused", str(exc))
+    finally:
+        store.close()
+    return ok_envelope(
+        "room admission-order", result={"round_id": args.round_id, **result},
+        next_actions=[next_action(
+            ["trialerror", "room", "create", "--topic", "<batch 1 room 1>", "--participants", "<lens,lens>", "--dps", "<json>"],
+            "open the first batch's rooms in this order",
+        )],
+    )
+
+
 def _run_score(args: argparse.Namespace) -> dict:
+    if args.agreement_pct is None and args.label is None:
+        return error_envelope(
+            "room score", "nothing_to_record",
+            "pass --label (the moderator's discrete verdict; required where the point has structured final "
+            "stances, since the number is computed from them) and/or --agreement-pct (only where it does not)",
+            next_actions=[next_action(["trialerror", "room", "score", "--help"], "see both paths")],
+        )
     store, err = _open_store(args)
     if err is not None:
         return err
     try:
         # The CLI never calls an LLM (module docstring) -- the caller
-        # already produced this number; `judge` just hands it through.
-        judge = lambda _envelope: {"agreement_pct": args.agreement_pct, "note": args.note}  # noqa: E731
-        row = score_dp(store, room_id=args.room_id, dp_id=args.dp_id, judge=judge, by_launch=args.by_launch)
+        # already produced these values; `judge` just hands them through.
+        # agreement_pct is OMITTED from the handed-through mapping when the
+        # operator did not pass one, because on the structured-stance path
+        # score_dp refuses a supplied number outright and a None would read
+        # as "the judge answered None" rather than "the judge did not answer".
+        answer: dict = {"note": args.note}
+        if args.agreement_pct is not None:
+            answer["agreement_pct"] = args.agreement_pct
+        if args.label is not None:
+            answer["label"] = args.label
+        judge = lambda _envelope: answer  # noqa: E731
+        row = score_dp(
+            store, room_id=args.room_id, dp_id=args.dp_id, judge=judge, by_launch=args.by_launch,
+            require_extracts=args.require_extracts,
+        )
     except (RoomsError, StoreError, ValueError) as exc:
         return error_envelope("room score", "score_refused", str(exc))
     finally:

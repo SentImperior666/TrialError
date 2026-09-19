@@ -73,6 +73,12 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     p_knowledge.add_argument(
         "--platform-root", default=argparse.SUPPRESS, help="override the platform root (default: TRIALERROR_PLATFORM_ROOT or ~/.trialerror)"
     )
+    p_knowledge.add_argument(
+        "--launch-id", default=None, dest="launch_id",
+        help="serve this booked launch: when its attrs.slice_doc_ids names a slice, `search` and "
+             "`similar` are restricted to those documents for the life of the process. No tool "
+             "argument can widen it -- the value comes from here, not from the agent",
+    )
     p_knowledge.set_defaults(handler=_run_knowledge)
 
     parser.set_defaults(handler=_run_no_server)
@@ -131,5 +137,9 @@ def _run_knowledge(args: argparse.Namespace) -> dict:
     from trialerror.mcp.knowledge import run_server  # deferred: keep `trialerror --help`/argv parsing free of the store import chain
 
     platform_root = Path(args.platform_root) if args.platform_root else None
-    run_server(program_root=program_root, platform_root=platform_root)
-    return ok_envelope("mcp knowledge", result={"program_root": str(program_root), "stopped": True})
+    launch_id = getattr(args, "launch_id", None)
+    run_server(program_root=program_root, platform_root=platform_root, launch_id=launch_id)
+    return ok_envelope(
+        "mcp knowledge",
+        result={"program_root": str(program_root), "launch_id": launch_id, "stopped": True},
+    )

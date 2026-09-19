@@ -1,4 +1,4 @@
-"""Per-tool unit tests for ``trialerror.mcp.knowledge`` — each of the 11
+"""Per-tool unit tests for ``trialerror.mcp.knowledge`` — each of the 12
 ``trialerror-knowledge`` tool handlers, called directly (bypassing the
 JSON-RPC/stdio transport, which ``tests/test_mcp_knowledge_protocol.py``
 covers separately) so each test isolates exactly one tool's own
@@ -29,12 +29,13 @@ def _seeded_store_and_tools(program_root, platform_root):
     return tools, corpus
 
 
-def test_tool_registry_has_exactly_the_11_named_tools(program_root, platform_root):
+def test_tool_registry_has_exactly_the_12_named_tools(program_root, platform_root):
     tools = build_tools(program_root=program_root, platform_root=platform_root)
-    assert len(tools) == TOOL_COUNT == 11
+    assert len(tools) == TOOL_COUNT == 12
     assert set(tools) == {
         "search", "get_chunk", "get_source", "get_document_outline", "resolve_quote",
         "similar", "graph_neighbors", "corpus_stats", "memory_search", "list_requests", "poll_job",
+        "term_lookup",
     }
     for name, spec in tools.items():
         assert spec.name == name
@@ -218,10 +219,79 @@ def test_poll_job_happy_path(program_root, platform_root):
     assert env["result"]["heartbeat_age_s"] is None
 
 
+def _seed_term(program_root, platform_root, corpus):
+    """One 'quorum' sense, anchored to the restricted corpus's first chunk
+    -- what the fencing assertions in the ``term_lookup`` tests below need."""
+    from trialerror.lexicon import api as lexicon_api
+
+    store = open_store(program_root, platform_root=platform_root)
+    try:
+        anchor = dict(
+            store.knowledge.execute(
+                "SELECT * FROM quote_anchor WHERE chunk_id = ?", (corpus["restricted_chunk_ids"][0],)
+            ).fetchone()
+        )
+        result = lexicon_api.propose(
+            store,
+            lemma="quorum",
+            gloss="the minimum number of nodes that must agree before a decision is committed",
+            origin_kind="manual",
+            origin_ref=None,
+            evidence=[f"anchor:{anchor['anchor_id']}"],
+            by_launch=corpus["launch_id"],
+            procedure_version="manual-v1",
+            status="current",
+        )
+    finally:
+        store.close()
+    return result
+
+
+def test_term_lookup_happy_path_fences_a_restricted_anchor(program_root, platform_root):
+    tools, corpus = _seeded_store_and_tools(program_root, platform_root)
+    _seed_term(program_root, platform_root, corpus)
+
+    env = tools["term_lookup"].handler({"lemma": "quorum"})
+    assert env["ok"] is True
+    result = env["result"]
+    assert result["term"]["lemma"] == "quorum"
+    assert result["term"]["status"] == "active"
+    assert len(result["senses"]) == 1
+    sense = result["senses"][0]
+    assert sense["status"] == "current"
+    evidence = sense["evidence"][0]
+    assert evidence["anchored"] is True
+    assert evidence["fenced"] is True
+    assert len(evidence["excerpt"].split()) <= 20
+
+
+def test_term_lookup_by_term_id(program_root, platform_root):
+    tools, corpus = _seeded_store_and_tools(program_root, platform_root)
+    seeded = _seed_term(program_root, platform_root, corpus)
+
+    env = tools["term_lookup"].handler({"term_id": seeded["term_id"]})
+    assert env["ok"] is True
+    assert env["result"]["term"]["term_id"] == seeded["term_id"]
+
+
+def test_term_lookup_not_found_is_a_structured_error(program_root, platform_root):
+    tools, _ = _seeded_store_and_tools(program_root, platform_root)
+    env = tools["term_lookup"].handler({"lemma": "no-such-lemma-anywhere"})
+    assert env["ok"] is False
+    assert env["error"]["code"] == "not_found"
+
+
+def test_term_lookup_needs_lemma_or_term_id(program_root, platform_root):
+    tools, _ = _seeded_store_and_tools(program_root, platform_root)
+    env = tools["term_lookup"].handler({})
+    assert env["ok"] is False
+    assert env["error"]["code"] == "bad_input"
+
+
 def test_every_tool_logs_exactly_one_mcp_tool_call_event(program_root, platform_root):
     """Appendix B cross-cutting rule: "per-call log line (tool, input-hash,
     latency, output-size, error-code) -> events" -- proven once, across the
-    full 11-tool surface, on both a success and a failure call."""
+    full 12-tool surface, on both a success and a failure call."""
     tools, corpus = _seeded_store_and_tools(program_root, platform_root)
     tools["corpus_stats"].handler({})
     tools["get_chunk"].handler({"chunk_id": "CHK-does-not-exist"})  # a failure call

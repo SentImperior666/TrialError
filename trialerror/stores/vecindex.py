@@ -33,6 +33,7 @@ from trialerror.util.timeutil import now
 
 __all__ = [
     "VecBackend",
+    "safe_model_key",
     "vec_table_name",
     "try_load_sqlite_vec",
     "ensure_vec_table",
@@ -48,11 +49,21 @@ class VecBackend(str, Enum):
     FALLBACK = "fallback"
 
 
+def safe_model_key(model_key: str) -> str:
+    """``model_key`` reduced to the token :func:`vec_table_name` names its
+    table after: everything outside ``[A-Za-z0-9_]`` replaced by ``_``.
+
+    Public because the table name is not the only derived identifier that
+    has to spell a model key the same way -- the ``index`` stage's job id
+    carries it too (:func:`trialerror.ingest.handlers.index_job_id`), and a
+    second sanitizer would be a second answer to "which key is this?"."""
+    return _SAFE_NAME_RE.sub("_", model_key)
+
+
 def vec_table_name(model_key: str) -> str:
     """Deterministic, SQL-identifier-safe table name for a given
     ``model_key`` (design: "per active model_key")."""
-    safe = _SAFE_NAME_RE.sub("_", model_key)
-    return f"vec_chunks__{safe}"
+    return f"vec_chunks__{safe_model_key(model_key)}"
 
 
 def try_load_sqlite_vec(conn: sqlite3.Connection) -> bool:

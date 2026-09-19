@@ -1,6 +1,6 @@
 ---
 name: verify-hypothesis
-description: Run the hypothesis-vs-literature pipeline — stratified retrieve, contracrow-classify each evidence chunk, aggregate a label distribution, and write a typed verdict artifact. Use this when the user asks you to check, test, or verify a hypothesis against the corpus, or when a keystone artifact needs its central claim gated on evidence rather than asserted.
+description: Run the hypothesis-vs-literature pipeline — stratified retrieve, contracrow-classify each evidence chunk, aggregate a label distribution, and write a typed verdict artifact. Also covers the pairwise-label envelope an ideation record is judged under (procedure_version novelty-v2). Use this when the user asks you to check, test, or verify a hypothesis against the corpus, when a keystone artifact needs its central claim gated on evidence rather than asserted, or when an ideation record needs its novelty labels recorded as verdict rows.
 ---
 
 # /verify-hypothesis — retrieve → contracrow classify → verdict artifact
@@ -66,6 +66,32 @@ adjudicated.
    hypothesis backs a keystone. Do not paraphrase the verdict's own label
    when reporting it upstream; quote it.
 
+   **When the subject is an ideation record rather than a hypothesis, the
+   judgment is a PAIRWISE-LABEL envelope and the verdict rows carry
+   `procedure=custom`, `procedure_version=novelty-v2`.** That envelope is
+   built by the novelty screen (`trialerror lens screen --judged-prep`), not
+   by hand, and it has a different shape from the contracrow one above:
+
+   - It carries the record's raw fields (`requirements`, `statement`,
+     `home_mechanic`, `probe`, its provenance doc ids) **and the retrieved
+     rows themselves** — the inventory rows under one key, the corpus and
+     external hits under another. A judge asked for a pairwise comparison has
+     to be handed the other side of the pair.
+   - It withholds `author_rationale`, `surprise`, `assumed_circle`, the seat,
+     the card, the lens name and the arm. Self-assessment sentences are
+     stripped from the statement before it travels.
+   - The answer is two discrete labels from two closed vocabularies, not an
+     ordinal score: `same` / `variant` / `recombination` / `new-mechanism` /
+     `unscreenable` against the inventory rows, and `stated` / `implied` /
+     `adjacent` / `absent` against the corpus and external hits together. No
+     others, and no number.
+   - One verdict row per record per reference set, each citing the evidence
+     that rode in THAT record's envelope, with the round's `prereg_id` linked
+     and `prereg_compliant` recomputed rather than asserted.
+   - One submission per record per judge. A revised record is a NEW record
+     with `parent_ids`, screened by a fresh launch — never the same record
+     re-submitted until a label improves.
+
 6. **Reproduction, when the hypothesis has an attached script:**
    `trialerror verify reproduce <verdict_id> --by-launch <id> [--gate-id <id>]`
    re-runs it and byte-compares output sha to the recorded expectation — a
@@ -85,3 +111,7 @@ adjudicated.
   non-compliant; never back-fill a prereg.
 - To hand-write or "correct" a verdict row. A wrong verdict is superseded by
   a new run, never edited.
+- To write novelty labels for an ideation record by hand, or to run the
+  contracrow scale over one. Those rows come back through the screen
+  (`trialerror lens screen --record-verdicts`), which scores its plants first
+  and refuses the batch on a missed inventory plant.

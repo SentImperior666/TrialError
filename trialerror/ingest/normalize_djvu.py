@@ -19,45 +19,60 @@ does three things and nothing else:
    the derived PDF becomes this document's permanent ``raw_path``, so it
    lives beside ``archive/<doc_id>.txt`` in the same durable tree instead,
    never next to the raw ``.djvu`` file itself).
-2. Decides the derived PDF's route by running DjVuLibre's ``djvutxt`` over
-   the ORIGINAL ``.djvu`` source and counting non-whitespace characters:
-   ``>= DJVU_TEXT_LAYER_MIN_CHARS`` means "has a real text layer" ->
-   tentatively ``media_type = 'pdf-text'``; otherwise -> ``media_type =
-   'pdf-scan'``. Fix pass (F1): that count is taken over the SOURCE, and
-   said nothing about the PDF ``ddjvu`` actually produced -- a tentative
-   ``pdf-text`` verdict is now cross-checked against the derived PDF itself
-   via ``normalizers._detect_pdf_media_type`` (the same average-chars/page
-   heuristic a native PDF's own media_type is decided by) and downgraded to
-   ``pdf-scan`` whenever the two disagree, since indexing a document as
-   ``pdf-text`` when it has no real text is silent, undetected data loss,
-   while OCRing a document that already had usable text merely costs time.
-   The actual per-page text for the ``pdf-text`` route still comes from
-   ``normalize_pdf_text``'s own pypdf extraction over the derived PDF,
-   exactly like a native pdf-text document; ``pdf-scan`` sends the derived
-   PDF through the SAME ``ocr`` job a native scanned PDF uses.
+2. Decides where this document's TEXT comes from, by running DjVuLibre's
+   ``djvutxt`` over the ORIGINAL ``.djvu`` source and counting
+   non-whitespace characters: ``>= DJVU_TEXT_LAYER_MIN_CHARS`` means "there
+   is a real text layer here".
 
-   **Assumption, not verified (Fix pass F9):** all of the above rests on
-   ``ddjvu -format=pdf`` embedding the source's hidden text layer into the
-   PDF it produces when one exists (and rendering every page, at a DPI
-   suitable for a bitonal book scan, by default). Nothing on the build
-   machine can confirm this -- DjVuLibre is not installed here (hard
-   rule), so ``tests/test_ingest_djvu.py``'s one real-binary test always
-   skips. The F1 cross-check above is a safety net for the case this
-   assumption is wrong (or simply doesn't hold for a given DjVuLibre
-   build/file), not proof that it's right. Treat "first real ``.djvu`` on
-   a machine with DjVuLibre installed" as an explicit operator acceptance
-   step: confirm element count > 0 and the expected page count before
-   trusting the route in production.
-3. Rewrites the document's ``media_type``/``raw_path`` to the derived PDF
-   and re-enqueues the ``normalize``/``ocr`` stage for it -- so pages.json/
-   anchors/OCR routing downstream are produced by the EXACT SAME code path
-   a native PDF gets. ``run_djvu`` passes ``normalizer_id_override`` /
-   ``normalizer_version_override`` in that job's payload so the shared
-   ``_finish_normalize_stage`` tail stamps ``document.normalizer_id`` =
+   **FX-D1 (2026-09-06), the fix that matters most in this module.** When
+   there IS a text layer, the elements are now built FROM IT --
+   :func:`extract_djvu_page_texts` calls ``djvutxt --page=N`` once per page
+   and those page texts become the document's elements. The derived PDF is
+   still produced, and is still what ``raw_path`` points at for viewing,
+   but it is no longer the text source.
+
+   The previous revision routed ``pdf-text`` through
+   ``normalize_pdf_text``'s pypdf extraction over the derived PDF, and
+   cross-checked the ``djvutxt`` verdict against that PDF's own extractable
+   text (Fix pass F1), downgrading to ``pdf-scan`` on disagreement. Seen
+   live: ``djvutxt`` reported 484,825 characters, ``ddjvu -format=pdf``
+   produced a PDF whose extractable text failed the per-page threshold, and
+   the cross-check therefore threw away a real digitized text layer to go
+   and OCR images of the same pages. VERIFY_ingest-djvu.md F9 had named
+   that assumption explicitly ("rests on ``ddjvu -format=pdf`` embedding
+   the source's hidden text layer into the PDF it produces"); this is what
+   happens when it does not hold.
+
+   F1's underlying concern is kept, on the right evidence: a whole-document
+   character count is scale-blind, and U+FFFD/control bytes survive a
+   replace-decode and are not whitespace, so the extracted PER-PAGE text
+   must also average :data:`DJVU_MIN_USABLE_CHARS_PER_PAGE` of
+   :func:`usable_text` -- the same bar a native PDF's own route uses.
+   Failing that, or extracting no non-blank page, routes to OCR as before.
+   ``derived_pdf_media_type`` is still computed and recorded on the job
+   checkpoint, as a diagnostic rather than a veto.
+
+   **Still an assumption (F9's other half):** the page INDEX comes from the
+   derived PDF (``ddjvu`` rendering one PDF page per DjVu page). A mismatch
+   now fails loudly -- a ``djvutxt --page=N`` call errors and the job fails
+   by name -- rather than half-ingesting a book. DjVuLibre is not installed
+   on the build machine (hard rule), so ``tests/test_ingest_djvu.py``'s one
+   real-binary test always skips here; treat the first real ``.djvu`` on a
+   DjVuLibre-equipped machine as an explicit operator acceptance step and
+   confirm the element count and page count before trusting the route.
+3. Finishes the job by whichever route step 2 chose. On the text-layer
+   route the pages go straight through ``handlers._finish_normalize_stage``
+   (elements, ``stream_v1``, the document sha256, the archived stream text,
+   the ``chunk`` hand-off) -- the same shared tail every other format's
+   normalizer ends in, so anchors and chunking are produced by identical
+   code. On the OCR route the document's ``media_type``/``raw_path`` are
+   rewritten to the derived PDF and the ``ocr`` stage is enqueued for it,
+   exactly as a native scanned PDF. Either way ``document.normalizer_id`` =
    :data:`NORMALIZER_ID_DJVU` ("djvu-ddjvu") and ``normalizer_version`` =
-   the ``ddjvu --version``-probed string (or ``'unknown'``) instead of the
-   generic ``trialerror.ingest.normalizers.NORMALIZER_ID``/``NORMALIZER_VERSION``
-   every other format gets.
+   the ``ddjvu --version``-probed string (or ``'unknown'``) rather than the
+   generic ``trialerror.ingest.normalizers`` constants -- carried into the
+   OCR route via ``normalizer_id_override``/``normalizer_version_override``
+   in that job's payload.
 
 **Provenance note (no migration):** the brief asks for the derived PDF's
 own sha256 to land "in the document/normalizer metadata the schema already
@@ -125,14 +140,22 @@ __all__ = [
     "DJVU_DEBIAN_PACKAGE",
     "NORMALIZER_ID_DJVU",
     "DJVU_TEXT_LAYER_MIN_CHARS",
+    "DJVU_MIN_USABLE_CHARS_PER_PAGE",
     "DEFAULT_DJVU_TIMEOUT_S",
     "DEFAULT_DJVU_MAX_PDF_BYTES",
+    "TEXT_SOURCE_DJVUTXT",
+    "TEXT_SOURCE_OCR",
+    "DETECTION_ORIGIN_DJVUTXT",
     "resolve_djvu_binaries",
     "build_ddjvu_convert_cmd",
     "build_djvutxt_cmd",
+    "build_djvutxt_page_cmd",
     "build_ddjvu_version_cmd",
     "convert_djvu_to_pdf",
     "extract_djvu_text_char_count",
+    "extract_djvu_page_texts",
+    "derived_pdf_page_count",
+    "usable_text",
     "has_text_layer",
     "assert_pdf_within_size_cap",
     "probe_ddjvu_version",
@@ -161,6 +184,31 @@ NORMALIZER_ID_DJVU = "djvu-ddjvu"
 #: characters over the document)". Below this, the derived PDF is treated
 #: as image-only and routed to OCR exactly like a scanned PDF.
 DJVU_TEXT_LAYER_MIN_CHARS = 200
+
+#: Second gate, applied to the PER-PAGE text ``djvutxt`` actually returns
+#: (Fix pass F9/FX-D1). :data:`DJVU_TEXT_LAYER_MIN_CHARS` is a whole-document
+#: count and is scale-blind: a 400-page scan with a 200-character title page
+#: clears it. This is the same average-chars-per-page bar a NATIVE PDF's own
+#: pdf-text/pdf-scan route is decided by
+#: (``normalizers._SCANNED_PDF_CHARS_PER_PAGE_THRESHOLD``), imported rather
+#: than restated so the two routes cannot drift apart, and it is applied to
+#: :func:`usable_text` -- so U+FFFD and control bytes, which the naive
+#: non-whitespace count reads as "real characters", cannot carry a document
+#: over the bar.
+DJVU_MIN_USABLE_CHARS_PER_PAGE = normalizers._SCANNED_PDF_CHARS_PER_PAGE_THRESHOLD
+
+#: ``convert_and_route``'s ``text_source``: where this document's element
+#: text will come from. The checkpoint records it, because "which source of
+#: truth did this document's text come from" is not recoverable afterwards
+#: from the row alone.
+TEXT_SOURCE_DJVUTXT = "djvutxt"
+TEXT_SOURCE_OCR = "ocr"
+
+#: ``element.detection_origin`` for a page whose text came from the DjVu
+#: text layer -- distinct from ``pypdf`` (the derived PDF's own extraction)
+#: and from ``ocr:<backend>``, so an element's provenance names the tool
+#: that actually produced it.
+DETECTION_ORIGIN_DJVUTXT = "djvutxt"
 
 #: Default subprocess timeout (seconds) for both ``ddjvu`` and ``djvutxt``
 #: -- 30 minutes, "for large books" (design), same order of magnitude as
@@ -258,6 +306,23 @@ def build_djvutxt_cmd(djvutxt_exe: str, src: Path) -> list[str]:
     return [djvutxt_exe, str(src)]
 
 
+def build_djvutxt_page_cmd(djvutxt_exe: str, src: Path, page_number: int) -> list[str]:
+    """``djvutxt --page=N <src>`` -- ONE page's text layer.
+
+    Why per-page calls rather than one ``--detail=page`` call and a parse
+    (Fix pass FX-D1): ``--detail=page`` returns a nested S-expression whose
+    exact quoting/escaping this build cannot verify (DjVuLibre is not
+    installed here, hard rule), and guessing an output format for the code
+    path that decides a book's element text is how the F9 assumption became
+    a live bug in the first place. ``--page=N`` returns plain text and the
+    page number is an INPUT rather than something parsed out of the output,
+    so a mismatch surfaces as a non-zero exit rather than as silently
+    mis-numbered pages. The cost is one process per page; against the
+    alternative for a book with a text layer -- OCRing it on a GPU -- that
+    is not a trade worth agonizing over."""
+    return [djvutxt_exe, f"--page={int(page_number)}", str(src)]
+
+
 def build_ddjvu_version_cmd(ddjvu_exe: str) -> list[str]:
     return [ddjvu_exe, "--version"]
 
@@ -324,6 +389,88 @@ def extract_djvu_text_char_count(djvutxt_exe: str, src: Path, *, timeout_s: floa
 
 def has_text_layer(char_count: int) -> bool:
     return char_count >= DJVU_TEXT_LAYER_MIN_CHARS
+
+
+#: U+FFFD plus the C0/C1 control characters that are not whitespace. These
+#: survive an ``errors='replace'`` decode of a mis-encoded text layer and
+#: are not ``\s``, so :func:`extract_djvu_text_char_count` -- which only
+#: strips whitespace -- counts them as real characters. They are not text.
+_UNUSABLE_CHARS_RE = re.compile(r"[�\x00-\x08\x0b\x0e-\x1f\x7f-\x9f]")
+
+
+def usable_text(text: str) -> str:
+    """``text`` with replacement characters and non-whitespace control
+    bytes removed -- what is left is what could plausibly be read.
+
+    Used for the routing DECISION only; the element text inserted into the
+    record is the raw page text (minus the sanitizer's own pass), because
+    silently rewriting a book's characters to make a threshold is exactly
+    the kind of quiet edit this pipeline should not make."""
+    return _UNUSABLE_CHARS_RE.sub("", text or "")
+
+
+def extract_djvu_page_texts(
+    djvutxt_exe: str,
+    src: Path,
+    *,
+    page_count: int,
+    timeout_s: float = DEFAULT_DJVU_TIMEOUT_S,
+    on_progress=None,
+) -> list[tuple[int, str]]:
+    """``[(page_number, text), ...]`` for pages 1..``page_count``, straight
+    out of the DjVu text layer -- the document's element text on the
+    text-layer route.
+
+    Blank pages are dropped (they contribute no element), but the page
+    numbers of the pages that remain are the DjVu page numbers, so anchors
+    and citations point where a reader would look.
+
+    ``on_progress(page_number)`` is called after each page: the caller
+    (``handlers.run_djvu``) hooks its ``ctx.heartbeat()`` to it, because a
+    500-page book is 500 subprocess calls and the job's lease is 900s by
+    default -- the very trap :data:`DEFAULT_DJVU_TIMEOUT_S`'s docstring
+    documents for the conversion call, which that call at least cannot fix
+    from the inside and this one can.
+
+    A non-zero exit on any page raises :class:`DjVuConversionError`, the
+    same shape as the document-wide call. Loud: a page index that does not
+    line up with the derived PDF's is a wrong assumption about the file,
+    and truncating the book silently would hide it."""
+    pages: list[tuple[int, str]] = []
+    for page_number in range(1, max(0, int(page_count)) + 1):
+        cmd = build_djvutxt_page_cmd(djvutxt_exe, src, page_number)
+        result = _run(
+            cmd, timeout_s=timeout_s, tool="djvutxt", action=f"extracting page {page_number} of {src}"
+        )
+        if result.returncode != 0:
+            raise DjVuConversionError(
+                f"djvutxt exited {result.returncode} extracting page {page_number} of {src}: "
+                f"{(result.stderr or '')[:_STDERR_HEAD_CHARS]}"
+            )
+        text = (result.stdout or "").strip()
+        if text:
+            pages.append((page_number, text))
+        if on_progress is not None:
+            on_progress(page_number)
+    return pages
+
+
+def derived_pdf_page_count(pdf_path: Path) -> int:
+    """How many pages ``ddjvu`` rendered, via pypdf (already a dependency,
+    and already opened one stage later by ``normalize_pdf_text``).
+
+    This is the page INDEX the per-page ``djvutxt`` calls walk, so it rests
+    on ``ddjvu -format=pdf`` rendering one PDF page per DjVu page -- the
+    same F9-class assumption this module already documents, now with a
+    louder failure: a mismatch means a ``--page=N`` call errors out and the
+    job fails by name, instead of a book being quietly half-ingested.
+    Returns 0 on an unreadable PDF, which routes the document to OCR."""
+    try:
+        from pypdf import PdfReader
+
+        return len(PdfReader(str(pdf_path)).pages)
+    except Exception:  # noqa: BLE001 - unreadable PDF -> no page index -> OCR route
+        return 0
 
 
 def assert_pdf_within_size_cap(pdf_path: Path, *, max_bytes: int = DEFAULT_DJVU_MAX_PDF_BYTES) -> int:
@@ -398,6 +545,7 @@ def convert_and_route(
     src_path: Path,
     config: dict[str, Any],
     archive_dir: str | None = None,
+    on_progress=None,
 ) -> dict[str, Any]:
     """The pure(ish) core of the ``djvu`` job stage -- deliberately free of
     any ``Store``/``ctx``/ledger dependency (only ``Path``s and a plain
@@ -412,19 +560,49 @@ def convert_and_route(
     Converts ``src_path`` to a PDF under
     ``<program_root>/<archive_dir>/derived/<doc_id>/<doc_id>.pdf`` (Fix
     pass F3 -- durable, not ``jobs_work/`` scratch), enforces the size cap,
-    probes the text layer via ``djvutxt``, cross-checks that verdict
-    against the derived PDF itself (Fix pass F1), and returns everything
-    the handler needs to rewrite the document row and re-enqueue::
+    probes the text layer via ``djvutxt``, and returns everything the
+    handler needs::
 
         {
             "derived_pdf_path": Path,       # absolute
             "derived_pdf_rel_path": str,    # posix, relative to program_root
             "derived_pdf_sha256": str,
             "media_type": "pdf-text" | "pdf-scan",
+            "text_source": "djvutxt" | "ocr",
+            "pages": [(page_number, text), ...],   # empty on the ocr route
+            "page_count": int,
             "text_layer": bool,
             "text_chars": int,
+            "derived_pdf_media_type": str,  # informational -- see below
             "normalizer_version": str,      # ddjvu --version probe, or "unknown"
         }
+
+    **FX-D1: the text layer is the source of truth now.** Seen live
+    2026-09-06: ``djvutxt`` reported 484,825 characters over a book, and
+    the PDF ``ddjvu`` produced from it had extractable text below the
+    per-page threshold -- so the previous revision's F1 cross-check
+    downgraded the route to ``pdf-scan`` and the real, already-digitized
+    text layer was discarded in favour of OCRing images of the same pages.
+    VERIFY_ingest-djvu.md F9 had flagged exactly that assumption ("all of
+    the above rests on ``ddjvu -format=pdf`` embedding the source's hidden
+    text layer into the PDF it produces"); the live run is what happens
+    when it does not hold.
+
+    So when the document has a text layer, the pages come from ``djvutxt``
+    itself (:func:`extract_djvu_page_texts`, one call per page, page
+    numbers from the derived PDF's page index) and the derived PDF is kept
+    for VIEWING only -- it is no longer the text source, and its own
+    extractability no longer decides anything. ``derived_pdf_media_type``
+    is still computed and returned, and lands on the job checkpoint, but as
+    a diagnostic rather than a veto.
+
+    F1's real concern -- "a document-wide character count can be cleared by
+    garbage or by one dense page in a 400-page scan" -- is preserved, moved
+    onto the correct evidence: the extracted PER-PAGE text must average at
+    least :data:`DJVU_MIN_USABLE_CHARS_PER_PAGE` of :func:`usable_text`
+    (the same bar a native PDF is judged by, applied after U+FFFD and
+    control bytes are discounted). Fail that, or extract no non-blank page
+    at all, and the document takes the OCR route exactly as before.
     """
     ddjvu_exe, djvutxt_exe = resolve_djvu_binaries(config)
     timeout_s = _read_djvu_numeric_config(config, "timeout_s", DEFAULT_DJVU_TIMEOUT_S, float)
@@ -448,21 +626,30 @@ def convert_and_route(
     text_chars = extract_djvu_text_char_count(djvutxt_exe, src_path, timeout_s=timeout_s)
     djvutxt_says_text_layer = has_text_layer(text_chars)
 
-    # Fix pass (F1): djvutxt's count is over the ORIGINAL .djvu source and
-    # was never checked against the PDF ddjvu actually produced. Cross-check
-    # with the same average-chars/page heuristic a native PDF's own
-    # media_type is decided by (pypdf is already a dependency, and
-    # normalize_pdf_text already opens this exact file one stage later) --
-    # prefer the more conservative pdf-scan route whenever the two
-    # disagree. This catches both observed failure shapes: a document-wide
-    # count that clears the absolute DJVU_TEXT_LAYER_MIN_CHARS threshold
-    # but averages below the native per-page threshold over many pages, and
-    # djvutxt stdout that is not real text at all (decoded-with-replace
-    # U+FFFD / control bytes counted as "non-whitespace" by extract_djvu_text_char_count
-    # but never actually extractable from the derived PDF via pypdf).
+    # Informational only as of FX-D1 (it used to veto the route -- see the
+    # docstring). Still computed and still recorded on the checkpoint,
+    # because "djvutxt found a text layer and the derived PDF did not" is
+    # exactly the discrepancy that produced the live bug, and an operator
+    # should be able to see it after the fact.
     derived_pdf_media_type = normalizers._detect_pdf_media_type(derived_pdf_path)
-    text_layer = djvutxt_says_text_layer and derived_pdf_media_type == "pdf-text"
+
+    page_count = derived_pdf_page_count(derived_pdf_path)
+    pages: list[tuple[int, str]] = []
+    text_layer = False
+    if djvutxt_says_text_layer and page_count > 0:
+        pages = extract_djvu_page_texts(
+            djvutxt_exe, src_path, page_count=page_count, timeout_s=timeout_s, on_progress=on_progress
+        )
+        # F1's concern, on the right evidence: the per-page text that will
+        # actually become elements has to carry real characters, at a
+        # density a reader would recognize as text.
+        usable_chars = sum(len(usable_text(text)) for _n, text in pages)
+        text_layer = bool(pages) and (usable_chars / page_count) >= DJVU_MIN_USABLE_CHARS_PER_PAGE
+        if not text_layer:
+            pages = []
+
     resolved_media_type = "pdf-text" if text_layer else "pdf-scan"
+    text_source = TEXT_SOURCE_DJVUTXT if text_layer else TEXT_SOURCE_OCR
 
     derived_pdf_sha256 = sha256_file(derived_pdf_path)
     try:
@@ -482,7 +669,11 @@ def convert_and_route(
         "derived_pdf_rel_path": derived_pdf_rel_path,
         "derived_pdf_sha256": derived_pdf_sha256,
         "media_type": resolved_media_type,
+        "text_source": text_source,
+        "pages": pages,
+        "page_count": page_count,
         "text_layer": text_layer,
         "text_chars": text_chars,
+        "derived_pdf_media_type": derived_pdf_media_type,
         "normalizer_version": normalizer_version,
     }

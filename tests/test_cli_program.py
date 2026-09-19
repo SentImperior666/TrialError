@@ -93,6 +93,8 @@ def test_program_init_writes_commented_paths_knobs(tmp_path, platform_root, caps
         '# archive_dir = "archive"',
         '# law_digest_path = "law/LAW_DIGEST.md"',
         '# handoffs_dir = "handoffs"',
+        '# [session]',
+        '# handoffs_dir_outside_root = false',
         '# requests_path = "requests/REQUESTS.md"',
         '# memory_dir = "memory"',
         '# ingest_roots = ["raw", "inbox"]',

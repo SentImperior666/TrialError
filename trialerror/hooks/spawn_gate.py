@@ -58,10 +58,77 @@ not guaranteed for an ad-hoc hook invocation. Flagged for the M6 builder.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
 from trialerror.hooks import SUBAGENT_TOOL_NAMES
+
+#: Where a subagent definition may live, relative to a root this hook can
+#: see. Searched in order for the ``subagent_type`` a Task call names, so
+#: ``agent_model_matches_booking`` can read the file's declared ``model``
+#: when the call itself named none.
+_AGENT_DIRS: tuple[tuple[str, ...], ...] = (
+    ("plugin", "agents"),
+    (".claude", "agents"),
+)
+
+_FRONTMATTER_MODEL_RE = re.compile(r"^model\s*:\s*(.+?)\s*$", re.MULTILINE)
+
+
+def _frontmatter_block(text: str) -> str | None:
+    """The body of a leading ``---`` … ``---`` YAML frontmatter block, or
+    ``None`` when the file opens with anything else.
+
+    Slicing this out before searching is what keeps a PROSE line that
+    happens to begin ``model:`` from being read as the file's pin
+    (verification finding V-8). The direction that matters is the false
+    refusal: an agent file whose body discusses ``model: haiku`` would
+    otherwise refuse a perfectly correct top-class spawn."""
+    if not text.startswith("---"):
+        return None
+    rest = text[3:]
+    if rest[:1] not in ("\n", "\r"):
+        return None  # "---text" is not a fence
+    end = re.search(r"^---\s*$", rest, re.MULTILINE)
+    return rest[: end.start()] if end else None
+
+
+def _frontmatter_model(subagent_type: str | None, program_root: Path) -> str | None:
+    """The ``model:`` a subagent definition file declares, or ``None``.
+
+    A Task call that names no ``model`` is not a call with no model: Claude
+    Code uses whatever the agent file pins. Reading that file is what stops
+    "just leave model out of the call" from being a way around the guard.
+
+    Read from the frontmatter block ALONE: a file with no frontmatter, or
+    one whose pin lives only in its prose, makes no claim.
+
+    Best-effort by design — an agent file this process cannot find or read
+    yields ``None`` (no claim), never a refusal, because "no such file from
+    here" is a statement about the hook's view of the filesystem, not about
+    the spawn."""
+    if not subagent_type:
+        return None
+    name = str(subagent_type).strip()
+    if not name or "/" in name or "\\" in name or name.startswith("."):
+        return None
+    for root in (program_root, Path(__file__).resolve().parents[2]):
+        for parts in _AGENT_DIRS:
+            path = root.joinpath(*parts, f"{name}.md")
+            try:
+                if not path.is_file():
+                    continue
+                head = path.read_text(encoding="utf-8", errors="replace")[:4096]
+            except OSError:
+                continue
+            block = _frontmatter_block(head)
+            if block is None:
+                continue
+            match = _FRONTMATTER_MODEL_RE.search(block)
+            if match:
+                return match.group(1).strip().strip("\"'")
+    return None
 
 
 def _evaluate(payload: dict) -> tuple[int, str | None]:
@@ -97,11 +164,21 @@ def _evaluate(payload: dict) -> tuple[int, str | None]:
     program_root = find_program_root(cwd) or Path(cwd)
 
     policy: dict[str, str] | None = None
+    model_classes: dict[str, str] | None = None
     try:
         config = load_config(program_root / "trialerror.toml")
         policy = dict(config.models) if config.models else None
+        model_classes = {str(k): str(v) for k, v in config.model_classes.items()} or None
     except ConfigError:
         policy = None
+        model_classes = None
+
+    # agent_model_matches_booking's input: the model the Task call names,
+    # or -- when it names none -- the one the subagent's own definition file
+    # pins. Either can be absent, and absent means "no claim", not "fine".
+    agent_model = tool_input.get("model") or _frontmatter_model(
+        tool_input.get("subagent_type"), program_root
+    )
 
     try:
         store = open_store(program_root)
@@ -119,7 +196,9 @@ def _evaluate(payload: dict) -> tuple[int, str | None]:
         record_hook_alive_once(
             store, session_id=session["session_id"] if session is not None else None, hook_name="spawn_gate"
         )
-        result = evaluate_spawn_for_open_session(store, prompt_text, policy=policy)
+        result = evaluate_spawn_for_open_session(
+            store, prompt_text, policy=policy, agent_model=agent_model, model_classes=model_classes
+        )
     finally:
         store.close()
 

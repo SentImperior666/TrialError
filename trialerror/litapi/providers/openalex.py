@@ -134,6 +134,8 @@ def _work_to_record(data: dict) -> WorkRecord:
 
 class OpenAlexProvider:
     name = "openalex"
+    #: FB-1 item F3: what this provider's `search` matches on.
+    search_scope = "title only (filter=title.search)"
 
     def __init__(self, transport: ProviderTransport, config: ProviderApiConfig, *, program_root=None):
         self.transport = transport

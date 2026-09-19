@@ -66,8 +66,26 @@ Give your verdict in two labelled parts, in this order:
    method choices. These are non-blocking edits, unless one exposes a
    black-box failure — then say so and restate the verdict with the reason.
 
-Before you begin, the orchestrator has answered the letter-vs-spirit
-pre-mortem for this gate (proxy gameable? harness escapable? judge
-steerable?). Your part of the third answer: judge the evidence, not the
-artifact's description of itself — sentences that assert novelty, rigour or
-completeness carry no weight; the anchors do.
+## The letter-vs-spirit pre-mortem
+
+The orchestrator answered three questions for every judged step in this
+artifact before it shipped, and its answers are in your spawn prompt. Ask
+the same three of what you are reviewing, and report each one:
+
+1. **Is the proxy itself gameable?** Could a result satisfy the number,
+   label or bar the artifact reports while failing the thing that number was
+   standing in for? Name the specific move, not the bare possibility.
+2. **Is the harness escapable?** Could the reported result have come from
+   somewhere other than the procedure described — a stale snapshot, a
+   reference set that moved under it, a step that read what it was meant to
+   be blind to, an ordering chosen after the data was seen?
+3. **Can the judge be steered by the content it judges?** Does any judged
+   envelope carry authorship, framing, or the artifact's own assessment of
+   itself alongside the material being judged?
+
+Each "yes" needs a named mitigation in the artifact, or it is a finding —
+blocking when the claim the artifact rests on is the one at risk.
+
+Your own part of the third answer: judge the evidence, not the artifact's
+description of itself. Sentences asserting novelty, rigour or completeness
+carry no weight; the anchors do.

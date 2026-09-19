@@ -11,7 +11,7 @@ import argparse
 from trialerror.events.api import post_inbox, read_inbox
 from trialerror.events.cli_support import ProgramRootNotFoundError, open_program_store, program_root_argument
 from trialerror.stores.errors import StoreError
-from trialerror.util.envelope import error_envelope, ok_envelope
+from trialerror.util.envelope import error_envelope, next_action, ok_envelope
 
 GROUP_NAME = "inbox"
 HELP = "The user's inbox: `inbox post` (the one API-backed write path) + `inbox read`."
@@ -63,4 +63,25 @@ def run_read(args: argparse.Namespace) -> dict:
         items = read_inbox(store, session_id=args.session_id, mark_read=not args.no_mark_read)
     finally:
         store.close()
-    return ok_envelope("inbox read", result={"items": items, "count": len(items)})
+    # FB-1 item F10c: exactly one state earns an action here. `--no-mark-read`
+    # PEEKED at items that are still unread, and unread items are what
+    # `session close` refuses on -- so the caller is one command away from a
+    # refusal it has just been shown the cause of. Items that were marked
+    # read need nothing, and neither does an empty inbox.
+    actions = []
+    if items and args.no_mark_read:
+        argv = ["trialerror", "inbox", "read"]
+        if getattr(args, "program_root", None):
+            argv += ["--program-root", str(args.program_root)]
+        if args.session_id:
+            argv += ["--session-id", args.session_id]
+        actions.append(
+            next_action(
+                argv,
+                f"{len(items)} item(s) are still unread after this peek -- `session close` refuses "
+                "while any are",
+            )
+        )
+    return ok_envelope(
+        "inbox read", result={"items": items, "count": len(items)}, next_actions=actions
+    )

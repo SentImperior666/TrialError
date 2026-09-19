@@ -205,8 +205,11 @@ def test_full_round_trip_pending_to_indexed(store, offload_program, raw_dir, tmp
     assert [e["detection_origin"] for e in elements] == [f"ocr:{STUB_OCR_NAME}"] * len(elements)
     assert len(elements) == 2
 
-    # 4. chunk runs locally (no GPU), embed parks
+    # 4. chunk runs locally (no GPU), the full-text-only index job runs
+    # locally too (lane FB-6 item 8 -- the text is searchable while the
+    # embed sits on the other machine), and embed parks
     assert run_one(store, worker_id="w2")["status"] == "complete"  # chunk
+    assert run_one(store, worker_id="w2b")["status"] == "complete"  # index (full text)
     assert run_one(store, worker_id="w3")["status"] == "deferred"  # embed -> offload
     assert protocol.list_pending(root) == [embed_job]
     manifest = protocol.read_json(protocol.pending_dir(root) / f"{embed_job}.json")
@@ -248,6 +251,11 @@ def test_the_worker_reports_an_empty_queue_without_touching_anything(offload_pro
         "published": [],
         "failed": [],
         "lost": [],
+        # C-0097: a fifth outcome bucket (a claim handed back mid-job on
+        # request, which is neither a failure nor a loss) and the transition
+        # log every control act leaves behind. Both empty on a quiet run.
+        "stopped": [],
+        "control": [],
         "polls": 1,
         "message": "Queue empty - safe to switch DEV off",
     }
@@ -539,3 +547,158 @@ def test_a_raw_path_outside_the_program_root_is_never_queued(
     job = ledger.get_job(store, job_id)
     assert job["attempts"] == 1, "a refusal is a logic failure, not an absence"
     assert "program root" in (job["last_error"] or "")
+
+
+# ---------------------------------------------------------------------------
+# FX-S1: one backend instance -- and so one model load -- per worker RUN
+# ---------------------------------------------------------------------------
+class _CountingDevBackends:
+    """A :class:`~trialerror.offload.worker.DevBackends` that records how
+    often each stage's backend was RESOLVED, and whether the resolved
+    embed backend was closed. ``ConfigDevBackends`` builds a fresh backend
+    on every call, so "resolved twice" would mean "model loaded twice"."""
+
+    def __init__(self):
+        self.ocr_calls = 0
+        self.embed_calls = 0
+        self.validated = 0
+        self._ocr = StubOcrBackend()
+        self._embed = _ClosableStubEmbed()
+
+    def validate(self):
+        self.validated += 1
+
+    def ocr(self):
+        self.ocr_calls += 1
+        return self._ocr
+
+    def embed(self):
+        self.embed_calls += 1
+        return self._embed
+
+
+class _ClosableStubEmbed:
+    """The stub the resident driver's shape implies: it has ``close`` and a
+    ``log`` attribute, so the worker's teardown and its "driver started"
+    narration both have something real to land on."""
+
+    def __init__(self):
+        self.model_key = STUB_MODEL_KEY
+        self.dims = STUB_DIMS
+        self.closed = 0
+        self.log = None
+
+    def embed_batch(self, texts, *, kind="document"):
+        return [[float(len(t))] * self.dims for t in texts]
+
+    def close(self):
+        self.closed += 1
+
+
+def _queue_two_ocr_jobs(root):
+    from tests._offload_fixtures import queue_one
+
+    queue_one(root, "JOB-resident-1", stage="ocr", payload=b"page one\n")
+    queue_one(root, "JOB-resident-2", stage="ocr", payload=b"page two\n")
+
+
+def test_the_worker_resolves_each_backend_once_for_the_whole_run(offload_program, tmp_path):
+    """FX-S1. Before this, ``_process_one`` called ``backends.ocr()`` /
+    ``backends.embed()`` per job -- invisible while every batch reloaded
+    the model anyway, and the whole bug once the driver is resident."""
+    root = protocol.offload_root(offload_program)
+    _queue_two_ocr_jobs(root)
+    backends = _CountingDevBackends()
+
+    summary = run_worker(
+        transport=LocalTransport(root, worker_id="dev"),
+        backends=backends,
+        work_root=tmp_path / "devwork",
+    )
+
+    assert len(summary["published"]) == 2
+    assert backends.ocr_calls == 1, "one backend instance for both jobs"
+
+
+def test_the_worker_closes_the_embed_backend_when_the_run_ends(offload_program, tmp_path):
+    """A resident GPU process must not outlive the worker that started it.
+    The queue here is empty, so this is also the "nothing to do" path --
+    the one an operator hits most and the easiest to leak from."""
+    from trialerror.offload.worker import ResidentBackends
+
+    backends = _CountingDevBackends()
+    resident = ResidentBackends(backends)
+    embed = resident.embed()
+    resident.close()
+    assert embed.closed == 1
+
+    resident.close()  # idempotent: nothing resolved any more, nothing to close
+    assert embed.closed == 1
+
+
+def test_the_worker_run_closes_a_resolved_embed_backend(offload_program, tmp_path):
+    root = protocol.offload_root(offload_program)
+    from tests._offload_fixtures import queue_one
+    from trialerror.offload.stage import EMBED_INPUT_NAME, build_chunks_payload
+
+    protocol.queue_marker(
+        root,
+        job_id="JOB-resident-embed",
+        stage="embed",
+        doc_id="DOC-resident",
+        expect={
+            "stage": "embed",
+            "model_key": STUB_MODEL_KEY,
+            "dims": STUB_DIMS,
+            "outputs": ["vectors.jsonl"],
+            "input_name": EMBED_INPUT_NAME,
+            "chunk_ids": ["CHK-1"],
+        },
+        config_hash="cfg-hash",
+        inputs=[(EMBED_INPUT_NAME, build_chunks_payload([{"chunk_id": "CHK-1", "seq": 0, "text": "hello"}]))],
+    )
+    backends = _CountingDevBackends()
+    run_worker(
+        transport=LocalTransport(root, worker_id="dev"),
+        backends=backends,
+        work_root=tmp_path / "devwork",
+    )
+    assert backends.embed_calls == 1
+    assert backends._embed.closed == 1, "the driver must be reaped when the run ends"
+
+
+def test_a_backend_without_close_is_left_alone(offload_program, tmp_path):
+    """Every OCR backend and both fake embed backends have no ``close``;
+    the teardown must skip them rather than assume the resident shape."""
+    from trialerror.offload.worker import ResidentBackends
+
+    resident = ResidentBackends(StubDevBackends())
+    resident.ocr()
+    resident.embed()
+    resident.close()  # must not raise
+
+
+def test_the_worker_default_batch_size_is_a_gpu_batch_not_a_model_load_budget():
+    """FX-S1 made this number a GPU batch size rather than a model-load budget.
+    C-0097 D7 then MEASURED it: at 64 the driver spilled ~16 GB of a 16 GB
+    card into system RAM at about six seconds per chunk, and the same queue at
+    4 ran several times faster with bit-identical vectors. It is still a GPU
+    batch size -- it is now one backed by a measurement instead of a guess."""
+    from trialerror.offload.worker import DEFAULT_EMBED_BATCH_SIZE
+
+    assert DEFAULT_EMBED_BATCH_SIZE == 4
+
+
+def test_the_worker_log_carries_a_per_job_timing_line(offload_program, tmp_path):
+    root = protocol.offload_root(offload_program)
+    _queue_two_ocr_jobs(root)
+    lines: list[str] = []
+    run_worker(
+        transport=LocalTransport(root, worker_id="dev"),
+        backends=_CountingDevBackends(),
+        work_root=tmp_path / "devwork",
+        log=lines.append,
+    )
+    timed = [line for line in lines if "ran in" in line]
+    assert len(timed) == 2, lines
+    assert all("ocr ran in" in line for line in timed)

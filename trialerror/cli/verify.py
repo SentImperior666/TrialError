@@ -39,9 +39,16 @@ from trialerror.stores import get as store_get
 from trialerror.stores.errors import StoreError, ValidationError, XidTargetMissingError
 from trialerror.stores.store import Store, open_store
 from trialerror.util.config import find_program_root
+from trialerror.retrieve import engine
 from trialerror.util.envelope import error_envelope, next_action, ok_envelope
 from trialerror.verify.citecheck import run_citecheck
-from trialerror.verify.errors import CitecheckError, ReproductionRefError, VerdictNotFoundError, VerifyError
+from trialerror.verify.errors import (
+    CitecheckError,
+    QueryEmbedBackendUnrunnableError,
+    ReproductionRefError,
+    VerdictNotFoundError,
+    VerifyError,
+)
 from trialerror.verify.faithfulness import run_faithfulness
 from trialerror.verify.hypothesis import DEFAULT_FAR_FLOOR, DEFAULT_WEIGHTS, run_hypothesis_verification
 from trialerror.verify.reproduce import reproduce_verdict
@@ -257,6 +264,15 @@ def _run_hypothesis(args: argparse.Namespace) -> dict:
             judge=judge, issued_by_launch=args.issued_by_launch, k_total=args.k_total, weights=weights,
             far_floor=args.far_floor, mode=args.mode, procedure_version=args.procedure_version,
             prereg=args.prereg, prereg_title=args.prereg_title,
+        )
+    except QueryEmbedBackendUnrunnableError as exc:
+        # Its own code, not the generic "hypothesis_refused": this refusal has
+        # a named doctor check and one specific fix, and an agent that can
+        # branch on the code can act on it (lane F-1 item D).
+        return error_envelope(
+            "verify.hypothesis", exc.code or "hypothesis_refused", str(exc),
+            details={"doctor_check": engine.QUERY_EMBED_DOCTOR_CHECK, "config_table": engine.QUERY_EMBED_TABLE},
+            next_actions=[next_action(engine.query_embed_next_action_argv(store.program_root), "check the query-side embed backend")],
         )
     except (VerifyError, OSError, json.JSONDecodeError) as exc:
         return error_envelope("verify.hypothesis", "hypothesis_refused", str(exc))

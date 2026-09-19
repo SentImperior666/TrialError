@@ -14,6 +14,7 @@ from trialerror.sessions.handoff import (
     next_handoff_filename,
     render_handoff,
     rerender_handoff,
+    HandoffsDirOutsideRootError,
     resolve_handoffs_dir,
     write_handoff_with_supersession,
 )
@@ -130,8 +131,43 @@ def test_resolve_handoffs_dir_relative_override(tmp_path):
 
 def test_resolve_handoffs_dir_absolute_override_ignores_program_root(tmp_path):
     external = tmp_path / "elsewhere" / "handoffs"
-    config = {"paths": {"handoffs_dir": str(external)}}
+    config = {
+        "paths": {"handoffs_dir": str(external)},
+        "session": {"handoffs_dir_outside_root": True},
+    }
     assert resolve_handoffs_dir(tmp_path / "program", config) == external
+
+
+def test_an_absolute_handoffs_dir_outside_the_root_is_refused_without_the_flag(tmp_path):
+    """A handoff is a WRITE, and an absolute path is what a trialerror.toml
+    copied from another program gets wrong."""
+    external = tmp_path / "other-program"
+    with pytest.raises(HandoffsDirOutsideRootError) as excinfo:
+        resolve_handoffs_dir(tmp_path / "program", {"paths": {"handoffs_dir": str(external)}})
+    assert "handoffs_dir_outside_root = true" in str(excinfo.value)
+    # The refusal renders the offending directory with ``!r``, so on Windows
+    # the message carries a doubled-backslash repr and the native path string
+    # is not a substring of it. Compare against the same rendering the
+    # product uses -- the claim, that the refusal names the directory, is
+    # unchanged and is now made on both platforms.
+    assert repr(str(external)) in str(excinfo.value)
+
+
+def test_an_absolute_handoffs_dir_INSIDE_the_root_needs_no_flag(tmp_path):
+    program_root = tmp_path / "program"
+    inside = program_root / "closes"
+    assert resolve_handoffs_dir(program_root, {"paths": {"handoffs_dir": str(inside)}}) == inside
+
+
+def test_a_relative_escape_is_refused_the_same_way(tmp_path):
+    """``../elsewhere`` aims the same write at the same place; the rule is
+    about where the path LANDS, not about how it was spelled."""
+    with pytest.raises(HandoffsDirOutsideRootError):
+        resolve_handoffs_dir(tmp_path / "program", {"paths": {"handoffs_dir": "../elsewhere"}})
+
+
+def test_the_relative_default_is_always_fine(tmp_path):
+    assert resolve_handoffs_dir(tmp_path / "program") == tmp_path / "program" / HANDOFFS_DIR_NAME
 
 
 # ---------------------------------------------------------------------------

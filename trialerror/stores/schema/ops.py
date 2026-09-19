@@ -759,6 +759,86 @@ _V8 = (
     "ALTER TABLE thread__v8new RENAME TO thread",
 )
 
+# ---- schema-v9 (the ideation control seat + recipe-card blocks + the
+# arm-per-lens assignment mode; docs/AIIF_DESIGN.md Sections 3 and 4) --------
+#
+# 1. ``lens_roster.seat`` gains ``control``. The control seat is a
+#    matched-budget lens carrying the pre-framework brief -- same slice
+#    size, same arm as the modal lens, same budget, no recipe card and no
+#    ``requirements`` field. It is the only thing that makes "the framework
+#    improved ideation" a MEASURED claim rather than an assertion, so it
+#    needs to be a first-class seat value and not a naming convention
+#    smuggled into ``vantage`` (the interim was ``vantage =
+#    "CONTROL:no-recipe"``; that convention is now documented in
+#    ``trialerror.lens.roster`` as the pre-v9 spelling readers may still meet,
+#    not as the way to write a new one). Widening a CHECK needs the
+#    table-rebuild recipe; ``lens_assignment.roster_id`` is a same-file FK
+#    child with rows in it, which is exactly what
+#    ``trialerror.stores.migrate.apply_migrations``' PRAGMA foreign_keys
+#    bracketing exists for. ``lens_roster`` carries no indexes, so none are
+#    recreated.
+#
+# 2. ``lens_roster.recipe_cards`` (JSON array): the block of card names, in
+#    the seeded order the lens writes under. Cards are DATA so the
+#    pre-registered analysis can compare them; a card held by fewer than two
+#    lenses confounds card with vantage/slice/seed, which is what the
+#    ``recipe_rotation_honored`` doctor check reads this column to catch.
+#
+# 3. ``lens_assignment`` gains ``arm_mode`` (which of the two assignment
+#    semantics produced the row), ``far_lens_floor`` (the ROSTER-level floor
+#    -- how many LENSES must sit in the far arm; distinct from the existing
+#    per-lens ``far_floor``, which counts SLICES) and ``recipe_cards``
+#    (the roster row's block, denormalised onto the assignment so an export
+#    or a check reads one table). Plain ADD COLUMNs: all three land NULL on
+#    existing rows, and NULL ``arm_mode`` reads as "written before the mode
+#    existed", which every consumer treats as the per-slice default.
+_V9 = (
+    """
+    CREATE TABLE lens_roster__v9new (
+        roster_id     TEXT PRIMARY KEY,
+        round_id      TEXT NOT NULL,
+        lens_name     TEXT NOT NULL,
+        vantage       TEXT NOT NULL,
+        seat          TEXT NOT NULL CHECK (seat IN ('standard','assumption_buster','control')),
+        model_class   TEXT NOT NULL,
+        created_ts    TEXT NOT NULL,
+        recipe_cards  TEXT
+    )
+    """,
+    """
+    INSERT INTO lens_roster__v9new (
+        roster_id, round_id, lens_name, vantage, seat, model_class, created_ts, recipe_cards
+    )
+    SELECT roster_id, round_id, lens_name, vantage, seat, model_class, created_ts, NULL
+    FROM lens_roster
+    """,
+    "DROP TABLE lens_roster",
+    "ALTER TABLE lens_roster__v9new RENAME TO lens_roster",
+    "ALTER TABLE lens_assignment ADD COLUMN arm_mode TEXT CHECK (arm_mode IN ('per_lens','per_slice'))",
+    "ALTER TABLE lens_assignment ADD COLUMN far_lens_floor INTEGER",
+    "ALTER TABLE lens_assignment ADD COLUMN recipe_cards TEXT",
+)
+
+# ---- schema-v10 (a lens launch is linked to the assignment rows it was
+# booked for; lane FB-4 item 5) ---------------------------------------------
+#
+# ``lens_assignment.launch_id`` is the launch that WROTE the row -- the
+# orchestrator running `lens assign`. The lens's own launch is booked later,
+# off `lens export`, and nothing recorded which assignment rows it was booked
+# for: the per-launch retrieval scope and `lens_citations_within_slice` both
+# resolve a slice from ``launch.attrs``, so a booking made without those
+# attrs read as "not a lens launch", the audit SKIPped with "no feed posts by
+# a launch carrying a lens slice", and the barrier was off for exactly the
+# launches it exists for.
+#
+# ``lens_launch_id`` is that link, written by ``book_launch(assign_ids=...)``.
+# A plain ADD COLUMN: it lands NULL on every existing row, and NULL reads as
+# "no lens launch booked for this assignment", which is what was true.
+_V10 = (
+    "ALTER TABLE lens_assignment ADD COLUMN lens_launch_id TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_lens_assignment_lens_launch ON lens_assignment(lens_launch_id)",
+)
+
 MIGRATIONS = (
     Migration(version=1, name="ops_v1_initial_schema", statements=_V1),
     Migration(version=2, name="ops_v2_memory_item_account_id_nullable_and_thread_status_refs", statements=_V2),
@@ -768,4 +848,6 @@ MIGRATIONS = (
     Migration(version=6, name="ops_v6_feed_post_translation_gate_verdict", statements=_V6),
     Migration(version=7, name="ops_v7_memory_relation_and_reviewed_ts", statements=_V7),
     Migration(version=8, name="ops_v8_thread_created_by_nullable_and_author", statements=_V8),
+    Migration(version=9, name="ops_v9_lens_control_seat_recipe_cards_and_arm_mode", statements=_V9),
+    Migration(version=10, name="ops_v10_lens_assignment_lens_launch_id", statements=_V10),
 )

@@ -30,12 +30,25 @@ Module map::
                   worker's one connection per verb) and ``LocalTransport``
                   (in-process; what the tests drive, no SSH anywhere)
     stage.py      the sandbox side of the seam: the five-step
-                  resolve-or-park logic the ``ocr``/``embed`` handlers call
+                  resolve-or-park logic the ``ocr``/``embed`` handlers call,
+                  and (lane FB-8a) the rebuild of a queued job's input
+                  payloads from the record when a retry has to re-send them
+    retry.py      the offload half of ``trialerror jobs retry``: the inverse
+                  of a terminal marker, queue-before-store, with the failed
+                  attempt kept as evidence under ``failed/_retried/``
+    control.py    worker CONTROL and worker OBSERVABILITY (ruling C-0097):
+                  the semantics of the pause/resume/stop request the sandbox
+                  leaves in the queue, the control word the ``heartbeat``
+                  verb prints back, and the progress file that verb stores.
+                  No new verb, and no preemptive kill anywhere -- the sandbox
+                  ASKS, the worker complies at a cooperative checkpoint
     worker.py     the DEV side: claim -> pull -> run the real backend ->
-                  push -> publish, with a single-instance lock
+                  push -> publish, with a single-instance lock, and the
+                  checkpoints where it honours a control word
     lock.py       that single-instance lock (``msvcrt``/``fcntl``)
     checks.py     doctor: ``offload_backlog`` / ``offload_stale_claims`` /
-                  ``offload_failed`` / ``fake_backend_rows``
+                  ``offload_failed`` / ``worker_heartbeat_stale`` /
+                  ``offload_control_orphaned`` / ``fake_backend_rows``
     dashboard_items.py   HOME's "what needs a human" line
 
 Deliberately import-free at package level: ``trialerror.ingest.backends``

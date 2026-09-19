@@ -7,7 +7,10 @@ from trialerror.ingest.chunker import (
     CHUNKER_ID,
     CHUNKER_VERSION,
     MAX_CHUNK_TOKENS,
+    ROW_CHUNKER_ID,
+    ROW_CHUNKER_VERSION,
     build_chunks,
+    build_row_chunks,
     estimate_tokens,
 )
 
@@ -106,3 +109,66 @@ def test_element_first_last_reference_real_element_ids():
     assert len(chunks) == 1
     assert chunks[0]["element_first"] == "e1"
     assert chunks[0]["element_last"] == "e2"
+
+
+# ---------------------------------------------------------------------------
+# build_row_chunks -- one chunk per element (the inventory source kind)
+# ---------------------------------------------------------------------------
+
+
+def test_row_chunks_never_group_and_never_recombine():
+    """The whole point: the two-pass chunker would merge these four short
+    elements into one prose chunk. A reference set whose rows are the unit
+    of comparison must not have them blended."""
+    elements = [_el(f"e{i}", i, "NarrativeText", f"row {i} short text") for i in range(4)]
+    prose = build_chunks(elements)
+    rows = build_row_chunks(elements)
+
+    assert len(prose) < len(rows)
+    assert len(rows) == 4
+    assert [c["text"] for c in rows] == [f"row {i} short text" for i in range(4)]
+    assert [c["seq"] for c in rows] == [0, 1, 2, 3]
+    assert [c["element_first"] for c in rows] == [c["element_last"] for c in rows]
+
+
+def test_row_chunks_carry_their_own_chunker_id_not_the_two_pass_one():
+    rows = build_row_chunks([_el("e1", 0, "NarrativeText", "one row")])
+    assert rows[0]["chunker_id"] == ROW_CHUNKER_ID
+    assert rows[0]["chunker_version"] == ROW_CHUNKER_VERSION
+    assert rows[0]["chunker_id"] != CHUNKER_ID
+
+
+def test_row_chunks_read_elements_in_seq_order_not_list_order():
+    elements = [
+        _el("e2", 1, "NarrativeText", "second"),
+        _el("e0", 0, "NarrativeText", "first"),
+        _el("e3", 2, "NarrativeText", "third"),
+    ]
+    assert [c["text"] for c in build_row_chunks(elements)] == ["first", "second", "third"]
+
+
+def test_a_row_over_the_token_cap_is_split_and_still_attributed_to_its_element():
+    long_row = " ".join(f"w{i}" for i in range(MAX_CHUNK_TOKENS + 30))
+    rows = build_row_chunks([_el("e1", 0, "NarrativeText", long_row)])
+    assert len(rows) == 2
+    assert all(c["token_count"] <= MAX_CHUNK_TOKENS for c in rows)
+    assert all(c["element_first"] == "e1" and c["element_last"] == "e1" for c in rows)
+    assert [c["seq"] for c in rows] == [0, 1]
+
+
+def test_an_empty_row_is_skipped_rather_than_written_as_an_empty_chunk():
+    elements = [
+        _el("e0", 0, "NarrativeText", "a real row"),
+        _el("e1", 1, "NarrativeText", "   "),
+        _el("e2", 2, "NarrativeText", ""),
+        _el("e3", 3, "NarrativeText", "another real row"),
+    ]
+    rows = build_row_chunks(elements)
+    assert [c["text"] for c in rows] == ["a real row", "another real row"]
+    assert [c["seq"] for c in rows] == [0, 1]
+
+
+def test_row_chunks_carry_the_page_number_of_their_own_element():
+    elements = [_el("e0", 0, "NarrativeText", "row a", page=3), _el("e1", 1, "NarrativeText", "row b", page=4)]
+    rows = build_row_chunks(elements)
+    assert [(c["page_start"], c["page_end"]) for c in rows] == [(3, 3), (4, 4)]

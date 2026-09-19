@@ -28,6 +28,7 @@ from trialerror.ingest.normalize_djvu import (
     DEFAULT_DJVU_MAX_PDF_BYTES,
     DEFAULT_DJVU_TIMEOUT_S,
     DJVU_DEBIAN_PACKAGE,
+    DJVU_MIN_USABLE_CHARS_PER_PAGE,
     DJVU_STAGE,
     DJVU_TEXT_LAYER_MIN_CHARS,
     MEDIA_TYPE_DJVU,
@@ -36,12 +37,16 @@ from trialerror.ingest.normalize_djvu import (
     build_ddjvu_convert_cmd,
     build_ddjvu_version_cmd,
     build_djvutxt_cmd,
+    build_djvutxt_page_cmd,
     convert_and_route,
     convert_djvu_to_pdf,
+    derived_pdf_page_count,
+    extract_djvu_page_texts,
     extract_djvu_text_char_count,
     has_text_layer,
     probe_ddjvu_version,
     resolve_djvu_binaries,
+    usable_text,
 )
 from trialerror.ingest.normalizers import (
     MEDIA_TYPES_DIRECT,
@@ -365,7 +370,23 @@ def test_default_djvu_constants_are_sane():
 # ---------------------------------------------------------------------------
 
 
-def _patch_djvu_tools(monkeypatch, *, pdf_bytes: bytes, djvutxt_stdout: str, version_stdout: str = "DjVuLibre-3.5.28"):
+def _patch_djvu_tools(
+    monkeypatch,
+    *,
+    pdf_bytes: bytes,
+    djvutxt_stdout: str,
+    version_stdout: str = "DjVuLibre-3.5.28",
+    djvutxt_pages: list[str] | None = None,
+):
+    """Stand in for ``ddjvu``/``djvutxt`` (DjVuLibre is not installed here).
+
+    FX-D1 added the per-page half: a ``djvutxt --page=N`` call returns
+    ``djvutxt_pages[N-1]`` when the test supplies a page list, and falls
+    back to ``djvutxt_stdout`` when it does not. The distinction is not
+    cosmetic -- the route now turns on per-page text DENSITY, so a fake
+    that returned the whole document's text for every page would make
+    every fixture look uniformly text-rich and hide exactly the case the
+    density gate exists for."""
     monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _fake_run(cmd, **kwargs):
@@ -378,7 +399,15 @@ def _patch_djvu_tools(monkeypatch, *, pdf_bytes: bytes, djvutxt_stdout: str, ver
             Path(dest).parent.mkdir(parents=True, exist_ok=True)
             Path(dest).write_bytes(pdf_bytes)
             return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
-        # djvutxt <src>
+        page_arg = next((a for a in cmd if str(a).startswith("--page=")), None)
+        if page_arg is not None:
+            index = int(str(page_arg).split("=", 1)[1]) - 1
+            if djvutxt_pages is not None:
+                text = djvutxt_pages[index] if 0 <= index < len(djvutxt_pages) else ""
+            else:
+                text = djvutxt_stdout
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout=text, stderr="")
+        # djvutxt <src> -- the whole-document count
         return subprocess.CompletedProcess(cmd, returncode=0, stdout=djvutxt_stdout, stderr="")
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
@@ -508,18 +537,186 @@ def test_convert_and_route_raises_config_error_for_non_numeric_max_pdf_bytes(tmp
 
 
 # ---------------------------------------------------------------------------
-# F1: the route decision cross-checked against the PDF that was actually
-# produced, not trusted from djvutxt's source-side count alone.
+# FX-D1: the DjVu TEXT LAYER is the source of truth for a document that has
+# one. Seen live 2026-09-06: djvutxt reported 484,825 characters, the PDF
+# ddjvu produced from the same file failed the per-page extractable-text
+# threshold, and the previous revision's cross-check therefore discarded a
+# real digitized text layer and OCRed images of the same pages instead.
 # ---------------------------------------------------------------------------
+
+
+def test_convert_and_route_builds_pages_from_the_text_layer(tmp_path, monkeypatch):
+    """The headline: page texts come from ``djvutxt --page=N``, carry DjVu
+    page numbers, and blank pages contribute no element."""
+    pdf_bytes = build_minimal_pdf(["Rendered one.", "Rendered two.", "Rendered three."])
+    pages = [
+        "First page of the embedded text layer, long enough to be real prose.",
+        "   ",  # a blank page in the middle: no element, and no renumbering
+        "Third page of the embedded text layer, also long enough to count.",
+    ]
+    _patch_djvu_tools(
+        monkeypatch, pdf_bytes=pdf_bytes, djvutxt_stdout="embedded text " * 30, djvutxt_pages=pages
+    )
+
+    result = convert_and_route(program_root=tmp_path, doc_id="DOC-T1", src_path=tmp_path / "book.djvu", config={})
+
+    assert result["text_source"] == "djvutxt"
+    assert result["media_type"] == "pdf-text"
+    assert result["page_count"] == 3
+    assert [n for n, _t in result["pages"]] == [1, 3]
+    assert result["pages"][0][1].startswith("First page")
+    assert result["pages"][1][1].startswith("Third page")
+
+
+def test_convert_and_route_survives_a_derived_pdf_with_no_extractable_text(tmp_path, monkeypatch):
+    """THE live bug. ``ddjvu`` produced a PDF pypdf can extract nothing
+    from, so the old cross-check downgraded to pdf-scan and threw the real
+    text layer away. Now the PDF's extractability is a diagnostic, not a
+    veto: the text layer wins and the document is ingested as text."""
+    pdf_bytes = build_minimal_pdf(["", "", ""])  # nothing pypdf can extract
+    pages = ["Real embedded text on page %d, plenty of it." % n for n in (1, 2, 3)]
+    _patch_djvu_tools(
+        monkeypatch, pdf_bytes=pdf_bytes, djvutxt_stdout="embedded text " * 40, djvutxt_pages=pages
+    )
+
+    result = convert_and_route(program_root=tmp_path, doc_id="DOC-T2", src_path=tmp_path / "book.djvu", config={})
+
+    assert result["derived_pdf_media_type"] == "pdf-scan"  # the old veto would have fired here
+    assert result["text_source"] == "djvutxt"
+    assert result["media_type"] == "pdf-text"
+    assert len(result["pages"]) == 3
+
+
+def test_convert_and_route_falls_back_to_ocr_when_no_page_yields_text(tmp_path, monkeypatch):
+    """The whole-document count can clear the bar while every per-page call
+    comes back empty (a text layer djvutxt cannot address page-by-page, a
+    page-index mismatch that happens to return nothing). No pages means no
+    elements, and an empty document silently marked 'indexed' is the data
+    loss all of this exists to avoid -- so: OCR."""
+    pdf_bytes = build_minimal_pdf(["Rendered one.", "Rendered two."])
+    _patch_djvu_tools(
+        monkeypatch, pdf_bytes=pdf_bytes, djvutxt_stdout="embedded text " * 30, djvutxt_pages=["", ""]
+    )
+
+    result = convert_and_route(program_root=tmp_path, doc_id="DOC-T3", src_path=tmp_path / "book.djvu", config={})
+
+    assert result["text_source"] == "ocr"
+    assert result["media_type"] == "pdf-scan"
+    assert result["pages"] == []
+
+
+def test_convert_and_route_falls_back_to_ocr_when_the_derived_pdf_has_no_page_index(tmp_path, monkeypatch):
+    """No readable page index means no way to walk the text layer page by
+    page, so the derived PDF goes to OCR rather than being guessed at."""
+    _patch_djvu_tools(
+        monkeypatch, pdf_bytes=b"not a pdf at all", djvutxt_stdout="embedded text " * 30
+    )
+
+    result = convert_and_route(program_root=tmp_path, doc_id="DOC-T4", src_path=tmp_path / "book.djvu", config={})
+
+    assert result["page_count"] == 0
+    assert result["text_source"] == "ocr"
+    assert result["media_type"] == "pdf-scan"
+
+
+def test_convert_and_route_forwards_the_configured_timeout_to_the_per_page_calls(tmp_path, monkeypatch):
+    """A 500-page book is 500 djvutxt calls; every one of them has to be
+    bounded by the operator's own [ingest.djvu] timeout_s."""
+    seen: list[float] = []
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _fake_run(cmd, **kwargs):
+        seen.append(kwargs.get("timeout"))
+        if "--version" in cmd:
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout="DjVuLibre-3.5.28", stderr="")
+        if "-format=pdf" in cmd:
+            from pathlib import Path
+
+            Path(cmd[-1]).parent.mkdir(parents=True, exist_ok=True)
+            Path(cmd[-1]).write_bytes(build_minimal_pdf(["a", "b"]))
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+        # long enough that the whole-document probe finds a text layer,
+        # which is what makes the per-page calls happen at all
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="page text " * 30, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    convert_and_route(
+        program_root=tmp_path, doc_id="DOC-T5", src_path=tmp_path / "book.djvu", config={"timeout_s": 7}
+    )
+
+    # ddjvu, the document-wide djvutxt, two per-page djvutxt calls, ddjvu --version
+    assert len(seen) == 5
+    assert set(seen) == {7.0}
+
+
+def test_convert_and_route_reports_page_progress_for_the_lease(tmp_path, monkeypatch):
+    """``run_djvu`` hooks ``ctx.heartbeat()`` to this: without a beat per
+    page, a long book's per-page loop outlives the 900s lease and gets
+    reclaimed mid-extraction."""
+    pdf_bytes = build_minimal_pdf(["a", "b", "c"])
+    _patch_djvu_tools(
+        monkeypatch, pdf_bytes=pdf_bytes, djvutxt_stdout="embedded text " * 30,
+        djvutxt_pages=["page one text here", "page two text here", "page three text here"],
+    )
+    seen: list[int] = []
+
+    convert_and_route(
+        program_root=tmp_path, doc_id="DOC-T6", src_path=tmp_path / "book.djvu", config={},
+        on_progress=seen.append,
+    )
+
+    assert seen == [1, 2, 3]
+
+
+def test_extract_djvu_page_texts_raises_on_a_page_that_fails(tmp_path, monkeypatch):
+    """A page index that does not line up with the derived PDF's is a wrong
+    assumption about the file. Loud beats a silently half-ingested book."""
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="no such page"),
+    )
+    with pytest.raises(DjVuConversionError) as excinfo:
+        extract_djvu_page_texts("/usr/bin/djvutxt", tmp_path / "book.djvu", page_count=3)
+    assert "page 1" in str(excinfo.value)
+    assert "no such page" in str(excinfo.value)
+
+
+def test_build_djvutxt_page_cmd_shape(tmp_path):
+    src = tmp_path / "book.djvu"
+    assert build_djvutxt_page_cmd("/usr/bin/djvutxt", src, 7) == ["/usr/bin/djvutxt", "--page=7", str(src)]
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("plain text", "plain text"),
+        ("café naïve", "café naïve"),  # real non-ASCII survives
+        ("���", ""),  # replacement characters are not text
+        ("a\x00b\x1fc", "abc"),  # control bytes are not text
+        ("keeps\nnewlines\tand tabs", "keeps\nnewlines\tand tabs"),
+    ],
+)
+def test_usable_text_discounts_only_what_is_not_text(raw, expected):
+    assert usable_text(raw) == expected
+
+
+def test_derived_pdf_page_count_reads_the_pdf_and_zero_on_garbage(tmp_path):
+    good = tmp_path / "good.pdf"
+    good.write_bytes(build_minimal_pdf(["one", "two", "three"]))
+    assert derived_pdf_page_count(good) == 3
+    bad = tmp_path / "bad.pdf"
+    bad.write_bytes(b"not a pdf")
+    assert derived_pdf_page_count(bad) == 0
 
 
 def test_convert_and_route_prefers_pdf_scan_when_derived_pdf_has_no_real_text(tmp_path, monkeypatch):
     """djvutxt's stdout clears DJVU_TEXT_LAYER_MIN_CHARS (as garbage --
     U+FFFD/NUL survive errors='replace' decoding and are not \\s, so the
-    naive non-whitespace count sees them as 'real' characters), but the
-    derived PDF itself has no extractable text at all. The cross-check
-    against the PDF ddjvu actually produced must win: pdf-scan, not a
-    near-empty document silently marked 'indexed'."""
+    naive non-whitespace count sees them as 'real' characters). FX-D1 moved
+    the guard onto the per-page text that would actually become elements
+    and discounts exactly those characters, so the verdict is the same one
+    F1 reached and for a better reason: pdf-scan, not a near-empty document
+    silently marked 'indexed'."""
     pdf_bytes = build_minimal_pdf([""])  # nothing pypdf can extract
     garbage_with_high_count = "�" * 150 + "\x00" * 150  # 300 chars, 0 of them real text
     _patch_djvu_tools(monkeypatch, pdf_bytes=pdf_bytes, djvutxt_stdout=garbage_with_high_count)
@@ -534,21 +731,31 @@ def test_convert_and_route_prefers_pdf_scan_when_derived_pdf_has_no_real_text(tm
 def test_convert_and_route_prefers_pdf_scan_for_low_per_page_average_despite_document_wide_threshold(
     tmp_path, monkeypatch
 ):
-    """The native PDF route's own threshold is a scale-invariant AVERAGE
-    per page (normalizers._SCANNED_PDF_CHARS_PER_PAGE_THRESHOLD); the
-    djvutxt-side threshold is an absolute whole-document count. A 30-page
-    book whose only text is a 200-character front page clears the
-    document-wide count but would never clear the native per-page average
-    (avg ~6.7 chars/page) -- the cross-check must still route pdf-scan."""
+    """:data:`DJVU_TEXT_LAYER_MIN_CHARS` is an absolute whole-document
+    count and is therefore scale-blind: a 30-page book whose only text is a
+    200-character front page clears it. The per-page density gate
+    (:data:`DJVU_MIN_USABLE_CHARS_PER_PAGE`, the same bar a native PDF is
+    judged by) is what catches that -- avg ~6.7 chars/page -> OCR.
+
+    FX-D1 moved this gate onto the text ``djvutxt`` actually returns per
+    page, which is the evidence that decides the route now; the fixture
+    supplies that per-page text explicitly."""
     pages = ["x" * DJVU_TEXT_LAYER_MIN_CHARS] + [""] * 29
     pdf_bytes = build_minimal_pdf(pages)
-    _patch_djvu_tools(monkeypatch, pdf_bytes=pdf_bytes, djvutxt_stdout="x" * DJVU_TEXT_LAYER_MIN_CHARS)
+    _patch_djvu_tools(
+        monkeypatch,
+        pdf_bytes=pdf_bytes,
+        djvutxt_stdout="x" * DJVU_TEXT_LAYER_MIN_CHARS,
+        djvutxt_pages=pages,
+    )
 
     result = convert_and_route(program_root=tmp_path, doc_id="DOC-5", src_path=tmp_path / "book.djvu", config={})
 
     assert result["text_chars"] == DJVU_TEXT_LAYER_MIN_CHARS  # djvutxt alone crosses the threshold
-    assert result["media_type"] == "pdf-scan"  # the per-page cross-check overrides it
+    assert result["media_type"] == "pdf-scan"  # the per-page density gate overrides it
     assert result["text_layer"] is False
+    assert result["text_source"] == "ocr"
+    assert result["pages"] == []
 
 
 def test_convert_and_route_still_picks_pdf_text_when_both_signals_agree(tmp_path, monkeypatch):
@@ -584,8 +791,10 @@ def _drain(store, max_steps=12):
     return results
 
 
-def _add_djvu_document(store, program_root, monkeypatch, *, pdf_bytes, djvutxt_stdout):
-    _patch_djvu_tools(monkeypatch, pdf_bytes=pdf_bytes, djvutxt_stdout=djvutxt_stdout)
+def _add_djvu_document(store, program_root, monkeypatch, *, pdf_bytes, djvutxt_stdout, djvutxt_pages=None):
+    _patch_djvu_tools(
+        monkeypatch, pdf_bytes=pdf_bytes, djvutxt_stdout=djvutxt_stdout, djvutxt_pages=djvutxt_pages
+    )
     raw_dir = program_root / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
     djvu_path = raw_dir / "book.djvu"
@@ -604,9 +813,21 @@ def _add_djvu_document(store, program_root, monkeypatch, *, pdf_bytes, djvutxt_s
 
 
 def test_djvu_stage_end_to_end_pdf_text_route(store, program_root, monkeypatch):
-    pdf_bytes = build_minimal_pdf(["Djvu converted page one.", "Djvu converted page two."])
+    """FX-D1: the elements come from the DjVu TEXT LAYER, page by page --
+    the derived PDF is kept for viewing but is no longer the text source.
+
+    Note the fixture: the PDF's own pages say something DIFFERENT from the
+    text layer's, so "which source produced these elements" is decidable
+    from the element text alone rather than assumed."""
+    pdf_bytes = build_minimal_pdf(["Rendered image page one.", "Rendered image page two."])
     doc_id = _add_djvu_document(
-        store, program_root, monkeypatch, pdf_bytes=pdf_bytes, djvutxt_stdout="genuine embedded text " * 20
+        store, program_root, monkeypatch,
+        pdf_bytes=pdf_bytes,
+        djvutxt_stdout="genuine embedded text " * 20,
+        djvutxt_pages=[
+            "The text layer of djvu page one, with enough prose to clear the density gate.",
+            "The text layer of djvu page two, likewise carrying real readable characters.",
+        ],
     )
     djvu_job_id = f"JOB-ingest-{doc_id}"
 
@@ -622,8 +843,19 @@ def test_djvu_stage_end_to_end_pdf_text_route(store, program_root, monkeypatch):
     assert doc["raw_path"] == f"archive/derived/{doc_id}/{doc_id}.pdf"
     assert doc["ocr_backend"] is None  # pdf-text route never touches OCR
 
-    elements = store.knowledge.execute("SELECT COUNT(*) FROM element WHERE doc_id=?", (doc_id,)).fetchone()[0]
-    assert elements == 2  # normalize_pdf_text: one NarrativeText per non-empty page
+    elements = [
+        dict(r)
+        for r in store.knowledge.execute(
+            "SELECT * FROM element WHERE doc_id=? ORDER BY seq", (doc_id,)
+        ).fetchall()
+    ]
+    # FX-D1: one element per page, straight from the DjVu text layer -- and
+    # the page numbers are the DjVu page numbers, so an anchor points where
+    # a reader would look.
+    assert [e["page_number"] for e in elements] == [1, 2]
+    assert all(e["detection_origin"] == "djvutxt" for e in elements)
+    assert all("djvu page" in e["text"] for e in elements)
+    assert doc["page_count"] == 2
 
     djvu_job = ledger.get_job(store, djvu_job_id)
     import hashlib
@@ -633,6 +865,24 @@ def test_djvu_stage_end_to_end_pdf_text_route(store, program_root, monkeypatch):
     assert checkpoint["djvu_pdf_sha256"] == hashlib.sha256(pdf_bytes).hexdigest()
     assert checkpoint["djvu_route"] == "pdf-text"
     assert checkpoint["djvu_text_layer"] is True
+    assert checkpoint["djvu_text_source"] == "djvutxt"
+    assert checkpoint["djvu_page_count"] == 2
+    assert checkpoint["djvu_pages_with_text"] == 2
+    assert checkpoint["elements"] == 2
+
+    # The text route finishes normalize inline; no separate normalize job.
+    assert ledger.get_job(store, f"JOB-ingest-{doc_id}-normalize") is None
+    assert ledger.get_job(store, f"JOB-ingest-{doc_id}-chunk") is not None
+
+    # anchors resolve against the elements the text layer produced
+    from trialerror.ingest.anchors import spot_resolve
+
+    anchors = [
+        dict(r)
+        for r in store.knowledge.execute("SELECT * FROM quote_anchor WHERE doc_id=?", (doc_id,)).fetchall()
+    ]
+    assert anchors
+    assert all(spot_resolve(elements, a) for a in anchors)
 
     derived_pdf = program_root / doc["raw_path"]
     assert derived_pdf.is_file()
@@ -655,17 +905,24 @@ def test_djvu_stage_end_to_end_pdf_scan_route_uses_fake_ocr_backend(store, progr
     assert doc["ocr_backend"] == "fake"  # the OCR route DID run, through the fake backend
 
 
-def test_djvu_stage_resume_after_row_rewrite_does_not_reconvert(store, program_root, monkeypatch):
-    """Restart-safety: if a prior (crashed) attempt at the djvu job already
-    rewrote document.media_type/raw_path but never got to settle, a resumed
-    run must NOT try to feed the derived PDF back into ddjvu as if it were
-    the original .djvu source -- it should just re-derive the next stage
-    and enqueue it (idempotently)."""
+def test_djvu_stage_resume_after_the_text_route_finished_does_not_reconvert(store, program_root, monkeypatch):
+    """Restart-safety, text route (FX-D1 restart guard 2): a prior attempt
+    already wrote this document's elements from the text layer and rewrote
+    the row. A resumed run must not feed the derived PDF back into ddjvu,
+    and must not enqueue ``normalize`` either -- that would re-derive the
+    elements from the PDF via pypdf and overwrite good djvutxt text with
+    worse. It hands off to ``chunk`` and stops."""
     import json as json_mod
 
-    pdf_bytes = build_minimal_pdf(["Djvu converted page one.", "Djvu converted page two."])
+    pdf_bytes = build_minimal_pdf(["Rendered image page one.", "Rendered image page two."])
     doc_id = _add_djvu_document(
-        store, program_root, monkeypatch, pdf_bytes=pdf_bytes, djvutxt_stdout="genuine embedded text " * 20
+        store, program_root, monkeypatch,
+        pdf_bytes=pdf_bytes,
+        djvutxt_stdout="genuine embedded text " * 20,
+        djvutxt_pages=[
+            "The text layer of djvu page one, with enough prose to clear the density gate.",
+            "The text layer of djvu page two, likewise carrying real readable characters.",
+        ],
     )
     djvu_job_id = f"JOB-ingest-{doc_id}"
 
@@ -674,6 +931,11 @@ def test_djvu_stage_resume_after_row_rewrite_does_not_reconvert(store, program_r
 
     doc_after_first_run = dict(store.knowledge.execute("SELECT * FROM document WHERE doc_id=?", (doc_id,)).fetchone())
     assert doc_after_first_run["media_type"] == "pdf-text"
+    elements_after_first_run = [
+        dict(r)
+        for r in store.knowledge.execute("SELECT * FROM element WHERE doc_id=? ORDER BY seq", (doc_id,))
+    ]
+    assert len(elements_after_first_run) == 2
 
     # Now make subprocess.run explode if anything tries to shell out again
     # -- proves the resumed handler takes the "already converted" branch
@@ -689,17 +951,51 @@ def test_djvu_stage_resume_after_row_rewrite_does_not_reconvert(store, program_r
     r2 = run_one(store, worker_id="w1", job_id=djvu_job_id, kind="custom", payload=json_mod.loads(job["payload"]))
     assert r2["status"] == "complete"
 
-    # document row untouched by the resumed no-op re-run
+    # document row and elements untouched by the resumed no-op re-run
     doc_after_resume = dict(store.knowledge.execute("SELECT * FROM document WHERE doc_id=?", (doc_id,)).fetchone())
     assert doc_after_resume["media_type"] == "pdf-text"
     assert doc_after_resume["raw_path"] == doc_after_first_run["raw_path"]
+    assert [
+        dict(r) for r in store.knowledge.execute("SELECT * FROM element WHERE doc_id=? ORDER BY seq", (doc_id,))
+    ] == elements_after_first_run
 
-    # the normalize job it hands off to still carries the right override
-    normalize_job = ledger.get_job(store, f"JOB-ingest-{doc_id}-normalize")
-    assert normalize_job is not None
-    normalize_payload = json_mod.loads(normalize_job["payload"])
-    assert normalize_payload["normalizer_id_override"] == NORMALIZER_ID_DJVU
-    assert normalize_payload["normalizer_version_override"] == "3.5.28"
+    assert ledger.get_job(store, f"JOB-ingest-{doc_id}-normalize") is None
+    assert ledger.get_job(store, f"JOB-ingest-{doc_id}-chunk") is not None
+
+
+def test_djvu_stage_resume_after_row_rewrite_on_the_ocr_route(store, program_root, monkeypatch):
+    """Restart-safety, OCR route: the row rewrite happens BEFORE the ocr
+    job is enqueued, so a crash in between is the case this branch has
+    always covered. It must re-enqueue ``ocr`` (never ``ddjvu``) with the
+    normalizer override the checkpoint carries."""
+    import json as json_mod
+
+    pdf_bytes = build_minimal_pdf([""])  # image-only
+    doc_id = _add_djvu_document(
+        store, program_root, monkeypatch, pdf_bytes=pdf_bytes, djvutxt_stdout=""
+    )
+    djvu_job_id = f"JOB-ingest-{doc_id}"
+
+    assert run_one(store, worker_id="w0")["status"] == "complete"
+    assert dict(
+        store.knowledge.execute("SELECT * FROM document WHERE doc_id=?", (doc_id,)).fetchone()
+    )["media_type"] == "pdf-scan"
+
+    def _explode(cmd, **kwargs):
+        raise AssertionError(f"resumed djvu stage must not re-invoke a subprocess, got: {cmd}")
+
+    monkeypatch.setattr(subprocess, "run", _explode)
+    job = ledger.get_job(store, djvu_job_id)
+    store.jobs.execute("UPDATE job SET state='pending', claimed_by=NULL WHERE job_id=?", (djvu_job_id,))
+    store.jobs.commit()
+    r2 = run_one(store, worker_id="w1", job_id=djvu_job_id, kind="custom", payload=json_mod.loads(job["payload"]))
+    assert r2["status"] == "complete"
+
+    ocr_job = ledger.get_job(store, f"JOB-ingest-{doc_id}-ocr")
+    assert ocr_job is not None
+    ocr_payload = json_mod.loads(ocr_job["payload"])
+    assert ocr_payload["normalizer_id_override"] == NORMALIZER_ID_DJVU
+    assert ocr_payload["normalizer_version_override"] == "3.5.28"
 
 
 def test_djvu_stage_resume_rejects_unexpected_media_type(store, program_root):
@@ -942,3 +1238,34 @@ def test_djvu_end_to_end_with_real_djvulibre(store, program_root):
     doc = dict(store.knowledge.execute("SELECT * FROM document WHERE doc_id=?", (doc_id,)).fetchone())
     assert doc["status"] == "indexed"
     assert doc["normalizer_id"] == NORMALIZER_ID_DJVU
+
+    # FX-D1: the live half of the acceptance step this module's docstring
+    # asks for. A cjb2-encoded bitonal image has NO text layer, so this
+    # fixture must take the OCR route -- and the checkpoint has to say so
+    # explicitly, because "which source of truth produced this document's
+    # text" is the question the live bug turned on and is not recoverable
+    # from the row afterwards.
+    import json as json_mod
+
+    checkpoint = json_mod.loads(ledger.get_job(store, f"JOB-ingest-{doc_id}")["checkpoint"])
+    assert checkpoint["djvu_text_source"] in ("djvutxt", "ocr")
+    assert checkpoint["djvu_text_source"] == (
+        "djvutxt" if checkpoint["djvu_text_layer"] else "ocr"
+    )
+    assert checkpoint["djvu_page_count"] >= 1, "ddjvu must render at least one PDF page per DjVu page"
+
+    element_pages = [
+        r["page_number"]
+        for r in store.knowledge.execute(
+            "SELECT page_number FROM element WHERE doc_id=? ORDER BY seq", (doc_id,)
+        )
+    ]
+    assert element_pages, "a real DjVu ingest must produce elements"
+    assert max(element_pages) <= checkpoint["djvu_page_count"], (
+        "an element page number outside the DjVu page index means the per-page djvutxt calls and "
+        "the derived PDF's page index disagree -- the F9 assumption, live"
+    )
+    if checkpoint["djvu_text_source"] == "djvutxt":
+        assert doc["page_count"] == checkpoint["djvu_page_count"]
+        assert doc["ocr_backend"] is None
+        assert ledger.get_job(store, f"JOB-ingest-{doc_id}-normalize") is None

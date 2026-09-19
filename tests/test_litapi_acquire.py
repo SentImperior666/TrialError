@@ -18,7 +18,7 @@ from trialerror.litapi.transport import FakeTransport, TransportResponse
 from tests._ingest_fixtures import bootstrap_launch, build_minimal_pdf
 from tests._litapi_fixtures import load_fixture, load_text_fixture
 
-ARXIV_BASE = "http://export.arxiv.org/api"
+ARXIV_BASE = "https://export.arxiv.org/api"  # matches config.py's real (https) default
 UNPAYWALL_BASE = "https://api.unpaywall.org/v2"
 
 
@@ -112,6 +112,49 @@ def test_acquire_metadata_providers_and_failures_are_reported(store, program_roo
     assert "arxiv" in result.metadata_providers
     failed_names = {f["provider"] for f in result.metadata_failures}
     assert {"openalex", "semanticscholar", "unpaywall"} <= failed_names
+
+
+class _UnreachableTransport:
+    """litapi-arxiv-https build, task 3 / C-0093(a) incident repro: every
+    ``.get`` call raises ``urllib.error.URLError``, exactly what the real
+    ``UrllibTransport`` raises for a host an egress policy admitting only
+    tcp/443 refuses. Unlike every other test in this file, this is NOT a
+    ``FakeTransport`` -- the whole point is exercising the real transport-
+    level-failure path (``get_with_retry``'s own wrapping into
+    ``ProviderTransportError(host=..., scheme=...)``), not a canned
+    JSON/XML response."""
+
+    def get(self, url, *, headers=None, timeout_s=None):
+        import urllib.error
+
+        raise urllib.error.URLError("no route to host")
+
+
+def test_acquire_transport_unreachable_on_every_provider_tolerates_and_reports_transport_unreachable(
+    store, program_root
+):
+    """acquire() itself still tolerates this silently (module docstring:
+    'a total metadata-lookup failure does NOT abort acquisition') and
+    files a `wanted` request-queue row -- _cmd_acquire (trialerror/cli/lit.py)
+    is what turns this specific all-transport-unreachable case into a hard
+    error instead (see tests/test_litapi_cli.py's own coverage of that
+    CLI-layer decision); this test only pins acquire()'s own contract:
+    metadata_providers empty, every metadata_failures entry
+    code='transport_unreachable' with host/scheme recorded, no traceback."""
+    launch_id = bootstrap_launch(store)
+
+    result = acquire_mod.acquire(
+        store, program_root=program_root, arxiv_id="2101.00001", created_by_launch=launch_id,
+        litapi_config=_litapi_config(), transport=_UnreachableTransport(), fetch_fn=_fake_fetch(_pdf_bytes()),
+    )
+
+    assert result.outcome == "queued"
+    assert result.metadata_providers == []
+    assert result.metadata_failures  # non-empty
+    for failure in result.metadata_failures:
+        assert failure["code"] == "transport_unreachable"
+        assert failure["host"]
+        assert failure["scheme"]
 
 
 # ---------------------------------------------------------------------------

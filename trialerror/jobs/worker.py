@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from trialerror.jobs import ledger
-from trialerror.jobs.errors import JobPausedError
+from trialerror.jobs.errors import JobError, JobPausedError
 from trialerror.jobs.registry import discover_and_register_handlers, get_handler
 from trialerror.stores import paths
 from trialerror.stores.store import Store
@@ -171,6 +171,39 @@ class JobContext:
         self.job = ledger.heartbeat(self.store, self.job_id, self.worker_id, lease_s=self.lease_s, checkpoint=data)
 
 
+def _retracted_document_refusal(store: Store, job: dict[str, Any]) -> str | None:
+    """The refusal text for a job whose document has been retracted, or
+    ``None`` when there is nothing to refuse.
+
+    Reads the doc_id off the job's own payload -- every pipeline stage's
+    payload carries one -- and answers the question through
+    :func:`trialerror.ingest.retract.retracted_doc_ids`, the ONE place
+    "is this document retracted" is decided, so this guard moves with the
+    eventual ``document.status = 'retracted'`` migration for free.
+
+    Never raises: a program with no ``record`` table, no knowledge.db, or a
+    job whose payload carries no doc_id at all (the noop handler, the
+    ideation re-check) has nothing to say here, and a worker that fell over
+    reading its own guard would be worse than one without it."""
+    try:
+        payload = json.loads(job["payload"]) if job.get("payload") else {}
+        doc_id = payload.get("doc_id") if isinstance(payload, dict) else None
+        if not isinstance(doc_id, str) or not doc_id:
+            return None
+        from trialerror.ingest.retract import retracted_doc_ids
+
+        if doc_id not in retracted_doc_ids(store.knowledge):
+            return None
+    except Exception:  # noqa: BLE001 - a guard that cannot read is a guard that says nothing
+        return None
+    return (
+        f"document {doc_id!r} has been retracted -- refusing to run this stage, which would "
+        "re-derive the rows the retraction removed. Re-ingest the raw file with `trialerror "
+        "ingest add` if it should be in the corpus again; that creates a new document and leaves "
+        "the retraction on the record"
+    )
+
+
 def run_one(
     store: Store,
     *,
@@ -215,6 +248,39 @@ def run_one(
         claimed = ledger.claim_next(store, kinds=kinds, worker_id=worker_id, lease_s=lease_s)
     if claimed is None:
         return {"status": "idle", "worker_id": worker_id}
+
+    refusal = _retracted_document_refusal(store, claimed)
+    if refusal is not None:
+        # Lane FB-3 item 9. The requeue guard's rule, applied at RUN time:
+        # `ingest rechunk`/`re-embed` refuse to enqueue a stage for a
+        # retracted document, but nothing stopped a job that was ALREADY in
+        # the queue when the retraction happened -- or one a worker was
+        # holding -- from running and re-deriving the rows the retraction
+        # removed. Retraction now cancels the cancellable ones itself; this
+        # is what catches the rest, at the one point every stage passes
+        # through. Settled `abandoned` rather than failed: there is nothing
+        # to retry, and a failed row with attempts left comes straight back.
+        #
+        # Fix pass V-7: settled INSIDE a fence of its own. If this worker's
+        # lease was swept between the claim and this line, `claimed_by` no
+        # longer matches and `abandon` raises InvalidTransitionError -- which
+        # would propagate out of `run_one` and, since `run_loop` does not
+        # catch it, take the whole worker process down rather than settle one
+        # job. The refusal still stands either way (the job is not run), and
+        # whoever holds the lease now meets the same guard at its own claim.
+        settled = True
+        try:
+            ledger.abandon(store, claimed["job_id"], reason=refusal, worker_id=worker_id)
+        except JobError:
+            settled = False
+        return {
+            "status": "refused",
+            "reason": "document_retracted",
+            "message": refusal,
+            "settled": settled,
+            "job_id": claimed["job_id"],
+            "worker_id": worker_id,
+        }
 
     handler_name = claimed["kind"]
     if handler_name == "custom":

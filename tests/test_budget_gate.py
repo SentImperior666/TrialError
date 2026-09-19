@@ -315,3 +315,25 @@ def test_evaluate_spawn_for_open_session_happy_path(store):
     assert result.allowed is True
     row = get(store, "launch", pk_column="launch_id", pk_value=booked.launch_id)
     assert row["state"] == "RUNNING"
+
+
+def test_a_dated_pin_at_the_latest_digest_version_is_fresh(store):
+    """The SessionStart hook records ``v<N>@<date>`` (law.service.format_pin)
+    while ``law_digest.version`` is the bare ``v<N>``; the version part decides
+    freshness (2026-09-16: every direct Agent spawn was refused as stale on
+    the exact-string compare while ``law verify`` called the pin current)."""
+    account_id, session_id = open_account_session(store, boot_pin_version="v2@2026-09-16")
+    add_law_digest(store, "v1", generated_ts="2026-01-01T00:00:00.000Z")
+    add_law_digest(store, "v2", generated_ts="2026-02-01T00:00:00.000Z")
+    booked = _book(store, session_id)
+    result = evaluate_spawn(store, _prompt(booked.launch_id), session_id=session_id)
+    assert result.allowed is True
+
+
+def test_a_dated_pin_behind_the_latest_digest_version_is_stale(store):
+    account_id, session_id = open_account_session(store, boot_pin_version="v1@2026-01-01")
+    add_law_digest(store, "v1", generated_ts="2026-01-01T00:00:00.000Z")
+    add_law_digest(store, "v2", generated_ts="2026-02-01T00:00:00.000Z")
+    booked = _book(store, session_id)
+    result = evaluate_spawn(store, _prompt(booked.launch_id), session_id=session_id)
+    assert result.allowed is False and result.code == "stale_law_pin"

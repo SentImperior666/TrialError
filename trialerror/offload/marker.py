@@ -119,6 +119,22 @@ class OffloadMarker:
             "have run instead of calling the backend directly."
         )
 
+    def runnable(self) -> tuple[bool, str]:
+        """``(False, <reason>)``, always -- the fail-closed half of D13
+        stated as a SENTENCE instead of a raise.
+
+        :meth:`embed_batch`/:meth:`run` still raise for the caller that
+        computes through this object anyway (a handler that forgot its
+        offload branch is a bug, and a loud one). This method is for the
+        caller that is allowed to ask first: query-time embedding, which has
+        no offload branch to take (there is no document, no job and no
+        manifest -- see :func:`trialerror.retrieve.engine.query_vector_or_reason`)
+        and must degrade or refuse in an envelope rather than surface a
+        traceback to an agent."""
+        if self.kind == "embed":
+            return False, "embedding runs on the DEV GPU worker, never in this process"
+        return False, "OCR runs on the DEV GPU worker, never in this process"
+
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"OffloadMarker(kind={self.kind!r})"
 

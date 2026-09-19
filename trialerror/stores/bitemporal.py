@@ -44,8 +44,19 @@ from trialerror.util.timeutil import now
 
 __all__ = ["BITEMPORAL_TABLES", "assert_fact", "expire_fact", "end_fact_validity", "supersede_fact", "as_of"]
 
-#: table -> primary key column, for the two tables this module applies to.
-BITEMPORAL_TABLES: dict[str, str] = {"claim": "claim_id", "relation": "rel_id"}
+#: table -> primary key column, for the tables this module applies to.
+#: ``term_sense`` (lane e, knowledge_v5_lexicon_term_store) joins the
+#: original two because it carries the identical four-column set for the
+#: identical reason: a corrected gloss is a new row that supersedes the old
+#: one (transaction-time), while a reading the program has stopped using is
+#: a closed validity window on a row that stays readable (event-time). The
+#: lexicon's "compounding layer, never reset" discipline is exactly what
+#: those two axes already encode.
+BITEMPORAL_TABLES: dict[str, str] = {
+    "claim": "claim_id",
+    "relation": "rel_id",
+    "term_sense": "sense_id",
+}
 
 
 def _check_table(table: str) -> str:

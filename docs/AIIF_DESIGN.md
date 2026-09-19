@@ -11,15 +11,16 @@ AIIF (AI Ideation Framework) is the protocol TrialError uses to run an **ideatio
 | Piece | Harness surface | State |
 |---|---|---|
 | Lens, verifier and critic agents | `plugin/agents/{lens,critic,verifier}.md` (tool-locked; model Fable) | shipped |
-| Round driver | `plugin/skills/ideation-round/SKILL.md` | shipped (pre-AIIF form); AIIF steps land as revisions of this skill |
-| Slicing (near / moderate / far arms per lens) | `trialerror lens stratify`, `trialerror lens assign --arm-per-lens` | shipped / partial |
-| Mechanical novelty screen | `trialerror lens screen --mechanical` (`trialerror/lens/novelty.py`) | planned (round-0 precondition) |
-| Judged screen | verifier launches over novelty dossiers, `verdict` rows with a procedure version | planned |
-| Rooms (converge phase) | `trialerror room …` (freeze, converge, turn kinds, neutral extracts) | shipped in part; anti-hidden-profile turn order planned |
+| Round driver | `plugin/skills/ideation-round/SKILL.md` | shipped as Phases 0-8 |
+| Slicing (near / moderate / far arms per lens) | `trialerror lens stratify`, `trialerror lens assign --arm-per-lens` | shipped; a lens's arm lives on its assignment rows and is re-derived for the export rather than stored on the roster row |
+| Mechanical novelty screen | `trialerror lens screen --mechanical` (`trialerror/lens/novelty.py`) | shipped |
+| Judged screen | verifier launches over novelty dossiers, `verdict` rows with a procedure version | envelopes, plants and label recording shipped; the launch that spawns the judge is not in this code |
+| Rooms (converge phase) | `trialerror room …` (admission order, blind first turn, turn kinds, rank-all stances, neutral extracts, computed `agreement_pct`) | shipped; the extract and moderator passes take their results back through the CLI rather than spawning them |
 | Pre-registration and reveal | `trialerror prereg commit / reveal`, blind params, escrow hash | shipped |
 | Critic gate | `/gate-critic`, `trialerror gate …` | shipped |
-| Budgets and model floors | `budget book` per spawn; `[models]` table in `trialerror.toml` | booking shipped; model-floor table planned |
-| Acceptance | `trialerror accept --suite aiif_round` | planned |
+| Budgets and model floors | `budget book` per spawn; `[models]` table in `trialerror.toml`; the spawn gate compares the spawned model with the booked class | shipped; the program must create its own table (the scaffold ships the example commented out, as it ships every table) |
+| Acceptance | `trialerror eval gate --suite aiif_round` (fourteen checks over one round's artifacts) | shipped |
+| Convergent discovery (after a round closes) | `trialerror lens recheck` enqueues the `convergent_recheck` job; links land on `idea.convergent_with` | shipped |
 
 ## 2 · Principles (each names the mechanism it binds)
 
@@ -46,12 +47,12 @@ The evidence codes (E1–E10) are expanded in the evidence base document.
 
 ## 3 · One round, phase by phase
 
-0. **FRAME** (orchestrator, no spawns). Round charter with a context frame; corpus snapshot and reference-set hashes; blind pre-registration of every parameter (arm mode, weights, far floor, slices per lens, dedupe threshold, cards per block, external-query mode, room admission rule, contingencies); model floors; roster (standard seats with rotated vantages, one assumption-buster with the farthest slice, one CONTROL seat outside the roster count).
+0. **FRAME** (orchestrator, no spawns). Round charter with a context frame; corpus snapshot and reference-set hashes; blind pre-registration of every parameter (arm mode, weights, far floor, slices per lens, dedupe threshold, cards per block, external-query mode, the room admission RULE and its seed, contingencies); model floors; roster (standard seats with rotated vantages, one assumption-buster with the farthest slice, one CONTROL seat outside the roster count).
 1. **SLICE** (mechanical). Stratify the corpus by embedding distance from the home cells into near / moderate / far terciles; assign whole slices per lens from one arm under the seeded weights and the far floor.
 2. **DIVERGE, solo** (lenses, the expensive phase). Each lens is booked and spawned with its slice, vantage, seat, its card block (two cards in seeded order for standard lenses), the record schema and an abstract exclusion list; it never sees peer ideas, dossiers, rubrics or the program's inventory. It returns records; the orchestrator posts them verbatim under the lens's own launch identity.
 3. **NOVELTY SCREEN**, two halves. 3a mechanical and incremental: dedupe, known-mechanism flagging, distance statistics against the reference sets, pairwise similarity distribution, declared-operation counts. 3b judged: verifier launches read dossiers (requirements, statement, home cell, probe, retrieved evidence) with author, seat, card and rationale stripped, label against fixed vocabularies, with plants and a re-judge share for calibration.
 4. **ROTATE / RECOMBINE** (optional). Brainwriting: each lens re-spawned with k=3 consolidated records from other lenses, farthest from its own and from a different arm or cluster, in one envelope.
-5. **CONVERGE** (rooms). Every consolidated idea is roomed; seeded stratified admission on (arm, card); rooms of the charter size in batches; decision points with a fixed convergence bar; the buster's position envelope; neutral extracts for the moderator.
+5. **CONVERGE** (rooms). Every consolidated idea is roomed; seeded stratified admission on (arm, card), with the ORDER escrowed in its own commit here — after the judged screen, which is when the pool it is drawn over first exists, and before the first room opens; rooms of the charter size in batches; decision points with a fixed convergence bar; the buster's position envelope; neutral extracts for the moderator.
 6. **CRITIC GATE and REVEAL.** Synthesis and probe report through the two-tier gate (mechanical suite, then the read-only critic with the pre-mortem in its brief); pre-registration revealed at the gate.
 7. **ADOPT / KILL / LOG.** Adoption is a status plus a registered verdict plus entry into the program's expansion loop with kill conditions; kills are archived and revivable by ruling.
 8. **RETRO** (operator). Round card; catalogue, threshold and hyperparameter changes only between rounds, each an event line with its triggering signal.
@@ -68,7 +69,7 @@ At most four cards per round, drawn from a rotating catalogue; every standard le
 
 | Role | Sees | Never sees | Barrier class |
 |---|---|---|---|
-| Lens (standard / buster / CONTROL) | slice, vantage, seat, card block, schema, abstract exclusion list | peer ideas, dossiers, verdicts, rubrics, novelty feedback, escrowed weights, the inventory | slice scope: convention + audit until per-launch scope lands; inventory: enforced server-side |
+| Lens (standard / buster / CONTROL) | slice, vantage, seat, card block, schema, abstract exclusion list | peer ideas, dossiers, verdicts, rubrics, novelty feedback, escrowed weights, the inventory | inventory: **enforced** (server-side source-kind exclusion in the retrieval engine, lifted only by naming the kind explicitly) on every surface an agent reaches through the knowledge tools — the ranked ones and the id- and quote-addressed ones alike, the graph tier included; not on the two API/CLI-only graph walks or the counts-only corpus summary, which the engine names rather than implying "every"; slice scope: **enforced** for a launch whose booking declares its slice, resolved the way the audit resolves it (the slice attr, else the booking's assignment or roster rows — all three emitted by `lens export`), and a declared-EMPTY slice restricts to nothing rather than lifting the restriction; **audited** (`lens_citations_within_slice`) for a launch booked outside that path, which declares none of the three |
 | Recombiner | k=3 peer records without authorship | judge output, its own prior scoring | envelope (enforced) |
 | Mechanical screen | statements + structured fields | rationale, surprise | code |
 | Novelty judge | dossier fields + retrieved text, pairwise | author, seat, card, rationale, surprise, other judges' labels | envelope (enforced) |
@@ -90,7 +91,7 @@ Judges see content only; discrete or pairwise judgments wherever anything optimi
 
 ## 9 · What is not settled (honest list)
 
-The per-launch retrieval scope (today a convention with an audit), the `[models]` floor table, the `aiif_round` acceptance suite, the room turn kinds for the anti-hidden-profile order, and the novelty screen module are planned, not shipped. Two seams stay hypotheses to be measured: the `requirements` field (H-AF) and the card catalogue's single-source entries.
+Three things that read as code but are procedure: the room's neutral-extract pass and its moderator scoring pass are envelopes in and structured results back, so the launches that produce those results are the caller's, not this code's -- the same boundary the judged screen states for itself; and the `agreement_pct` a room converges on is computed from the participants' structured stances only where those stances were filed, which a room that skipped the rank-all point has not done. The convergent re-check's external half has not been run against a live index in this tree. The per-launch retrieval scope is enforced only where the booking declares a slice — through the slice attr, the assignment rows or the roster, all three of which the standard export emits: a lens booked by hand with none of them is covered by the audit, not by the engine, and the audit reports after the fact. The novelty screen records distances and routes ideas to a judge; it never turns a distance into "novel", and the judged half needs a judge this code does not call — the screen builds the envelopes and takes discrete labels back, and the step that spawns the judge is not in it. The screen's external reference set reaches whichever index the run names; no run in this tree has yet been made against a live one. Two seams stay hypotheses to be measured: the `requirements` field (H-AF) and the card catalogue's single-source entries.
 
 ## 10 · How this document changes
 

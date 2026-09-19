@@ -135,6 +135,66 @@ def test_budget_book_reconcile_status_rollup_round_trip(roots, account_and_sessi
     assert env["result"]["actual_tokens_total"] == 88
 
 
+def test_budget_book_assign_id_links_the_lens_launch_to_its_slice(roots, account_and_session):
+    """The CLI half of the lens-launch link: a booking made here carries no
+    exported attrs, so before schema-v10 nothing recorded which assignment
+    rows it covered and its slice resolved to nothing at all."""
+    platform_root, program_root = roots
+    _account_id, session_id = account_and_session
+    common = ["--program-root", str(program_root), "--platform-root", str(platform_root)]
+
+    store = open_store(program_root, platform_root=platform_root)
+    insert(
+        store, "lens_roster",
+        {"roster_id": "ROST-cli", "round_id": "r-cli", "lens_name": "lens-1", "vantage": "v",
+         "seat": "standard", "model_class": "top", "created_ts": now()},
+    )
+    for assign_id, doc_id in (("ASGN-cli-1", "DOC-1"), ("ASGN-cli-2", "DOC-2")):
+        insert(
+            store, "lens_assignment",
+            {"assign_id": assign_id, "roster_id": "ROST-cli",
+             "slice_spec": json.dumps({"candidate_id": doc_id, "arm": "near"}),
+             "arm": "near", "seed": "s", "created_ts": now()},
+        )
+    store.close()
+
+    rc, env = _run_cli([
+        "budget", *common, "book", "--session-id", session_id, "--program-id", "PROG-test",
+        "--agent-kind", "lens", "--model-class", "mid", "--model", "sonnet",
+        "--purpose", "mechanical", "--est-tokens", "100",
+        "--assign-id", "ASGN-cli-1", "--assign-id", "ASGN-cli-2",
+    ])
+    assert rc == 0, env
+    launch_id = env["result"]["launch_id"]
+
+    store = open_store(program_root, platform_root=platform_root)
+    try:
+        linked = {
+            row["assign_id"]
+            for row in store.ops.execute(
+                "SELECT assign_id FROM lens_assignment WHERE lens_launch_id = ?", (launch_id,)
+            )
+        }
+    finally:
+        store.close()
+    assert linked == {"ASGN-cli-1", "ASGN-cli-2"}
+
+
+def test_budget_book_refuses_an_assign_id_that_names_no_row(roots, account_and_session):
+    platform_root, program_root = roots
+    _account_id, session_id = account_and_session
+    common = ["--program-root", str(program_root), "--platform-root", str(platform_root)]
+
+    rc, env = _run_cli([
+        "budget", *common, "book", "--session-id", session_id, "--program-id", "PROG-test",
+        "--agent-kind", "lens", "--model-class", "mid", "--model", "sonnet",
+        "--purpose", "mechanical", "--est-tokens", "100", "--assign-id", "ASGN-nope",
+    ])
+    assert env["ok"] is False
+    assert env["error"]["code"] == "unknown_assignment"
+    assert "ASGN-nope" in env["error"]["message"]
+
+
 def test_budget_book_no_open_session_refused(roots, tmp_path):
     platform_root, program_root = roots
     store = open_store(program_root, platform_root=platform_root)

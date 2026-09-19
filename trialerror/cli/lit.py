@@ -48,13 +48,44 @@ from pathlib import Path
 from trialerror.ingest.errors import IngestError
 from trialerror.litapi.client import LitApiClient, build_default_providers
 from trialerror.litapi.config import load_litapi_config, resolve_api_key
-from trialerror.litapi.errors import LitApiError
+from trialerror.litapi.errors import AllProvidersFailedError, LitApiError
 from trialerror.stores.errors import StoreError
 from trialerror.util.config import find_program_root
 from trialerror.util.envelope import error_envelope, next_action, ok_envelope
 
 GROUP_NAME = "lit"
 HELP = "Literature metadata lookup + acquisition: redundant OpenAlex + Semantic Scholar + arXiv + Unpaywall client."
+
+
+def _all_failures_transport_unreachable(failures: list[dict]) -> bool:
+    """True when every recorded per-provider failure was a genuine
+    transport-level unreachability -- ``trialerror.litapi.providers.base.get_with_retry``
+    wraps a raw ``URLError``/socket timeout/``ConnectionError`` into
+    ``ProviderTransportError(host=..., scheme=...)`` and
+    ``trialerror.litapi.client``'s own ``_failure_entry`` helper records that
+    (and ONLY that) case with ``code == "transport_unreachable"`` -- never a
+    bad HTTP status or a legitimate not-found. An empty ``failures`` list is
+    NOT all-transport-unreachable (there is nothing to be unreachable)."""
+    return bool(failures) and all(f.get("code") == "transport_unreachable" for f in failures)
+
+
+def _litapi_error_code_and_details(exc: LitApiError) -> tuple[str, dict | None]:
+    """Shared ``lookup``/``citations``/``search``/``acquire`` mapping: an
+    :class:`~trialerror.litapi.errors.AllProvidersFailedError` caused ENTIRELY
+    by transport-unreachable failures (see
+    :func:`_all_failures_transport_unreachable`) is reported with the more
+    actionable ``transport_unreachable`` code instead of the generic
+    exception-class-name one (design brief Section 5.1: \"errors returned as
+    structured content ... never exceptions\" -- following the same
+    ``except OSError as exc: return error_envelope(cmd, \"<code>\", ...)``
+    pattern ``trialerror/cli/jobs.py``'s ``_cmd_kick`` uses for its own
+    transport-adjacent failure). Every other ``LitApiError`` keeps the
+    pre-existing generic mapping unchanged."""
+    if isinstance(exc, AllProvidersFailedError):
+        failures = exc.details.get("failures", [])
+        if _all_failures_transport_unreachable(failures):
+            return "transport_unreachable", {"failures": failures}
+    return type(exc).__name__, getattr(exc, "details", None)
 
 
 def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
@@ -87,9 +118,19 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     p_citations.add_argument("--offset", type=int, default=0)
     p_citations.set_defaults(handler=_cmd_citations)
 
-    p_search = sub.add_parser("search", help="reconciled title/keyword search across providers")
+    p_search = sub.add_parser(
+        "search",
+        help="reconciled search across providers -- each provider searches its OWN way: title only on "
+             "OpenAlex (filter=title.search), all fields on arXiv (search_query=all:), relevance on "
+             "Semantic Scholar. The query is passed through verbatim to each; the result reports the "
+             "scope per provider beside providers_succeeded",
+    )
     _common(p_search)
-    p_search.add_argument("--query", required=True)
+    p_search.add_argument(
+        "--query", required=True,
+        help="passed to every provider verbatim -- read the per-provider scope above before comparing "
+             "their hit counts (a title-only provider returning nothing is not evidence the paper is absent)",
+    )
     p_search.add_argument("--limit", type=int, default=10)
     p_search.set_defaults(handler=_cmd_search)
 
@@ -188,8 +229,8 @@ def _cmd_lookup(args: argparse.Namespace) -> dict:
             result = client.lookup_arxiv(args.arxiv_id)
         return ok_envelope("lit.lookup", result=result.to_dict())
     except LitApiError as exc:
-        details = getattr(exc, "details", None)
-        return error_envelope("lit.lookup", type(exc).__name__, str(exc), details=details)
+        code, details = _litapi_error_code_and_details(exc)
+        return error_envelope("lit.lookup", code, str(exc), details=details)
 
 
 def _cmd_citations(args: argparse.Namespace) -> dict:
@@ -198,18 +239,50 @@ def _cmd_citations(args: argparse.Namespace) -> dict:
         page = client.get_citations(args.identifier, limit=args.limit, offset=args.offset)
         return ok_envelope("lit.citations", result=page.to_dict())
     except LitApiError as exc:
-        details = getattr(exc, "details", None)
-        return error_envelope("lit.citations", type(exc).__name__, str(exc), details=details)
+        code, details = _litapi_error_code_and_details(exc)
+        return error_envelope("lit.citations", code, str(exc), details=details)
+
+
+def _search_next_actions(args: argparse.Namespace, result) -> list:
+    """Two states, two actions, nothing else (FB-1 item F10c).
+
+    A provider that FAILED is a configuration or reachability question, and
+    the check that answers it is the one the setup guide already points at.
+    Zero records across every provider that DID answer is a different
+    question -- the providers searched their own narrow ways (see
+    ``provider_query_scope``), and the local all-arXiv index is the one
+    surface here that does neither a title filter nor a keyword match. A
+    search that returned records earns no action."""
+    actions = []
+    if result.providers_failed:
+        failed = ", ".join(sorted({str(f.get("provider")) for f in result.providers_failed}))
+        actions.append(
+            next_action(
+                ["trialerror", "doctor", "--only", "litapi_providers_ready"],
+                f"provider(s) failed ({failed}): check keys, email identification and reachability",
+            )
+        )
+    elif not result.records:
+        actions.append(
+            next_action(
+                ["trialerror", "lit", "arxiv-semantic", "--q", args.query],
+                "no provider returned a record: try the local all-arXiv semantic index, which "
+                "matches meaning rather than a title filter",
+            )
+        )
+    return actions
 
 
 def _cmd_search(args: argparse.Namespace) -> dict:
     client = _build_client(args)
     try:
         result = client.search(args.query, limit=args.limit)
-        return ok_envelope("lit.search", result=result.to_dict())
+        return ok_envelope(
+            "lit.search", result=result.to_dict(), next_actions=_search_next_actions(args, result)
+        )
     except LitApiError as exc:
-        details = getattr(exc, "details", None)
-        return error_envelope("lit.search", type(exc).__name__, str(exc), details=details)
+        code, details = _litapi_error_code_and_details(exc)
+        return error_envelope("lit.search", code, str(exc), details=details)
 
 
 def _cmd_acquire(args: argparse.Namespace) -> dict:
@@ -232,18 +305,62 @@ def _cmd_acquire(args: argparse.Namespace) -> dict:
             store, program_root=program_root, doi=args.doi, arxiv_id=args.arxiv_id,
             created_by_launch=args.launch_id, litapi_config=litapi_cfg, config=raw_config, yes=args.yes,
         )
+
+        # trialerror.ingest.acquire.acquire tolerates a total metadata-lookup
+        # failure silently (module docstring: "a total metadata-lookup
+        # failure does NOT abort acquisition") and files a `wanted`
+        # request-queue row instead -- correct when providers genuinely have
+        # no record, but misleading when EVERY provider failed because none
+        # could be REACHED at all (getattr, not a direct attribute access:
+        # AcquireResult always carries these two fields, but a caller's own
+        # test stub may not -- see tests/test_litapi_cli.py's _FakeAcquireResult).
+        # Surface that distinctly rather than silently queuing a request no
+        # human asked for over what is very likely an egress/DNS problem.
+        metadata_providers = getattr(result, "metadata_providers", None)
+        metadata_failures = getattr(result, "metadata_failures", None) or []
+        if (
+            result.outcome == "queued"
+            and not metadata_providers
+            and _all_failures_transport_unreachable(metadata_failures)
+        ):
+            return error_envelope(
+                "lit.acquire", "transport_unreachable",
+                "metadata reconciliation reached no configured provider (transport-level failure on "
+                "every one) -- filed no request-queue row; this is very likely an egress/DNS problem, "
+                "not \"no open-access copy exists\"",
+                details={"failures": metadata_failures},
+            )
+
         next_actions = []
         if result.outcome == "acquired" and result.job:
-            next_actions.append(
-                next_action(["trialerror", "jobs", "start-worker", "--job-id", result.job["job_id"]],
-                            "run the enqueued pipeline job")
+            # FB-1 item F4: "acquired" is not "searchable". The result says so
+            # in two keys and these two actions say what to do about it -- the
+            # second is the small-batch answer (one document, one job, run it
+            # here), mirroring `ingest add` word for word from the one module
+            # that owns the sentence.
+            from trialerror.ingest import pipeline_status
+
+            next_actions.extend(
+                pipeline_status.not_yet_searchable_next_actions(result.job, next_action=next_action)
             )
         elif result.outcome == "queued":
             next_actions.append(
                 next_action(["trialerror", "ingest", "requests-md", "--program-root", str(program_root)],
                             "re-render requests/REQUESTS.md for the human-fulfillment queue")
             )
-        return ok_envelope("lit.acquire", result=result.to_dict(), next_actions=next_actions)
+        # FB-1 item F10a, mirrored word for word from `ingest add` (same
+        # helper): an acquisition that routes to OCR is about to have its
+        # pages read by whatever [ingest.ocr] names, and an absent table
+        # names the stand-in. In the envelope, never on stderr.
+        from trialerror.ingest.backends import fake_stage_backend_warning
+
+        warning = fake_stage_backend_warning(getattr(result, "stage_backend", None))
+        return ok_envelope(
+            "lit.acquire",
+            result=result.to_dict(),
+            warnings=[warning] if warning else None,
+            next_actions=next_actions,
+        )
     except ValueError as exc:  # cost-gate refusal (mirrors trialerror/cli/ingest.py's own _cmd_add handling)
         return error_envelope("lit.acquire", "cost_gate_refused", str(exc), next_actions=[
             next_action(
@@ -253,8 +370,11 @@ def _cmd_acquire(args: argparse.Namespace) -> dict:
             )
         ])
     except (LitApiError, IngestError, StoreError) as exc:
-        details = getattr(exc, "details", None)
-        return error_envelope("lit.acquire", type(exc).__name__, str(exc), details=details)
+        if isinstance(exc, LitApiError):
+            code, details = _litapi_error_code_and_details(exc)
+        else:
+            code, details = type(exc).__name__, getattr(exc, "details", None)
+        return error_envelope("lit.acquire", code, str(exc), details=details)
     finally:
         store.close()
 

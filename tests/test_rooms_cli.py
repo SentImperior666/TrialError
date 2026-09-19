@@ -177,3 +177,185 @@ def test_room_converge_check_apply_without_by_launch_refused(seeded):
     rc, env = _run_cli(["room", "converge-check", *_pr(program_root), "--id", room_id, "--apply"])
     assert rc == 1
     assert env["error"]["code"] == "by_launch_required"
+
+
+# ---------------------------------------------------------------------------
+# the framework procedure, from the CLI (stage C)
+# ---------------------------------------------------------------------------
+
+
+def _lens_launch_row(program_root, platform_root, *, lens_name: str) -> str:
+    """A launch whose ``attrs`` declare a lens name, the way ``lens export``
+    books one -- the seam the by-name NEITHER check reads."""
+    store = open_store(program_root, platform_root=platform_root)
+    account_id = new_id("ACC")
+    insert(store, "account", {"account_id": account_id, "label": "t", "created_ts": now()})
+    session_id = new_id("SESS")
+    insert(store, "session", {"session_id": session_id, "account_id": account_id, "opened_ts": now(), "status": "open"})
+    launch_id = new_id("LNCH")
+    insert(
+        store, "launch",
+        {
+            "launch_id": launch_id, "account_id": account_id, "program_id": "PROG-test",
+            "session_id": session_id, "agent_kind": "lens", "model_class": "top", "model": "sonnet",
+            "purpose": "ideation", "est_tokens": 100, "booked_ts": now(), "state": "PROVISIONAL",
+            "attrs": json.dumps({"lens_name": lens_name}),
+        },
+    )
+    store.close()
+    return launch_id
+
+
+def _seed_consolidated_ideas(program_root, platform_root, *, launch_id: str, n: int = 4) -> list[str]:
+    store = open_store(program_root, platform_root=platform_root)
+    ids = []
+    for i in range(n):
+        idea_id = new_id("IDEA")
+        insert(
+            store, "idea",
+            {
+                "idea_id": idea_id, "round_id": "ROUND-cli", "author_launch": launch_id, "body": f"idea {i}",
+                "status": "consolidated", "created_ts": now(),
+                "tier": ("near", "far")[i % 2], "recipe_card": ("MISMATCH", "TRANSFER")[i % 2],
+            },
+        )
+        ids.append(idea_id)
+    store.close()
+    return ids
+
+
+def test_room_post_carries_a_turn_kind_and_refuses_closure_in_round_one(seeded):
+    _platform_root, program_root, launch_id = seeded
+    room_id = _create_room(program_root)
+    rc, env = _run_cli(
+        ["room", "post", *_pr(program_root), "--id", room_id, "--launch-id", launch_id, "--dp", "DP1",
+         "--body", "q?", "--kind", "question"]
+    )
+    assert rc == 0, env
+    assert env["result"]["kind"] == "question"
+
+    rc, env = _run_cli(
+        ["room", "post", *_pr(program_root), "--id", room_id, "--launch-id", launch_id, "--dp", "DP2",
+         "--body", "done", "--kind", "closure"]
+    )
+    assert rc == 1
+    assert env["error"]["code"] == "post_refused"
+    assert "round 1" in env["error"]["message"]
+
+
+def test_room_score_needs_a_label_or_a_number(seeded):
+    _platform_root, program_root, launch_id = seeded
+    room_id = _create_room(program_root)
+    rc, env = _run_cli(["room", "score", *_pr(program_root), "--id", room_id, "--dp", "DP1", "--by-launch", launch_id])
+    assert rc == 1
+    assert env["error"]["code"] == "nothing_to_record"
+
+
+def test_room_stance_then_score_computes_the_number_and_refuses_a_supplied_one(seeded, tmp_path):
+    platform_root, program_root, launch_id = seeded
+    a1 = _lens_launch_row(program_root, platform_root, lens_name="lens_a")
+    b1 = _lens_launch_row(program_root, platform_root, lens_name="lens_b")
+    rc, env = _run_cli(
+        ["room", "create", *_pr(program_root), "--topic", "cli framework room",
+         "--dps", json.dumps([{"prompt": "p1"}, {"prompt": "p2"}]),
+         "--participants", "lens_a,lens_b", "--rank-all", "--blind-first-turn", "--buster", "lens_b"]
+    )
+    assert rc == 0, env
+    room_id = env["result"]["room_id"]
+
+    stance_file = tmp_path / "stance.json"
+    stance_file.write_text(
+        json.dumps({
+            "ranking": {"a": ["DP1", "DP2"], "b": ["DP1", "DP2"]},
+            "stances": {"DP1": {"a": "yes", "b": "yes"}, "DP2": {"a": "yes", "b": "no"}},
+        }),
+        encoding="utf-8",
+    )
+    for participant, launch in (("lens_a", a1), ("lens_b", b1)):
+        rc, env = _run_cli(
+            ["room", "stance", *_pr(program_root), "--id", room_id, "--launch-id", launch,
+             "--participant", participant, "--file", str(stance_file)]
+        )
+        assert rc == 0, env
+
+    rc, env = _run_cli(
+        ["room", "score", *_pr(program_root), "--id", room_id, "--dp", "DP1", "--label", "MEETS-BOTH",
+         "--by-launch", launch_id]
+    )
+    assert rc == 0, env
+    assert env["result"]["label"] == "MEETS-BOTH"
+    assert env["result"]["agreement_pct"] == 100.0
+    assert env["result"]["agreement_from"] == "structured_stances"
+
+    rc, env = _run_cli(
+        ["room", "score", *_pr(program_root), "--id", room_id, "--dp", "DP2", "--label", "FAILS",
+         "--agreement-pct", "99", "--by-launch", launch_id]
+    )
+    assert rc == 1
+    assert env["error"]["code"] == "score_refused"
+    assert "not the judge's to supply" in env["error"]["message"]
+
+
+def test_room_extracts_then_require_extracts_scoring(seeded, tmp_path):
+    _platform_root, program_root, launch_id = seeded
+    room_id = _create_room(program_root)
+    _run_cli(["room", "post", *_pr(program_root), "--id", room_id, "--launch-id", launch_id, "--dp", "DP1", "--body", "p"])
+    extracts_file = tmp_path / "extracts.json"
+    extracts_file.write_text(
+        json.dumps([{
+            "seq": 1, "claim": "c", "anchors": ["DOC-1"], "stance_a": "yes", "stance_b": "unclear",
+            "residual_disagreement": "none",
+        }]),
+        encoding="utf-8",
+    )
+    rc, env = _run_cli(
+        ["room", "extracts", *_pr(program_root), "--id", room_id, "--dp", "DP1", "--file", str(extracts_file),
+         "--by-launch", launch_id]
+    )
+    assert rc == 0, env
+
+    rc, env = _run_cli(
+        ["room", "score", *_pr(program_root), "--id", room_id, "--dp", "DP1", "--agreement-pct", "95",
+         "--by-launch", launch_id, "--require-extracts"]
+    )
+    assert rc == 0, env
+
+    rc, env = _run_cli(
+        ["room", "score", *_pr(program_root), "--id", room_id, "--dp", "DP2", "--agreement-pct", "95",
+         "--by-launch", launch_id, "--require-extracts"]
+    )
+    assert rc == 1
+    assert env["error"]["code"] == "score_refused"
+
+
+def test_room_admission_order_from_the_rounds_consolidated_ideas(seeded):
+    platform_root, program_root, launch_id = seeded
+    ids = _seed_consolidated_ideas(program_root, platform_root, launch_id=launch_id, n=4)
+    rc, env = _run_cli(
+        ["room", "admission-order", *_pr(program_root), "--round-id", "ROUND-cli", "--seed", "seed-1",
+         "--ideas-per-room", "2", "--rooms-per-batch", "1", "--no-enforce-batch-band"]
+    )
+    assert rc == 0, env
+    assert sorted(env["result"]["order"]) == sorted(ids)
+    assert len(env["result"]["hash"]) == 64
+    assert len(env["result"]["rooms"]) == 2
+
+
+def test_room_admission_order_with_nothing_consolidated(seeded):
+    _platform_root, program_root, _launch_id = seeded
+    rc, env = _run_cli(
+        ["room", "admission-order", *_pr(program_root), "--round-id", "ROUND-empty", "--seed", "s"]
+    )
+    assert rc == 1
+    assert env["error"]["code"] == "no_consolidated_ideas"
+
+
+def test_room_admission_order_outside_the_charter_band(seeded):
+    platform_root, program_root, launch_id = seeded
+    _seed_consolidated_ideas(program_root, platform_root, launch_id=launch_id, n=4)
+    rc, env = _run_cli(
+        ["room", "admission-order", *_pr(program_root), "--round-id", "ROUND-cli", "--seed", "s",
+         "--rooms-per-batch", "99"]
+    )
+    assert rc == 1
+    assert env["error"]["code"] == "admission_order_refused"

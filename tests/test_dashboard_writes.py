@@ -1049,6 +1049,319 @@ def test_thread_create_missing_field(program_root, platform_root):
     assert "body" in result["message"]
 
 
+# ===========================================================================
+# Lane e (E4) -- the four term-store decisions the Lexicon detail pane draws.
+# Design: docs/reviews/LANE_E_TERM_STORE_DESIGN.md section 5; ruling L-E4.
+# Each gets the house trio: success / clean refusal / missing field.
+# ===========================================================================
+
+
+@pytest.fixture()
+def proposed_sense(program_root, platform_root, seeded):
+    """A second, still-``proposed`` sense of the fixture's own term --
+    ``seeded["term_sense"]`` is already ``current``, which is exactly the
+    state ``accept_sense``/``reject_sense``/``mark_reviewed`` each refuse
+    (a decided/current-only reading, re-decided)."""
+    from trialerror.lexicon.api import propose
+
+    store = open_store(program_root, platform_root=platform_root)
+    try:
+        result = propose(
+            store,
+            lemma="Test Term",  # resolves onto the fixture's existing term
+            gloss="a second, not-yet-decided reading of the same term",
+            origin_kind="manual",
+            origin_ref=None,
+            evidence=[{"kind": "record", "ref_id": seeded["record"], "source_key": "second-register"}],
+            by_launch=seeded["launch"],
+            procedure_version="manual-v1",
+        )
+    finally:
+        store.close()
+    return result
+
+
+@pytest.fixture()
+def two_conflicting_senses(program_root, platform_root, seeded):
+    """A second CURRENT, disjoint-source sense of the fixture's own term,
+    plus a fresh term-scoped ``conflicts_with`` relation naming both --
+    the exact shape ``decide_relation``'s ``scoped``/``not_conflict`` arms
+    expect (member sense ids read from the relation's own ``evidence``
+    JSON; design §3's "one queue item, not thirty-six pairwise ones")."""
+    from trialerror.lexicon.api import accept_sense, open_relation, propose
+
+    store = open_store(program_root, platform_root=platform_root)
+    try:
+        second = propose(
+            store,
+            lemma="Test Term",
+            gloss="a second, disjoint-source reading of the same term",
+            origin_kind="manual",
+            origin_ref=None,
+            evidence=[{"kind": "record", "ref_id": seeded["record"], "source_key": "second-register"}],
+            by_launch=seeded["launch"],
+            procedure_version="manual-v1",
+        )
+        accept_sense(store, second["sense_id"], by_launch=seeded["launch"])
+        rel = open_relation(
+            store,
+            src_kind="term", src_id=seeded["term"], dst_kind="term", dst_id=seeded["term"],
+            verb="conflicts_with", marked_by_kind="system", marked_by_model="scan-v1",
+            evidence={"sense_ids": [seeded["term_sense"], second["sense_id"]]},
+        )
+    finally:
+        store.close()
+    return {"sense_id": second["sense_id"], "rel_id": rel["rel_id"]}
+
+
+def test_term_sense_accept_success(program_root, platform_root, seeded, proposed_sense):
+    result = _dispatch(program_root, platform_root, "term-sense-accept", {
+        "sense_id": proposed_sense["sense_id"], "by_launch": seeded["launch"],
+    })
+    assert result["ok"] is True, result
+    assert result["result"]["status"] == "current"
+    assert result["result"]["term_id"] == seeded["term"]
+
+
+def test_term_sense_accept_refusal_not_proposed(program_root, platform_root, seeded):
+    """The fixture's own sense is already 'current' -- accepting it again is
+    the "decided sense, re-decided" refusal, never a crash."""
+    result = _dispatch(program_root, platform_root, "term-sense-accept", {
+        "sense_id": seeded["term_sense"], "by_launch": seeded["launch"],
+    })
+    assert result["ok"] is False
+    assert result["status"] == "SenseNotDecidableError"
+    assert "not 'proposed'" in result["message"]
+
+
+def test_term_sense_accept_missing_field(program_root, platform_root):
+    result = _dispatch(program_root, platform_root, "term-sense-accept", {"sense_id": "SENSE-x"})
+    assert result["ok"] is False
+    assert result["status"] == "missing_fields"
+    assert "by_launch" in result["message"]
+
+
+def test_term_sense_accept_refuses_an_unknown_launch_and_never_falls_back(
+    program_root, platform_root, proposed_sense
+):
+    """Ruling L-E4, stated as a test -- the same rule ``gate-send-back``'s
+    own test proves for L-C2: an id with no ``platform.launch`` row FAILS
+    WITH THE NAMED ERROR, never a silent fallback."""
+    result = _dispatch(program_root, platform_root, "term-sense-accept", {
+        "sense_id": proposed_sense["sense_id"], "by_launch": "LNCH-does-not-exist",
+    })
+    assert result["ok"] is False
+    assert result["status"] == "XidTargetMissingError"
+    assert "LNCH-does-not-exist" in result["message"]
+
+
+def test_term_sense_reject_success(program_root, platform_root, seeded, proposed_sense):
+    result = _dispatch(program_root, platform_root, "term-sense-reject", {
+        "sense_id": proposed_sense["sense_id"], "by_launch": seeded["launch"], "reason": "a false start",
+    })
+    assert result["ok"] is True, result
+    assert result["result"]["status"] == "rejected"
+    assert result["result"]["reason"] == "a false start"
+
+
+def test_term_sense_reject_refusal_not_proposed(program_root, platform_root, seeded):
+    result = _dispatch(program_root, platform_root, "term-sense-reject", {
+        "sense_id": seeded["term_sense"], "by_launch": seeded["launch"],
+    })
+    assert result["ok"] is False
+    assert result["status"] == "SenseNotDecidableError"
+
+
+def test_term_sense_reject_missing_field(program_root, platform_root):
+    result = _dispatch(program_root, platform_root, "term-sense-reject", {"by_launch": "LNCH-x"})
+    assert result["ok"] is False
+    assert result["status"] == "missing_fields"
+    assert "sense_id" in result["message"]
+
+
+def test_term_mark_reviewed_success(program_root, platform_root, seeded):
+    result = _dispatch(program_root, platform_root, "term-mark-reviewed", {
+        "sense_id": seeded["term_sense"], "by_launch": seeded["launch"],
+    })
+    assert result["ok"] is True, result
+    assert result["result"]["sense_id"] == seeded["term_sense"]
+    # the window was RESET, not left at the fixture's far-future stamp --
+    # "reviewing is cheap and changes no status" still means the clock moves.
+    assert result["result"]["review_after"] != "2099-01-01T00:00:00.000Z"
+
+
+def test_term_mark_reviewed_refusal_not_current(program_root, platform_root, seeded, proposed_sense):
+    """Only a 'current' reading carries a review window."""
+    result = _dispatch(program_root, platform_root, "term-mark-reviewed", {
+        "sense_id": proposed_sense["sense_id"], "by_launch": seeded["launch"],
+    })
+    assert result["ok"] is False
+    assert result["status"] == "SenseNotDecidableError"
+
+
+def test_term_mark_reviewed_missing_field(program_root, platform_root):
+    result = _dispatch(program_root, platform_root, "term-mark-reviewed", {"sense_id": "SENSE-x"})
+    assert result["ok"] is False
+    assert result["status"] == "missing_fields"
+    assert "by_launch" in result["message"]
+
+
+def test_term_relation_decide_scoped_success(program_root, platform_root, seeded, two_conflicting_senses):
+    result = _dispatch(program_root, platform_root, "term-relation-decide", {
+        "rel_id": two_conflicting_senses["rel_id"], "decision": "scoped", "by_launch": seeded["launch"],
+        "disambiguators": {
+            seeded["term_sense"]: "the first system's reading",
+            two_conflicting_senses["sense_id"]: "the second system's reading",
+        },
+    })
+    assert result["ok"] is True, result
+    assert result["result"]["status"] == "confirmed"
+    assert sorted(result["result"]["member_sense_ids"]) == sorted(
+        [seeded["term_sense"], two_conflicting_senses["sense_id"]]
+    )
+    assert len(result["result"]["prov_edges"]) == 1  # design §3: one contradicts edge per member pair
+
+
+def test_term_relation_decide_scoped_missing_disambiguator_is_a_clean_refusal(
+    program_root, platform_root, seeded, two_conflicting_senses
+):
+    """SCOPE keeps every sense, so every member needs a name of its own --
+    naming only one is refused, never silently applied to the rest."""
+    result = _dispatch(program_root, platform_root, "term-relation-decide", {
+        "rel_id": two_conflicting_senses["rel_id"], "decision": "scoped", "by_launch": seeded["launch"],
+        "disambiguators": {seeded["term_sense"]: "only one named"},
+    })
+    assert result["ok"] is False
+    assert result["status"] == "MissingDisambiguatorError"
+
+
+def test_term_relation_decide_not_conflict_success(program_root, platform_root, seeded, two_conflicting_senses):
+    result = _dispatch(program_root, platform_root, "term-relation-decide", {
+        "rel_id": two_conflicting_senses["rel_id"], "decision": "not_conflict", "by_launch": seeded["launch"],
+        "into": seeded["term_sense"],
+    })
+    assert result["ok"] is True, result
+    assert result["result"]["kept_sense_id"] == seeded["term_sense"]
+    assert two_conflicting_senses["sense_id"] in result["result"]["superseded_sense_ids"]
+
+
+def test_term_relation_decide_rejected_success(program_root, platform_root, seeded, two_conflicting_senses):
+    result = _dispatch(program_root, platform_root, "term-relation-decide", {
+        "rel_id": two_conflicting_senses["rel_id"], "decision": "rejected", "by_launch": seeded["launch"],
+    })
+    assert result["ok"] is True, result
+    assert result["result"]["status"] == "rejected"
+
+
+def test_term_relation_decide_refusal_not_pending(program_root, platform_root, seeded, two_conflicting_senses):
+    first = _dispatch(program_root, platform_root, "term-relation-decide", {
+        "rel_id": two_conflicting_senses["rel_id"], "decision": "rejected", "by_launch": seeded["launch"],
+    })
+    assert first["ok"] is True
+    second = _dispatch(program_root, platform_root, "term-relation-decide", {
+        "rel_id": two_conflicting_senses["rel_id"], "decision": "rejected", "by_launch": seeded["launch"],
+    })
+    assert second["ok"] is False
+    assert second["status"] == "RelationNotPendingError"
+
+
+def test_term_relation_decide_missing_field(program_root, platform_root):
+    result = _dispatch(program_root, platform_root, "term-relation-decide", {"rel_id": "TREL-x"})
+    assert result["ok"] is False
+    assert result["status"] == "missing_fields"
+    assert "decision" in result["message"] and "by_launch" in result["message"]
+
+
+def test_term_relation_decide_disambiguators_must_be_an_object(
+    program_root, platform_root, seeded, two_conflicting_senses
+):
+    """``disambiguators`` is the one lane e field whose JSON type is an
+    OBJECT rather than a string -- a caller sending the wrong shape is
+    refused by name, before any store is opened (the same
+    ``_NON_STRING_FIELDS``-closed-check contract every other field here
+    already has)."""
+    result = _dispatch(program_root, platform_root, "term-relation-decide", {
+        "rel_id": two_conflicting_senses["rel_id"], "decision": "scoped", "by_launch": seeded["launch"],
+        "disambiguators": "not-an-object",
+    })
+    assert result["ok"] is False
+    assert result["status"] == "bad_request"
+    assert "disambiguators" in result["message"]
+
+
+def test_term_relation_decide_refuses_an_unknown_launch_and_never_falls_back(
+    program_root, platform_root, two_conflicting_senses
+):
+    result = _dispatch(program_root, platform_root, "term-relation-decide", {
+        "rel_id": two_conflicting_senses["rel_id"], "decision": "rejected", "by_launch": "LNCH-does-not-exist",
+    })
+    assert result["ok"] is False
+    assert result["status"] == "XidTargetMissingError"
+    assert "LNCH-does-not-exist" in result["message"]
+
+
+def test_lexicon_errors_are_clean_refusals_via_is_lexicon_refusal(program_root, platform_root):
+    """``LexiconError`` is deliberately NOT a member of ``_EXPECTED_ERRORS``
+    (see ``_is_lexicon_refusal``'s own docstring for why) -- this proves
+    ``dispatch`` still turns one into a clean ``{"ok": False}`` refusal
+    rather than letting it propagate as a 500, using an injected probe
+    handler so this test needs no real lexicon store state at all."""
+    from trialerror.lexicon.errors import LexiconError, SenseNotDecidableError
+
+    assert not any(
+        expected is LexiconError or (isinstance(expected, type) and issubclass(LexiconError, expected))
+        for expected in writes._EXPECTED_ERRORS
+    )
+
+    def _raiser(_store, _body):
+        raise SenseNotDecidableError("sense 'SENSE-x' is 'current', not 'proposed'")
+
+    original = writes.WRITABLE_ACTIONS.get("__lexicon_probe__")
+    writes.WRITABLE_ACTIONS["__lexicon_probe__"] = _raiser
+    try:
+        result = _dispatch(program_root, platform_root, "__lexicon_probe__", {})
+    finally:
+        if original is None:
+            del writes.WRITABLE_ACTIONS["__lexicon_probe__"]
+        else:  # pragma: no cover - defensive
+            writes.WRITABLE_ACTIONS["__lexicon_probe__"] = original
+    assert result["ok"] is False
+    assert result["status"] == "SenseNotDecidableError"
+    assert "not 'proposed'" in result["message"]
+
+
+def test_a_non_lexicon_exception_still_reaches_the_500_path(program_root, platform_root):
+    """``_is_lexicon_refusal`` must answer False for anything that is not a
+    ``LexiconError`` -- an unrelated bug in a probe handler must still
+    propagate, exactly as the module docstring's "a genuine bug must look
+    like one" promises."""
+
+    def _raiser(_store, _body):
+        raise RuntimeError("boom")
+
+    original = writes.WRITABLE_ACTIONS.get("__boom_probe__")
+    writes.WRITABLE_ACTIONS["__boom_probe__"] = _raiser
+    try:
+        with pytest.raises(RuntimeError):
+            _dispatch(program_root, platform_root, "__boom_probe__", {})
+    finally:
+        if original is None:
+            del writes.WRITABLE_ACTIONS["__boom_probe__"]
+        else:  # pragma: no cover - defensive
+            writes.WRITABLE_ACTIONS["__boom_probe__"] = original
+
+
+def test_every_lane_e_action_is_registered_with_its_required_fields():
+    for action, required in (
+        ("term-sense-accept", ("sense_id", "by_launch")),
+        ("term-sense-reject", ("sense_id", "by_launch")),
+        ("term-relation-decide", ("rel_id", "decision", "by_launch")),
+        ("term-mark-reviewed", ("sense_id", "by_launch")),
+    ):
+        assert action in writes.WRITABLE_ACTIONS, action
+        assert writes.REQUIRED_FIELDS[action] == required, action
+
+
 # ---------------------------------------------------------------------------
 # the table itself
 # ---------------------------------------------------------------------------
@@ -1067,6 +1380,205 @@ def test_every_lane_c_action_is_registered_with_its_required_fields():
 
 def test_the_lane_c_actions_add_no_non_string_fields():
     """`_NON_STRING_FIELDS` is what makes `_validate_fields` a CLOSED check.
-    All four new actions take strings only, so the table is unchanged -- and
-    this asserts that rather than leaving it to be noticed later."""
-    assert set(writes._NON_STRING_FIELDS) == {"agreement_pct"}
+    All four lane C actions take strings only, so THEY add nothing to the
+    table -- lane e's `disambiguators` (below) is the next entry after
+    `agreement_pct`, not a lane C one, and this asserts that rather than
+    leaving it to be noticed later."""
+    assert set(writes._NON_STRING_FIELDS) == {"agreement_pct", "disambiguators"}
+
+
+# ---------------------------------------------------------------------------
+# C-0097 D5 -- `worker-control`
+#
+# The success / refusal / missing-field trio this module gives every action,
+# plus the one thing that is specific to this one: it writes through the SAME
+# function `trialerror offload worker-control` calls, so the refusals cannot
+# differ between the two surfaces.
+# ---------------------------------------------------------------------------
+def _offload_queue(program_root, *, worker_id="dev", report=True, age_s=0.0):
+    from datetime import timedelta
+
+    from trialerror.offload import control as control_api
+    from trialerror.offload import protocol
+    from trialerror.offload.transport import LocalTransport
+    from trialerror.util.timeutil import parse
+
+    root = protocol.ensure_layout(protocol.offload_root(program_root))
+    if report:
+        target = protocol.idle_job_id(worker_id)
+        LocalTransport(root, worker_id=worker_id).heartbeat(
+            target,
+            progress=control_api.encode_progress({"worker_id": worker_id, "state": "idle"}),
+        )
+        if age_s:
+            stamp = protocol.claimed_dir(root) / worker_id / f"{target}{protocol.HEARTBEAT_SUFFIX}"
+            stamp.write_text(
+                (parse(now()) - timedelta(seconds=age_s)).strftime("%Y-%m-%dT%H:%M:%S.000Z") + "\n",
+                encoding="utf-8",
+            )
+    return root
+
+
+def test_worker_control_is_registered_with_its_required_fields():
+    assert "worker-control" in writes.WRITABLE_ACTIONS
+    assert writes.REQUIRED_FIELDS["worker-control"] == ("worker_id", "request", "by_launch")
+    # the action namespace stays hyphenated; the EVENT type stays underscored
+    assert "worker_control" not in writes.WRITABLE_ACTIONS
+    from trialerror.offload.control import CONTROL_EVENT_TYPE
+
+    assert CONTROL_EVENT_TYPE == "offload_worker_control"
+
+
+def test_worker_control_success_writes_the_request_and_one_event(seeded, program_root, platform_root):
+    from trialerror.offload import control as control_api
+
+    root = _offload_queue(program_root)
+    result = _dispatch(
+        program_root, platform_root,
+        "worker-control",
+        {"worker_id": "dev", "request": "pause", "by_launch": seeded["launch"]},
+    )
+    assert result["ok"] is True, result
+    assert result["result"]["requested"] == "pause"
+    assert result["result"]["worker_id"] == "dev"
+    assert result["result"]["by_launch"] == seeded["launch"]
+
+    record = control_api.read_control(root, "dev")
+    assert record["request"] == "pause"
+    assert record["by_launch"] == seeded["launch"]
+    assert record["stale"] is False
+
+    store = open_store(program_root, platform_root=platform_root)
+    try:
+        rows = store.ops.execute(
+            "SELECT payload, launch_id FROM event WHERE type = 'offload_worker_control'"
+        ).fetchall()
+    finally:
+        store.close()
+    assert len(rows) == 1
+    assert json.loads(rows[0]["payload"])["request"] == "pause"
+    assert rows[0]["launch_id"] == seeded["launch"]
+
+
+def test_worker_control_refuses_an_unknown_worker(seeded, program_root, platform_root):
+    """The first of the three refusals D5 names. "Unknown" means no progress
+    file inside the lost window -- i.e. nothing is listening, so the request
+    would sit there until it expired and surprise somebody."""
+    from trialerror.offload import protocol
+
+    root = _offload_queue(program_root, report=False)
+    result = _dispatch(
+        program_root, platform_root,
+        "worker-control",
+        {"worker_id": "ghost", "request": "stop", "by_launch": seeded["launch"]},
+    )
+    assert result["ok"] is False
+    assert "no worker" in result["message"]
+    assert not protocol.control_path(root, "ghost").exists()
+
+    # a worker past the lost window is "unknown" too: the reading is about the
+    # heartbeat age, not about whether a directory exists
+    _offload_queue(program_root, worker_id="sleepy", age_s=5_000)
+    lost = _dispatch(
+        program_root, platform_root,
+        "worker-control",
+        {"worker_id": "sleepy", "request": "stop", "by_launch": seeded["launch"]},
+    )
+    assert lost["ok"] is False
+    assert "no worker" in lost["message"]
+
+
+def test_worker_control_refuses_a_request_that_is_already_pending(seeded, program_root, platform_root):
+    """The second refusal. Silently replacing an unread request would lose an
+    instruction the operator believes they gave."""
+    _offload_queue(program_root)
+    body = {"worker_id": "dev", "request": "pause", "by_launch": seeded["launch"]}
+    assert _dispatch(program_root, platform_root, "worker-control", body)["ok"] is True
+    second = _dispatch(program_root, platform_root, "worker-control", dict(body))
+    assert second["ok"] is False
+    assert "still pending" in second["message"]
+
+    # …but a stop may always overtake a pending pause: it is strictly stronger,
+    # and an operator escalating must not have to wait out a TTL.
+    escalate = _dispatch(
+        program_root, platform_root,
+        "worker-control",
+        {"worker_id": "dev", "request": "stop", "by_launch": seeded["launch"]},
+    )
+    assert escalate["ok"] is True, escalate
+
+
+def test_worker_control_accepts_a_resume_after_the_worker_read_the_pause(
+    seeded, program_root, platform_root
+):
+    """FIX V-2 on the dashboard surface -- the same function, so the same fix: a
+    resume used to be refused for the full TTL with "still pending", on the one
+    step an operator reaches for most (pause, look, carry on)."""
+    from trialerror.offload import control as control_api
+    from trialerror.offload import protocol
+    from trialerror.offload.transport import LocalTransport
+
+    root = _offload_queue(program_root)
+    body = {"worker_id": "dev", "request": "pause", "by_launch": seeded["launch"]}
+    assert _dispatch(program_root, platform_root, "worker-control", body)["ok"] is True
+
+    LocalTransport(root, worker_id="dev").heartbeat(
+        protocol.idle_job_id("dev"),
+        progress=control_api.encode_progress(
+            {"worker_id": "dev", "state": "paused", "control_seen": "pause"}
+        ),
+    )
+    resumed = _dispatch(
+        program_root, platform_root,
+        "worker-control",
+        {"worker_id": "dev", "request": "resume", "by_launch": seeded["launch"]},
+    )
+    assert resumed["ok"] is True, resumed
+    assert control_api.read_control(root, "dev")["request"] == "resume"
+
+
+def test_worker_control_refuses_a_launch_with_no_row(seeded, program_root, platform_root):
+    """The third refusal, and the one that makes the control law attributable:
+    ruling L-E4's posture, the same as every lane e decision -- an id with no
+    ``platform.launch`` row refuses, never falls back to an identity."""
+    from trialerror.offload import protocol
+
+    root = _offload_queue(program_root)
+    result = _dispatch(
+        program_root, platform_root,
+        "worker-control",
+        {"worker_id": "dev", "request": "pause", "by_launch": "LNCH-does-not-exist"},
+    )
+    assert result["ok"] is False
+    assert result["status"] == "XidTargetMissingError"
+    assert not protocol.control_path(root, "dev").exists()
+
+
+def test_worker_control_missing_fields_are_refused_by_name(seeded, program_root, platform_root):
+    for body, missing in (
+        ({"request": "pause", "by_launch": seeded["launch"]}, "worker_id"),
+        ({"worker_id": "dev", "by_launch": seeded["launch"]}, "request"),
+        ({"worker_id": "dev", "request": "pause"}, "by_launch"),
+    ):
+        result = _dispatch(program_root, platform_root, "worker-control", body)
+        assert result["ok"] is False
+        assert result["status"] == "missing_fields"
+        assert missing in result["message"]
+
+
+def test_worker_control_refuses_a_request_word_it_does_not_know(seeded, program_root, platform_root):
+    """There is no `kill`: D8 forbids preemptive termination anywhere in the
+    harness, so the word is refused at the surface rather than quietly mapped
+    onto a stop."""
+    from trialerror.offload import protocol
+
+    root = _offload_queue(program_root)
+    for word in ("kill", "terminate", "PAUSE"):
+        result = _dispatch(
+            program_root, platform_root,
+            "worker-control",
+            {"worker_id": "dev", "request": word, "by_launch": seeded["launch"]},
+        )
+        assert result["ok"] is False, word
+        assert "pause, resume or stop" in result["message"]
+    assert not protocol.control_path(root, "dev").exists()

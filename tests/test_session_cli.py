@@ -122,6 +122,73 @@ def test_session_close_hooks_disabled_refused_then_succeeds_after_hook_alive(roo
     assert env["result"]["code"] == "closed"
 
 
+def test_session_close_refuses_a_handoffs_dir_outside_the_program_root(roots, account, tmp_path):
+    """The incident: a scratch program scaffolded from another program's
+    trialerror.toml carried that program's ABSOLUTE handoffs_dir, and
+    `session close` rendered HANDOFF_<date>.md into the other program's repo
+    root -- marking a live session closed there."""
+    platform_root, program_root = roots
+    other_program = tmp_path / "other-program"
+    other_program.mkdir()
+    common = ["--program-root", str(program_root), "--platform-root", str(platform_root)]
+    rc, env = _run_cli(["session", "boot", *common])
+    assert rc == 0, env
+    session_id = env["result"]["session_id"]
+
+    store = open_store(program_root, platform_root=platform_root)
+    append_event(store, event_type="hook_alive", session_id=session_id, payload={})
+    store.close()
+
+    # the copied config lands (this is a scratch program scaffolded from
+    # another program's trialerror.toml)
+    (program_root / "trialerror.toml").write_text(
+        f'[program]\nid = "scratch"\n\n[paths]\nhandoffs_dir = {str(other_program)!r}\n',
+        encoding="utf-8",
+    )
+
+    rc, env = _run_cli(["session", "boot", *common])
+    assert env["ok"] is False
+    assert env["error"]["code"] == "handoffs_dir_outside_root"
+
+    rc, env = _run_cli(["session", "close", "--course-check", '{"rungs":"1"}', *common])
+    assert env["ok"] is False
+    assert env["error"]["code"] == "handoffs_dir_outside_root"
+    assert "handoffs_dir_outside_root = true" in env["error"]["message"]
+    # nothing was written into the other program, and the session is still open
+    assert list(other_program.iterdir()) == []
+    rc, env = _run_cli(["session", "status", *common])
+    assert env["result"]["open"] is True
+
+
+def test_a_refused_boot_opens_no_session(roots, account, tmp_path):
+    """Fix pass N-4. The refusal used to come out of the boot BUNDLE, i.e.
+    after the session row had been written: the operator was told the boot
+    did not complete and the store held an open session, which is not what
+    `docs/USER_SETUP.md` says."""
+    platform_root, program_root = roots
+    other_program = tmp_path / "other-program-boot"
+    other_program.mkdir()
+    (program_root / "trialerror.toml").write_text(
+        f'[program]\nid = "scratch"\n\n[paths]\nhandoffs_dir = {str(other_program)!r}\n',
+        encoding="utf-8",
+    )
+    common = ["--program-root", str(program_root), "--platform-root", str(platform_root)]
+
+    rc, env = _run_cli(["session", "boot", *common])
+    assert env["ok"] is False
+    assert env["error"]["code"] == "handoffs_dir_outside_root"
+
+    rc, env = _run_cli(["session", "status", *common])
+    assert env["result"]["open"] is False
+    store = open_store(program_root, platform_root=platform_root)
+    try:
+        n = store.ops.execute("SELECT COUNT(*) AS n FROM session").fetchone()["n"]
+    finally:
+        store.close()
+    assert n == 0
+    assert list(other_program.iterdir()) == []
+
+
 def test_session_close_and_render_handoff_respect_configured_handoffs_dir(roots, account, tmp_path):
     """the import-design notes (internal, not in this export) Sec 5 knob #3: the CLI actually loads
     trialerror.toml and threads it through boot/close/render-handoff -- not
@@ -130,7 +197,9 @@ def test_session_close_and_render_handoff_respect_configured_handoffs_dir(roots,
     platform_root, program_root = roots
     external = tmp_path / "external-handoffs"
     (program_root / "trialerror.toml").write_text(
-        f'[program]\nid = "demo"\n\n[paths]\nhandoffs_dir = {str(external)!r}\n', encoding="utf-8"
+        f'[program]\nid = "demo"\n\n[paths]\nhandoffs_dir = {str(external)!r}\n'
+        "\n[session]\nhandoffs_dir_outside_root = true\n",
+        encoding="utf-8",
     )
     common = ["--program-root", str(program_root), "--platform-root", str(platform_root)]
     rc, env = _run_cli(["session", "boot", *common])
