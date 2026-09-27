@@ -43,7 +43,7 @@ import json
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol
+from typing import Any, Mapping, Protocol, Sequence
 
 from trialerror.litapi.errors import TransportNotConfiguredError
 
@@ -106,7 +106,23 @@ class FakeTransport:
 
     def __init__(self) -> None:
         self._routes: dict[str, TransportResponse] = {}
+        self._sequences: dict[str, list[TransportResponse]] = {}
         self.calls: list[dict[str, Any]] = []
+
+    def add_sequence(self, url: str, responses: Sequence[TransportResponse]) -> None:
+        """Register SUCCESSIVE responses for one exact ``url``: the first
+        ``get`` returns the first, the second the second, and once the list is
+        exhausted the last one repeats.
+
+        This is what a retry test needs and :meth:`add_response` cannot
+        express -- "429, then 200" is a different fixture from either of its
+        halves, and a route that changed its answer on its own would make
+        every existing single-response test ambiguous. ``add_response`` is
+        unchanged."""
+        if not responses:
+            raise ValueError("add_sequence requires at least one response")
+        self._sequences[url] = list(responses)
+        self._routes[url] = responses[0]
 
     def add_response(self, url: str, response: TransportResponse) -> None:
         """Register the canned response for an exact ``url`` (including
@@ -137,6 +153,9 @@ class FakeTransport:
         timeout_s: float | None = None,
     ) -> TransportResponse:
         self.calls.append({"url": url, "headers": dict(headers) if headers else {}})
+        sequence = self._sequences.get(url)
+        if sequence:
+            return sequence.pop(0) if len(sequence) > 1 else sequence[0]
         if url not in self._routes:
             raise TransportNotConfiguredError(
                 f"FakeTransport has no canned response registered for URL: {url!r} "

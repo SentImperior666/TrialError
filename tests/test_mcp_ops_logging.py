@@ -46,7 +46,10 @@ def test_every_tool_logs_exactly_one_mcp_tool_call_event(program_root, platform_
 
     tools = build_tools(program_root=program_root, platform_root=platform_root)
     tools["session_status"].handler({})  # a success call (informational "no session_id given" path)
-    tools["reconcile_launch"].handler({"launch_id": "LNCH-does-not-exist", "actual_tokens": 1})  # a failure call
+    tools["book_launch"].handler(
+        {"program_id": "PROG-test", "agent_kind": "tester", "model_class": "top", "model": "sonnet",
+         "purpose": "fixture", "est_tokens": "not-a-number"}
+    )  # a failure call (bad_input)
 
     store = open_store(program_root, platform_root=platform_root)
     try:
@@ -58,8 +61,8 @@ def test_every_tool_logs_exactly_one_mcp_tool_call_event(program_root, platform_
     payloads = [json.loads(e["payload"]) for e in events]
     assert payloads[0]["tool"] == "session_status"
     assert payloads[0]["error_code"] is None
-    assert payloads[1]["tool"] == "reconcile_launch"
-    assert payloads[1]["error_code"] == "reconcile_refused"
+    assert payloads[1]["tool"] == "book_launch"
+    assert payloads[1]["error_code"] == "bad_input"
     for p in payloads:
         assert p["server"] == "trialerror-ops"
         assert isinstance(p["latency_ms"], (int, float))

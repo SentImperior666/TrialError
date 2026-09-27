@@ -87,6 +87,7 @@ import re
 import sqlite3
 from collections import defaultdict
 
+from trialerror.lens.link import assignment_rows_for_launch, bound_assignment_count
 from trialerror.lens.roster import BUSTER_ONLY_CARD, roster_cards
 from trialerror.stores import paths
 from trialerror.stores.connection import connect
@@ -102,6 +103,7 @@ __all__ = [
     "check_idea_missing_dossier",
     "check_round_collapse_flag_unacknowledged",
     "check_lens_brief_contains_verdict_text",
+    "check_rejudge_rows_match_recorded_kappa",
 ]
 
 #: Default floor for the WARN-only cluster-coverage check (build brief:
@@ -590,12 +592,16 @@ def _slice_docs_for_launch(
     Four sources, most direct first: the ``slice_doc_ids`` the retrieval
     scope itself reads; the ``assign_ids`` a bookable row carries; the
     ``roster_id`` it also carries, whose lens's whole logged slice is the
-    answer; and the ``lens_assignment.lens_launch_id`` link
-    ``budget book --assign-id`` writes from the assignment side (ops
-    schema-v10). The fourth exists because the first three all live in
-    ``launch.attrs``: a lens booked through the CLI carries none of them,
-    resolved to ``None``, and this whole check SKIPped -- reporting on a
-    barrier that never engaged for exactly the launches it exists for.
+    answer; and the assignment-side link ``budget book --assign-id`` writes
+    (``lens_assignment_launch`` since ops schema-v11, falling back to the
+    v10 ``lens_assignment.lens_launch_id`` column). The fourth exists
+    because the first three all live in ``launch.attrs``: a lens booked
+    through the CLI carries none of them, resolved to ``None``, and this
+    whole check SKIPped -- reporting on a barrier that never engaged for
+    exactly the launches it exists for. Reading the link table rather than
+    the column alone (lane R0-B item 3) is what lets it judge a post made
+    under a lens's SECOND launch: bindings accumulate, so the later phase
+    audits against the same slice as the first.
 
     A lens launch that resolves to an EMPTY slice is still a lens
     launch -- it returns an empty set, and every id it cites is outside it,
@@ -621,9 +627,7 @@ def _slice_docs_for_launch(
         return _candidate_ids(rows)
 
     if launch_id:
-        rows = ops.execute(
-            "SELECT slice_spec FROM lens_assignment WHERE lens_launch_id = ?", (str(launch_id),)
-        ).fetchall()
+        rows = assignment_rows_for_launch(ops, launch_id, columns="slice_spec")
         if rows:
             return _candidate_ids(rows)
 
@@ -733,9 +737,7 @@ def check_lens_citations_within_slice(ctx: DoctorContext) -> CheckResult:
         lens_posts = [(row, slice_docs) for row, slice_docs in lens_posts if slice_docs is not None]
         if not lens_posts:
             n_assignments = conn.execute("SELECT COUNT(*) AS n FROM lens_assignment").fetchone()["n"]
-            n_linked = conn.execute(
-                "SELECT COUNT(*) AS n FROM lens_assignment WHERE lens_launch_id IS NOT NULL"
-            ).fetchone()["n"]
+            n_linked = bound_assignment_count(conn)
             return CheckResult(
                 name="lens_citations_within_slice", category="lens", status="skip",
                 message=(
@@ -1187,3 +1189,193 @@ def check_lens_brief_contains_verdict_text(ctx: DoctorContext) -> CheckResult:
         name=name, category="lens", status=status, message=message,
         details={"offenders": offenders, "briefs_checked": len(briefs)},
     )
+
+
+@register_check("rejudge_rows_match_recorded_kappa", category="lens")
+def check_rejudge_rows_match_recorded_kappa(ctx: DoctorContext) -> CheckResult:
+    """A batch whose recording published a kappa can still produce it from
+    the store.
+
+    A judged screen may re-judge a share of its subjects with a second
+    judge, and the recording prints Cohen's kappa per reference set. Until
+    knowledge-v13 that was the ONLY trace: the second judge's labels were
+    read for the number and then dropped, so the round's own analysis tool
+    -- which reproduces its figures from ``idea`` and ``verdict`` -- printed
+    the round's kappa with n = 0 while the re-judge had in fact run, and the
+    raw disagreements had to be rebuilt from the judges' sheets by hand. The
+    harness's own rule is that an audit number must be reproducible from the
+    store, so a published kappa with no ``verdict_rejudge`` rows behind it
+    is a number nothing can check.
+
+    ``warn``, never ``fail``: every batch recorded before this migration is
+    in exactly that state through no fault of its own, and the answer is a
+    backfill rather than an alarm. The message names the batch and the verb.
+
+    Only batches whose recording reports a kappa block with ``n > 0`` are
+    judged -- a batch with no second judge published no number, and a kappa
+    over fewer than two co-labelled subjects is reported as ``None`` by the
+    recorder itself."""
+    name = "rejudge_rows_match_recorded_kappa"
+    if ctx.program_root is None:
+        return CheckResult(name=name, category="lens", status="skip", message="program_root not configured")
+    knowledge_path = paths.knowledge_db_path(ctx.program_root)
+    if not knowledge_path.exists():
+        return CheckResult(
+            name=name, category="lens", status="skip",
+            message="knowledge.db not found (program not yet initialized)",
+        )
+    dirs = _round_dirs(ctx)
+    if not dirs:
+        return CheckResult(
+            name=name, category="lens", status="skip",
+            message="no round directory on disk (the novelty screen has not run in this program)",
+        )
+
+    from trialerror.lens.novelty import (
+        REFERENCE_SETS,
+        REJUDGE_TABLE,
+        rejudge_report,
+    )
+
+    # Every recording result that published a kappa, off the round
+    # directories the screen itself writes. The result file carries the
+    # round's own `label_vocabularies` when it declared one, which is what
+    # the chance term must be computed over -- the same instrument the
+    # number was published under, read from the same file.
+    published: list[dict] = []
+    for round_id, round_path in dirs.items():
+        judged = round_path / "judged"
+        if not judged.is_dir():
+            continue
+        for result_file in sorted(judged.glob("*-verdicts.json")):
+            try:
+                recorded = json.loads(result_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            kappa = recorded.get("kappa") or {}
+            wanted = {
+                key: block for key, block in kappa.items()
+                if isinstance(block, dict) and (block.get("n") or 0) > 0
+            }
+            if not wanted:
+                continue
+            published.append(
+                {
+                    "round_id": round_id,
+                    "batch_id": str(recorded.get("batch_id") or result_file.name[: -len("-verdicts.json")]),
+                    "kappa": wanted,
+                    "label_vocabularies": recorded.get("label_vocabularies"),
+                }
+            )
+    if not published:
+        return CheckResult(
+            name=name, category="lens", status="skip",
+            message=(
+                "no batch on disk published a kappa over two or more co-labelled subjects -- no round "
+                "in this program has been re-judged"
+            ),
+            details={"rounds": sorted(dirs)},
+        )
+
+    knowledge = connect(knowledge_path, read_only=True)
+    try:
+        present = knowledge.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (REJUDGE_TABLE,)
+        ).fetchone()
+    finally:
+        knowledge.close()
+    if present is None:
+        return CheckResult(
+            name=name, category="lens", status="skip",
+            message=(
+                f"this program's knowledge.db has no {REJUDGE_TABLE} table: it predates knowledge "
+                "schema v13, so there is nothing yet for a published kappa to be checked against"
+            ),
+        )
+
+    # A Store over the program root, so `rejudge_report` reads the same two
+    # tables a caller would; opened once for every batch, and only SELECTs
+    # are issued through it. A root this check cannot open is reported as a
+    # skip rather than as a traceback -- every other check here degrades that
+    # way, and "the platform root is not resolvable from here" is a statement
+    # about the environment and not about any round's kappa.
+    from trialerror.stores.store import open_store
+
+    offenders: list[dict] = []
+    try:
+        store = open_store(ctx.program_root)
+    except Exception as exc:
+        return CheckResult(
+            name=name, category="lens", status="skip",
+            message=f"could not open this program's stores to read the re-judge back ({type(exc).__name__}: {exc})",
+        )
+    try:
+        for entry in published:
+            try:
+                report = rejudge_report(
+                    store,
+                    round_id=entry["round_id"],
+                    batch_id=entry["batch_id"],
+                    label_vocabularies=entry["label_vocabularies"],
+                )
+            except Exception as exc:  # a report that cannot be read IS the finding
+                offenders.append(
+                    {
+                        "round_id": entry["round_id"], "batch_id": entry["batch_id"],
+                        "reason": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
+            computed = report["pooled"]["sets"]
+            if not report["n_rows"]:
+                offenders.append(
+                    {
+                        "round_id": entry["round_id"], "batch_id": entry["batch_id"],
+                        "reason": "no re-judge row on file for a batch that published a kappa",
+                        "recorded": entry["kappa"],
+                    }
+                )
+                continue
+            for reference_set, key in REFERENCE_SETS.items():
+                was = entry["kappa"].get(key)
+                if not was:
+                    continue
+                is_now = computed.get(reference_set) or {}
+                differing = {
+                    field: {"recorded": was.get(field), "recomputed": is_now.get(field)}
+                    for field in ("kappa", "n", "observed_agreement")
+                    if not _same_statistic(is_now.get(field), was.get(field))
+                }
+                if differing:
+                    offenders.append(
+                        {
+                            "round_id": entry["round_id"], "batch_id": entry["batch_id"],
+                            "reference_set": reference_set,
+                            "reason": "the recomputed kappa is not the published one",
+                            "differing": differing,
+                        }
+                    )
+    finally:
+        store.close()
+
+    status = "warn" if offenders else "pass"
+    message = (
+        f"{len(offenders)} published kappa(s) cannot be reproduced from {REJUDGE_TABLE} -- back them "
+        "fill with `trialerror lens screen --record-rejudge --round-id R --batch-id B "
+        "--second-judge-file F --launch-id L`, which verifies itself against the recorded number"
+        if offenders
+        else f"all {len(published)} published kappa(s) are reproducible from verdict + {REJUDGE_TABLE}"
+    )
+    return CheckResult(
+        name=name, category="lens", status=status, message=message,
+        details={"offenders": offenders, "batches_checked": len(published)},
+    )
+
+
+def _same_statistic(recomputed, recorded) -> bool:
+    """Is a recomputed figure the published one, at the precision the
+    recording result file holds it to? The shared helper lives in the screen
+    itself; this is its one caller outside it."""
+    from trialerror.lens.novelty import _matches_recorded
+
+    return _matches_recorded(recomputed, recorded)

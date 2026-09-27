@@ -1,0 +1,21 @@
+{
+  "id": "https://openalex.org/W9000000001",
+  "doi": "https://doi.org/10.9999/widgets",
+  "title": "A Study of Widgets",
+  "publication_year": 1986,
+  "type": "article",
+  "ids": {"openalex": "https://openalex.org/W9000000001", "doi": "https://doi.org/10.9999/widgets"},
+  "authorships": [
+    {"author_position": "first", "author": {"id": "https://openalex.org/A9000000001", "display_name": "Cat Writer"}},
+    {"author_position": "last", "author": {"id": "https://openalex.org/A9000000002", "display_name": "Dan Other"}}
+  ],
+  "primary_location": {"source": {"display_name": "Journal of Widget Studies"}},
+  "open_access": {"is_oa": false, "oa_url": null},
+  "cited_by_count": 250,
+  "counts_by_year": [
+    {"year": 2025, "cited_by_count": 4},
+    {"year": 2024, "cited_by_count": 6}
+  ],
+  "abstract_inverted_index": {"Widgets": [0], "are": [1], "studied.": [2]},
+  "referenced_works": ["https://openalex.org/W9200000001"]
+}

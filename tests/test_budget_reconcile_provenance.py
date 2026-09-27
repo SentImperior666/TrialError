@@ -261,18 +261,9 @@ def test_every_assertable_source_still_works(store, source):
     assert result["reconcile_source"] == source
 
 
-def test_the_mcp_reconcile_tool_cannot_assert_the_event_source(store):
-    """The MCP tool passes ``reconcile_source`` straight through from its
-    args, so the refusal has to live in the write path, not in the CLI."""
-    from trialerror.mcp.ops import _tool_reconcile_launch
-
-    _account, session_id = open_account_session(store)
-    booked = _book(store, session_id)
-    envelope = _tool_reconcile_launch(
-        {"launch_id": booked.launch_id, "actual_tokens": 9000, "reconcile_source": "event"}, store=store
-    )
-    assert envelope["ok"] is False
-    assert envelope["error"]["code"] == "reconcile_refused"
+# The MCP reconcile tool that used to pass ``reconcile_source`` straight through
+# was retired in Phase 0 (it had no use). The refusal lives in the write path,
+# which the tests above exercise directly, so nothing is lost by its removal.
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,15 @@
+{
+  "meta": {"count": 1, "page": 1, "per_page": 8},
+  "results": [
+    {
+      "id": "https://openalex.org/W9300000001",
+      "doi": "https://doi.org/10.9999/widgets.revisited",
+      "title": "Widgets Revisited",
+      "publication_year": 2019,
+      "type": "article",
+      "authorships": [{"author": {"id": "https://openalex.org/A9000000001", "display_name": "Cat Writer"}}],
+      "cited_by_count": 9
+    }
+  ],
+  "group_by": []
+}

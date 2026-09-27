@@ -149,3 +149,103 @@ def test_openai_query_encoder_malformed_response_raises_encoder_error(monkeypatc
     enc = OpenAIQueryEncoder(api_key="sk-test")
     with pytest.raises(OpenAIEncoderError, match="missing data"):
         enc.encode_query("q")
+
+
+# ---------------------------------------------------------------------------
+# lane FB-acq item 3: encode_queries -- one round-trip for a whole batch
+# ---------------------------------------------------------------------------
+
+
+def test_fake_encode_queries_equals_per_query_encoding():
+    encoder = FakeQueryEncoder(dims=8)
+    texts = ["one query", "another query", "a third"]
+
+    assert encoder.encode_queries(texts) == [encoder.encode_query(t) for t in texts]
+    assert encoder.encode_queries([]) == []
+
+
+def test_openai_encode_queries_sends_one_post_with_a_list_input(monkeypatch):
+    sent = {}
+
+    class _Resp:
+        def read(self):
+            return json.dumps(
+                {"data": [
+                    {"index": 0, "embedding": [1.0, 0.0]},
+                    {"index": 1, "embedding": [0.0, 1.0]},
+                ]}
+            ).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _fake_urlopen(request, timeout):
+        sent["body"] = json.loads(request.data.decode("utf-8"))
+        return _Resp()
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+    encoder = OpenAIQueryEncoder(api_key="example-key")
+
+    vectors = encoder.encode_queries(["first", "second"])
+
+    assert sent["body"]["input"] == ["first", "second"]  # ONE post for the batch
+    assert vectors == [[1.0, 0.0], [0.0, 1.0]]
+
+
+def test_openai_encode_queries_orders_by_index_not_by_arrival(monkeypatch):
+    """The API documents an ``index`` per embedding precisely because the
+    response order is not part of the contract -- a batch whose vectors
+    silently belonged to other queries would produce plausible, wrong answers."""
+
+    class _Resp:
+        def read(self):
+            return json.dumps(
+                {"data": [
+                    {"index": 2, "embedding": [3.0]},
+                    {"index": 0, "embedding": [1.0]},
+                    {"index": 1, "embedding": [2.0]},
+                ]}
+            ).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda request, timeout: _Resp())
+    encoder = OpenAIQueryEncoder(api_key="example-key")
+
+    assert encoder.encode_queries(["a", "b", "c"]) == [[1.0], [2.0], [3.0]]
+
+
+def test_openai_encode_queries_refuses_a_short_response(monkeypatch):
+    class _Resp:
+        def read(self):
+            return json.dumps({"data": [{"index": 0, "embedding": [1.0]}]}).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda request, timeout: _Resp())
+    encoder = OpenAIQueryEncoder(api_key="example-key")
+
+    with pytest.raises(OpenAIEncoderError, match="2 inputs"):
+        encoder.encode_queries(["a", "b"])
+
+
+def test_openai_encode_queries_wraps_a_transport_failure_like_encode_query(monkeypatch):
+    def _boom(request, timeout):
+        raise urllib.error.URLError("no route to host")
+
+    monkeypatch.setattr("urllib.request.urlopen", _boom)
+    encoder = OpenAIQueryEncoder(api_key="example-key")
+
+    with pytest.raises(OpenAIEncoderError):
+        encoder.encode_queries(["a", "b"])

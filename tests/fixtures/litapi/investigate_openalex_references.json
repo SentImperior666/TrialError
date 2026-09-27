@@ -1,0 +1,15 @@
+{
+  "meta": {"count": 1, "page": 1, "per_page": 10},
+  "results": [
+    {
+      "id": "https://openalex.org/W9200000001",
+      "doi": "https://doi.org/10.9999/widgets.notes",
+      "title": "Early Notes on Widgets",
+      "publication_year": 1970,
+      "type": "book-chapter",
+      "authorships": [{"author": {"id": "https://openalex.org/A9200000001", "display_name": "Eve Earlier"}}],
+      "cited_by_count": 70
+    }
+  ],
+  "group_by": []
+}

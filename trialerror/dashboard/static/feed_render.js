@@ -30,8 +30,7 @@
      ARRIVED    cards in `panel.posts` -- append order, the raw truth.
 
    WHAT IS DELIBERATELY NOT HERE. The post BODY. Lane b owns
-   `buildPostBody(post, panel)` -- the AS POSTED / PLAIN ENGLISH split, the five
-   translation_state readings, the withheld strip, the TRANSLATE button -- and
+   `buildPostBody(post, panel)` -- the post's body as posted -- and
    this file calls it UNCHANGED for every card, in both orders, at every depth.
    The only thing threading does to a body is put `is-stacked` on the card at
    depth >= 3 so dashboard.css collapses the two columns into one; the body
@@ -62,7 +61,7 @@
      writesEnabled    false -> every REPLY IN THREAD is drawn disabled WITH a
                       reason (DASHBOARD_V2_API section 12.11), which is also
                       what makes the static export read-only by construction
-     buildPostBody(post, panel) -> node      lane b's, injected
+     buildPostBody(post, panel) -> node      the page's body renderer, injected
      chip(text, variant) -> node             the page's
      fmtHM(iso) -> string                    the page's
      onReply(post)                           set the composer's reply target

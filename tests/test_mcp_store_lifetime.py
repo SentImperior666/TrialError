@@ -108,5 +108,8 @@ def test_ops_store_still_closes_and_logs_on_the_normal_caught_error_path(program
     from trialerror.mcp.ops import build_tools
 
     tools = build_tools(program_root=program_root, platform_root=platform_root)
-    env = tools["reconcile_launch"].handler({"launch_id": "LNCH-does-not-exist", "actual_tokens": 1})
-    assert env["ok"] is False  # already-caught BudgetError path (StoreError-family) -- see test_mcp_ops_logging.py
+    env = tools["book_launch"].handler(
+        {"program_id": "PROG-test", "agent_kind": "tester", "model_class": "top", "model": "sonnet",
+         "purpose": "fixture", "est_tokens": 500}
+    )
+    assert env["ok"] is False  # already-caught NoOpenSessionError path (a BudgetError) -- see test_mcp_ops_logging.py

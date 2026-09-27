@@ -48,7 +48,7 @@ ignored, never an error.
 
 SSE (`GET /dashboard/events`) is unchanged by this build: `hello` once on
 connect, `changed` whenever any watched store file's mtime moves (the new
-`criterion`/`feed_post_translation` tables live inside `ops.db`, already a
+`criterion` table lives inside `ops.db`, already a
 watched file — no new SSE event type was needed or added), a heartbeat
 comment every 15s otherwise. A client showing one of the seven new panels
 should just re-fetch that panel's own route on `changed`, exactly like
@@ -97,20 +97,7 @@ Every OTHER field described below is only present when `status == "ok"`.
       "ts": "2026-08-29T17:22:59.787Z",
       "body": "test post body",
       "in_reply_to": null,
-      "kind": "launch",
-      "translation_state": "translated",
-      "translation": {
-        "translation_id": "XLAT-01M178QK2S946RDDWD4F8NSJA8",
-        "body": "test translation body",
-        "style_mode": "flavored",
-        "translator_version": "1",
-        "faithfulness_score": null,
-        "created_ts": "2026-08-29T17:22:59.801Z",
-        "gate_status": "pass",
-        "gate_reasons": {"passed": true, "reasons": [], "score": null, "threshold": 0.8,
-                          "judged": false, "style": {"style_mode": "flavored", "violations": [],
-                                                     "hedges_lost": []}}
-      }
+      "kind": "launch"
     }
   ],
   "unread_directives": [
@@ -122,9 +109,7 @@ Every OTHER field described below is only present when `status == "ok"`.
       "read_ts": null,
       "read_by_session": null
     }
-  ],
-  "translator_table_available": true,
-  "translation_withheld_count": 0
+  ]
 }
 ```
 
@@ -134,16 +119,7 @@ Notes:
 - `active_thread_id` — the resolved selection: the `thread_id` you passed, or (default) the thread with the most recently-posted message, or (if no thread has any posts yet) the newest-created thread, or `null` if there are zero threads at all.
 - `posts` — full-text posts in `active_thread_id`, oldest first (append order). `author` is server-derived and NEVER caller-settable (`trialerror.events.api._derive_author`) — always `"<agent_kind>:<launch_id>"` or `"orchestrator:<session_id>"`.
 - `kind` — the text before the first `:` in `author`. Use this to badge a post (`orchestrator`, `lens`, `critic`, whatever `agent_kind` a launch actually used — this is real data, not a fixed enum, so render an unknown value neutrally rather than assuming a closed set).
-- `translation_state` — **read this, not `translation != null`.** One of five values (`trialerror.dashboard.data._translation_slot`), matching the internal translator design notes' §4.4 right-column states (not in this export):
-  - `"translated"` — a gated, PASSING translation. `translation.body` is the plain-English text.
-  - `"ungated"` — a translation stored with no gate verdict (a row written before schema v6, or one hand-inserted outside `trialerror.feed_translate`). Served, but render the "not gated" note: it was never checked.
-  - `"withheld"` — the faithfulness gate FAILED it. **`translation.body` is `null` — the withheld text is not in the payload at all**, deliberately (a body the UI must not render has no business crossing the wire). `translation.gate_reasons.reasons` carries the human-readable failure list; show that plus the original.
-  - `"pending"` — a `feed_translate` job for this post is queued/claimed/running on the ledger. Render "translation pending".
-  - `"absent"` — nothing has been asked for. Render the `TRANSLATE ▾` affordance (which posts `write/feed-translate`, §12.10).
-- `translation` — `null` for `pending`/`absent`; otherwise the one `status='current'` row for that post, with `gate_status` (`pass`/`fail`/`ungated`), `gate_reasons` (a parsed JSON object, or `null`), and `faithfulness_score` (`null` unless the optional judged tier ran — the always-on deterministic tier produces no score).
 - `unread_directives` — **NOT scoped to `active_thread_id`.** `inbox_item` (the operator directive channel) carries no `thread_id` column in the real schema — it is a program-wide channel. Render it as its own "operator inbox" surface, not inline in the thread's post stream (the `Feed.dc.html` mockup shows an inline "OPERATOR ... DIRECTIVE" card; that shape isn't backed by real per-thread data — build the directive UI as a separate list instead). Reading this list is a plain `SELECT ... WHERE read_ts IS NULL` — it does **not** mark anything read (`mark_read=False` is always passed).
-- `translator_table_available` — `true`/`false`. Grey out or hide the `TRANSLATE ▾` affordance entirely on a program whose `ops.db` predates schema v4.
-- `translation_withheld_count` — how many posts in this thread the gate withheld. Surface it near the panel chrome: a withheld translation is invisible by design, so without this number a systematically broken translator looks exactly like one nobody ran. `trialerror doctor` reports the program-wide figure as `feed_translation_failures`.
 
 ### 2.1 Threading (lane C item B)
 
@@ -286,7 +262,7 @@ One flat, unioned queue. No selection param — always the whole thing.
     {
       "kind": "acquisition", "id": "SRC-...", "title": "wanted paper",
       "request_state": "wanted", "source_kind": "paper", "blocking": false,
-      "consequence": "Transitioning this source unblocks: rejected, requested."
+      "consequence": "Needed by literature request SRC-...."
     },
     {
       "kind": "prereg_reveal", "id": "PREG-...", "title": "test prereg",
@@ -325,7 +301,7 @@ Notes:
 - **Six kinds, not four** — the brief's four (gate edits, KG merges, acquisitions, prereg/room escalations) plus `memory_conflict` (REDESIGN finding S26: "queue kind, not drawn" — surfaced here as data even though no artboard draws it). Lane e (E4) adds two more: `term_conflict` and `term_duplicate` — see below. Every item has `kind`, `id` (unique per item, but its FORMAT differs by kind — don't parse it, just use it as a React/DOM key), `blocking` (bool), and `consequence` (a plain-English sentence naming what resolving THIS item unblocks — pure string derivation over gate/artifact/criterion linkage, never an LLM call).
 - `gate_edit` — **one row per unverified BLOCKING edit**, not one row per gate (a gate with 3 blocking edits produces 3 items). `consequence` names either "N more blocking edits remain" or, on the last one, whether reproduction still blocks union_applied or registration is next.
 - `kg_merge` — every `merge_proposal` row at `status='draft'` (`trialerror.ingest.extract.list_pending`). `members` is already parsed to a list of entity ids (not a JSON string).
-- `acquisition` — every `source` row whose `request_state` is `wanted`/`requested`/`delivered`/`verifying` (terminal states `indexed`/`rejected`/`failed` are excluded — nothing to decide on those). `consequence` lists the legal next states from `trialerror.ingest.requests.TRANSITIONS`.
+- `acquisition` — every `source` row whose `request_state` is `wanted` or `requested`, `wanted` sorted first (nobody has gone looking yet, vs. already asked for). `delivered` and `verifying` are excluded along with the terminal states `indexed`/`rejected`/`failed`: `delivered` is `register_source`'s own default and nothing here moves a row off `delivered` or `verifying` automatically, so both are resting states with nothing left for the operator to act on. `consequence` names the still-open literature request this source answers (`source` carries no purpose/lens column, so this is `"Needed by literature request <source_id>."`, never the legal next request-queue states).
 - `prereg_reveal` — every `prereg` row at `status='committed'` (awaiting the reveal action that unseals its escrowed procedure/params hash).
 - `room_escalation` — every `room` at `state='frozen'`, with its freeze reason resolved from the `room_frozen` event trail.
 - `memory_conflict` — every open (`status='needs_merge'`) memory-sync conflict group, from `trialerror.memory.merge.list_conflicts`. `key` is the memory item's key both sides disagree on; `version_count` is normally 2 (`::left`/`::right`).
@@ -355,7 +331,8 @@ Notes:
     "superseded_by": [],
     "registers_records": 1,
     "discharges_criteria": [{"criterion_id": "G-01", "label": "test criterion", "phase": "test-phase"}],
-    "note": "Assembled only from the launch ledger, gate history, artifact.supersedes and record/criterion links. knowledge.prov_edge has zero writers in this codebase, so no general consumed-source provenance graph is drawn here."
+    "note": "Lineage is drawn from launches, gates, supersessions and record links only.",
+    "note_detail": "Assembled only from the launch ledger, gate history, artifact.supersedes and record/criterion links. knowledge.prov_edge has zero writers in this codebase, so no general consumed-source provenance graph is drawn here."
   }
 }
 ```
@@ -370,7 +347,7 @@ Notes:
 - `verdicts` — every `knowledge.verdict` row with `subject_kind='artifact'` and `subject_id=active_artifact_id`, newest first. **Different verdict procedures (`citecheck`/`contracrow`/`gate`/`reproduction`/`custom`) write completely different `label` vocabularies** (`"PASS"` vs `"match"` vs a bare confidence number as a string) — render each row's `procedure` and `label` together, never assume one shared scale across rows.
 - `version_chain` — every artifact reachable from `active_artifact_id` by walking `supersedes` in EITHER direction (older versions it supersedes, and any newer version that later superseded it), oldest-registered first. This is the only version-chain data the schema carries — there's no separate version-chain table.
 - `context_frame` — **almost always `null` today.** `artifact.context_frame` (REDESIGN §5.3 item 9: goal / prior-state / what-changed / why-it-matters) is not a real column yet — this reads `artifact.attrs.context_frame` best-effort (only non-null if some future producer happens to stash one there under `attrs`). Don't build UI that assumes this is normally populated; treat it exactly like `Dossier.dc.html`'s own "WHERE THIS CAME FROM" block would need to — as an honest empty state until the real column ships.
-- `lineage.note` — **always render this note wherever lineage is shown.** `knowledge.prov_edge` (the general consumed-source provenance graph) had zero writers anywhere in this codebase when this section was written — **as of lane e (E4), that is no longer true in general, only for THIS builder's own narrower reading.** `lexicon.api` (knowledge v5, step E1) is now the graph's first writer, but scoped to lexicon lineage only (`derived_from` on an accepted sense, `supersedes` on a corrected reading, `contradicts` between two scoped senses — ruling L-E5); it never writes an edge FROM or TO an `artifact`, which is what this builder's own lineage reads. So `build_dossier_panel` still does not read `prov_edge` and the note below is still accurate for what it describes — lineage here is assembled ONLY from the launch ledger (`produced_by_launch`/`in_session`), `artifact.supersedes`/reverse-lookup, `record.artifact_id` (`registers_records`, a count — not a list, to keep the payload small; drill into `knowledge.record` separately if a list is ever needed), and the new `criterion.discharged_by_artifact` link (`discharges_criteria`). This is the exact set REDESIGN's own Dossier mockup (`Dossier.dc.html`'s amber "△" lineage-note strip) asks to be stated on the card, verbatim. (The Evidence route's own `argues.note`, §14.7, carries the precise, no-longer-blanket statement — "zero writers outside lexicon lineage edges" — for the surface that actually reads the table now.)
+- `lineage.note` — **always render this note wherever lineage is shown.** A8 (dashboard operator-notes pass) split this into a short plain sentence for the screen and a `lineage.note_detail` sibling field for the implementation story: the client renders `note`'s text and puts `note_detail` in a `title` (tooltip). The detail: `knowledge.prov_edge` (the general consumed-source provenance graph) had zero writers anywhere in this codebase when this section was written — **as of lane e (E4), that is no longer true in general, only for THIS builder's own narrower reading.** `lexicon.api` (knowledge v5, step E1) is now the graph's first writer, but scoped to lexicon lineage only (`derived_from` on an accepted sense, `supersedes` on a corrected reading, `contradicts` between two scoped senses — ruling L-E5); it never writes an edge FROM or TO an `artifact`, which is what this builder's own lineage reads. So `build_dossier_panel` still does not read `prov_edge` and the detail is still accurate for what it describes — lineage here is assembled ONLY from the launch ledger (`produced_by_launch`/`in_session`), `artifact.supersedes`/reverse-lookup, `record.artifact_id` (`registers_records`, a count — not a list, to keep the payload small; drill into `knowledge.record` separately if a list is ever needed), and the new `criterion.discharged_by_artifact` link (`discharges_criteria`). This is the exact set REDESIGN's own Dossier mockup (`Dossier.dc.html`'s amber "△" lineage-note strip) asks to be stated on the card, verbatim, and is now carried in `note_detail` rather than on screen. (The Evidence route's own `argues.note`/`argues.note_detail`, §14.7, carries the precise, no-longer-blanket statement — "zero writers outside lexicon lineage edges" — for the surface that actually reads the table now.)
 
 ## 6. Lexicon — `GET /dashboard/api/lexicon[?term_id=TERM-...]`
 
@@ -455,6 +432,10 @@ Notes:
   yet on this program's `knowledge.db` (the `course` panel's exact
   convention, §1): a write path (any CLI command) applies knowledge v5
   automatically; `trialerror dashboard` never migrates a store itself.
+  `message` is the plain on-screen sentence ("The knowledge store needs an
+  upgrade before this page can show terms."); a sibling `message_detail`
+  carries the old developer-facing wording (naming the `term` table and
+  schema v5) for the page's `title` (A8).
 - `terms` — every term, always (`merged`/`retired` rows included — nothing
   is hidden, matching the store's own "nothing is deleted" posture),
   sorted by `last_revised` (`term.updated_ts`, or `created_at` if that is
@@ -536,7 +517,7 @@ Notes:
 Notes — **this is the smallest of the seven seams, read the scope carefully:**
 
 - This build adds exactly ONE new table, `criterion (criterion_id, label, phase, state, discharged_by_artifact)` — deliberately narrower than REDESIGN §5.3 item 6's full three-table wishlist (`charter_criterion`/`course_dimension`/`course_phase`). **There is no separate phase table or dimension table.** "Mission phases" (`phases` below) are DERIVED by grouping `criteria` on their own `phase` string — a free-form scoping column, like `launch.workpackage`, not a foreign key to anything.
-- `status == "awaiting_migration"` — this program's `ops.db` predates schema v4 (no `criterion` table yet). This is expected and common right after this stage lands: only a write path (any CLI command that opens the store) applies the migration, and `trialerror dashboard` never migrates anything itself (read-only by design). Render this exactly like `not_initialized` — a plain "not ready yet" state, `message` explains why.
+- `status == "awaiting_migration"` — this program's `ops.db` predates schema v4 (no `criterion` table yet). This is expected and common right after this stage lands: only a write path (any CLI command that opens the store) applies the migration, and `trialerror dashboard` never migrates anything itself (read-only by design). Render this exactly like `not_initialized` — a plain "not ready yet" state, `message` explains why. `message` is the plain on-screen sentence ("The knowledge store needs an upgrade before this page can show the course."); a sibling `message_detail` carries the old developer-facing wording (naming the `criterion` table and schema v4) for the page's `title` (A8).
 - `criteria` — every row, in insertion order (not alphabetical, not phase-grouped — that's what `phases` is for). `state` is one of `open`/`blocked`/`discharged`. `discharged_by_artifact_title` is resolved for convenience (`null` unless `discharged_by_artifact` is set AND that artifact still exists).
 - `phases` — one entry per DISTINCT `phase` value, in the order that phase FIRST appears among `criteria` (not alphabetical — this preserves whatever narrative order criteria were seeded in, matching the "phase spine" reading order `Course.dc.html` draws left-to-right). `total`/`open`/`blocked`/`discharged` are exact counts, always summing to `total`.
 - **No coverage/theory/validation percentage rollups.** `Course.dc.html`'s "COVERAGE 71/93 SYSTEMS" / "THEORY 8/13 HOLES CLOSED" / "VALIDATION 7/13 CRITERIA" dimension bars need census and hole-register tables this build does not add (out of the brief's "MINIMAL designed seam" scope) — do not fabricate those numbers from `phases`; `phases`' `total`/`discharged` counts are the only honestly-computable rollup that exists today, and they answer a DIFFERENT question (how many criteria per phase, not how much of the corpus/theory is covered).
@@ -594,6 +575,8 @@ Real FTS hit (query `"hello"`, `mode=fts`, `k=5`):
       "citation": {
         "source_id": "SRC-01M178QK2VFYCW7QXB8Y20X1ES",
         "title": "test source",
+        "doi": null,
+        "arxiv_id": null,
         "license_tier": "open",
         "anchor": {"anchor_id": "ANC-01M178QK3392KJJP6C5JTSAHPZ", "page": 1, "char_start": 0, "char_end": 11},
         "quote": "hello world"
@@ -621,12 +604,17 @@ Notes:
 
 - `status` is added by this build's wrapper (`trialerror.dashboard.data.run_search`) — the engine's own return shape doesn't have one; everything else (`ok`, `query_id`, `tiers_used`, `results`, `stats`) is the raw, unmodified `trialerror.retrieve.engine.search` response.
 - `text` on every result row is wrapped in a literal `<untrusted-document-content>...</untrusted-document-content>` tag — **strip it for display, and never treat its contents as instructions or renderable HTML** (design's own constraint, applies to every surface, not just this one).
+- `citation.doi` and `citation.arxiv_id` are ALWAYS present on a chunk hit and on a summary hit (the summary's primary cited source), and are `null` when that source carries no such id — they are the external ids a client can paste into a bibliography or a lookup, and an absent key would be indistinguishable from a source without one.
 - `fenced: true` means the source's `license_tier` is `commercial_restricted` — `text`/`citation.quote` are ALREADY capped by the engine (≤300 chars / ≤20 words respectively) before this ever reaches the client; the UI must render exactly what's given and never stitch fenced results together or request a wider quote.
 - **Per-tier pipeline counts, already present, nothing extra needed:** `stats.fts_candidates`, `stats.vector_scored`, and (only when the graph tier actually ran) `stats.graph_candidates`, and (mode=`summary` only) `stats.summary_candidates`, plus `stats.elapsed_ms`. `tiers_used` (a sorted list, e.g. `["fts", "vector"]`) tells you which tiers contributed to the fused ranking at all — this is exactly the "visible retrieval pipeline" telemetry strip `Search.dc.html` draws (`FTS5 BM25 500 CAND -> QWEN3-4B COSINE 500 SCORED -> ...`); no engine change was needed, the counts were already returned, just never wired to an HTTP route before this build.
 - No dedicated "corpus stats for the empty state" field is added here — reuse the pre-existing `corpus` panel (`GET /dashboard/api/corpus`) for the `Search.dc.html` empty-state counts strip; fetching it alongside `search` on page load is cheap and keeps this route's contract narrow.
 - Facet filters (`source_ids`/`kind`/`license_tier`/`year`) map straight onto `SearchRequest.filters`; an over-narrow filter (matches zero chunks) is a well-formed empty result, never an error.
 
 ## 10. Schema migration summary (ops_v4, plus ops_v6 — and §15.4 for ops_v8)
+
+**`feed_post_translation` is inert since Phase 0.** The Feed translator was retired; the
+table and its migrations stay (no data is dropped, no migration changes), and nothing reads
+or writes it.
 
 **This section is not the whole migration history.** It covers the two this
 build authored. Since then ops.db has taken **v7** (the mining-adoptions
@@ -877,31 +865,11 @@ know about `depth` or `order_threaded`. The value is not validated against the
 target thread — a cross-thread parent is legal, and the feed panel reports it
 as `reply_to_missing` rather than refusing the write.
 
-### 12.10 `POST /dashboard/api/write/feed-translate`
+### 12.10 `POST /dashboard/api/write/feed-translate` (retired)
 
-Added by lane-b-translator. ENQUEUES a `feed_translate` job on the M2
-ledger (`trialerror.jobs.ledger.enqueue`, `kind="custom"`,
-`payload["handler"] = "feed_translate"`) and returns immediately — **it
-never translates inline and never calls a model from the HTTP process.**
-That is the design's own option C (internal translator design notes §4.1, not in
-this export); its rejected option B was "book a
-launch per VIEW", which this route exists to avoid.
-
-Body: exactly ONE of `"post_id"` / `"thread_id"`; `"style_mode"`
-(`flavored` default, or `strict`) optional. Giving both, or neither,
-refuses cleanly. Success `result`: `{"job_id", "state", "kind", "target"}`.
-
-`created_by_launch` is always `null`: a dashboard operator has no launch
-identity (the same reason `feed-post` always passes `launch_id=None`), so
-the resulting translation is stored under the orchestrator's no-launch
-identity. A program configured with a budget-spending translator backend
-(`[feed.translator] backend = "model"`) therefore REFUSES such a job at
-the worker rather than running unbooked — book a launch and use
-`trialerror feed translate --by-launch ...` for that case.
-
-After a successful enqueue the affected post's `translation_state` reads
-`"pending"` on the next `GET /dashboard/api/feed` until a worker lands a
-row; re-fetch the panel rather than optimistically rendering anything.
+Retired in Phase 0 (never used). The route is gone; a client that posts to it
+gets the standard unknown-action refusal. Section number kept so the others
+do not move.
 
 ### 12.11 `POST /dashboard/api/doctor/run`
 
@@ -955,7 +923,6 @@ audit trail; none of the routes above add a second one:
 | `room-score` | `room_dp_scored` (same). |
 | `room-freeze` | `room_frozen` (same). |
 | `feed-post` | None dedicated — `feed_post` itself IS the durable, queryable row (same posture as `verify-edit`: the mutation is its own record; nothing else in this codebase treats "a row was inserted" as needing a second event mirror). |
-| `feed-translate` | None dedicated — the enqueued `job` row and its `job_event` trail (`trialerror.jobs.ledger.enqueue` writes an `enqueued` job event) ARE the record; the translation row it eventually produces carries its own `gate_status`/`gate_reasons` audit. |
 | `doctor/run` | None — writes only its own sidecar state file (`trialerror.dashboard.doctor_run`), never the program's real stores. |
 
 ---
@@ -1156,7 +1123,7 @@ absent, so a builder never has to tell "not asked" from "asked for nothing".
  argues: {contradicts: [prov_edge...], supports: [prov_edge...],
           verdicts: [{verdict_id, procedure, procedure_version, label, ts,
                       issued_by_launch, prereg_compliant}],
-          note},
+          note, note_detail},
  co_anchored_claims: [{claim_id, kind, text_short, shared: "anchor"|"chunk"|"document"}],
  neighbourhood: {seed_entities: [{entity_id, name, entity_type, via_anchor}],
                  nodes: [{id, kind: "claim"|"entity", label}],
@@ -1164,7 +1131,7 @@ absent, so a builder never has to tell "not asked" from "asked for nothing".
                  max_hops, hops_reached, hop_limit, truncated,
                  node_count, edge_count, edges_listed, seeds_dropped},
  lineage: {superseded_by, supersedes: [claim_id...]},
- term_conflicts_omitted: {reason: "awaiting_migration", message}}   see 14.7
+ term_conflicts_omitted: {reason: "awaiting_migration", message, message_detail}}   see 14.7
 ```
 
 ### 14.4 Fencing and the untrusted wrapper — which fields, and why
@@ -1216,15 +1183,18 @@ card says `N NODES, DRAWN AS A TABLE ONLY`. The table is present either way.
 
 - **`prov_edge` is read here for `role IN ('contradicts','supports')` between
   two CLAIMS, and reported empty.** That specific query has zero writers
-  (`argues.note` says so, and still correctly): lane e (E1) is the table's
-  first writer overall, but scoped to lexicon lineage only (`derived_from`
-  on an accepted sense, `supersedes` on a corrected reading, `contradicts`
-  between two SCOPED SENSES, never between two claims — ruling L-E5). This
-  builder's own read is therefore still honestly empty on every real
-  program; it is `build_lexicon_panel`'s `term.conflict`/`term.relations`
+  (`argues.note_detail` says so, and still correctly): lane e (E1) is the
+  table's first writer overall, but scoped to lexicon lineage only
+  (`derived_from` on an accepted sense, `supersedes` on a corrected reading,
+  `contradicts` between two SCOPED SENSES, never between two claims — ruling
+  L-E5). This builder's own read is therefore still honestly empty on every
+  real program; it is `build_lexicon_panel`'s `term.conflict`/`term.relations`
   (§6) that reads the lexicon's own edges, not this one.
   `verdict(subject_kind='claim', procedure='contracrow')` is the live
-  claim-level contradiction signal.
+  claim-level contradiction signal. `argues.note` is the plain on-screen
+  sentence ("Contradictions shown here come from contradiction verdicts
+  only."); the paragraph above is `argues.note_detail`, which the page puts
+  in a `title` (A8), never on screen.
 - **Term-sense conflicts are omitted, with the reason stated** (ruling L-C5)
   — until lexicon knowledge v5 has actually been migrated on this program.
   Lane e (E1) landed `lexicon.api.conflicts_for_claim`, and this builder
@@ -1234,9 +1204,13 @@ card says `N NODES, DRAWN AS A TABLE ONLY`. The table is present either way.
   placeholder). On a program whose lexicon package is not importable
   (`ImportError`, an old SQLite build) or whose `knowledge.db` has not run
   the v5 migration yet (`sqlite3.OperationalError`), the payload still
-  carries `term_conflicts_omitted: {reason: "awaiting_migration", message}`
-  and the renderer prints that message — never an empty box that reads "no
-  conflicts" when what is true is "nothing can answer that yet".
+  carries `term_conflicts_omitted: {reason: "awaiting_migration", message,
+  message_detail}` and the renderer prints `"TERM-SENSE CONFLICTS: " +
+  message` — never an empty box that reads "no conflicts" when what is true
+  is "nothing can answer that yet". `message` is the plain on-screen
+  sentence ("Term-sense conflicts per claim are not available yet.");
+  `message_detail` (naming `lexicon.api.conflicts_for_claim`) is the old
+  developer-facing wording, which the page puts in a `title` (A8).
 - **SEND TO DETERMINATIONS / OPEN A ROOM ON IT are drawn disabled**, with their
   reasons in `title` (section 12.11's convention): no callable exists for
   either verb.

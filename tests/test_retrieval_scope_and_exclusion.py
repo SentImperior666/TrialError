@@ -400,7 +400,7 @@ def test_graph_neighbors_withholds_an_edge_anchored_outside_the_scope(store, cor
     assert not (anchored_docs & set(corpus["inventory_doc_ids"].values()))
 
 
-def test_the_five_id_addressed_mcp_tools_are_bound_to_the_session_launch(program_root, platform_root):
+def test_the_id_addressed_mcp_tools_are_bound_to_the_session_launch(program_root, platform_root):
     """The reproduction that made this a blocker: through the real registry,
     bound to a scoped launch, `resolve_quote` + `get_chunk` read an inventory
     row verbatim."""
@@ -410,7 +410,8 @@ def test_the_five_id_addressed_mcp_tools_are_bound_to_the_session_launch(program
     store.close()
 
     tools = build_tools(program_root=program_root, platform_root=platform_root, launch_id=scoped)
-    for name in ("get_chunk", "get_source", "get_document_outline", "resolve_quote", "graph_neighbors"):
+    # graph_neighbors, the fifth id-addressed tool, was retired in Phase 0.
+    for name in ("get_chunk", "get_source", "get_document_outline", "resolve_quote"):
         assert "launch_id" not in tools[name].input_schema["properties"]
 
     env = tools["resolve_quote"].handler({"quote": " a "})

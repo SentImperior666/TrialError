@@ -24,7 +24,6 @@ import argparse
 import json
 from pathlib import Path
 
-from trialerror.jobs.ledger import enqueue as enqueue_job
 from trialerror.stores.errors import StoreError, ValidationError, XidTargetMissingError
 from trialerror.stores.store import Store, open_store
 from trialerror.summarize.api import DEFAULT_WORD_CAP, build_summary_envelope, get_summary, get_summary_by_id, list_summaries, store_summary
@@ -33,7 +32,7 @@ from trialerror.util.config import find_program_root
 from trialerror.util.envelope import error_envelope, next_action, ok_envelope
 
 GROUP_NAME = "summarize"
-HELP = "L1 summary tier: build/store overview summaries per document or collection, look them up, batch-generate per corpus."
+HELP = "L1 summary tier: build/store overview summaries per document or collection, look them up."
 
 
 def _add_program_root_arg(p: argparse.ArgumentParser) -> None:
@@ -51,17 +50,16 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     _add_program_root_arg(parser)
     actions = parser.add_subparsers(dest="action", metavar="<action>")
 
-    p_run = actions.add_parser("run", help="build a summary envelope for one subject; store it if a body/judgment is supplied, or enqueue a batch job")
+    p_run = actions.add_parser("run", help="build a summary envelope for one subject; store it if a body/judgment is supplied")
     _add_program_root_arg(p_run)
     p_run.add_argument("--subject-kind", choices=["document", "collection"], default="document", dest="subject_kind")
     p_run.add_argument("--subject-id", dest="subject_id", help="a doc_id (subject_kind=document) or a collection key/source_id (subject_kind=collection)")
     p_run.add_argument("--doc-id", action="append", default=None, dest="doc_ids", metavar="DOC_ID", help="collection member doc_id (repeatable; collection only)")
     p_run.add_argument("--word-cap", type=int, default=DEFAULT_WORD_CAP, dest="word_cap")
-    p_run.add_argument("--by-launch", dest="issued_by_launch", help="required unless --batch (batch jobs carry created_by_launch in the job payload instead)")
+    p_run.add_argument("--by-launch", dest="issued_by_launch", help="the launch this summary is issued by")
     p_run.add_argument("--procedure-version", default="1", dest="procedure_version")
     p_run.add_argument("--body", default=None, help="the summary text (an agent that already authored it out-of-band)")
-    p_run.add_argument("--judgments-file", default=None, dest="judgments_file", help="JSON {subject_id: body_text} -- an entry for --subject-id, or the whole map for --batch")
-    p_run.add_argument("--batch", action="store_true", help="auto-discover every subject_kind='document' missing/stale a summary and enqueue a 'summarize' job (design Section 6: rides the M2 ledger) instead of running one subject synchronously")
+    p_run.add_argument("--judgments-file", default=None, dest="judgments_file", help="JSON {subject_id: body_text} -- an entry for --subject-id")
     p_run.set_defaults(handler=_run_run)
 
     p_show = actions.add_parser("show", help="show one summary (by --id, or the current one for --subject-kind/--subject-id)")
@@ -115,43 +113,13 @@ def _load_judgments_file(path: str | None) -> dict[str, str] | None:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def _run_batch(args: argparse.Namespace, store: Store) -> dict:
-    if not args.issued_by_launch:
-        return error_envelope("summarize.run", "missing_by_launch", "--batch requires --by-launch (recorded as the job payload's created_by_launch)")
-    if args.subject_kind == "collection":
-        return error_envelope(
-            "summarize.run", "batch_collection_unsupported",
-            "--batch auto-discovery only supports --subject-kind document -- a 'collection' target set is "
-            "caller-defined and has no natural auto-discovery; enqueue explicit targets via the job payload instead",
-        )
-    judgments = _load_judgments_file(args.judgments_file) or {}
-    payload = {
-        "handler": "summarize",
-        "subject_kind": args.subject_kind,
-        "created_by_launch": args.issued_by_launch,
-        "word_cap": args.word_cap,
-        "procedure_version": args.procedure_version,
-        "judgments": judgments,
-    }
-    job = enqueue_job(store, kind="custom", payload=payload)
-    return ok_envelope(
-        "summarize.run", result={"job": job, "status": "enqueued"},
-        next_actions=[
-            next_action(["trialerror", "jobs", "start-worker", "--job-id", job["job_id"], "--mode", "once"], "run the enqueued batch job")
-        ],
-    )
-
-
 def _run_run(args: argparse.Namespace) -> dict:
     store, err = _open(args, "summarize.run")
     if err is not None:
         return err
     try:
-        if args.batch:
-            return _run_batch(args, store)
-
         if not args.subject_id:
-            return error_envelope("summarize.run", "missing_subject_id", "--subject-id is required unless --batch is given")
+            return error_envelope("summarize.run", "missing_subject_id", "--subject-id is required")
         if not args.issued_by_launch:
             return error_envelope("summarize.run", "missing_by_launch", "--by-launch is required")
 

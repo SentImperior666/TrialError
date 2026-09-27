@@ -11,7 +11,7 @@ AIIF (AI Ideation Framework) is the protocol TrialError uses to run an **ideatio
 | Piece | Harness surface | State |
 |---|---|---|
 | Lens, verifier and critic agents | `plugin/agents/{lens,critic,verifier}.md` (tool-locked; model Fable) | shipped |
-| Round driver | `plugin/skills/ideation-round/SKILL.md` | shipped as Phases 0-8 |
+| Round driver | `plugin/skills/ideation-round/SKILL.md` (retired in Phase 0; restorable from git) | shipped as Phases 0-8 |
 | Slicing (near / moderate / far arms per lens) | `trialerror lens stratify`, `trialerror lens assign --arm-per-lens` | shipped; a lens's arm lives on its assignment rows and is re-derived for the export rather than stored on the roster row |
 | Mechanical novelty screen | `trialerror lens screen --mechanical` (`trialerror/lens/novelty.py`) | shipped |
 | Judged screen | verifier launches over novelty dossiers, `verdict` rows with a procedure version | envelopes, plants and label recording shipped; the launch that spawns the judge is not in this code |

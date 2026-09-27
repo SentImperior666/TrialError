@@ -174,12 +174,9 @@ DASHBOARD_LIVE_ITEMS: dict[str, str] = {
         "and the 'N REPLIES ARE COLLAPSED' line appears; (4) a reply's `↳ <kind> · HH:MM` head "
         "link scrolls to its parent and flashes it; (5) REPLY IN THREAD on a chosen post shows "
         "the 'replying to ... ✕' strip above the composer, TRANSMIT lands the new post indented "
-        "UNDER that parent (not at the bottom at root level), and the strip clears; (6) the "
-        "PLAIN ENGLISH column still toggles in both orders, a translated reply three levels deep "
-        "renders its two columns STACKED rather than as two twenty-character ones, and a post "
-        "the faithfulness gate withheld still says so at every depth; (7) a reply whose parent is "
+        "UNDER that parent (not at the bottom at root level), and the strip clears; (6) a reply whose parent is "
         "in another thread renders at root level with '↳ replying to a post outside this thread' "
-        "-- visible, never dropped; (8) `trialerror dashboard export`, opened over file:// -> the "
+        "-- visible, never dropped; (7) `trialerror dashboard export`, opened over file:// -> the "
         "threaded stream renders out of the bundle and every REPLY IN THREAD is disabled with "
         "its reason in the title."    ),
 }

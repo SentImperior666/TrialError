@@ -59,11 +59,19 @@ def test_gate_suite_check(check_name):
     own subprocess exit code is only PASS/FAIL, never the structured
     per-check breakdown a gate row needs to carry forward (the
     ``reproduction_ref`` pattern -- see
-    :func:`~trialerror.eval.gate_suites.run_gate_suite_for_gate`)."""
+    :func:`~trialerror.eval.gate_suites.run_gate_suite_for_gate`).
+
+    A ``not_applicable`` result is a SKIP, never an assertion: it neither
+    passes nor fails the case, pytest reports it as skipped, and the run's
+    exit code stays 0 unless some other case failed -- which is what makes
+    ``reproduction_status`` ``match`` iff every check passed or was not
+    applicable."""
     metric_fn = _SUITE.checks[check_name]
     result = metric_fn(_SUBJECT)
     _RESULTS.append(result.to_dict())
     if _RESULTS_PATH:
         with open(_RESULTS_PATH, "w", encoding="utf-8") as f:
             json.dump(_RESULTS, f, ensure_ascii=False)
+    if result.not_applicable:
+        pytest.skip(f"{check_name}: {result.message}")
     assert result.passed, f"{check_name}: {result.message}"

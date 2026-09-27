@@ -1,0 +1,12 @@
+{
+  "offset": 0,
+  "next": null,
+  "data": [
+    {"paperId": "cccc01", "title": "Widgets Revisited", "externalIds": {"DOI": "10.1234/widgets.2019"}, "year": 2019,
+     "authors": [{"authorId": "1000", "name": "Ann Author"}], "publicationTypes": ["JournalArticle"], "citationCount": 12},
+    {"paperId": "cccc02", "title": "Early Widget Notes", "externalIds": {}, "year": 2004,
+     "authors": [{"authorId": "1000", "name": "Ann Author"}], "publicationTypes": null, "citationCount": 30},
+    {"paperId": "cccc03", "title": "An Undated Widget Note", "externalIds": {}, "year": null,
+     "authors": [{"authorId": "1000", "name": "Ann Author"}], "publicationTypes": null, "citationCount": 0}
+  ]
+}

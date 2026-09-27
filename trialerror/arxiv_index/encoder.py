@@ -32,7 +32,7 @@ import struct
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, Sequence
 
 __all__ = [
     "OPENAI_EMBEDDINGS_URL",
@@ -71,6 +71,13 @@ class QueryEncoder(Protocol):
     dims: int
 
     def encode_query(self, text: str) -> list[float]: ...
+
+    def encode_queries(self, texts: Sequence[str]) -> list[list[float]]:
+        """Several queries at once, in the SAME order they were given (lane
+        FB-acq item 3). Batching exists because the index scan can now serve Q
+        queries in one pass -- Q separate embedding round-trips in front of one
+        pass would be the remaining per-query cost."""
+        ...
 
 
 def estimate_token_count(text: str) -> int:
@@ -115,6 +122,12 @@ class FakeQueryEncoder:
         floats = [(v / 0xFFFFFFFF) * 2.0 - 1.0 for v in raw]
         norm = sum(f * f for f in floats) ** 0.5 or 1.0
         return [f / norm for f in floats]
+
+    def encode_queries(self, texts: Sequence[str]) -> list[list[float]]:
+        """Per-query encoding, in order -- there is no network call to batch
+        here, and a fake that answered differently in a batch would make the
+        batch path untestable against the single-query one."""
+        return [self.encode_query(t) for t in texts]
 
 
 class OpenAIQueryEncoder:
@@ -171,3 +184,48 @@ class OpenAIQueryEncoder:
         except (KeyError, IndexError, TypeError) as exc:
             raise OpenAIEncoderError(f"OpenAI embeddings response missing data[0].embedding: {payload!r}") from exc
         return [float(v) for v in vector]
+
+    def encode_queries(self, texts: Sequence[str]) -> list[list[float]]:
+        """ONE POST for the whole batch (``"input": [...]``), same error
+        wrapping as :meth:`encode_query`.
+
+        Results are ordered by each item's own ``index`` field, never by the
+        order they happen to arrive in: the API documents an ``index`` per
+        embedding precisely because the response order is not part of the
+        contract, and a batch whose vectors silently belonged to other queries
+        would produce plausible, wrong answers."""
+        items = list(texts)
+        if not items:
+            return []
+        body = json.dumps({"model": self._model, "input": items}).encode("utf-8")
+        request = urllib.request.Request(
+            OPENAI_EMBEDDINGS_URL,
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout_s) as resp:  # noqa: S310 - deliberate: this IS the http client
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise OpenAIEncoderError(f"OpenAI embeddings call failed: HTTP {exc.code}: {detail[:500]}") from exc
+        except urllib.error.URLError as exc:
+            raise OpenAIEncoderError(f"OpenAI embeddings call failed: {exc}") from exc
+
+        try:
+            data = payload["data"]
+            ordered = sorted(data, key=lambda item: int(item["index"]))
+            vectors = [[float(v) for v in item["embedding"]] for item in ordered]
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise OpenAIEncoderError(
+                f"OpenAI embeddings response is not a batch of indexed embeddings: {payload!r}"
+            ) from exc
+        if len(vectors) != len(items):
+            raise OpenAIEncoderError(
+                f"OpenAI embeddings response has {len(vectors)} embeddings for {len(items)} inputs"
+            )
+        return vectors

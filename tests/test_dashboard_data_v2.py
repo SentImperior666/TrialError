@@ -58,12 +58,8 @@ def test_feed_panel_ok(seeded):
     post = panel["posts"][0]
     assert post["post_id"] == ids["feed_post"]
     assert post["kind"] == "launch"  # fixture author is "launch:<LNCH-...>"
-    # the shared fixture now seeds one 'current' translation for this exact
-    # post (schema-roundtrip coverage of ops_v4's feed_post_translation).
-    assert post["translation"] is not None
-    assert post["translation"]["translation_id"] == ids["feed_post_translation"]
-    assert post["translation"]["body"] == "test translation body"
-    assert panel["translator_table_available"] is True  # v4 migration ran via open_store()
+    assert "translation" not in post and "translation_state" not in post  # the translator was retired
+    assert "translator_table_available" not in panel
     assert any(item["item_id"] == ids["inbox_item"] for item in panel["unread_directives"])
 
 
@@ -80,45 +76,6 @@ def test_feed_panel_explicit_thread_id_with_no_posts(seeded, program_root, platf
         panel = data.build_feed_panel(rostore, thread_id=empty_thread["thread_id"])
         assert panel["active_thread_id"] == empty_thread["thread_id"]
         assert panel["posts"] == []
-    finally:
-        rostore.close()
-
-
-def test_feed_panel_surfaces_current_translation(seeded, program_root, platform_root):
-    rostore, ids = seeded
-    store = open_store(program_root, platform_root=platform_root)
-    # the shared fixture already seeds one 'current' translation for this
-    # post -- supersede it first so there is exactly one 'current' row,
-    # matching the real versioned-row-chain contract (AISPEAK design
-    # Section 4.2) instead of two same-status rows racing on created_ts.
-    store_update(
-        store, "feed_post_translation", pk_column="translation_id", pk_value=ids["feed_post_translation"],
-        changes={"status": "superseded"},
-    )
-    store_insert(
-        store,
-        "feed_post_translation",
-        {
-            "translation_id": new_id("XLAT"),
-            "post_id": ids["feed_post"],
-            "translator_version": "2",
-            "style_mode": "flavored",
-            "body": "plain english body",
-            "original_sha256": "a" * 64,
-            "status": "current",
-            "supersedes": ids["feed_post_translation"],
-            "created_ts": now(),
-        },
-    )
-    store.close()
-    rostore.close()
-    rostore = _reopen_ro(program_root, platform_root)
-    try:
-        panel = data.build_feed_panel(rostore)
-        translation = panel["posts"][0]["translation"]
-        assert translation is not None
-        assert translation["body"] == "plain english body"
-        assert translation["style_mode"] == "flavored"
     finally:
         rostore.close()
 
@@ -486,7 +443,65 @@ def test_determinations_panel_all_kinds_present(seeded, program_root, platform_r
         assert "union_applied" in gate_item["consequence"] or "registration" in gate_item["consequence"]
 
         acq_item = next(i for i in panel["items"] if i["kind"] == "acquisition")
-        assert "requested" in acq_item["consequence"] or "rejected" in acq_item["consequence"]
+        assert "unblocks" not in acq_item["consequence"]
+        assert acq_item["consequence"] == f"Needed by literature request {acq_item['id']}."
+    finally:
+        rostore.close()
+
+
+def test_determinations_panel_acquisition_excludes_delivered_and_sorts_wanted_first(
+    seeded, program_root, platform_root
+):
+    """SPEC A3: only 'wanted'/'requested' sources are actionable -- a
+    'delivered' row is the pipeline's own resting default
+    (``register_source``'s ``request_state`` default) that nothing moves on,
+    so it must NOT appear in the acquisitions list. Among the actionable
+    ones, 'wanted' (nobody has gone looking yet) sorts before 'requested'
+    (already asked for)."""
+    rostore, ids = seeded
+    store = open_store(program_root, platform_root=platform_root)
+    delivered_id = new_id("SRC")
+    requested_id = new_id("SRC")
+    wanted_id = new_id("SRC")
+    store_insert(
+        store, "source",
+        {
+            "source_id": delivered_id, "kind": "paper", "title": "already delivered",
+            "license_tier": "unknown", "acquisition_route": "web", "request_state": "delivered",
+            "registered_ts": now(), "registered_by_launch": ids["launch"],
+        },
+    )
+    store_insert(
+        store, "source",
+        {
+            "source_id": requested_id, "kind": "paper", "title": "already requested",
+            "license_tier": "unknown", "acquisition_route": "web", "request_state": "requested",
+            "registered_ts": now(), "registered_by_launch": ids["launch"],
+        },
+    )
+    store_insert(
+        store, "source",
+        {
+            "source_id": wanted_id, "kind": "paper", "title": "newly wanted",
+            "license_tier": "unknown", "acquisition_route": "web", "request_state": "wanted",
+            "registered_ts": now(), "registered_by_launch": ids["launch"],
+        },
+    )
+    store.close()
+
+    rostore = _reopen_ro(program_root, platform_root)
+    try:
+        panel = data.build_determinations_panel(rostore)
+        acq_ids = [i["id"] for i in panel["items"] if i["kind"] == "acquisition"]
+        assert delivered_id not in acq_ids
+        assert requested_id in acq_ids and wanted_id in acq_ids
+        assert acq_ids.index(wanted_id) < acq_ids.index(requested_id)
+
+        for item in panel["items"]:
+            if item["kind"] != "acquisition":
+                continue
+            assert "unblocks" not in item["consequence"]
+            assert item["consequence"] == f"Needed by literature request {item['id']}."
     finally:
         rostore.close()
 
@@ -616,7 +631,11 @@ def test_dossier_panel_ok(seeded):
     # the shared fixture now seeds one criterion ("G-01") discharged by this
     # exact artifact (schema-roundtrip coverage of ops_v4's criterion table).
     assert [c["criterion_id"] for c in panel["lineage"]["discharges_criteria"]] == [ids["criterion"]]
-    assert "prov_edge" in panel["lineage"]["note"]
+    # A8: `note` is the plain on-screen sentence; the developer-facing detail
+    # (naming `knowledge.prov_edge`) moves to `note_detail`, which the page
+    # puts in a `title`.
+    assert panel["lineage"]["note"] == "Lineage is drawn from launches, gates, supersessions and record links only."
+    assert "prov_edge" in panel["lineage"]["note_detail"]
 
 
 def test_dossier_panel_version_chain_and_criterion_discharge(seeded, program_root, platform_root):
@@ -648,6 +667,66 @@ def test_dossier_panel_version_chain_and_criterion_discharge(seeded, program_roo
         assert chain_ids == {ids["artifact"], newer_id}
         assert panel["lineage"]["superseded_by"] == [newer_id]
         assert {c["criterion_id"] for c in panel["lineage"]["discharges_criteria"]} == {ids["criterion"], "G-02"}
+    finally:
+        rostore.close()
+
+
+def test_dossier_panel_passes_disposition_through(seeded, program_root, platform_root):
+    """A registration with a disclosed deviation carries its
+    disposition to the registry rail, the open artifact and the version chain
+    (showing it is the dashboard lane's work; this only checks it is not lost)."""
+    rostore, ids = seeded
+    store = open_store(program_root, platform_root=platform_root)
+    older_id = new_id("ART")
+    store_insert(
+        store, "artifact",
+        {
+            "artifact_id": older_id, "type": ids["template"], "title": "with deviation", "path": "artifacts/d.md",
+            "sha256": "7" * 64, "status": "registered", "disposition": "registered_with_deviation",
+            "registered_ts": now(), "registered_by_launch": ids["launch"], "supersedes": ids["artifact"],
+        },
+    )
+    store.close()
+    rostore.close()
+    rostore = _reopen_ro(program_root, platform_root)
+    try:
+        panel = data.build_dossier_panel(rostore, artifact_id=older_id)
+        assert panel["artifact"]["disposition"] == "registered_with_deviation"
+        rail = {a["artifact_id"]: a for a in panel["registry"]}
+        assert rail[older_id]["disposition"] == "registered_with_deviation"
+        assert rail[ids["artifact"]]["disposition"] is None
+        chain = {v["artifact_id"]: v for v in panel["version_chain"]}
+        assert chain[older_id]["disposition"] == "registered_with_deviation"
+    finally:
+        rostore.close()
+
+
+def test_dossier_panel_defaults_to_the_newest_registered_artifact(seeded, program_root, platform_root):
+    """te-dash A7: with no artifact asked for, the panel opens the newest
+    REGISTERED artifact, not a newer draft that decides nothing; with no
+    registered artifact at all it falls back to the newest row."""
+    rostore, ids = seeded
+    store = open_store(program_root, platform_root=platform_root)
+    registered_id, draft_id = new_id("ART"), new_id("ART")
+    for art_id, status in ((registered_id, "registered"), (draft_id, "draft")):
+        store_insert(
+            store, "artifact",
+            {
+                "artifact_id": art_id, "type": ids["template"], "title": status, "path": f"artifacts/{status}.md",
+                "sha256": "8" * 64, "status": status, "registered_ts": now(),
+                "registered_by_launch": ids["launch"],
+            },
+        )
+    store.close()
+
+    rostore.close()
+    rostore = _reopen_ro(program_root, platform_root)
+    try:
+        panel = data.build_dossier_panel(rostore)
+        assert panel["registry"][0]["artifact_id"] == draft_id  # the newest row is the draft
+        assert panel["active_artifact_id"] == registered_id
+        # an explicit ask still wins
+        assert data.build_dossier_panel(rostore, artifact_id=draft_id)["active_artifact_id"] == draft_id
     finally:
         rostore.close()
 
@@ -811,6 +890,11 @@ def test_lexicon_panel_awaiting_migration_before_v5(tmp_path, monkeypatch):
     try:
         panel = data.build_lexicon_panel(rostore)
         assert panel["status"] == "awaiting_migration"
+        # A8: `message` is the plain on-screen sentence; the developer-facing
+        # detail (naming the schema/table and the read-only posture) moves to
+        # `message_detail`, which the page puts in a `title`.
+        assert panel["message"] == "The knowledge store needs an upgrade before this page can show terms."
+        assert "schema v5" in panel["message_detail"]
     finally:
         rostore.close()
 
@@ -842,6 +926,11 @@ def test_course_panel_awaiting_migration_before_v4(tmp_path, monkeypatch):
     try:
         panel = data.build_course_panel(rostore)
         assert panel["status"] == "awaiting_migration"
+        # A8: `message` is the plain on-screen sentence; the developer-facing
+        # detail (naming the schema/table and the read-only posture) moves to
+        # `message_detail`, which the page puts in a `title`.
+        assert panel["message"] == "The knowledge store needs an upgrade before this page can show the course."
+        assert "schema v4" in panel["message_detail"]
     finally:
         rostore.close()
 

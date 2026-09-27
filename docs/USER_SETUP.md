@@ -344,6 +344,166 @@ Set it `false` only if you want the pre-FB-6 ordering back; there is no cost to 
 on, since the full-text pass is idempotent and the real `index` job re-runs over the same
 chunks without duplicating a row.
 
+## 1b. Renting the OCR GPU
+
+Skip this section unless you want the GPU worker of section 1a to run its OCR on a GPU rented from vast.ai instead
+of its own card. Everything here is configured on the **worker machine**, in its backend-config-root's
+`trialerror.toml`; the queue side gets no new setting for it (one optional switch, at the end). It is off by default,
+and **nothing leaves the machine until you name it and approve it**. How it behaves, what each refusal means and what
+remains where: `docs/OPERATOR_GUIDE.md`, "OCR on a rented GPU (vast.ai)".
+
+### What you do, once
+
+1. **The API key.** Create a vast.ai API key and save it in a file on the worker machine, for example under
+   `<backend-config-root>/keys/`. Point `[vastai] api_key_path` at it. TrialError checks that the file exists when the
+   worker starts and reads it only when it calls vast.ai; no command prints it.
+2. **A dedicated ssh key pair.** Generate one for vast.ai alone and register its public half in your vast.ai account:
+
+   ```powershell
+   ssh-keygen -t ed25519 -f ~/.ssh/te_vastai -N ""
+   ```
+
+   Point `[vastai] ssh_identity_path` at the private half. **Never use the queue key** (section 1a's `te_offload`) for
+   this: a rented host is somebody else's machine, and it must not hold anything that reaches your queue.
+
+   **Registering it is not optional.** TrialError sends no key when it creates an instance: vast.ai puts the keys of
+   your ACCOUNT on a new instance, and nothing else. An identity that is not registered there is refused by every host
+   you rent, after the rental is already billing. `trialerror vastai plan --input <pdf>` now asks first, for free:
+   its `ssh_key` block says `registered`, `not-registered` (it names the fingerprint it compared and the console page)
+   or `unknown`, and the worker refuses `key-missing` before it creates anything when the account's key list was read
+   and does not hold your fingerprint. The comparison reads only `<ssh_identity_path>.pub`.
+
+   **If a host refuses the key anyway**, with the account's list saying `registered`: an instance created before the
+   registration never receives it, and an instance whose sshd answers before the keys are in place refuses it for a
+   moment. A rental retries such a refusal for a bounded 90 s over 3 attempts before it gives up, and the refusal says
+   how many attempts over how long. `trialerror vastai ssh-probe --backend-config-root <root>` prices the question for
+   free and, with `--rent --max-usd X`, answers it live for a few cents: it rents the cheapest host your own
+   `[vastai.egress]` policy admits, attempts ssh, runs `nvidia-smi -L` if it gets in, and destroys. It sends no
+   document, runs no bootstrap, and keeps only an allow-list of `ssh -v` lines -- the identity FILE's path, the ssh
+   versions, the key fingerprints it OFFERED and the server's replies. Never a private half.
+3. **The hashed lock.** `trialerror vastai lock-deps --backend-config-root <root>` reads the packaged pins of marker's
+   environment, asks PyPI for the sha256 of every file of each release, and writes `[vastai.ocr] requirements_lock`
+   (default `marker-requirements.lock` beside the toml). torch, triton and `nvidia-*` come with the image and are left
+   out. Without the lock the worker refuses to start and names this command.
+4. **The first-run configuration**: listed documents only, by sha256, and nothing else.
+
+   ```toml
+   [ingest.ocr]
+   backend = "marker"
+   executor = "vastai"
+
+   [vastai]
+   api_key_path = "keys/vastai.key"
+   ssh_identity_path = "C:/path/to/.ssh/te_vastai"
+
+   [vastai.egress]
+   allow_documents = ["<sha256 of the one PDF you mean to send>"]
+   ```
+
+5. **The approval.** In an interactive terminal, `trialerror vastai approve-ocr --backend-config-root <root>`. It
+   prints what may leave and the spend envelope, asks you to type back a short challenge, and writes a signed approval
+   beside the key file. It expires after `approval_max_days` (at most 7), and any later change to `[vastai.egress]`
+   voids it until you approve again. It cannot be run by an agent or a script.
+6. **The dry run.** `trialerror vastai plan --backend-config-root <root> --input <pdf>` before any real run: the range
+   plan, the RAM floor, one read-only offer search, the ranked offers, the TTL, the worst case and which caps pass. It
+   rents nothing.
+7. **The reaper on a schedule.** Add `trialerror vastai reap --ocr --backend-config-root <root>` to the Task Scheduler,
+   every 15 minutes, so an instance orphaned by a crash is destroyed even if no worker runs again soon.
+
+**The first live run is a separate act that you approve.** Nothing above rents a GPU. The first rental happens when you
+start the worker with vast.ai on, for example
+`trialerror offload worker --remote te-offload --backend-config-root <root> --stages ocr --max-jobs 1` (a run with
+`--stages ocr` checks only the OCR side at start, so it needs no `[ingest.embed]` table), and watch it through: `trialerror vastai ledger` afterwards, and `trialerror doctor --program-root <root> --only vastai_ocr_ledger`.
+Add **`--log-file <path>`** to watch it *while* it runs: the worker's own log lines reach the envelope only when the
+run ends, so a lease that boots for five minutes prints nothing until it is over; with the flag each line is appended,
+UTC-stamped, as it happens (`Get-Content -Wait <path>`).
+Add **`--keep-range-cache`** when the point of the run is to LOOK at what marker wrote: a chunked job's range cache
+(`<work-root>\_ranges\<job-id>\`, one `.md` of marker's own text per range) is removed once the document is
+published, and with the flag it is kept. It remains that job id's resume cache — delete it before running the same
+job again, or the ranges will come from disk instead of a GPU.
+Keep the machine awake while a lease is live: closing the lid mid-lease costs up to one TTL of rental.
+
+### Every key and its default
+
+All of these live in the worker machine's backend-config-root. Every value is a default you may change by
+configuration only; an unknown key in any `[vastai*]` table is refused by name, and so are the forbidden ones
+(`keep_alive`, `reuse_instance`, `ttl_extend` and their kind).
+
+The `[vastai]` table is shared with the embedding lane (`trialerror vastai run`, `docs/VASTAI_EMBED_DESIGN.md`), which
+reads it with its own loader. The keys whose meaning starts with "the embedding lane's" are that lane's, with its
+defaults; the OCR lane accepts them and never reads them. The OCR lane reads its own `image`, `startup_s`, `safety` and
+`disk_gb` under `[vastai.ocr]`, so setting them in `[vastai]` changes nothing for OCR. A `ttl_cap_s` above 4 h is
+clamped to 4 h, as the embedding lane clamps it, and the configuration's status line carries a note that says so.
+
+| key | default | meaning |
+|---|---|---|
+| `[ingest.ocr] executor` | `"local"` | "vastai" sends this worker's OCR to vast.ai; any other value than "local" or "vastai" is refused by name |
+| `[vastai] api_key_path` | `required with executor = "vastai"` | the key file's path; its existence is checked at start, its contents are read only by the API client at call time |
+| `[vastai] ssh_identity_path` | `required` | the private half of the dedicated vast.ai key pair; only ssh opens it |
+| `[vastai] approval_path` | `<directory of api_key_path>/vastai-ocr.approval` | where the operator-minted egress approval lives |
+| `[vastai] tier` | `"mid"` | the GPU tier (low / mid / high); "high" still needs `trialerror vastai approve-high` |
+| `[vastai] type` | `"ondemand"` | the rental type; only on-demand exists: "bid" (interruptible) is refused by name, because a preempted lease strands the document |
+| `[vastai] max_job_usd` | `3.00` | worst-case dollars one job may cost; finite and > 0 |
+| `[vastai] max_run_usd` | `10.00` | worst-case dollars one worker run may cost; finite and > 0 |
+| `[vastai] max_approval_usd` | `25.00` | the ceiling of an approval's envelope (its max_total_usd); finite and > 0 |
+| `[vastai] ttl_cap_s` | `14400` | the longest a lease may live; may be lowered, never raised: a value above 4 h is clamped to 4 h, with a note |
+| `[vastai] startup_s` | `1200` | the embedding lane's: seconds the TTL reserves for boot, image, pip and the model download (the OCR lane reads [vastai.ocr] startup_s) |
+| `[vastai] safety` | `2.0` | the embedding lane's: multiplier on the estimated compute time (the OCR lane reads [vastai.ocr] safety) |
+| `[vastai] grace_s` | `300` | seconds added to every TTL |
+| `[vastai] image` | `"pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime"` | the embedding lane's base image (the OCR lane reads [vastai.ocr] image) |
+| `[vastai] image_cuda` | `"13.0"` | the image's CUDA version; hosts must offer cuda_max_good >= it |
+| `[vastai] disk_gb` | `40` | the embedding lane's container disk per lease (GB) (the OCR lane reads [vastai.ocr] disk_gb) |
+| `[vastai] poll_interval_s` | `10` | seconds between instance-status polls |
+| `[vastai] doctor_api_check` | `true` | whether the doctor lists the account's instances |
+| `[vastai] batch_size` | `64` | the embedding lane's: chunks per embedding batch on the instance |
+| `[vastai] max_jobs_per_run` | `50` | the embedding lane's: embed jobs one `trialerror vastai run` takes from the queue (--max-jobs may lower it) |
+| `[vastai] pip_packages` | `["sentence-transformers>=5.0", "transformers>=4.51"]` | the embedding lane's: the packages pip installs on the instance |
+| `[vastai] module_dir` | `unset` | the embedding lane's: the directory of the embed_backend.py the instance runs, used when [ingest.embed.query] module_dir is not set |
+| `[vastai.gpu_factors] <GPU name>` | `the embedding lane's built-in table` | the embedding lane's throughput relative to DEV per card, over its built-in table |
+| `[vastai.tiers.<t>] gpus` | `the ported table` | the GPU names the tier admits |
+| `[vastai.tiers.<t>] min_vram_gb` | `the ported table` | the tier's GPU memory floor (GB) |
+| `[vastai.tiers.<t>] max_dph` | `the ported table` | the tier's effective hourly price ceiling ($/h, disk included) |
+| `[vastai.tiers.<t>] min_reliability` | `the ported table` | the tier's host reliability floor |
+| `[vastai.ocr] requirements_lock` | `"marker-requirements.lock"` | the hashed requirements lock (relative to the backend-config-root), written by `trialerror vastai lock-deps` |
+| `[vastai.ocr] models_manifest` | `""` | "" = the packaged manifest for marker 1.10.2; a path overrides; another marker_version needs one |
+| `[vastai.ocr] max_range_pixels` | `2000000000` | the pixel budget of one marker_single range |
+| `[vastai.ocr] max_range_pages` | `128` | the page cap of one range, applied after the pixel budget |
+| `[vastai.ocr] fixed_mem_gb` | `16` | the fixed RAM of one marker_single invocation (GB) |
+| `[vastai.ocr] mem_bytes_per_px` | `9.4` | RAM per planned pixel of a range |
+| `[vastai.ocr] ram_headroom` | `0.8` | the share of a host's RAM a range may use (0-1] |
+| `[vastai.ocr] dev_pages_per_min` | `7.5` | DEV's measured OCR speed, the speed of a card with factor 1.0 |
+| `[vastai.ocr] reload_s` | `60` | seconds of model load per range |
+| `[vastai.ocr] uplink_mb_s` | `1.0` | DEV's upload rate (MB/s) used to price the transfer |
+| `[vastai.ocr] bootstrap_download_gb` | `13.0` | image + wheels + models, priced as download bandwidth in the worst case |
+| `[vastai.ocr] max_document_mb` | `1024` | the largest document that may leave (MB) |
+| `[vastai.ocr] max_leases_per_job` | `2` | leases one job may use, failovers included |
+| `[vastai.ocr] max_inet_cost_per_gb` | `0.02` | the bandwidth price ceiling ($/GB, both directions) |
+| `[vastai.ocr] canary_min_similarity` | `0.97` | the canary page's minimum text similarity |
+| `[vastai.ocr] range_timeout_s` | `0` | per-range timeout; 0 = derived (2 x the expected range time + 300 s, never past the deadline) |
+| `[vastai.ocr] image` | `"pytorch/pytorch:2.13.0-cuda13.0-cudnn9-runtime"` | the OCR lane's base image; its torch is DEV's marker venv's torch |
+| `[vastai.ocr] startup_s` | `1500` | the OCR lane's: seconds the TTL reserves for boot, image, wheels and models |
+| `[vastai.ocr] safety` | `1.5` | the OCR lane's: multiplier on the estimated compute time (>= 1) |
+| `[vastai.ocr] disk_gb` | `32` | the OCR lane's container disk rented with each lease (GB) |
+| `[vastai.ocr_gpu_factors] <GPU name>` | `empty (every card 1.0)` | OCR speed relative to DEV per card; every card not listed is 1.0 |
+| `[vastai.egress] allow_license_tiers` | `[]` | licence tiers whose documents may leave; unknown cannot be named |
+| `[vastai.egress] allow_documents` | `[]` | input sha256s that may leave, whatever their tier |
+| `[vastai.egress] require_datacenter` | `true` | datacenter (Secure Cloud) hosts only |
+| `[vastai.egress] require_verified` | `true` | verified hosts only |
+| `[vastai.egress] allow_geolocations` | `[]` | host countries allowed; empty = any |
+| `[vastai.egress] remote_scratch` | `"shm"` | "shm" refuses a host whose /dev/shm is too small; "shm_or_disk" allows the container disk, except for shm_required_tiers |
+| `[vastai.egress] shm_required_tiers` | `["commercial_restricted"]` | tiers that must stay in RAM-backed /dev/shm on the host |
+| `[vastai.egress] require_approval` | `true` | whether an operator-minted, sealed approval is needed on top of the config switch |
+| `[vastai.egress] approval_max_days` | `7` | an approval's longest lifetime in days; may be lowered, never raised above 7 |
+| `[vastai.egress] when_refused` | `"return"` | "return" leaves a refused document pending; "local" runs it on DEV's own marker (needs [ingest.ocr] marker_single_exe) |
+
+Two keys of `[ingest.ocr]` change meaning with `executor = "vastai"`: `marker_single_exe` is not needed on this
+machine (the instance has marker) unless `when_refused = "local"`, and `marker_version` becomes a checked claim about
+the instance.
+
+**On the queue side**, one optional key: `[ingest.ocr] record_offsite_ocr_events` (default `true`). While it is on,
+folding an OCR result that ran on a rented GPU appends one `offload_ocr_offsite` event to the program's own event
+table. It is not part of the configuration hash, so changing it re-queues nothing.
+
 ## 2. Optional: local Phoenix trace sink
 
 Entirely optional observability — every span emission no-ops silently if this isn't
@@ -619,6 +779,19 @@ raw vectors dominate the payload either way).
    re-embeds the dataset). Cost is one `text-embedding-3-large` call per query (a few tens of
    tokens, a small fraction of a cent at $0.13/1M input tokens) — `arxiv-semantic`'s own
    output reports the estimated cost alongside results.
+
+   **Issuing SEVERAL queries? Use `--q-file`, not a shell loop.** The vector table has no
+   approximate index, so every `--q` call is a full scan of the whole index — ten queries in
+   a loop are ten full scans. A file of queries (UTF-8, one per line, blank lines skipped, at
+   most 256) is answered in **one** pass, with identical results:
+   ```console
+   trialerror lit arxiv-semantic --q-file queries.txt --k 10
+   ```
+   The result reports `scan_mode` (`single_pass` or `per_query`), `passes`, `rows_scanned`
+   and a `timing` block (`open_s`, `encode_s`, `search_s`, `total_s`) — which both forms now
+   carry, and which is the instrument to measure your own index with. The single pass needs
+   numpy (the optional `fast` extra); without it the command still answers, one scan per
+   query, and says so in a warning.
 5. **`trialerror doctor`** now reports an `arxiv_index_ready` row (absent/building/ready, row
    count, dims sanity) once you've run step 3.
 6. **Weekly refresh**: the dataset's own Kaggle page updates roughly weekly (per its
@@ -1047,11 +1220,11 @@ trialerror accept
    second stop).
 4. **Task-matcher wiring** — confirm the `PreToolUse` hook fires only for `Task` calls,
    never `Bash`/`Read`/etc., in a real session (not just the script's own internal guard).
-5. **`trialerror-knowledge` MCP smoke** — register it in a real session and confirm all 11
+5. **`trialerror-knowledge` MCP smoke** — register it in a real session and confirm all 8
    tools are actually offered to and callable by a live agent.
 6. **`trialerror-ops` MCP smoke: book → spawn → reconcile** — call `book_launch` via the MCP
    tool, spawn a real `Task` with the returned `launch_id` (exercising item 2 above live),
-   then `reconcile_launch`.
+   then reconcile it with `trialerror budget reconcile` (`reconcile_launch` is no longer an MCP tool).
 
 **GPU backend verification** (needs the local models from §1 above, actually installed):
 

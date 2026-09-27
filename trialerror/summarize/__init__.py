@@ -15,11 +15,8 @@ Four submodules:
 - :mod:`trialerror.summarize.api` — envelope building, versioned storage,
   lookup/listing, and the shared staleness-key computation
   (:func:`~trialerror.summarize.api.compute_subject_sha256`) both the doctor
-  check and the batch job handler call.
-- :mod:`trialerror.summarize.handlers` — the ``summarize`` job handler
-  (envelope-producing, riding the M2 ledger like M7's ``extract`` does —
-  see its own module docstring for the "no LLM in the jobs/CLI layer"
-  boundary this observes).
+  check call. (The ``summarize`` job handler and the CLI's ``--batch`` path
+  were retired in Phase 0.)
 - :mod:`trialerror.summarize.checks` — the ``summaries_stale`` doctor check.
 
 **LLM-judgment boundary (stated once, mirrors ``trialerror/verify/__init__.py``

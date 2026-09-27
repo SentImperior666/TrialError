@@ -10,7 +10,7 @@ docstring quotes verbatim), the M1-built ``room`` DDL
 CHECK constraint — room state legality is enforced ENTIRELY by this module
 (and by every ``trialerror.rooms.api`` write going through it), not by SQLite
 itself. Flagged for a v3 migration: a ``CHECK (state IN ('open',
-'converged','frozen'))`` constraint would make this a belt-and-suspenders
+'converged','frozen','closed'))`` constraint would make this a belt-and-suspenders
 invariant instead of a purely application-level one, matching every other
 state-carrying table in the schema (``gate.state``, ``job.state``,
 ``artifact.status``, ...) — see ``trialerror/rooms/__init__.py``'s module
@@ -26,6 +26,16 @@ kind of unstated edge ``trialerror.artifacts.state_machine``'s own TRIALERROR-DE
 warns against manufacturing. A human who wants to retry a frozen room's
 substance opens a NEW room (a fresh, auditable room_id) rather than
 resurrecting the old one — the append-only room doc stays a true history.
+
+One edge was added later: ``frozen -> closed``. A freeze escalates to the
+operator, and until then nothing could record the operator's answer "close
+it" — the room stayed frozen, and so stayed in the dashboard's DECIDE queue,
+forever. ``closed`` is where :func:`trialerror.rooms.api.close_room` puts a
+frozen room on an operator decision (``decided_by``); it is terminal, and it
+is still not a reopening: the turns, the scores and the ``room_frozen``
+event all stay as they were, and a ``room_closed`` event is added beside
+them. ``frozen`` is therefore no longer terminal; ``converged`` and
+``closed`` are.
 """
 
 from __future__ import annotations
@@ -38,21 +48,23 @@ __all__ = [
     "assert_legal_transition",
 ]
 
-#: The three values ``room.state`` is used with (design Section 9.8: "state
+#: The four values ``room.state`` is used with (design Section 9.8: "state
 #: machine: open -> converged (all DPs >= bar) | frozen (moderator
-#: escalation w/ reason)"). No DDL CHECK constraint enumerates these (see
-#: module TRIALERROR-DEV-NOTE) — this tuple is the sole source of truth.
-STATES: tuple[str, ...] = ("open", "converged", "frozen")
+#: escalation w/ reason)", plus ``closed``: a frozen room the operator
+#: decided to close). No DDL CHECK constraint enumerates these (see module
+#: TRIALERROR-DEV-NOTE) — this tuple is the sole source of truth.
+STATES: tuple[str, ...] = ("open", "converged", "frozen", "closed")
 
-#: Both non-``open`` states are terminal in v0/v1 scope — see module
-#: docstring for why reopening is deliberately not modeled.
-TERMINAL_STATES: frozenset[str] = frozenset({"converged", "frozen"})
+#: ``converged`` and ``closed`` are terminal — see module docstring for why
+#: reopening is deliberately not modeled.
+TERMINAL_STATES: frozenset[str] = frozenset({"converged", "closed"})
 
 #: ``from_state -> {legal to_state, ...}``.
 LEGAL_TRANSITIONS: dict[str, frozenset[str]] = {
     "open": frozenset({"converged", "frozen"}),
     "converged": frozenset(),
-    "frozen": frozenset(),
+    "frozen": frozenset({"closed"}),  # close_room only: an operator decision
+    "closed": frozenset(),
 }
 
 # Every state has an entry above, and every entry's targets are themselves

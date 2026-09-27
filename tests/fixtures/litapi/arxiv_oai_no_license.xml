@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">
+  <responseDate>2026-01-01T00:00:00Z</responseDate>
+  <request verb="GetRecord" identifier="oai:arXiv.org:2101.00001" metadataPrefix="arXiv">https://export.arxiv.org/oai2</request>
+  <GetRecord>
+    <record>
+      <header>
+        <identifier>oai:arXiv.org:2101.00001</identifier>
+        <datestamp>2021-01-05</datestamp>
+        <setSpec>cs</setSpec>
+      </header>
+      <metadata>
+        <arXiv xmlns="http://arxiv.org/OAI/arXiv/">
+          <id>2101.00001</id>
+          <created>2021-01-01</created>
+          <title>A Fixture Paper About Distributed Systems Metadata Reconciliation</title>
+          <categories>cs.AI</categories>
+        </arXiv>
+      </metadata>
+    </record>
+  </GetRecord>
+</OAI-PMH>

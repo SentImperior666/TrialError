@@ -70,10 +70,7 @@ def test_dispatch_missing_required_fields_never_opens_a_store(program_root, plat
     bug) -- proven by monkeypatching ``open_store`` to explode if reached.
 
     Actions with an EMPTY ``REQUIRED_FIELDS`` entry are excluded: they have
-    no field this table can pre-check (``feed-translate`` takes exactly one
-    of two alternatives), so they validate inside the handler and their
-    refusal is a ``ValueError``-shaped one -- covered by
-    ``tests/test_dashboard_feed_translation.py`` instead."""
+    no field this table can pre-check, so they validate inside the handler."""
 
     def _boom(*_a, **_k):
         raise AssertionError(f"open_store must not be called for a missing-field refusal on {action!r}")

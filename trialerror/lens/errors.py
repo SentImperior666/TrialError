@@ -19,6 +19,7 @@ __all__ = [
     "MissingEmbeddingError",
     "UnknownRosterError",
     "DuplicateSliceError",
+    "DuplicateLensNameError",
     "ArmAllocationError",
 ]
 
@@ -60,6 +61,18 @@ class ArmAllocationError(LensError):
     rather than quietly demoting a buster out of the far arm or a control
     out of the modal arm — either silent fix would make the round report an
     arm balance it did not run."""
+
+
+class DuplicateLensNameError(LensError):
+    """Two lenses in one round's roster carry the same ``lens_name``, under a
+    salt scheme that makes the name the lens's identity in the seeded draw
+    (``salt_scheme="lens-name"``). Two lenses with one name would then share
+    one draw stream and one position in the processing order, so the round's
+    draw would not be defined at all — refused before anything is written
+    rather than resolved by a tie-break nothing pre-registered. Under the
+    legacy ``roster-id`` scheme a repeated name is not an error (the minted
+    id is the identity there), so nothing that used to be accepted is
+    refused by this."""
 
 
 class DuplicateSliceError(LensError):

@@ -69,7 +69,6 @@ from trialerror.budget.pools import budget_status, list_pools, usage_split_total
 from trialerror.dashboard.store_ro import RoStore
 from trialerror.events.api import list_threads, read_inbox
 from trialerror.ingest.extract import EXTRACT_REGISTER_KEY, list_pending
-from trialerror.ingest.requests import TRANSITIONS as REQUEST_TRANSITIONS
 from trialerror.jobs.ledger import list_jobs
 from trialerror.memory.merge import list_conflicts as list_memory_conflicts
 from trialerror.offload import control as offload_control
@@ -80,7 +79,13 @@ from trialerror.retrieve import engine as retrieve_engine
 from trialerror.retrieve.errors import InvalidSearchModeError
 from trialerror.retrieve.fence import citation_quote, is_fenced_license
 from trialerror.retrieve.wrap import untrusted_wrap
-from trialerror.rooms.api import CONVERGENCE_BAR_PCT, check_room_converged, get_freeze_reason, list_room_turns
+from trialerror.rooms.api import (
+    CONVERGENCE_BAR_PCT,
+    check_room_converged,
+    get_close_record,
+    get_freeze_reason,
+    list_room_turns,
+)
 from trialerror.sessions.lifecycle import session_status
 from trialerror.util.timeutil import now, now_dt, parse
 
@@ -179,7 +184,7 @@ def _elapsed_s(ts: str | None, *, reference: Any) -> float | None:
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     """Same ``sqlite_master`` check ``trialerror.retrieve.vecsearch._table_exists``
     / ``trialerror.ingest.checks`` already use elsewhere. New v4 seam tables
-    (``criterion``, ``feed_post_translation``) may not exist yet on a
+    (``criterion``) may not exist yet on a
     program whose ``ops.db`` was last migrated by a write path (``trialerror
     dashboard`` never migrates -- see ``store_ro.py``'s module docstring)
     before this build landed; every builder below checks this FIRST rather
@@ -478,6 +483,13 @@ def _session_timeline(rostore: RoStore, session_row: dict[str, Any]) -> dict[str
             if span is not None:
                 span["end_ts"] = row["ts"]
                 span["status"] = "frozen" if etype == "room_frozen" else "complete"
+        elif etype == "room_closed" and room_id:
+            # A close follows a freeze: the span already ended at the freeze;
+            # the close only settles what the bar says.
+            span = room_open.get(room_id)
+            if span is not None:
+                span["end_ts"] = span["end_ts"] or row["ts"]
+                span["status"] = "closed"
         elif etype in ("room_dp_scored", "hook_alive"):
             instants.append(
                 {
@@ -890,7 +902,7 @@ def build_corpus_panel(rostore: RoStore) -> dict[str, Any]:
 
     # KG extraction stage (trialerror.ingest.extract, design Section 6 stage 8):
     # candidates land as pending `record` rows (register_key=
-    # EXTRACT_REGISTER_KEY) until `trialerror extract accept/reject` resolves
+    # EXTRACT_REGISTER_KEY) until an accept/reject (the DECIDE queue's merge-accept/merge-reject) resolves
     # them into real entity/relation/claim rows -- the backlog-vs-resolved
     # split IS "extract coverage" for an ops cockpit (how much extraction
     # work is queued vs already landed), not a per-document fraction.
@@ -930,151 +942,6 @@ def _derive_post_kind(author: str) -> str:
     badge a post with (LENS / CRITIC / ORCHESTRATOR / ...) is exactly the
     text before that first colon; no second source of truth is invented."""
     return author.split(":", 1)[0] if author else "unknown"
-
-
-def _load_translations_for_posts(
-    conn: sqlite3.Connection, post_ids: Sequence[str]
-) -> dict[str, dict[str, Any] | None]:
-    """The one ``status='current'`` translation row per post in
-    ``post_ids``, or ``None`` for a post with none -- either because the
-    ``feed_post_translation`` table doesn't exist yet on this program
-    (pre-v4 ``ops.db``) or because that post has never been translated.
-    Never raises on a missing table (see :func:`_table_exists`).
-
-    Batched (n2, fix pass): one ``sqlite_master`` probe and one query for
-    the whole thread, rather than a per-post query (each of which re-probed
-    ``sqlite_master`` too) -- a 100-post thread went through roughly 200
-    queries to do what 2 can. When more than one ``status='current'`` row
-    exists for a post (should not happen, given the supersede invariant,
-    but this keeps the same ``ORDER BY created_ts DESC`` tie-break a
-    per-post query would use rather than assuming it away), the most
-    recent one wins."""
-    result: dict[str, dict[str, Any] | None] = {pid: None for pid in post_ids}
-    if not post_ids or not _table_exists(conn, "feed_post_translation"):
-        return result
-    placeholders = ",".join("?" for _ in post_ids)
-    rows = conn.execute(
-        f"SELECT * FROM feed_post_translation WHERE post_id IN ({placeholders}) AND status = 'current' "
-        "ORDER BY post_id, created_ts DESC",
-        list(post_ids),
-    ).fetchall()
-    for r in rows:
-        d = dict(r)
-        result.setdefault(d["post_id"], None)
-        if result[d["post_id"]] is None:  # first row per post_id wins (created_ts DESC)
-            result[d["post_id"]] = d
-    return result
-
-
-#: ``job.kind`` + ``payload["handler"]`` the translator enqueues under
-#: (``trialerror.cli.feed.run_translate`` / the ``feed-translate`` write
-#: action). Kept here rather than imported so this read-only panel module
-#: does not pull the whole ``trialerror.feed_translate`` package (and its
-#: ``trialerror.eval`` / ``trialerror.verify`` imports) into the dashboard
-#: process just to spell one string.
-_TRANSLATE_HANDLER = "feed_translate"
-_UNSETTLED_JOB_STATES = ("pending", "claimed", "running", "failed")
-
-
-def _pending_translation_post_ids(rostore: RoStore, post_ids: Sequence[str]) -> set[str]:
-    """Which of ``post_ids`` have a translation job in flight -- the
-    dashboard's third right-column state ("translation pending", design
-    Section 4.4's cache-miss line, made honest: the operator clicked
-    Translate, a job exists, no row has landed yet).
-
-    Read from the jobs ledger rather than from a flag on the post, because
-    the ledger is already the durable record of "work asked for, not yet
-    done" (``trialerror.jobs.ledger``'s own state machine) and a second
-    per-post flag would be a thing to keep in sync for no gain. A job
-    naming no ``post_ids`` is a thread-wide or program-wide sweep, so
-    every candidate post counts as pending under it.
-    """
-    if not post_ids or not rostore.is_available("jobs"):
-        return set()
-    wanted = set(post_ids)
-    placeholders = ",".join("?" for _ in _UNSETTLED_JOB_STATES)
-    rows = rostore.jobs.execute(
-        f"SELECT payload FROM job WHERE kind = 'custom' AND state IN ({placeholders})",
-        list(_UNSETTLED_JOB_STATES),
-    ).fetchall()
-    pending: set[str] = set()
-    for r in rows:
-        try:
-            payload = json.loads(r["payload"] or "{}")
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(payload, dict) or payload.get("handler") != _TRANSLATE_HANDLER:
-            continue
-        targets = payload.get("post_ids")
-        if targets:
-            pending |= wanted & set(targets)
-        else:
-            # a sweep: no explicit target list, so every post in view that
-            # has no translation yet is covered by it.
-            pending |= wanted
-    return pending
-
-
-def _translation_slot(row: dict[str, Any] | None, *, job_pending: bool) -> tuple[dict[str, Any] | None, str]:
-    """``(translation, state)`` for one post's right-hand column.
-
-    ``state`` is the UI contract, and it is the whole point of the
-    fail-closed gate being visible rather than silent
-    (``docs/reviews/AISPEAK_TRANSLATOR_DESIGN.md`` Section 4.4's three
-    states, plus the two this build's job path adds):
-
-    - ``"translated"`` -- a gated, passing translation. ``translation`` is
-      the row.
-    - ``"ungated"`` -- a translation stored without a gate verdict (a
-      pre-v5 row, or one hand-inserted straight through
-      ``trialerror.stores.insert``). Served, but flagged: the operator is
-      told it was never checked rather than being quietly shown
-      unverified text as if it had passed.
-    - ``"withheld"`` -- the gate FAILED this translation. ``translation``
-      is ``None``: the body is never sent to the browser at all, so no
-      amount of client-side cleverness can render it. ``gate_reasons``
-      travels instead (with its ``style`` block stripped -- FT-4, fix
-      pass, see below), so the operator can see WHY.
-    - ``"pending"`` -- a translation job is in flight for this post.
-    - ``"absent"`` -- nothing asked for yet.
-
-    FT-4 (fix pass): for a ``"withheld"`` row, ``gate_reasons.style`` is
-    dropped before it reaches this slot's caller. ``style.violations[].
-    detail`` for ``r1_sentence_length`` quotes up to 80 characters of the
-    very translation the gate just rejected
-    (:mod:`trialerror.feed_translate.style`'s own rule text), which is
-    exactly the text this docstring's ``"withheld"`` bullet promises never
-    crosses the wire. The UI's own ``gateReasonLines()`` only ever reads
-    ``gate_reasons.reasons`` (never ``.style``), so nothing the panel
-    renders is lost by dropping it.
-    """
-    if row is None:
-        return None, ("pending" if job_pending else "absent")
-
-    gate_status = row.get("gate_status") or "ungated"
-    try:
-        gate_reasons = json.loads(row["gate_reasons"]) if row.get("gate_reasons") else None
-    except (TypeError, ValueError):
-        gate_reasons = None
-
-    common = {
-        "translation_id": row["translation_id"],
-        "style_mode": row["style_mode"],
-        "translator_version": row["translator_version"],
-        "faithfulness_score": row["faithfulness_score"],
-        "created_ts": row["created_ts"],
-        "gate_status": gate_status,
-    }
-    if gate_status == "fail":
-        redacted = (
-            {k: v for k, v in gate_reasons.items() if k != "style"}
-            if isinstance(gate_reasons, dict)
-            else gate_reasons
-        )
-        return {**common, "gate_reasons": redacted, "body": None}, "withheld"
-    return {**common, "gate_reasons": gate_reasons, "body": row["body"]}, (
-        "ungated" if gate_status == "ungated" else "translated"
-    )
 
 
 def _thread_shape(posts: list[dict[str, Any]]) -> list[str]:
@@ -1173,22 +1040,13 @@ def _thread_shape(posts: list[dict[str, Any]]) -> list[str]:
 
 def build_feed_panel(rostore: RoStore, *, thread_id: str | None = None) -> dict[str, Any]:
     """Threads, one thread's full-text post stream, unread operator
-    directives, and a per-post ``translation`` slot reading the AISPEAK
-    sidecar table (``docs/reviews/AISPEAK_TRANSLATOR_DESIGN.md``) IF it
-    exists on this program -- ``null`` otherwise.
+    directives.
 
     Every post also carries its place in the thread's reply structure --
     ``reply_to``, ``root_post_id``, ``depth``, ``reply_count``,
     ``reply_to_missing`` -- and the panel carries ``order_threaded``, the
     id sequence the THREADED reading order renders (see
     :func:`_thread_shape`). ``posts`` itself stays in ARRIVAL order.
-
-    Each post also carries ``translation_state`` -- one of ``translated``,
-    ``ungated``, ``withheld``, ``pending``, ``absent`` (see
-    :func:`_translation_slot`). A ``withheld`` post's translation BODY is
-    never included in the payload: the fail-closed gate
-    (:mod:`trialerror.feed_translate.gate`) refused it, and a body the UI is
-    forbidden to render has no business crossing the wire.
 
     ``inbox_item`` (the operator directive channel) carries NO
     ``thread_id`` column in the M1-built schema -- it is a program-wide
@@ -1223,14 +1081,8 @@ def build_feed_panel(rostore: RoStore, *, thread_id: str | None = None) -> dict[
             (active_thread_id,),
         ).fetchall()
         raw = [{k: v for k, v in dict(r).items() if k != "_rowid"} for r in rows]
-        translations = _load_translations_for_posts(conn, [d["post_id"] for d in raw])
-        untranslated = [pid for pid, t in translations.items() if t is None]
-        job_pending = _pending_translation_post_ids(rostore, untranslated)
         for d in raw:
             d["kind"] = _derive_post_kind(d["author"])
-            d["translation"], d["translation_state"] = _translation_slot(
-                translations[d["post_id"]], job_pending=d["post_id"] in job_pending
-            )
             posts.append(d)
         order_threaded = _thread_shape(posts)
 
@@ -1260,8 +1112,6 @@ def build_feed_panel(rostore: RoStore, *, thread_id: str | None = None) -> dict[
         "posts": posts,
         "order_threaded": order_threaded,
         "unread_directives": unread_directives,
-        "translator_table_available": _table_exists(conn, "feed_post_translation"),
-        "translation_withheld_count": sum(1 for p in posts if p["translation_state"] == "withheld"),
     }
 
 
@@ -1270,7 +1120,7 @@ def build_feed_panel(rostore: RoStore, *, thread_id: str | None = None) -> dict[
 # ---------------------------------------------------------------------------
 _ROOM_EVENT_TYPES = (
     "room_created", "room_turn", "room_dp_scored", "room_converged",
-    "room_frozen", "room_deliverable_registered",
+    "room_frozen", "room_closed", "room_deliverable_registered",
 )
 
 
@@ -1355,6 +1205,8 @@ def build_rooms_panel(rostore: RoStore, *, room_id: str | None = None) -> dict[s
     dp_agreement_series: dict[str, list[dict[str, Any]]] = {}
     moderator_events: list[dict[str, Any]] = []
     freeze_reason = None
+    frozen_earlier_reason = None
+    close_record = None
     detail_error = None
 
     if active_room_id is not None:
@@ -1385,8 +1237,13 @@ def build_rooms_panel(rostore: RoStore, *, room_id: str | None = None) -> dict[s
                         "converged": ev["payload"].get("converged"),
                     }
                 )
+            # freeze_reason is the reason of a room frozen NOW (the page heads it FROZEN, in red); a
+            # closed room's freeze is history, handed over as frozen_earlier_reason beside its close record
             if active_room is not None and active_room["state"] == "frozen":
                 freeze_reason = get_freeze_reason(rostore, active_room_id)
+            if active_room is not None and active_room["state"] == "closed":
+                frozen_earlier_reason = get_freeze_reason(rostore, active_room_id)
+                close_record = get_close_record(rostore, active_room_id)
         except (TypeError, KeyError, ValueError) as exc:
             detail_error = f"{type(exc).__name__}: {exc}"
 
@@ -1396,6 +1253,8 @@ def build_rooms_panel(rostore: RoStore, *, room_id: str | None = None) -> dict[s
         "active_room_id": active_room_id,
         "active_room": active_room,
         "freeze_reason": freeze_reason,
+        "frozen_earlier_reason": frozen_earlier_reason,
+        "close_record": close_record,
         "turns": turns,
         "convergence": convergence,
         "convergence_bar_pct": CONVERGENCE_BAR_PCT,
@@ -1505,16 +1364,31 @@ def _kg_merge_items(rostore: RoStore) -> list[dict[str, Any]]:
 
 
 def _acquisition_items(rostore: RoStore) -> list[dict[str, Any]]:
+    """DECIDE's "ACQUISITIONS -- ONLY YOU CAN DELIVER THESE": sources the
+    operator can actually act on. ``delivered`` and ``verifying`` are
+    deliberately excluded -- ``delivered`` is the pipeline's own default
+    (``trialerror.ingest.pipeline.register_source``'s ``request_state``
+    default) and nothing here moves a row off it or off ``verifying``
+    automatically, so both are resting states with nothing left for the
+    operator to DO, not open asks. Only ``wanted`` (nobody has gone looking
+    yet) and ``requested`` (asked for, not yet in hand) are actionable, with
+    ``wanted`` surfaced first -- it is the state furthest from done.
+
+    ``source`` (``trialerror/stores/schema/knowledge.py``) carries no
+    purpose/lens/notes/requested-by column recording WHY a given source was
+    wanted -- only bibliographic and licensing fields plus the request-state
+    machinery itself. Absent that, the honest consequence is that this
+    row is what a still-open literature request names, not a guess at its
+    purpose."""
     if not rostore.is_available("knowledge"):
         return []
     rows = rostore.knowledge.execute(
-        "SELECT * FROM source WHERE request_state IN ('wanted','requested','delivered','verifying') "
-        "ORDER BY request_state, registered_ts"
+        "SELECT * FROM source WHERE request_state IN ('wanted','requested') "
+        "ORDER BY CASE request_state WHEN 'wanted' THEN 0 ELSE 1 END, registered_ts"
     ).fetchall()
     items: list[dict[str, Any]] = []
     for r in rows:
         d = dict(r)
-        next_states = sorted(REQUEST_TRANSITIONS.get(d["request_state"], frozenset()))
         items.append(
             {
                 "kind": "acquisition",
@@ -1523,11 +1397,7 @@ def _acquisition_items(rostore: RoStore) -> list[dict[str, Any]]:
                 "request_state": d["request_state"],
                 "source_kind": d["kind"],
                 "blocking": False,
-                "consequence": (
-                    f"Transitioning this source unblocks: {', '.join(next_states)}."
-                    if next_states
-                    else "This request state is terminal."
-                ),
+                "consequence": f"Needed by literature request {d['source_id']}.",
             }
         )
     return items
@@ -1587,6 +1457,8 @@ def _prereg_reveal_items(conn_ops: sqlite3.Connection) -> list[dict[str, Any]]:
 
 
 def _room_escalation_items(rostore: RoStore, conn_ops: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Frozen rooms only: a ``closed`` room (``trialerror room close``, the
+    operator's decision) has had its answer and leaves the queue."""
     rows = conn_ops.execute("SELECT * FROM room WHERE state = 'frozen'").fetchall()
     items: list[dict[str, Any]] = []
     for r in rows:
@@ -1599,7 +1471,10 @@ def _room_escalation_items(rostore: RoStore, conn_ops: sqlite3.Connection) -> li
                 "topic": d["topic"],
                 "reason": reason,
                 "blocking": True,
-                "consequence": "This room stays frozen until an operator turn resolves it (freeze-and-escalate).",
+                "consequence": (
+                    "This room stays frozen until the operator decides what happens to it (freeze-and-escalate); "
+                    "a decision to close it is recorded with `trialerror room close`."
+                ),
             }
         )
     return items
@@ -1885,7 +1760,7 @@ def _version_chain(conn_ops: sqlite3.Connection, artifact_id: str) -> list[dict[
             continue
         seen.add(aid)
         row = conn_ops.execute(
-            "SELECT artifact_id, title, status, registered_ts, supersedes FROM artifact WHERE artifact_id = ?",
+            "SELECT artifact_id, title, status, disposition, registered_ts, supersedes FROM artifact WHERE artifact_id = ?",
             (aid,),
         ).fetchone()
         if row is None:
@@ -1916,9 +1791,14 @@ def build_dossier_panel(rostore: RoStore, *, artifact_id: str | None = None) -> 
     registry = list_artifacts(rostore, limit=200)
     type_filters = [dict(r) for r in conn.execute("SELECT type_key, title, gated FROM template ORDER BY type_key").fetchall()]
 
+    # te-dash A7: with nothing asked for, open the newest REGISTERED artifact
+    # -- the newest row is often a draft that "decides nothing" -- and fall
+    # back to the newest row of any status. ``list_artifacts`` is newest
+    # first.
     active_artifact_id = artifact_id
     if active_artifact_id is None and registry:
-        active_artifact_id = registry[0]["artifact_id"]
+        registered = next((a for a in registry if a.get("status") == "registered"), None)
+        active_artifact_id = (registered or registry[0])["artifact_id"]
 
     artifact = None
     gate = None
@@ -2001,7 +1881,8 @@ def build_dossier_panel(rostore: RoStore, *, artifact_id: str | None = None) -> 
                 "superseded_by": superseded_by,
                 "registers_records": registers_records,
                 "discharges_criteria": discharges_criteria,
-                "note": (
+                "note": "Lineage is drawn from launches, gates, supersessions and record links only.",
+                "note_detail": (
                     "Assembled only from the launch ledger, gate history, artifact.supersedes and "
                     "record/criterion links. knowledge.prov_edge has zero writers in this codebase, "
                     "so no general consumed-source provenance graph is drawn here."
@@ -2366,7 +2247,8 @@ def _evidence_argues(conn: sqlite3.Connection, claim_id: str) -> dict[str, Any]:
         "contradicts": [e for e in edges if e["role"] == "contradicts"],
         "supports": [e for e in edges if e["role"] == "supports"],
         "verdicts": verdicts,
-        "note": (
+        "note": "Contradictions shown here come from contradiction verdicts only.",
+        "note_detail": (
             "prov_edge has zero writers outside lexicon lineage edges (ruling L-E5: "
             "derived_from, supersedes, contradicts between two scoped senses); no writer "
             "puts a claim on either end of one, so contradiction verdicts "
@@ -2721,7 +2603,8 @@ def build_evidence_panel(
     else:
         panel["term_conflicts_omitted"] = {
             "reason": "awaiting_migration",
-            "message": (
+            "message": "Term-sense conflicts per claim are not available yet.",
+            "message_detail": (
                 "the per-claim term-sense conflict read (lexicon.api.conflicts_for_claim) is not in "
                 "this program yet -- this region is omitted rather than drawn empty"
             ),
@@ -2972,7 +2855,8 @@ def build_lexicon_panel(rostore: RoStore, *, term_id: str | None = None) -> dict
     if not _table_exists(conn, "term"):
         return {
             "status": "awaiting_migration",
-            "message": (
+            "message": "The knowledge store needs an upgrade before this page can show terms.",
+            "message_detail": (
                 "knowledge.db has not been migrated to schema v5 yet (the term table doesn't "
                 "exist) -- any write path that opens this program's store (e.g. a CLI command) "
                 "picks up the migration automatically; trialerror dashboard never migrates a store "
@@ -3138,7 +3022,8 @@ def build_course_panel(rostore: RoStore) -> dict[str, Any]:
     if not _table_exists(conn, "criterion"):
         return {
             "status": "awaiting_migration",
-            "message": (
+            "message": "The knowledge store needs an upgrade before this page can show the course.",
+            "message_detail": (
                 "ops.db has not been migrated to schema v4 yet (the criterion table doesn't "
                 "exist) -- any write path that opens this program's store (e.g. a CLI command) "
                 "picks up the migration automatically; trialerror dashboard never migrates a store "
@@ -3217,6 +3102,11 @@ def _room_event_summary(event_type: str, payload: dict[str, Any]) -> str:
         return f"Room {room_id} converged on every discussion point."
     if event_type == "room_frozen":
         return f"Room {room_id} was frozen: {payload.get('reason') or '(no reason recorded)'}"
+    if event_type == "room_closed":
+        return (
+            f"Room {room_id} was closed by operator decision {payload.get('decided_by') or '?'}: "
+            f"{payload.get('reason') or '(no reason recorded)'}"
+        )
     if event_type == "room_created":
         return f"Room {room_id} opened: {payload.get('topic', '')}"
     if event_type == "room_deliverable_registered":

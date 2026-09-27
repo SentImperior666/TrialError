@@ -52,12 +52,15 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from trialerror.jobs import ledger
-from trialerror.jobs.errors import JobError, JobPausedError
+from trialerror.jobs.errors import JobError, JobPausedError, UnknownHandlerError
 from trialerror.jobs.registry import discover_and_register_handlers, get_handler
 from trialerror.stores import paths
 from trialerror.stores.store import Store
 from trialerror.util.ids import new_id
 from trialerror.util.timeutil import now
+
+#: Handlers retired in Phase 0 whose queued rows are abandoned at once.
+RETIRED_HANDLERS = frozenset({"feed_translate", "summarize", "extract"})
 
 __all__ = [
     "DEFAULT_JITTER_FRACTION",
@@ -307,6 +310,31 @@ def run_one(
         # trialerror.util.doctor.run_checks applies per-check).
         handler = get_handler(handler_name)
         handler(ctx)
+    except UnknownHandlerError:
+        # A queued row whose handler was retired (or never existed) never
+        # crashes the worker. A handler in RETIRED_HANDLERS is abandoned at
+        # once with a plain reason (no retry can succeed). Any other unknown
+        # name keeps the bounded logic-failure retry: a worker missing an
+        # optional dependency skips that handlers module
+        # (jobs/registry.py), so a LIVE handler can look unregistered, and
+        # abandoning it would drop live work.
+        if handler_name in RETIRED_HANDLERS:
+            ledger.abandon(
+                store,
+                claimed["job_id"],
+                reason=f"handler {handler_name!r} is not registered (retired or unknown)",
+                worker_id=worker_id,
+            )
+            return {"status": "abandoned", "job_id": claimed["job_id"], "worker_id": worker_id}
+        row = ledger.fail(
+            store,
+            claimed["job_id"],
+            worker_id,
+            failure_class="logic",
+            error=f"handler {handler_name!r} is not registered (retired or unknown)",
+        )
+        status = "abandoned" if row["state"] == "abandoned" else "failed"
+        return {"status": status, "job_id": claimed["job_id"], "worker_id": worker_id}
     except JobPausedError:
         return {"status": "paused", "job_id": claimed["job_id"], "worker_id": worker_id}
     except EnvironmentalFailure as exc:

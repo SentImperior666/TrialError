@@ -346,7 +346,11 @@ def test_argues_reports_the_contracrow_verdict_and_an_honestly_empty_prov_edge(t
     assert v["label"] == "CONTRADICTED", "the label is carried verbatim, never re-worded"
     assert v["prereg_compliant"] == 1
     assert argues["contradicts"] == [] and argues["supports"] == []
-    assert "prov_edge has zero writers outside lexicon lineage edges" in argues["note"], (
+    # A8: the plain operator sentence is the on-screen `note`; the old
+    # developer-facing wording (ruling L-E5's narrower, no-longer-blanket
+    # statement) moves to `note_detail`, which the page puts in a `title`.
+    assert argues["note"] == "Contradictions shown here come from contradiction verdicts only."
+    assert "prov_edge has zero writers outside lexicon lineage edges" in argues["note_detail"], (
         "ruling L-E5 made the blanket statement false the moment lane e landed; the note\n"
         "for THIS read is the narrower true one"
     )
@@ -732,7 +736,10 @@ def test_the_region_is_still_omitted_and_said_so_when_the_module_is_absent(trace
     panel = data.build_evidence_panel(rostore, claim_id=ids["claim"])
     assert "term_conflicts" not in panel
     assert panel["term_conflicts_omitted"]["reason"] == "awaiting_migration"
-    assert "conflicts_for_claim" in panel["term_conflicts_omitted"]["message"]
+    # A8: `message` is the plain on-screen sentence; the developer-facing
+    # detail (naming the actual read) moves to `message_detail`.
+    assert panel["term_conflicts_omitted"]["message"] == "Term-sense conflicts per claim are not available yet."
+    assert "conflicts_for_claim" in panel["term_conflicts_omitted"]["message_detail"]
 
 
 def test_the_region_is_omitted_on_a_store_that_has_not_run_the_migration(traced, monkeypatch):

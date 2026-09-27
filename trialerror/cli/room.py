@@ -1,6 +1,7 @@
 """``trialerror room`` — the brainstorm-rooms runtime CLI surface. Mission brief
 (v1-rooms lane): "CLI: trialerror room {create, status, post, score, freeze,
-converge-check, export}." Thin wrapper over ``trialerror.rooms.api`` — all logic
+converge-check, export}" (``close`` was added later: frozen -> closed on an
+operator decision). Thin wrapper over ``trialerror.rooms.api`` — all logic
 lives there; this module only parses argv and shapes the AgentEnvelope
 (same split ``trialerror/cli/gate.py``/``trialerror/cli/artifact.py`` document for
 M10, and ``trialerror/cli/verify.py`` documents for the judge-callable boundary
@@ -45,11 +46,13 @@ from trialerror.rooms.api import (
     TURN_KINDS,
     build_admission_order,
     check_room_converged,
+    close_room,
     consolidated_ideas_for_admission,
     converge_room,
     create_room,
     export_room,
     freeze_room,
+    get_close_record,
     get_room,
     list_room_turns,
     post_final_stance,
@@ -65,7 +68,7 @@ from trialerror.util.envelope import error_envelope, next_action, ok_envelope
 
 GROUP_NAME = "room"
 HELP = (
-    "Brainstorm-rooms runtime: create, status, post, score, stance, extracts, freeze, converge-check, "
+    "Brainstorm-rooms runtime: create, status, post, score, stance, extracts, freeze, close, converge-check, "
     "export, admission-order."
 )
 
@@ -205,6 +208,19 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     p_freeze.add_argument("--by-launch", required=True, dest="by_launch")
     p_freeze.set_defaults(handler=_run_freeze)
 
+    p_close = actions.add_parser(
+        "close", help="frozen -> closed: an operator decision closes a frozen room (terminal; append-only)"
+    )
+    _add_program_root_arg(p_close)
+    p_close.add_argument("--id", required=True, dest="room_id")
+    p_close.add_argument("--reason", required=True, help="why the room is closed, in words")
+    p_close.add_argument(
+        "--decided-by", required=True, dest="decided_by", metavar="REF",
+        help="the reference of the operator decision that closes the room",
+    )
+    p_close.add_argument("--by-launch", required=True, dest="by_launch")
+    p_close.set_defaults(handler=_run_close)
+
     p_converge = actions.add_parser(
         "converge-check", help="open -> converged if every discussion point is at/above the bar, else report what's missing"
     )
@@ -244,7 +260,7 @@ def _run_no_action(args: argparse.Namespace) -> dict:
     return error_envelope(
         "room",
         "no_action",
-        "specify an action: create|status|post|score|stance|extracts|freeze|converge-check|export|admission-order",
+        "specify an action: create|status|post|score|stance|extracts|freeze|close|converge-check|export|admission-order",
         next_actions=[next_action(["trialerror", "room", "--help"], "list room actions")],
     )
 
@@ -294,14 +310,14 @@ def _run_status(args: argparse.Namespace) -> dict:
         turn_counts: dict[str, int] = {}
         for t in turns:
             turn_counts[t["dp_ref"]] = turn_counts.get(t["dp_ref"], 0) + 1
+        result = {"room": room, "convergence": convergence, "turn_count": len(turns), "turn_counts_by_dp_ref": turn_counts}
+        if room["state"] == "closed":
+            result["closed"] = get_close_record(store, args.room_id)
     except (RoomsError, StoreError, ValueError) as exc:
         return error_envelope("room status", "status_refused", str(exc))
     finally:
         store.close()
-    return ok_envelope(
-        "room status",
-        result={"room": room, "convergence": convergence, "turn_count": len(turns), "turn_counts_by_dp_ref": turn_counts},
-    )
+    return ok_envelope("room status", result=result)
 
 
 def _run_post(args: argparse.Namespace) -> dict:
@@ -451,6 +467,22 @@ def _run_freeze(args: argparse.Namespace) -> dict:
     finally:
         store.close()
     return ok_envelope("room freeze", result=row)
+
+
+def _run_close(args: argparse.Namespace) -> dict:
+    store, err = _open_store(args)
+    if err is not None:
+        return err
+    try:
+        row = close_room(
+            store, room_id=args.room_id, by_launch=args.by_launch, reason=args.reason, decided_by=args.decided_by
+        )
+        record = get_close_record(store, args.room_id)
+    except (RoomsError, StoreError, ValueError) as exc:
+        return error_envelope("room close", "close_refused", str(exc))
+    finally:
+        store.close()
+    return ok_envelope("room close", result={"room": row, "closed": record})
 
 
 def _run_converge_check(args: argparse.Namespace) -> dict:

@@ -23,11 +23,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from trialerror.jobs import ledger
-from trialerror.lens.assign import list_assignments, run_assignment, slice_distances
+from trialerror.lens.assign import (
+    LEGACY_SALT_SCHEME,
+    SALT_SCHEMES,
+    list_assignments,
+    run_assignment,
+    slice_distances,
+)
 from trialerror.lens.errors import LensError
 from trialerror.lens.export import export_launch_bookable, lens_log
 from trialerror.lens.ideas import IDEA_STATUSES, intake_records
@@ -52,9 +59,12 @@ from trialerror.lens.novelty import (
     normalize_judged_sets,
     record_calibration,
     record_novelty_verdicts,
+    record_rejudge,
+    rejudge_report,
     round_dir,
     run_mechanical_screen,
 )
+from trialerror.lens.planfile import PlanFileRefusedError, write_plan
 from trialerror.lens.roster import SEATS, add_lens, list_roster
 from trialerror.lens.stratify import score_candidates, stratify
 from trialerror.lens.vectors import fetch_doc_vectors
@@ -109,22 +119,49 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     _add_stratify_args(stratify_p)
     stratify_p.set_defaults(handler=_run_stratify)
 
-    assign = sub.add_parser("assign", help="stratify + seeded quota draw + write lens_assignment rows")
-    _add_stratify_args(assign)
+    assign = sub.add_parser(
+        "assign",
+        help="stratify + seeded quota draw + write lens_assignment rows; or, with --plan-file, write the "
+             "rows a plan file lists (no draw), read them back, and keep them only if they match",
+    )
+    # Not required at the parser: the --plan-file mode takes none of them, and
+    # _run_assign refuses whichever the chosen mode is missing, by name.
+    _add_stratify_args(assign, required=False)
     assign.add_argument("--round-id", required=True)
     assign.add_argument("--roster-id", action="append", default=None, dest="roster_ids", metavar="ROSTER_ID", help="restrict to these lenses (default: every lens in the round's roster)")
-    assign.add_argument("--slices-per-lens", type=int, required=True)
-    assign.add_argument("--seed", required=True)
-    assign.add_argument("--weights", default="40,40,20", help="comma-separated near,moderate,far percentages")
-    assign.add_argument("--far-floor", type=int, default=2)
+    assign.add_argument("--slices-per-lens", type=int, default=None, help="required unless --plan-file")
+    assign.add_argument("--seed", default=None, help="required unless --plan-file")
+    assign.add_argument("--weights", default=None, help="comma-separated near,moderate,far percentages (default 40,40,20)")
+    assign.add_argument("--far-floor", type=int, default=None, help="default 2")
     assign.add_argument(
         "--arm-per-lens", action="store_true",
         help="split the ROSTER across the arms (one arm per lens, whole slice from it) instead of "
              "splitting each lens's slice; --far-floor then counts far LENSES, not far slices",
     )
+    assign.add_argument(
+        "--slice-salt", default=None, choices=list(SALT_SCHEMES), dest="slice_salt",
+        help="what the seeded draw is a function of. 'roster-id' (the default, and what every "
+             "round before this flag ran under) salts each lens's stream with its minted roster_id "
+             "and processes the roster in insertion order, so re-adding a row moves the draw; "
+             "'lens-name' salts with '<round-id>::<lens-name>' and processes the roster in "
+             "ascending lens-name order, so the draw depends on the design and not on minted ids "
+             "(lens names must then be unique in the round). Pre-register the scheme with the round",
+    )
     assign.add_argument("--inter-cluster-mandate", action="store_true")
     assign.add_argument("--home-cluster", default=None)
-    assign.add_argument("--launch-id", default=None)
+    assign.add_argument("--launch-id", default=None, help="the launch writing the rows; required with --plan-file")
+    assign.add_argument(
+        "--plan-file", default=None, dest="plan_file", metavar="PATH",
+        help="write the rows this plan file (trialerror-plan-file/1) lists instead of drawing them: every "
+             "check first, then one transaction, then a read-back that rolls everything back on any "
+             "difference. Takes none of the draw flags (--model-key, --home, --candidate, "
+             "--slices-per-lens, --seed, --roster-id, --weights, --far-floor, --arm-per-lens, "
+             "--slice-salt, --inter-cluster-mandate, --home-cluster, --cluster-of): the plan carries them",
+    )
+    assign.add_argument(
+        "--expect-plan-sha256", default=None, dest="expect_plan_sha256", metavar="HEX",
+        help="with --plan-file: refuse unless the plan hashes to this (its plan_sha256)",
+    )
     assign.set_defaults(handler=_run_assign)
 
     log = sub.add_parser("log", help="list logged lens_assignment rows for a round")
@@ -367,6 +404,44 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
              "supersede. Without it a re-scoring is refused (one submission per judge)",
     )
     screen.add_argument("--second-judge-file", default=None, dest="second_judge_file", metavar="FILE")
+    screen.add_argument(
+        "--judge-launch", action="append", default=None, dest="judge_launches", metavar="LAUNCH_ID",
+        help="with --record-verdicts: a launch the PRIMARY judge ran under; repeat for several. Every "
+             "id must name a real launch or the recording is refused before anything is written. The "
+             "list rides in the recording result and the batch's verdicts file under 'judges', beside "
+             "the second judge's -- a verdict row records the RECORDING launch, which is a different "
+             "fact from who judged",
+    )
+    screen.add_argument(
+        "--second-judge-launch", action="append", default=None, dest="second_judge_launches",
+        metavar="LAUNCH_ID",
+        help="the same for the re-judge, and stored on every verdict_rejudge row this recording (or "
+             "--record-rejudge) writes. Repeatable; every id must exist",
+    )
+    screen.add_argument(
+        "--rejudge-report", action="store_true", dest="rejudge_report",
+        help="READ-ONLY: the re-judge, read back out of the STORE -- per batch and pooled over the "
+             "round, per reference set, n / observed agreement / expected agreement / Cohen's kappa, "
+             "the judging launches and the raw disagreement rows. Computed from the verdict and "
+             "verdict_rejudge tables and nothing else. Pass --batch-id to narrow it to one batch. The "
+             "CATEGORY VOCABULARY -- a kappa's chance term is over the words a judge could have used, "
+             "and those are the round's when it declared a labels file -- is resolved PER BATCH from "
+             "that batch's own recording result file (then its batch file), so the report reproduces "
+             "the number the recording published with no flag to remember. --labels-file overrides it "
+             "for every batch, and a batch whose recorded hash differs from the one given is reported "
+             "rather than refused. A batch whose recording cannot be found is reported as such and its "
+             "kappa is marked as computed under the DEFAULT vocabulary",
+    )
+    screen.add_argument(
+        "--record-rejudge", action="store_true", dest="record_rejudge",
+        help="backfill the second judge's rows for a batch that was RECORDED before they were stored. "
+             "Takes the same --second-judge-file the recording took (masked or unmasked), needs "
+             "--batch-id and --launch-id, writes verdict_rejudge rows and NOTHING else -- no verdict "
+             "row, no consolidation, no plant re-scored -- and then verifies itself: the kappa, n and "
+             "observed agreement recomputed from the store must equal the ones that batch's recording "
+             "result file already published. On any mismatch it rolls back, writes nothing and refuses "
+             "with both numbers. --supersede replaces rows already on file",
+    )
     screen.add_argument("--rescreen", action="store_true", help="re-screen ideas that already have a dossier")
     screen.add_argument(
         "--corpus-mode", default=DEFAULT_CORPUS_MODE, dest="corpus_mode", choices=["auto", "fts", "vector", "hybrid"],
@@ -419,10 +494,10 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     return parser
 
 
-def _add_stratify_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--model-key", required=True, help="embedding model_key (matches vec_chunks__<model_key>)")
-    p.add_argument("--home", action="append", default=[], dest="home_doc_ids", metavar="DOC_ID", required=True)
-    p.add_argument("--candidate", action="append", default=[], dest="candidate_doc_ids", metavar="DOC_ID", required=True)
+def _add_stratify_args(p: argparse.ArgumentParser, *, required: bool = True) -> None:
+    p.add_argument("--model-key", required=required, default=None, help="embedding model_key (matches vec_chunks__<model_key>)")
+    p.add_argument("--home", action="append", default=[], dest="home_doc_ids", metavar="DOC_ID", required=required)
+    p.add_argument("--candidate", action="append", default=[], dest="candidate_doc_ids", metavar="DOC_ID", required=required)
     p.add_argument("--cluster-of", default=None, help='JSON object string: {"doc_id": "cluster_id", ...}')
 
 
@@ -471,6 +546,10 @@ def _novelty_config(program_root: Path) -> dict:
 RECORDING_BATCH_STEMS: tuple[tuple[str, str, str], ...] = (
     ("record_calibration", "--record-calibration", "calibration-0"),
     ("record_verdicts", "--record-verdicts", "judged-0"),
+    # lane R0-C: the backfill records against a batch too, and against the
+    # same file --record-verdicts read, so it resolves the declared sets the
+    # same way rather than falling back to the CLI default.
+    ("record_rejudge", "--record-rejudge", "judged-0"),
 )
 
 
@@ -650,7 +729,56 @@ def _run_stratify(args: argparse.Namespace) -> dict:
     )
 
 
+#: ``lens assign``'s draw flags, as ``(flag, dest)``: what the seeded draw
+#: reads, and what a plan file already carries. The ``--plan-file`` mode takes
+#: none of them (a flag the plan overrides would be a flag silently ignored).
+_DRAW_FLAGS: tuple[tuple[str, str], ...] = (
+    ("--model-key", "model_key"),
+    ("--home", "home_doc_ids"),
+    ("--candidate", "candidate_doc_ids"),
+    ("--slices-per-lens", "slices_per_lens"),
+    ("--seed", "seed"),
+    ("--roster-id", "roster_ids"),
+    ("--weights", "weights"),
+    ("--far-floor", "far_floor"),
+    ("--arm-per-lens", "arm_per_lens"),
+    ("--slice-salt", "slice_salt"),
+    ("--inter-cluster-mandate", "inter_cluster_mandate"),
+    ("--home-cluster", "home_cluster"),
+    ("--cluster-of", "cluster_of"),
+)
+
+#: The draw flags the draw mode cannot run without.
+_DRAW_REQUIRED: tuple[tuple[str, str], ...] = (
+    ("--model-key", "model_key"),
+    ("--home", "home_doc_ids"),
+    ("--candidate", "candidate_doc_ids"),
+    ("--slices-per-lens", "slices_per_lens"),
+    ("--seed", "seed"),
+)
+
+
+def _given(args: argparse.Namespace, dest: str) -> bool:
+    # Identity, not equality: ``0 == False``, so an integer flag given as 0 must still count as given.
+    value = getattr(args, dest, None)
+    return not (value is None or value is False or value == [])
+
+
 def _run_assign(args: argparse.Namespace) -> dict:
+    if getattr(args, "plan_file", None) is not None:
+        return _run_assign_plan_file(args)
+    if getattr(args, "expect_plan_sha256", None) is not None:
+        return error_envelope(
+            "lens assign", "plan_file_conflict",
+            "--expect-plan-sha256 checks a plan file's hash and goes with --plan-file only",
+        )
+    missing = [flag for flag, dest in _DRAW_REQUIRED if not _given(args, dest)]
+    if missing:
+        return error_envelope(
+            "lens assign", "missing_fields",
+            f"lens assign draws the slices from {missing!r}, which are missing; or pass --plan-file to "
+            "write the rows a plan file lists",
+        )
     store, err = _open_store(args)
     if err is not None:
         return err
@@ -666,7 +794,7 @@ def _run_assign(args: argparse.Namespace) -> dict:
                 next_actions=[next_action(["trialerror", "lens", "roster", "--add"], "add a lens to this round first")],
             )
         cluster_of = json.loads(args.cluster_of) if args.cluster_of else None
-        weights = tuple(int(w) for w in args.weights.split(","))
+        weights = tuple(int(w) for w in (args.weights if args.weights is not None else "40,40,20").split(","))
         result = run_assignment(
             store,
             round_id=args.round_id,
@@ -676,6 +804,7 @@ def _run_assign(args: argparse.Namespace) -> dict:
             lenses=[
                 {
                     "roster_id": r["roster_id"],
+                    "lens_name": r.get("lens_name"),
                     "seat": r.get("seat"),
                     "recipe_cards": r.get("recipe_cards"),
                 }
@@ -684,8 +813,9 @@ def _run_assign(args: argparse.Namespace) -> dict:
             slices_per_lens=args.slices_per_lens,
             seed=args.seed,
             weights=weights,
-            far_floor=args.far_floor,
+            far_floor=2 if args.far_floor is None else args.far_floor,
             arm_mode="per_lens" if getattr(args, "arm_per_lens", False) else "per_slice",
+            salt_scheme=getattr(args, "slice_salt", None) or LEGACY_SALT_SCHEME,
             inter_cluster_mandate=args.inter_cluster_mandate,
             cluster_of=cluster_of,
             home_cluster=args.home_cluster,
@@ -703,9 +833,54 @@ def _run_assign(args: argparse.Namespace) -> dict:
             "rows": result["rows"],
             "count": len(result["rows"]),
             "arm_mode": result["plan"]["arm_mode"],
+            "salt_scheme": result["salt_scheme"],
             "roster_quota": result["plan"]["roster_quota"],
         },
+        warnings=result["warnings"],
         next_actions=[next_action(["trialerror", "lens", "log", "--round-id", args.round_id], "see the logged assignment")],
+    )
+
+
+def _run_assign_plan_file(args: argparse.Namespace) -> dict:
+    """``lens assign --plan-file``: the rows a plan file lists, validated
+    first, written in one transaction and kept only if they read back as
+    planned (:func:`trialerror.lens.planfile.write_plan`)."""
+    conflicts = [flag for flag, dest in _DRAW_FLAGS if _given(args, dest)]
+    if conflicts:
+        return error_envelope(
+            "lens assign", "plan_file_conflict",
+            f"--plan-file writes the rows the plan lists and draws nothing, so it takes none of the draw "
+            f"flags; given: {conflicts!r}. The plan file carries the seed, weights, floors and slices",
+        )
+    if not getattr(args, "launch_id", None):
+        return error_envelope(
+            "lens assign", "missing_fields",
+            "--plan-file needs --launch-id: the launch writing the rows, recorded on every row",
+        )
+    store, err = _open_store(args)
+    if err is not None:
+        return err
+    try:
+        result = write_plan(
+            store,
+            plan_path=Path(args.plan_file),
+            round_id=args.round_id,
+            launch_id=args.launch_id,
+            expect_plan_sha256=args.expect_plan_sha256,
+        )
+    except PlanFileRefusedError as exc:
+        return error_envelope("lens assign", exc.code, str(exc), details=exc.details())
+    except (StoreError, sqlite3.Error) as exc:
+        return error_envelope("lens assign", "assign_error", str(exc))
+    finally:
+        store.close()
+    return ok_envelope(
+        "lens assign",
+        result=result,
+        next_actions=[
+            next_action(["trialerror", "lens", "log", "--round-id", args.round_id], "see the written assignment"),
+            next_action(["trialerror", "doctor"], "run the lens checks over the round"),
+        ],
     )
 
 
@@ -948,15 +1123,31 @@ def _run_screen(args: argparse.Namespace) -> dict:
     calibration = getattr(args, "calibration", False)
     record_calibration_mode = getattr(args, "record_calibration", False)
     baseline_mode = getattr(args, "baseline", False)
+    rejudge_report_mode = getattr(args, "rejudge_report", False)
+    record_rejudge_mode = getattr(args, "record_rejudge", False)
     if not (
         args.mechanical or args.judged_prep or args.record_verdicts
         or calibration or record_calibration_mode or baseline_mode
+        or rejudge_report_mode or record_rejudge_mode
     ):
         return error_envelope(
             "lens screen", "no_phase",
             "specify a phase: --mechanical, --judged-prep, --record-verdicts <file>, --calibration, "
-            "--record-calibration or --baseline",
+            "--record-calibration, --baseline, --rejudge-report or --record-rejudge",
             next_actions=[next_action(["trialerror", "lens", "screen", "--help"], "see the screen's phases")],
+        )
+    if record_rejudge_mode and not getattr(args, "second_judge_file", None):
+        return error_envelope(
+            "lens screen", "second_judge_file_required",
+            "--record-rejudge backfills the SECOND judge's rows, so it needs the sheet they are on: "
+            "pass --second-judge-file, the same file --record-verdicts took",
+        )
+    if record_rejudge_mode and not getattr(args, "batch_id", None):
+        return error_envelope(
+            "lens screen", "batch_id_required",
+            "--record-rejudge needs --batch-id: it is checked against the numbers ONE batch's recording "
+            "published, and a backfill aimed at a batch nobody named would verify itself against a file "
+            "chosen by default",
         )
     where, where_refusal = _parse_where(getattr(args, "where", None))
     if where_refusal is not None:
@@ -1343,6 +1534,8 @@ def _run_screen(args: argparse.Namespace) -> dict:
                 executed_procedure=_executed_procedure(args),
                 executed_params=json.loads(args.executed_params) if args.executed_params else None,
                 second_judge_labels=second,
+                judge_launches=getattr(args, "judge_launches", None),
+                second_judge_launches=getattr(args, "second_judge_launches", None),
                 supersede=args.supersede,
                 label_vocabularies=label_vocabularies,
                 batch_fail_on=batch_fail_on,
@@ -1350,6 +1543,44 @@ def _run_screen(args: argparse.Namespace) -> dict:
             result["record_verdicts"] = {
                 k: v for k, v in recorded.items() if k != "verdicts"
             } | {"verdict_ids": [v["verdict_id"] for v in recorded["verdicts"]]}
+
+        if record_rejudge_mode:
+            if not args.launch_id:
+                return error_envelope(
+                    "lens screen", "launch_id_required",
+                    "--record-rejudge needs --launch-id: a re-judge row records WHO recorded it, which "
+                    "is a different fact from which launch judged (--second-judge-launch)",
+                )
+            batch_file = recording_batch_file(args, base, "judged-0")
+            if not batch_file.is_file():
+                return error_envelope(
+                    "lens screen", "no_judged_batch",
+                    f"no judged batch at {batch_file}; the backfill unmasks the second judge's sheet "
+                    "through that batch's own mask",
+                )
+            backfilled = record_rejudge(
+                store,
+                round_id=args.round_id,
+                batch_id=args.batch_id,
+                batch=json.loads(batch_file.read_text(encoding="utf-8")),
+                second_judge_labels=json.loads(
+                    Path(args.second_judge_file).read_text(encoding="utf-8")
+                ),
+                recorded_by_launch=args.launch_id,
+                second_judge_launches=getattr(args, "second_judge_launches", None),
+                prereg_id=args.prereg_id,
+                label_vocabularies=label_vocabularies,
+                supersede=args.supersede,
+            )
+            result["record_rejudge"] = backfilled
+
+        if rejudge_report_mode:
+            result["rejudge_report"] = rejudge_report(
+                store,
+                round_id=args.round_id,
+                batch_id=getattr(args, "batch_id", None),
+                label_vocabularies=label_vocabularies,
+            )
     except QueryEmbedBackendUnrunnableError as exc:
         # lane F-1 item D: a screen refused for want of a query-side embed
         # backend gets its own code and the doctor check that reports it, so
@@ -1398,7 +1629,16 @@ def _run_screen(args: argparse.Namespace) -> dict:
             ["trialerror", "lens", "screen", "--round-id", args.round_id, "--judged-prep", "--seed", "<seed>"],
             "build the judged batch once every lens has posted",
         ))
-    return ok_envelope("lens screen", result=result, next_actions=next_actions)
+    # Lane FB-acq item 7: a kappa the report had to compute under the DEFAULT
+    # vocabulary (no recording on disk for that batch), or a pooled kappa over
+    # batches judged under different ones, is material to how the number reads
+    # -- and a caveat buried inside `result` is a caveat a reader of the
+    # headline misses. The envelope's own `warnings` block is where it belongs.
+    screen_warnings = list((result.get("rejudge_report") or {}).get("warnings") or [])
+    return ok_envelope(
+        "lens screen", result=result, next_actions=next_actions,
+        warnings=screen_warnings or None,
+    )
 
 
 def _run_recheck(args: argparse.Namespace) -> dict:

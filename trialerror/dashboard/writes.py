@@ -8,14 +8,6 @@ verb already calls (``trialerror.artifacts.gates``, ``trialerror.ingest.extract`
 never raw SQL, never a second implementation of a rule those modules already
 enforce (design constraint #1 of this build's brief).
 
-One later action, ``feed-translate`` (lane-b-translator), wraps
-``trialerror.jobs.ledger.enqueue`` instead of a subsystem write function, with
-the exact payload ``trialerror.cli.feed.run_translate`` builds -- because
-translation is a JOB, never an inline call, so the "same function the CLI
-verb calls" for that action IS the enqueue. Every rule about what gets
-translated and how it is gated still lives in one place, the handler
-(``trialerror.feed_translate.handlers``), never here.
-
 **Store discipline** (design constraint #2): every action here opens a REAL
 (read-write) :class:`~trialerror.stores.store.Store` via
 :func:`trialerror.stores.store.open_store`, does exactly one business-logic call,
@@ -104,7 +96,6 @@ from trialerror.events import api as events_api
 from trialerror.ingest import extract as extract_api
 from trialerror.ingest import requests as ingest_requests
 from trialerror.ingest.errors import IngestError
-from trialerror.jobs import ledger as jobs_ledger
 from trialerror.offload import protocol as offload_protocol
 from trialerror.offload.protocol import OffloadError
 from trialerror.rooms import api as rooms_api
@@ -437,49 +428,6 @@ def _do_term_mark_reviewed(store: Store, body: dict[str, Any]) -> dict[str, Any]
     return lexicon_api.mark_reviewed(store, body["sense_id"], by_launch=body["by_launch"])
 
 
-def _do_feed_translate(store: Store, body: dict[str, Any]) -> dict[str, Any]:
-    """ENQUEUE a plain-English translation job for one post or one thread.
-    Never translates inline: the operator's click books work on the M2
-    ledger and returns immediately, and the feed panel renders that post's
-    right-hand column as "translation pending" until a worker lands a row
-    (``docs/reviews/AISPEAK_TRANSLATOR_DESIGN.md`` Section 4.1's option C;
-    its option B -- "book a launch per VIEW" -- is exactly what this
-    avoids).
-
-    This is the one action here that does not wrap a business-logic
-    function some CLI verb already calls: it calls the same
-    ``trialerror.jobs.ledger.enqueue`` with the same payload
-    ``trialerror.cli.feed.run_translate`` builds. That payload shape is the
-    handler's documented contract
-    (``trialerror.feed_translate.handlers.run_feed_translate``), and the
-    HANDLER -- never this function -- owns every rule about what gets
-    translated and how it is gated.
-
-    ``created_by_launch`` is deliberately never taken from the request
-    body: a dashboard operator has no launch identity (the same reason
-    :func:`_do_feed_post` always passes ``launch_id=None``), so a
-    translation requested here is stored under the orchestrator's
-    no-launch identity, exactly like an orchestrator feed post. A
-    budget-spending backend refuses such a job outright rather than
-    running unbooked -- see that handler's "Budget law" note.
-    """
-    post_id = _clean(body.get("post_id"))
-    thread_id = _clean(body.get("thread_id"))
-    if bool(post_id) == bool(thread_id):
-        raise ValueError("feed-translate: give exactly one of post_id / thread_id")
-    style_mode = _clean(body.get("style_mode")) or "flavored"
-    if style_mode not in ("flavored", "strict"):
-        raise ValueError(f"feed-translate: style_mode must be 'flavored' or 'strict', got {style_mode!r}")
-
-    payload: dict[str, Any] = {"handler": "feed_translate", "style_mode": style_mode, "created_by_launch": None}
-    if post_id:
-        payload["post_ids"] = [post_id]
-    else:
-        payload["thread_id"] = thread_id
-    job = jobs_ledger.enqueue(store, kind="custom", payload=payload)
-    return {"job_id": job["job_id"], "state": job["state"], "kind": job["kind"], "target": post_id or thread_id}
-
-
 def _do_worker_control(store: Store, body: dict[str, Any]) -> dict[str, Any]:
     """Ask a GPU worker to pause, resume or stop (ruling C-0097 D5).
 
@@ -535,7 +483,6 @@ WRITABLE_ACTIONS: dict[str, Callable[[Store, dict[str, Any]], dict[str, Any]]] =
     "room-score": _do_room_score,
     "room-freeze": _do_room_freeze,
     "feed-post": _do_feed_post,
-    "feed-translate": _do_feed_translate,
     # lane C (C7): the four the Determinations queue used to draw disabled.
     "prereg-reveal": _do_prereg_reveal,
     "memory-resolve": _do_memory_resolve,
@@ -563,11 +510,6 @@ REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "room-score": ("room_id", "dp_id", "agreement_pct", "by_launch"),
     "room-freeze": ("room_id", "by_launch", "reason"),
     "feed-post": ("thread_id", "body"),
-    # feed-translate takes exactly ONE of post_id/thread_id, which this
-    # flat "every listed field is required" table cannot express --
-    # validated inside the handler instead, where a ValueError becomes the
-    # same clean {"ok": false, "message": ...} refusal (_EXPECTED_ERRORS).
-    "feed-translate": (),
     # lane C (C7).
     "prereg-reveal": ("prereg_id",),
     "memory-resolve": ("group_id", "keep"),

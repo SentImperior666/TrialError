@@ -64,6 +64,7 @@ import hashlib
 import json
 import math
 import re
+import sqlite3
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -87,8 +88,10 @@ from trialerror.retrieve.vecsearch import (
 from trialerror.retrieve.wrap import untrusted_wrap
 from trialerror.util import vecmath
 from trialerror.util.vecmath import cosine_many
+from trialerror.stores import insert as store_insert
 from trialerror.stores import update as store_update
 from trialerror.stores.store import Store
+from trialerror.util.ids import new_id
 from trialerror.util.timeutil import now
 from trialerror.verify.hypothesis import DEFAULT_FAR_FLOOR, DEFAULT_WEIGHTS, stratified_retrieve
 from trialerror.verify.independence import DEFAULT_PROXIMITY_THRESHOLD, UnionFind
@@ -201,6 +204,12 @@ __all__ = [
     "fill_idea_vector_cache",
     "record_calibration",
     "record_novelty_verdicts",
+    "REJUDGE_TABLE",
+    "REJUDGE_ROLE",
+    "REJUDGE_SUBJECT_KINDS",
+    "recorded_vocabularies",
+    "rejudge_report",
+    "record_rejudge",
     "CONVERGENT_RECHECK_VERSION",
     "CONVERGENT_LINK_FIELDS",
     "known_neighbour_keys",
@@ -5666,6 +5675,167 @@ def _rounds_named(prior: Mapping[tuple[str, str], Sequence[Mapping[str, Any]]]) 
     return sorted(seen)
 
 
+# ---------------------------------------------------------------------------
+# the re-judge, kept in the store (knowledge schema v13, lane R0-C)
+# ---------------------------------------------------------------------------
+
+#: Where a second opinion lands. NOT ``verdict``: a ``verdict`` row is the
+#: label of record and every reader that counts rows per idea --
+#: consolidation, the doctor's own checks, the lens export -- would count a
+#: second opinion as one.
+REJUDGE_TABLE = "verdict_rejudge"
+
+#: The only ``judge_role`` this module writes. The PRIMARY judge's labels
+#: are the ``verdict`` rows and stay the only copy of themselves; writing
+#: them here too would put two rows in the store for one answer, with
+#: nothing saying which is the record.
+REJUDGE_ROLE = "second"
+
+#: ``subject_kind`` on a re-judge row. The recording already separates the
+#: batch's plants from its records (a plant is scored, a record is
+#: consolidated), and the same separation is carried onto the row so a
+#: reader counting second opinions on the round's OWN records does not have
+#: to know the plants file to do it.
+REJUDGE_SUBJECT_KINDS: tuple[str, str] = ("record", "plant")
+
+
+def _require_launch_ids(
+    store: Store, launch_ids: Sequence[str] | None, *, argument: str
+) -> list[str]:
+    """De-duplicated launch ids, every one of which names a real
+    ``platform.launch`` row.
+
+    Checked HERE rather than at the write, and before any row of the
+    recording is written, because ``judge_launches`` rides as a JSON list
+    (which the XID registry has no form for) and because the answer must be
+    the same whether the list lands on a row, in the result file or in
+    neither: a recording that names a launch nothing knows is refused with
+    nothing written."""
+    ids = [str(lid) for lid in dict.fromkeys(launch_ids or ()) if str(lid).strip()]
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    known = {
+        row["launch_id"]
+        for row in store.platform.execute(
+            f"SELECT launch_id FROM launch WHERE launch_id IN ({placeholders})", ids
+        )
+    }
+    missing = [lid for lid in ids if lid not in known]
+    if missing:
+        raise NoveltyError(
+            f"{argument}: launch id(s) {missing!r} name no row in platform.launch. A judge list is an "
+            "attribution -- a recording that says a launch judged something must be able to say which "
+            "launch, or the attribution is a string nobody can resolve"
+        )
+    return ids
+
+
+def _existing_rejudge_rows(
+    store: Store, *, round_id: str, batch_id: str, judge_role: str = REJUDGE_ROLE
+) -> list[str]:
+    """The ``rejudge_id``s already on file for this batch and role, oldest
+    first. Empty when the table is absent -- a store that predates
+    knowledge-v13 holds no second opinions by construction."""
+    try:
+        rows = store.knowledge.execute(
+            f"SELECT rejudge_id FROM {REJUDGE_TABLE} WHERE round_id = ? AND batch_id = ? "
+            "AND judge_role = ? ORDER BY ts, rejudge_id",
+            (str(round_id), str(batch_id), judge_role),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [row["rejudge_id"] for row in rows]
+
+
+def _build_rejudge_rows(
+    *,
+    round_id: str,
+    batch_id: str,
+    declared: Sequence[str],
+    labels: Mapping[str, Mapping[str, Any]],
+    second_judge_labels: Mapping[str, Mapping[str, Any]],
+    plant_ids: set[str],
+    vocabularies: Mapping[str, Any] | None,
+    judge_launches_json: str | None,
+    recorded_by_launch: str,
+    prereg_id: str | None,
+    ts: str,
+) -> list[dict[str, Any]]:
+    """One row per subject per declared set the SECOND judge answered, in a
+    stable order (subject id, then the canonical reference-set order).
+
+    ``agrees`` is computed on the ROUND's own label words -- the same
+    comparison :func:`cohens_kappa` is handed by the recording, whose
+    ``categories`` are :func:`accepted_labels_for_set`'s round spellings --
+    and NOT on the canonical ones. Two round labels that both canonicalise
+    onto one design label are two different answers to the judge that gave
+    them, and an agreement number must count what the judges did. The
+    canonical half is stored beside it so a later reader can do the other
+    comparison deliberately.
+
+    ``first_label`` is the primary label of record AS GIVEN, copied off the
+    same sheet the ``verdict`` row was written from. A subject the first
+    judge left unlabelled gets NULL there and NULL ``agrees``, which is
+    exactly the subject the kappa drops."""
+    rows: list[dict[str, Any]] = []
+    for subject_id in sorted(second_judge_labels):
+        given = second_judge_labels.get(subject_id) or {}
+        primary = labels.get(subject_id) or {}
+        for reference_set in declared:
+            key = REFERENCE_SETS[reference_set]
+            label = given.get(key)
+            if label is None:
+                continue
+            first_label = primary.get(key)
+            rows.append(
+                {
+                    "rejudge_id": new_id("RJDG"),
+                    "round_id": str(round_id),
+                    "batch_id": str(batch_id),
+                    "subject_kind": "plant" if subject_id in plant_ids else "record",
+                    "subject_id": subject_id,
+                    "reference_set": reference_set,
+                    "label": str(label),
+                    "label_canonical": canonical_label(
+                        vocabularies, reference_set=reference_set, label=str(label)
+                    ),
+                    "first_label": None if first_label is None else str(first_label),
+                    "agrees": None if first_label is None else (1 if str(first_label) == str(label) else 0),
+                    "judge_role": REJUDGE_ROLE,
+                    "judge_launches": judge_launches_json,
+                    "recorded_by_launch": recorded_by_launch,
+                    "prereg_id": prereg_id,
+                    "ts": ts,
+                }
+            )
+    return rows
+
+
+def _rejudge_block(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """The recording result's ``rejudge`` summary: how many subjects, how
+    many rows, and the RAW disagreements -- which subject, which set, which
+    two labels -- in the rows' own stable order.
+
+    The raw list rather than a count, because a kappa with no disagreement
+    list beside it sends every reader back to the judges' sheets to find out
+    what the two judges actually read differently."""
+    return {
+        "n_subjects": len({row["subject_id"] for row in rows}),
+        "n_rows": len(rows),
+        "disagreements": [
+            {
+                "subject_id": row["subject_id"],
+                "reference_set": row["reference_set"],
+                "first": row["first_label"],
+                "second": row["label"],
+            }
+            for row in rows
+            if row["agrees"] == 0
+        ],
+    }
+
+
 def record_novelty_verdicts(
     store: Store,
     *,
@@ -5677,6 +5847,8 @@ def record_novelty_verdicts(
     executed_procedure: str | None = None,
     executed_params: Mapping[str, Any] | None = None,
     second_judge_labels: Mapping[str, Mapping[str, Any]] | None = None,
+    judge_launches: Sequence[str] | None = None,
+    second_judge_launches: Sequence[str] | None = None,
     consolidate: bool = True,
     supersede: bool = False,
     out_dir: Path | str | None = None,
@@ -5735,6 +5907,26 @@ def record_novelty_verdicts(
     own parameters are not what the round pre-registered, and comparing them
     would produce a confident False). Without them the column stays NULL and
     ``prereg_compliance`` says why, rather than the omission being invisible.
+
+    **The re-judge is kept** (knowledge-v13, lane R0-C). A
+    ``second_judge_labels`` sheet used to be read for one number -- Cohen's
+    kappa per reference set -- and then dropped, so the round's own analysis
+    tool, which reads ``idea`` and ``verdict``, could not see that a
+    re-judge had run at all. Every label that sheet carries now lands in
+    :data:`REJUDGE_TABLE` as its own row, with the primary label of record
+    beside it and an ``agrees`` flag computed on the SAME comparison the
+    kappa is (the round's own label words, not the canonical ones). The
+    ``verdict`` rows are untouched and no reader of them changes: a second
+    opinion is not a label of record, and a table that mixed the two would
+    be miscounted by everything that counts rows per idea.
+
+    ``judge_launches`` and ``second_judge_launches`` are the launches that
+    judged, and every id in either must name a real ``platform.launch`` row
+    -- checked before the first write, so a recording that misattributes a
+    judge writes nothing. The second judge's list is stored on each re-judge
+    row; the primary judges' list rides in the result and in the batch's
+    verdicts file under ``judges``, where the recording already keeps what
+    is true of the batch rather than of one row.
     """
     scope = list(batch["scope"]["scope"])
     unjudged_scope = list(batch["scope"].get("unjudged") or [])
@@ -5807,6 +5999,33 @@ def record_novelty_verdicts(
                 raise NoveltyError(
                     f"{key} for {subject!r} must be one of {list(vocabulary)!r}, got {label!r}"
                 )
+
+    # --- who judged --------------------------------------------------------
+    # Before the one-submission guard and well before any write: a launch
+    # list that names nothing is an argument error, and an argument error
+    # that surfaces after half the verdict rows are down is a half-recorded
+    # batch.
+    first_judge_launches = _require_launch_ids(store, judge_launches, argument="judge_launches")
+    rejudge_launches = _require_launch_ids(
+        store, second_judge_launches, argument="second_judge_launches"
+    )
+    if second_judge_launches and not second_judge_labels:
+        raise NoveltyError(
+            "record_novelty_verdicts: second_judge_launches names the launch(es) a second judge ran "
+            "under, but no second_judge_labels sheet was given. There is nothing for those launches to "
+            "be the judges OF"
+        )
+    # One second opinion per subject per set per batch. The table's UNIQUE
+    # key would refuse a second set of rows anyway -- at the insert, with
+    # the verdict rows already written, which is the half-recorded batch
+    # this guard exists to avoid.
+    prior_rejudge = _existing_rejudge_rows(store, round_id=round_id, batch_id=str(batch["batch_id"]))
+    if prior_rejudge and second_judge_labels and not supersede:
+        raise NoveltyError(
+            f"record_novelty_verdicts: batch {batch['batch_id']!r} of round {round_id!r} already carries "
+            f"{len(prior_rejudge)} {REJUDGE_ROLE}-judge row(s) in {REJUDGE_TABLE}. Pass supersede=True to "
+            "replace them; a second opinion recorded twice is one re-judge counted as two"
+        )
 
     # --- one submission per idea per judge -------------------------------
     survivors = [*scope, *unjudged_scope]
@@ -6062,6 +6281,40 @@ def record_novelty_verdicts(
             second = {s: v[key] for s, v in second_judge_labels.items() if v.get(key) is not None}
             kappa[key] = cohens_kappa(first, second, categories=categories)
 
+    # --- the re-judge, written down ---------------------------------------
+    # Same discipline as the verdict rows above: one validated insert per
+    # row, after the guards that would have refused the whole recording. A
+    # supersede REPLACES the batch's rows rather than appending beside them
+    # -- the verdict table can append because it is append-only and each new
+    # row names the rows it supersedes, while a second opinion is keyed
+    # UNIQUE per subject and set, so "replaced" is the only shape it has.
+    rejudge_rows: list[dict[str, Any]] = []
+    if second_judge_labels:
+        if prior_rejudge:
+            with store.knowledge:
+                store.knowledge.execute(
+                    f"DELETE FROM {REJUDGE_TABLE} WHERE rejudge_id IN "
+                    f"({','.join('?' for _ in prior_rejudge)})",
+                    prior_rejudge,
+                )
+        rejudge_rows = _build_rejudge_rows(
+            round_id=round_id,
+            batch_id=str(batch["batch_id"]),
+            declared=declared,
+            labels=labels,
+            second_judge_labels=second_judge_labels,
+            plant_ids=plant_ids,
+            vocabularies=vocabularies,
+            judge_launches_json=(
+                json.dumps(rejudge_launches, ensure_ascii=False) if rejudge_launches else None
+            ),
+            recorded_by_launch=issued_by_launch,
+            prereg_id=prereg_id,
+            ts=now(),
+        )
+        for row in rejudge_rows:
+            store_insert(store, REJUDGE_TABLE, row)
+
     on_topic_label = on_topic_seed_label(vocabularies)
     round_unscreenable = unscreenable_word(vocabularies)
     seed_counts = {
@@ -6106,6 +6359,19 @@ def record_novelty_verdicts(
         "judged_sets": list(declared),
         "plants": plants,
         "kappa": kappa,
+        # Which launches judged this batch, beside the numbers they
+        # produced. The store keeps the second judge's list on its own rows;
+        # the PRIMARY judges' list has no row of its own -- the verdict rows
+        # carry the RECORDING launch, which is a different fact -- so it
+        # lives here, which is where the recording already keeps what is true
+        # of the batch rather than of one row. Empty lists mean the
+        # recording declared none, which is what every recording before
+        # knowledge-v13 did.
+        "judges": {"first": first_judge_launches, "second": rejudge_launches},
+        # The raw disagreements, in a stable order: which subject, which
+        # set, which two labels. A kappa printed without them sends its
+        # reader back to the judges' sheets.
+        "rejudge": _rejudge_block(rejudge_rows),
         "prereg_compliant": prereg_compliant,
         "prereg_compliance": prereg_compliance,
         "prereg_compliance_detail": prereg_detail,
@@ -6135,6 +6401,569 @@ def record_novelty_verdicts(
         encoding="utf-8", newline="\n",
     )
     return result
+
+
+def _rejudge_stats(
+    rows: Sequence[Mapping[str, Any]], *, vocabularies: Mapping[str, Any] | None
+) -> dict[str, dict[str, Any]]:
+    """``{reference_set: block}`` over re-judge rows, keyed per subject by
+    ``(batch_id, subject_id)``.
+
+    The composite key matters for the POOLED figure: a ``plant_id`` is
+    whatever the round's plants file called it, so two batches of one round
+    may legitimately re-use one, and pooling on the bare subject id would
+    silently collapse two subjects into one.
+
+    The first label comes off the ``verdict_rejudge`` row's own
+    ``first_label`` and not off the ``verdict`` row, for the one reason the
+    column exists: a PLANT is a subject of the re-judge and carries no
+    ``verdict`` row at all, so a kappa read through ``verdict`` alone could
+    not reproduce a recorded one taken over a sheet that included plants.
+    The ``verdict`` rows are read beside it, as a cross-check that the two
+    copies of the label of record still say the same thing."""
+    out: dict[str, dict[str, Any]] = {}
+    for reference_set in REFERENCE_SETS:
+        set_rows = [r for r in rows if r["reference_set"] == reference_set]
+        if not set_rows:
+            continue
+        categories = accepted_labels_for_set(vocabularies, reference_set=reference_set)
+        first = {
+            (r["batch_id"], r["subject_id"]): str(r["first_label"])
+            for r in set_rows if r["first_label"] is not None
+        }
+        second = {(r["batch_id"], r["subject_id"]): str(r["label"]) for r in set_rows}
+        stats = cohens_kappa(first, second, categories=categories)
+        out[reference_set] = {
+            **stats,
+            "label_key": REFERENCE_SETS[reference_set],
+            "categories": list(categories),
+            "n_rows": len(set_rows),
+            "n_unpaired": sum(1 for r in set_rows if r["first_label"] is None),
+            "disagreements": [
+                {
+                    "subject_id": r["subject_id"],
+                    "reference_set": reference_set,
+                    "first": r["first_label"],
+                    "second": r["label"],
+                }
+                for r in set_rows if r["agrees"] == 0
+            ],
+        }
+    return out
+
+
+def _decoded_launches(raw: Any) -> list[str]:
+    """One row's ``judge_launches`` JSON list, tolerant of a NULL and of a
+    string that is not a list -- a report is a read, and a read that raises
+    on one malformed cell reports nothing about the other nine."""
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return [str(item) for item in value] if isinstance(value, list) else []
+
+
+def _readable_json_mapping(path: Path) -> Mapping[str, Any] | None:
+    """One JSON object off disk, or ``None`` for anything that is not one.
+
+    A report is a READ. A missing file, a truncated one, a file holding a list
+    -- none of those is a reason for the read to raise, and all three mean the
+    same thing to the caller: this file cannot tell us what vocabulary the
+    batch was judged under."""
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return loaded if isinstance(loaded, Mapping) else None
+
+
+def recorded_vocabularies(
+    base: Path, batch_id: str
+) -> tuple[Mapping[str, Any] | None, str, str | None]:
+    """``(vocabularies, source, labels_sha256)``: the label vocabulary the
+    RECORDING of ``batch_id`` was taken under, read off that recording.
+
+    The chance term of a Cohen's kappa is computed over the categories a judge
+    COULD have used, and those are the ROUND's whenever it declared a labels
+    file of its own. :func:`rejudge_report` used to compute its kappa under
+    whatever vocabulary its CALLER happened to pass -- the design's default
+    unless someone remembered ``--labels-file`` -- so a round that re-spelled
+    its labels got a re-judge report whose number did not match the one its own
+    recording had published, with the same ``n`` and the same observed
+    agreement beside it. Only the expected agreement had moved, which is the
+    hardest kind of discrepancy to notice.
+
+    The vocabulary is a FILE, and the recording wrote it down. Read it back:
+
+    - ``<base>/judged/<batch_id>-verdicts.json`` readable and carrying
+      ``label_vocabularies`` -> ``(vocab, "recording", sha)``;
+    - readable and NOT carrying it -> ``(None, "recording_default", None)``.
+      The recording itself used the design's default, so the default is the
+      correct vocabulary here -- this is an answer, not a fallback;
+    - otherwise the batch file ``<base>/judged/<batch_id>.json``, readable and
+      carrying it -> ``(vocab, "batch_file", sha)`` (the same second place
+      :func:`record_rejudge` looks);
+    - otherwise ``(None, "default_unresolved", None)`` -- nothing on disk says,
+      and a caller told so can decide what the number is worth.
+
+    A declared mapping without a ``sha256`` is normalised through
+    :func:`load_label_vocabularies` against that same file's own
+    ``judged_sets``, exactly as :func:`record_rejudge` does, so the hash this
+    returns is comparable with the one the batch was stamped with. A mapping
+    that will not normalise counts as "not readable" and the next candidate is
+    tried.
+    """
+    judged = Path(base) / "judged"
+
+    def _resolve(holder: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        vocab = holder.get("label_vocabularies")
+        if not isinstance(vocab, Mapping):
+            return None
+        if vocab.get("sha256"):
+            return vocab
+        try:
+            return load_label_vocabularies(
+                vocab, judged_sets=normalize_judged_sets(holder.get("judged_sets"))
+            )
+        except NoveltyError:
+            return None
+
+    recording = _readable_json_mapping(judged / f"{batch_id}-verdicts.json")
+    if recording is not None:
+        resolved = _resolve(recording)
+        if resolved is not None:
+            return resolved, "recording", resolved.get("sha256")
+        if "label_vocabularies" not in recording:
+            return None, "recording_default", None
+
+    batch_file = _readable_json_mapping(judged / f"{batch_id}.json")
+    if batch_file is not None:
+        resolved = _resolve(batch_file)
+        if resolved is not None:
+            return resolved, "batch_file", resolved.get("sha256")
+
+    return None, "default_unresolved", None
+
+
+#: What a batch block says when no recording and no batch file could be found
+#: for it: the kappa below is under the DEFAULT vocabulary, which may not be
+#: the one the batch was judged under.
+_UNRESOLVED_VOCABULARY = "default_unresolved"
+
+#: The chance-dependent fields of a :func:`cohens_kappa` block -- the only ones
+#: the category vocabulary can move. ``n``, the observed agreement and the
+#: disagreement rows are computed from the two judges' labels alone.
+_CHANCE_FIELDS = ("kappa", "expected_agreement")
+
+
+def rejudge_report(
+    store: Store,
+    *,
+    round_id: str,
+    batch_id: str | None = None,
+    label_vocabularies: Mapping[str, Any] | None = None,
+    judge_role: str = REJUDGE_ROLE,
+    out_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """The re-judge, read back out of the STORE: per batch and pooled over
+    the round, per reference set -- ``n``, observed and expected agreement,
+    Cohen's kappa, the judging launches and the raw disagreement rows.
+
+    Read-only, and computed from ``verdict`` and :data:`REJUDGE_TABLE` and
+    nothing else. That is the whole point of the lane: a round's kappa was
+    reproducible only from the judges' sheets, which live outside the store,
+    so the round's own analysis tool -- which reads ``idea`` and ``verdict``
+    -- printed it with ``n = 0`` although the re-judge had run.
+
+    ``label_vocabularies`` is the one thing the store cannot supply. The
+    chance term of a kappa is computed over the categories a judge COULD
+    have used, which are the ROUND's when it declared a vocabulary of its
+    own, and a round's label file is a file -- never a table.
+
+    So it is resolved PER BATCH, off that batch's own recording
+    (:func:`recorded_vocabularies`): the report reproduces the number the
+    recording published without anybody having to remember a flag. Passing
+    ``label_vocabularies`` explicitly overrides it for every batch, and a
+    batch whose recorded hash differs from the one given is reported
+    (``vocabulary_mismatch``) rather than refused -- a report states what it
+    found. A batch with no recording and no batch file on disk is computed
+    under the DEFAULT vocabulary and says so, in the batch block
+    (``vocabulary_warning``), in every one of its per-set blocks
+    (``kappa_vocabulary``) and in the report's top-level ``warnings``: a
+    reader who looks at one number must not be able to miss it.
+
+    ``out_dir`` overrides where those files are looked for, exactly as it does
+    on :func:`record_novelty_verdicts` and :func:`record_rejudge`; the default
+    is the round's own directory."""
+    params: list[Any] = [str(round_id), judge_role]
+    where = "round_id = ? AND judge_role = ?"
+    if batch_id is not None:
+        where += " AND batch_id = ?"
+        params.append(str(batch_id))
+    try:
+        raw_rows = store.knowledge.execute(
+            f"SELECT * FROM {REJUDGE_TABLE} WHERE {where} ORDER BY batch_id, subject_id, reference_set",
+            params,
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        raise NoveltyError(
+            f"rejudge_report: this store has no {REJUDGE_TABLE} table ({exc}). It predates knowledge "
+            "schema v13; migrate it before reading a re-judge back"
+        ) from None
+    rows = [dict(row) for row in raw_rows]
+
+    # The cross-check, and the other half of "from verdict AND
+    # verdict_rejudge": the label of record is a `verdict` row, and the copy
+    # on the re-judge row must still say the same thing. A subject with no
+    # `verdict` row is not an error -- a plant never has one -- so it is
+    # reported rather than counted as a disagreement.
+    verdict_labels: dict[tuple[str, str], list[str]] = {}
+    if rows:
+        batches = sorted({r["batch_id"] for r in rows})
+        placeholders = ",".join("?" for _ in batches)
+        for row in store.knowledge.execute(
+            f"SELECT subject_id, batch_id, label FROM verdict WHERE round_id = ? AND procedure = ? "
+            f"AND procedure_version = ? AND batch_id IN ({placeholders})",
+            [str(round_id), PROCEDURE, PROCEDURE_VERSION, *batches],
+        ):
+            verdict_labels.setdefault((row["batch_id"], row["subject_id"]), []).append(str(row["label"]))
+    no_verdict_row: list[dict[str, str]] = []
+    first_label_mismatch: list[dict[str, Any]] = []
+    for row in rows:
+        prefix = f"{row['reference_set']}:"
+        found = [
+            label for label in verdict_labels.get((row["batch_id"], row["subject_id"]), [])
+            if label.startswith(prefix)
+        ]
+        entry = {
+            "batch_id": row["batch_id"], "subject_id": row["subject_id"],
+            "reference_set": row["reference_set"],
+        }
+        if not found:
+            no_verdict_row.append({**entry, "subject_kind": row["subject_kind"]})
+            continue
+        # Prefix rather than equality: a caveated batch writes
+        # `R3:<label>:<caveats>` into the verdict row, and the caveat is a
+        # fact about the BATCH rather than a different answer.
+        if not any(label[len(prefix):].startswith(str(row["first_label"] or "")) for label in found):
+            first_label_mismatch.append({**entry, "first_label": row["first_label"], "verdict_labels": found})
+
+    by_batch: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_batch.setdefault(str(row["batch_id"]), []).append(row)
+
+    def _launches(group: Sequence[Mapping[str, Any]]) -> list[str]:
+        return sorted({lid for r in group for lid in _decoded_launches(r["judge_launches"])})
+
+    base = Path(out_dir) if out_dir is not None else round_dir(store.program_root, round_id)
+    given_sha = (label_vocabularies or {}).get("sha256")
+    warnings: list[str] = []
+    batch_blocks: list[dict[str, Any]] = []
+    #: ``(vocabulary identity, source word, vocabulary mapping)`` per batch --
+    #: the identity is the resolved hash, or ``None`` for "the default", which
+    #: is itself one identity that every default batch shares.
+    resolved: list[tuple[str | None, str, Mapping[str, Any] | None]] = []
+    for bid, group in sorted(by_batch.items()):
+        mismatch: dict[str, Any] | None = None
+        if label_vocabularies is not None:
+            vocabularies: Mapping[str, Any] | None = label_vocabularies
+            source = "argument"
+            sha = given_sha
+            _v, _s, recorded_sha = recorded_vocabularies(base, bid)
+            if recorded_sha and recorded_sha != given_sha:
+                mismatch = {"given": given_sha, "recorded": recorded_sha}
+        else:
+            vocabularies, source, sha = recorded_vocabularies(base, bid)
+        sets = _rejudge_stats(group, vocabularies=vocabularies)
+        block: dict[str, Any] = {
+            "batch_id": bid,
+            "n_rows": len(group),
+            "n_subjects": len({r["subject_id"] for r in group}),
+            "judge_launches": _launches(group),
+            "recorded_by_launch": sorted({str(r["recorded_by_launch"]) for r in group}),
+            "sets": sets,
+            "vocabulary_source": source,
+            "labels_sha256": sha,
+        }
+        if mismatch is not None:
+            block["vocabulary_mismatch"] = mismatch
+        if source == _UNRESOLVED_VOCABULARY:
+            sentence = (
+                f"no recording result or batch file was found for batch {bid} under {base / 'judged'}; "
+                "kappa and expected agreement below are computed under the DEFAULT category vocabulary "
+                "and may differ from the recorded ones"
+            )
+            block["vocabulary_warning"] = sentence
+            warnings.append(sentence)
+            for set_block in sets.values():
+                set_block["kappa_vocabulary"] = _UNRESOLVED_VOCABULARY
+        batch_blocks.append(block)
+        resolved.append((sha, source, vocabularies))
+
+    identities = {entry[0] for entry in resolved}
+    if len(identities) > 1:
+        # A kappa pooled over batches judged under DIFFERENT vocabularies has
+        # no single chance term, so it has no value -- while n, the observed
+        # agreement and the disagreement rows pool perfectly well, because
+        # none of them looks at the categories. Report those and null the two
+        # that would be a fiction.
+        pooled_sets = _rejudge_stats(rows, vocabularies=None)
+        for set_block in pooled_sets.values():
+            for field_name in _CHANCE_FIELDS:
+                if field_name in set_block:
+                    set_block[field_name] = None
+        pooled_source = "mixed"
+        warnings.append(
+            "this round's batches were judged under different label vocabularies "
+            f"({sorted(str(i) for i in identities)!r}), so a POOLED kappa is not defined: the pooled n, "
+            "observed agreement and disagreements below are real and the pooled kappa and expected "
+            "agreement are null. Read the per-batch numbers instead"
+        )
+    else:
+        pooled_vocabularies = resolved[0][2] if resolved else label_vocabularies
+        pooled_sets = _rejudge_stats(rows, vocabularies=pooled_vocabularies)
+        sources = {entry[1] for entry in resolved}
+        if len(sources) == 1:
+            pooled_source = sources.pop()
+        elif sources:
+            pooled_source = "mixed_sources_same_vocabulary"
+        else:
+            # No batch at all: nothing was resolved, and there is no set block
+            # for a vocabulary to have moved.
+            pooled_source = "argument" if label_vocabularies is not None else _UNRESOLVED_VOCABULARY
+
+    return {
+        "round_id": str(round_id),
+        "batch_id": None if batch_id is None else str(batch_id),
+        "judge_role": judge_role,
+        "n_rows": len(rows),
+        "batches": batch_blocks,
+        "pooled": {
+            "n_rows": len(rows),
+            "n_subjects": len({(r["batch_id"], r["subject_id"]) for r in rows}),
+            "judge_launches": _launches(rows),
+            "sets": pooled_sets,
+            "vocabulary_source": pooled_source,
+        },
+        "no_verdict_row": no_verdict_row,
+        "first_label_mismatch": first_label_mismatch,
+        # Unchanged meaning: the hash of the vocabulary this CALL was given,
+        # and None when it was given none. The per-batch blocks carry what was
+        # actually resolved for each of them.
+        "labels_sha256": given_sha,
+        "warnings": warnings,
+        "ts": now(),
+    }
+
+
+#: The precision a recording result file holds a kappa statistic to:
+#: :func:`cohens_kappa` rounds every number it returns to this many
+#: decimals, and the result file is written straight from it. So an exact
+#: comparison at six decimals is exactly as precise as the file, and no more.
+#:
+#: NOT the recorded value's own PRINTED decimals, which is the looser thing
+#: it looks like: a stored ``1.0`` prints one decimal, and comparing at one
+#: decimal would accept a recomputed 0.96 as "the same number".
+KAPPA_DECIMALS = 6
+
+
+def _matches_recorded(recomputed: Any, recorded: Any) -> bool:
+    """Is a recomputed statistic the recorded one, at the precision the file
+    holds it to (:data:`KAPPA_DECIMALS`)?
+
+    ``None`` matches only ``None``: "the kappa was not computable" and "the
+    kappa is 0" are different findings, and a comparison that let one stand
+    for the other would pass a backfill that reproduced neither."""
+    if recomputed is None or recorded is None:
+        return recomputed is None and recorded is None
+    if isinstance(recorded, int) and not isinstance(recorded, bool):
+        return int(recomputed) == recorded
+    return round(float(recomputed), KAPPA_DECIMALS) == round(float(recorded), KAPPA_DECIMALS)
+
+
+def record_rejudge(
+    store: Store,
+    *,
+    round_id: str,
+    batch_id: str,
+    batch: Mapping[str, Any],
+    second_judge_labels: Mapping[str, Mapping[str, Any]],
+    recorded_by_launch: str,
+    second_judge_launches: Sequence[str] | None = None,
+    prereg_id: str | None = None,
+    label_vocabularies: Mapping[str, Any] | None = None,
+    supersede: bool = False,
+    out_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Backfill :data:`REJUDGE_TABLE` for a batch that was RECORDED before
+    this lane existed, and then verify the backfill against the number that
+    recording already published.
+
+    It takes the same second-judge file :func:`record_novelty_verdicts`
+    took, unmasked through the same batch mask, and writes re-judge rows and
+    NOTHING else: no ``verdict`` row is written, updated or superseded, no
+    idea is consolidated, no plant is re-scored. The first label of record
+    is read out of the batch's own ``verdict`` rows rather than taken from a
+    sheet, because the sheet is exactly what a backfill cannot be trusted to
+    still be the one that was recorded.
+
+    **Then it checks itself.** Cohen's kappa is recomputed per reference set
+    from ``verdict`` plus the rows just written, and must equal the kappa,
+    the ``n`` and the observed agreement that batch's recording result file
+    already holds, at the precision the file holds them to. On any mismatch
+    the rows are deleted again and the refusal carries both numbers: a
+    backfill that quietly writes a re-judge which does not reproduce the
+    published one has replaced an audit with an assertion."""
+    base = Path(out_dir) if out_dir is not None else round_dir(store.program_root, round_id)
+    result_path = base / "judged" / f"{batch_id}-verdicts.json"
+    if not result_path.is_file():
+        raise NoveltyError(
+            f"record_rejudge: no recording on file for batch {batch_id!r} of round {round_id!r} "
+            f"({result_path}). A backfill is checked against the numbers the recording published; with "
+            "no recording there is nothing to check it against, and --record-verdicts is the verb that "
+            "records a batch for the first time"
+        )
+    recorded = json.loads(result_path.read_text(encoding="utf-8"))
+    recorded_kappa = recorded.get("kappa")
+    if not recorded_kappa:
+        raise NoveltyError(
+            f"record_rejudge: the recording of batch {batch_id!r} reports no kappa, so it was recorded "
+            "with no second judge at all. There is no published number for a backfill to reproduce -- "
+            "re-record the batch with --record-verdicts --second-judge-file instead"
+        )
+
+    declared = normalize_judged_sets(batch.get("judged_sets"))
+    vocabularies = label_vocabularies if label_vocabularies is not None else batch.get("label_vocabularies")
+    if vocabularies is not None and not vocabularies.get("sha256"):
+        vocabularies = load_label_vocabularies(vocabularies, judged_sets=declared)
+    batch_hash = batch.get("labels_sha256")
+    if vocabularies is not None and batch_hash and vocabularies["sha256"] != batch_hash:
+        raise NoveltyError(
+            f"record_rejudge: the labels file given here hashes {vocabularies['sha256'][:12]} but batch "
+            f"{batch_id!r} was judged under {str(batch_hash)[:12]}"
+        )
+
+    sheet = unmask_labels(second_judge_labels, batch.get("mask"))
+    scope = list(batch["scope"]["scope"])
+    plant_ids = {p["plant_id"] for p in batch["plants"]}
+    unknown = sorted(set(sheet) - set(scope) - plant_ids)
+    if unknown:
+        raise NoveltyError(
+            f"record_rejudge: the second judge's sheet names subject(s) {unknown!r} that are neither in "
+            f"batch {batch_id!r}'s judged scope nor among its plants"
+        )
+    declared_keys = {REFERENCE_SETS[name]: name for name in declared}
+    for subject, given in sheet.items():
+        for key, reference_set in declared_keys.items():
+            label = given.get(key)
+            if label is None:
+                continue
+            vocabulary = accepted_labels_for_set(vocabularies, reference_set=reference_set)
+            if label not in vocabulary:
+                raise NoveltyError(
+                    f"{key} for {subject!r} must be one of {list(vocabulary)!r}, got {label!r}"
+                )
+
+    launches = _require_launch_ids(store, second_judge_launches, argument="second_judge_launches")
+    prior = _existing_rejudge_rows(store, round_id=round_id, batch_id=batch_id)
+    if prior and not supersede:
+        raise NoveltyError(
+            f"record_rejudge: batch {batch_id!r} of round {round_id!r} already carries {len(prior)} "
+            f"{REJUDGE_ROLE}-judge row(s). Pass supersede=True to replace them"
+        )
+
+    # The label of record, off the batch's own verdict rows. The caveat
+    # suffix is the recording's own, read back off the file it wrote, so the
+    # raw label is recovered exactly rather than guessed at by splitting.
+    suffix = f":{'+'.join(recorded.get('caveats') or [])}" if recorded.get("caveats") else ""
+    primary: dict[str, dict[str, Any]] = {}
+    for row in store.knowledge.execute(
+        "SELECT subject_id, label FROM verdict WHERE round_id = ? AND batch_id = ? AND procedure = ? "
+        "AND procedure_version = ?",
+        (str(round_id), str(batch_id), PROCEDURE, PROCEDURE_VERSION),
+    ):
+        label = str(row["label"])
+        if suffix and label.endswith(suffix):
+            label = label[: -len(suffix)]
+        reference_set, _sep, raw = label.partition(":")
+        if reference_set in declared_keys.values():
+            primary.setdefault(row["subject_id"], {})[REFERENCE_SETS[reference_set]] = raw
+
+    rows = _build_rejudge_rows(
+        round_id=round_id,
+        batch_id=batch_id,
+        declared=declared,
+        labels=primary,
+        second_judge_labels=sheet,
+        plant_ids=plant_ids,
+        vocabularies=vocabularies,
+        judge_launches_json=json.dumps(launches, ensure_ascii=False) if launches else None,
+        recorded_by_launch=recorded_by_launch,
+        prereg_id=prereg_id,
+        ts=now(),
+    )
+    if prior:
+        with store.knowledge:
+            store.knowledge.execute(
+                f"DELETE FROM {REJUDGE_TABLE} WHERE rejudge_id IN ({','.join('?' for _ in prior)})",
+                prior,
+            )
+    for row in rows:
+        store_insert(store, REJUDGE_TABLE, row)
+
+    # --- and now check ourselves against what was published ----------------
+    report = rejudge_report(
+        store, round_id=round_id, batch_id=batch_id, label_vocabularies=vocabularies,
+        out_dir=out_dir,
+    )
+    computed = report["pooled"]["sets"]
+    mismatches: list[dict[str, Any]] = []
+    for reference_set in declared:
+        key = REFERENCE_SETS[reference_set]
+        if key not in recorded_kappa:
+            continue
+        was = recorded_kappa[key] or {}
+        is_now = computed.get(reference_set) or {}
+        for field_name in ("kappa", "n", "observed_agreement"):
+            if not _matches_recorded(is_now.get(field_name), was.get(field_name)):
+                mismatches.append(
+                    {
+                        "reference_set": reference_set,
+                        "statistic": field_name,
+                        "recorded": was.get(field_name),
+                        "recomputed": is_now.get(field_name),
+                    }
+                )
+    if mismatches:
+        with store.knowledge:
+            store.knowledge.execute(
+                f"DELETE FROM {REJUDGE_TABLE} WHERE rejudge_id IN ({','.join('?' for _ in rows)})",
+                [row["rejudge_id"] for row in rows],
+            )
+        detail = "; ".join(
+            f"{m['reference_set']} {m['statistic']}: recorded {m['recorded']!r}, recomputed "
+            f"{m['recomputed']!r}" for m in mismatches
+        )
+        raise NoveltyError(
+            f"record_rejudge: the rows this backfill would write do not reproduce the numbers batch "
+            f"{batch_id!r}'s recording published ({detail}). Nothing was written. Either this is not the "
+            "second-judge sheet that recording took, or the batch's verdict rows have moved since"
+        )
+    return {
+        "round_id": str(round_id),
+        "batch_id": str(batch_id),
+        "judge_role": REJUDGE_ROLE,
+        "judge_launches": launches,
+        "recorded_by_launch": recorded_by_launch,
+        "superseded": prior,
+        "verified_against": str(result_path),
+        "kappa_recorded": {REFERENCE_SETS[s]: recorded_kappa.get(REFERENCE_SETS[s]) for s in declared},
+        "rejudge": _rejudge_block(rows),
+        "report": report,
+        "ts": now(),
+    }
 
 
 # ---------------------------------------------------------------------------

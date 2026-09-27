@@ -51,6 +51,7 @@ Registration rule (design Section 5.2 / lane safety): this module lives at
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 from pathlib import Path
 
 from trialerror.jobs import ledger
@@ -206,6 +207,34 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
         action="store_true",
         help="keep both stages' backends loaded for the whole run instead of unloading the idle "
         "one when the job kind switches (needs the memory for both at once)",
+    )
+    # The vast.ai OCR design's O5: a worker that serves OCR only keeps the DEV
+    # GPU free of embed jobs while its OCR runs on a rented GPU.
+    p_worker.add_argument(
+        "--stages",
+        default="ocr,embed",
+        help="comma-separated job stages this worker serves (default: ocr,embed). A claimed job of "
+        "another stage is returned to the queue unrun (reason stage-not-served, no attempt burned) "
+        "and skipped for the rest of the run; e.g. --stages ocr",
+    )
+    # A renting worker prints NOTHING until it exits: its log lines reach the
+    # operator only inside the final envelope, so a five-minute lease looks
+    # dead while it is billing [observed live, canary C4 of 2026-09-19].
+    p_worker.add_argument(
+        "--log-file",
+        default=None,
+        metavar="PATH",
+        help="append each worker log line to PATH as it happens (UTC-stamped, flushed per line), so a "
+        "long lease can be watched while it runs; the envelope still carries the whole log",
+    )
+    # Live records (canary attempt 3, 2026-09-20): what marker actually wrote, kept for a canary. The default
+    # removes it, because a published document's ranges are nobody's resume.
+    p_worker.add_argument(
+        "--keep-range-cache",
+        action="store_true",
+        help="keep a chunked OCR job's range cache (<work-root>/_ranges/<job-id>/, marker's own "
+        "text per range) after the document is published, instead of removing it; the kept "
+        "directory is still that job id's resume cache, so remove it before re-running the job",
     )
     p_worker.set_defaults(handler=_cmd_worker)
 
@@ -609,6 +638,32 @@ def _worker_warnings(args: argparse.Namespace) -> list[dict] | None:
     return [{"code": "deprecated_flag", "message": BACKEND_CONFIG_ROOT_DEPRECATION}]
 
 
+def worker_log_sink(lines: list[str], log_path: Path | None):
+    """The worker's log sink: the envelope's list AND, when ``--log-file`` is
+    given, the file -- one line at a time, opened and closed per line.
+
+    A renting worker printed NOTHING until it exited: its lines reached the
+    operator only inside the final envelope, so five minutes of a billing
+    lease looked dead [observed live, canary C4 of 2026-09-19, both redirected
+    console files 0 bytes for the whole lease]. Per line, and flushed by the
+    close, a lease is watchable while it runs and a killed worker still leaves
+    every line it reached.
+    """
+
+    def log(line: str) -> None:
+        lines.append(line)
+        if log_path is None:
+            return
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            with log_path.open("a", encoding="utf-8", errors="replace") as fh:
+                print(f"{stamp} {line}", file=fh)
+        except OSError:  # a log that cannot be written never fails the run
+            pass
+
+    return log
+
+
 def _cmd_worker(args: argparse.Namespace) -> dict:
     from trialerror.offload.lock import WorkerAlreadyRunning, single_instance_lock
     from trialerror.offload.transport import LocalTransport, SshTransport
@@ -616,8 +671,12 @@ def _cmd_worker(args: argparse.Namespace) -> dict:
         DEFAULT_EMBED_BATCH_SIZE,
         ConfigDevBackends,
         WorkerConfigError,
+        parse_stages,
         run_worker,
     )
+    # Tiny (it imports only the settlement class): the vast.ai executor's
+    # start-up refusal is surfaced by name like every other refusal here.
+    from trialerror.vastai.errors import VastConfigError
 
     # The real default, resolved HERE (see _BATCH_SIZE_HELP_DEFAULT): the
     # worker import belongs on the one code path that actually runs a
@@ -635,6 +694,26 @@ def _cmd_worker(args: argparse.Namespace) -> dict:
             meta=meta,
             warnings=warnings,
         )
+    try:
+        stages = parse_stages(getattr(args, "stages", "ocr,embed"))
+    except WorkerConfigError as exc:
+        return error_envelope("offload.worker", "bad_arguments", str(exc), meta=meta, warnings=warnings)
+
+    lines: list[str] = []
+    log_path: Path | None = None
+    if getattr(args, "log_file", None):
+        try:
+            log_path = Path(args.log_file)
+            if str(log_path.parent):
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.open("a", encoding="utf-8").close()  # fail now, not mid-lease
+        except OSError as exc:
+            return error_envelope(
+                "offload.worker", "bad_arguments",
+                f"--log-file {args.log_file} could not be opened: {exc}",
+                meta=meta, warnings=warnings,
+            )
+    log_line = worker_log_sink(lines, log_path)
 
     program_root = _resolve_program_root(args)
     if program_root is None:
@@ -664,12 +743,11 @@ def _cmd_worker(args: argparse.Namespace) -> dict:
         if args.remote
         else LocalTransport(args.queue_root, worker_id=args.worker_id)
     )
-    lines: list[str] = []
     try:
         with single_instance_lock(args.lock_path):
             summary = run_worker(
                 transport=transport,
-                backends=ConfigDevBackends(config),
+                backends=ConfigDevBackends(config, root=program_root),
                 work_root=args.work_root,
                 worker_id=args.worker_id,
                 stay=args.stay,
@@ -678,7 +756,9 @@ def _cmd_worker(args: argparse.Namespace) -> dict:
                 max_polls=args.max_polls,
                 batch_size=batch_size,
                 keep_resident=args.keep_resident,
-                log=lines.append,
+                keep_range_cache=args.keep_range_cache,
+                log=log_line,
+                stages=stages,
             )
     except WorkerAlreadyRunning as exc:
         return error_envelope(
@@ -688,15 +768,40 @@ def _cmd_worker(args: argparse.Namespace) -> dict:
         return error_envelope(
             "offload.worker", "fake_backend_refused", str(exc), meta=meta, warnings=warnings
         )
-    except KeyboardInterrupt:  # pragma: no cover - operator Ctrl+C
+    except VastConfigError as exc:
+        # The vast.ai executor's own refusal to start ([vastai] settings, a
+        # missing runtime file), by key name, before anything was claimed.
+        return error_envelope(
+            "offload.worker",
+            "vastai_config_refused",
+            str(exc),
+            details={"next_actions": list(exc.next_actions)},
+            meta=meta,
+            warnings=warnings,
+        )
+    except KeyboardInterrupt as exc:  # pragma: no cover - operator Ctrl+C
+        # A vast.ai lease that reached its TTL arrives here too (LeaseExpired
+        # is a KeyboardInterrupt): its reason is the message.
         return error_envelope(
             "offload.worker",
             "interrupted",
-            "interrupted; the claim was returned",
+            "interrupted; the claim was returned" + (f" ({exc})" if str(exc) else ""),
             meta=meta,
             warnings=warnings,
         )
 
+    # Class-R refusals, one line each for the text renderer. Emitted only when
+    # something WAS refused, so a run without refusals prints what it did.
+    refused = summary.get("refused") or []
+    if refused:
+        warnings = list(warnings or []) + [
+            {
+                "code": "offload_job_refused",
+                "message": f"{entry.get('job_id')}: [{entry.get('reason_code')}] {entry.get('message')}",
+                "next_actions": list(entry.get("next_actions") or []),
+            }
+            for entry in refused
+        ]
     return ok_envelope(
         "offload.worker", result={**summary, "log": lines}, meta=meta, warnings=warnings
     )

@@ -33,7 +33,19 @@ Submodules:
   provider results into one record (DOI-preferred identity, provenance).
 - :mod:`trialerror.litapi.client` -- ``LitApiClient``, the top-level
   orchestration (``lookup_doi``/``lookup_arxiv``/``search``/
-  ``get_citations``) + the ``DEFAULT_CLIENTS``/``ALL_CLIENTS`` pattern.
+  ``get_citations``, and since lane SI ``get_references``/
+  ``get_author_works``) + the ``DEFAULT_CLIENTS``/``ALL_CLIENTS`` pattern.
+- :mod:`trialerror.litapi.citeparse` (lane SI) -- ``parse_citation``/
+  ``parse_seed_list``: DOI, arXiv id, ISBN-13, years, first-author surname and
+  a quoted title out of one free-text citation.
+- :mod:`trialerror.litapi.match` (lane SI) -- ``match_citation``/
+  ``best_title_match``: does a resolved record agree with the citation that
+  named it (``exact``/``probable``/``mismatch``/``none``).
+- :mod:`trialerror.litapi.investigate` (lane SI part B) -- the source
+  investigator behind ``trialerror lit investigate run|verdict|render``: one
+  dossier per cited work (resolution, match, held check, citing works,
+  reviews, references, the authors' recent works) over a ``source_evidence``
+  response cache, verdicts under fixed refusals, and the operator lines.
 - :mod:`trialerror.litapi.checks` -- doctor checks (auto-discovered; imported
   for side effects by ``trialerror.util.doctor.discover_and_register_checks``,
   same convention as every other subsystem's ``checks.py``) -- including
@@ -43,7 +55,7 @@ Submodules:
   ``trialerror.ingest`` not this package -- the acquisition->ingest seam, see
   the "M7 ingestion" bullet below) -- ``LitApiClient`` results feed into
   ``trialerror.ingest.pipeline``'s existing ``register_source``/``add_document``.
-- CLI: ``trialerror/cli/lit.py`` (``trialerror lit lookup|citations|search|acquire``),
+- CLI: ``trialerror/cli/lit.py`` (``trialerror lit lookup|citations|search|acquire|investigate``),
   auto-discovered by ``trialerror.cli.discover_groups`` -- not part of this
   package proper (the CLI-group convention lives under ``trialerror/cli/``
   repo-wide), listed here for discoverability.
@@ -83,7 +95,15 @@ Submodules:
 
 from __future__ import annotations
 
-from trialerror.litapi.client import ALL_CLIENTS, DEFAULT_CLIENTS, LitApiClient, LookupResult, SearchResult
+from trialerror.litapi.client import (
+    ALL_CLIENTS,
+    DEFAULT_CLIENTS,
+    AuthorWorks,
+    AuthorWorksResult,
+    LitApiClient,
+    LookupResult,
+    SearchResult,
+)
 from trialerror.litapi.errors import (
     AllProvidersFailedError,
     LitApiError,
@@ -93,12 +113,15 @@ from trialerror.litapi.errors import (
     ProviderUnsupportedOperationError,
     TransportNotConfiguredError,
 )
-from trialerror.litapi.models import CitationEdge, CitationsPage, WorkRecord
+from trialerror.litapi.models import CitationEdge, CitationsPage, WorkRecord, provider_extra
 
 __all__ = [
     "LitApiClient",
     "LookupResult",
     "SearchResult",
+    "AuthorWorks",
+    "AuthorWorksResult",
+    "provider_extra",
     "DEFAULT_CLIENTS",
     "ALL_CLIENTS",
     "WorkRecord",

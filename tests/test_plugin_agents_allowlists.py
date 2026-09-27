@@ -120,7 +120,7 @@ def test_verifier_and_lens_get_trialerror_knowledge_alone(stem, live_knowledge_t
     fields = _parse_frontmatter(AGENTS_DIR / f"{stem}.md")
     tools = _tool_list(fields)
 
-    assert len(tools) == 12, f"'{stem} gets trialerror-knowledge alone: 12 tools' (M8's 11 + lane e's term_lookup) — got {len(tools)}"
+    assert len(tools) == 8, f"'{stem} gets trialerror-knowledge alone: 8 tools' (M8's 11 + lane e's term_lookup, less the four Phase 0 retired) — got {len(tools)}"
     assert all(t.startswith("mcp__trialerror-knowledge__") for t in tools), f"{stem}: every tool must be a trialerror-knowledge tool, no bare native tool and no trialerror-ops tool"
 
     declared_bare_names = {t.removeprefix("mcp__trialerror-knowledge__") for t in tools}
@@ -129,8 +129,7 @@ def test_verifier_and_lens_get_trialerror_knowledge_alone(stem, live_knowledge_t
     # silently drifting from the allowlist file.
     assert declared_bare_names == live_knowledge_tool_names == {
         "search", "get_chunk", "get_source", "get_document_outline", "resolve_quote",
-        "similar", "graph_neighbors", "corpus_stats", "memory_search", "list_requests", "poll_job",
-        "term_lookup",
+        "similar", "corpus_stats", "term_lookup",
     }
 
     # no trialerror-ops tool leaked in under any naming.
@@ -139,13 +138,12 @@ def test_verifier_and_lens_get_trialerror_knowledge_alone(stem, live_knowledge_t
     assert not any("trialerror-ops" in t for t in tools)
 
 
-def test_knowledge_and_ops_tool_counts_match_the_design_table():
-    """Sanity anchor for the two fixtures above. ``trialerror-ops`` is still
-    design §5.1's own stated 12; ``trialerror-knowledge`` grew from §5.1's
-    original 11 to 12 with lane e's ``term_lookup`` (E3) -- see the section
-    comment above this test's siblings."""
-    assert len(build_knowledge_tools(program_root=Path("unused-nonexistent-root"))) == 12
-    assert len(build_ops_tools(program_root=Path("unused-nonexistent-root"))) == 12
+def test_knowledge_and_ops_tool_counts_match_the_kept_tools():
+    """Sanity anchor for the two fixtures above. Phase 0 retired four of
+    ``trialerror-knowledge``'s tools and nine of ``trialerror-ops``'s (0 uses),
+    leaving 8 and 3."""
+    assert len(build_knowledge_tools(program_root=Path("unused-nonexistent-root"))) == 8
+    assert len(build_ops_tools(program_root=Path("unused-nonexistent-root"))) == 3
 
 
 # ---------------------------------------------------------------------------

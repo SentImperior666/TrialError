@@ -104,7 +104,7 @@ id = "{program_id}"
 # configured_path_value) -- relocate any of TrialError's rendered/output
 # locations without moving data, e.g. to bridge INTO an existing non-TrialError
 # project's own layout instead of restructuring it (see
-# plugin/skills/import-existing-project, and docs/the import-design notes (internal, not in this export) for
+# docs/GETTING_STARTED.md path 2, and docs/the import-design notes (internal, not in this export) for
 # the worked example). Every value below is program-root-relative unless
 # given as an absolute path; a field left commented out falls back to the
 # literal shown. `ingest_roots` (a list) is the one knob that predates this
@@ -193,6 +193,41 @@ id = "{program_id}"
 # backend = "offload"
 # model_key = "qwen3-4b"        # REQUIRED for offload -- emb rows are keyed by it
 # dims = 2048
+# gpu = "dev"                   # WHO serves the queue: "dev" (the DEV worker, default)
+#                               # or "vastai" (`trialerror vastai run` rents a GPU).
+#                               # The one-line switch; not part of the config hash.
+#
+# vast.ai executor (docs/VASTAI_EMBED_DESIGN.md). Instances live only as long
+# as the job: create -> run -> destroy, hard TTL, per-job $ cap, reaper.
+# There is no keep-alive option. Tiers are for Qwen3-Embedding-4B @ 2048 dims;
+# mid ~= an RTX 5080 Laptop GPU and is the default. max_dph values are
+# ceilings you choose, not prices -- check live offers with `trialerror vastai plan`.
+# The same table serves the OCR lane on a GPU worker's backend-config-root
+# ([ingest.ocr] executor = "vastai"; docs/USER_SETUP.md section 1b), which reads
+# its own image, startup_s, safety and disk_gb from [vastai.ocr].
+# [vastai]
+# api_key_path = "keys/vastai.key"            # operator-placed; never inline the key
+# ssh_identity_path = "C:/path/to/.ssh/te_vastai"   # a key pair for vast.ai alone, registered there
+# tier = "mid"                  # low | mid | high. "high" ALSO needs an operator
+#                               # approval (`trialerror vastai approve-high`, TTY only)
+# max_job_usd = 3.00            # refuse to start if the worst case ($/h x TTL) exceeds this
+# ttl_cap_s = 14400             # hard TTL ceiling; cannot exceed 4 h
+# startup_s = 1200              # estimate: boot + image + pip + model download
+# [vastai.tiers.low]
+# gpus = ["RTX 4060 Ti", "RTX 5060 Ti", "RTX A4000", "RTX 4000Ada"]
+# min_vram_gb = 16
+# max_dph = 0.25
+# min_reliability = 0.95
+# [vastai.tiers.mid]
+# gpus = ["RTX 3090", "RTX 3090 Ti", "RTX A5000", "RTX 4070S Ti", "RTX 4070 Ti Super", "RTX 4080", "RTX 4080S", "RTX 5070 Ti", "RTX 5080"]
+# min_vram_gb = 16
+# max_dph = 0.45
+# min_reliability = 0.97
+# [vastai.tiers.high]
+# gpus = ["RTX 4090", "RTX 5090", "L40S", "A100 PCIE", "A100 SXM4", "H100 PCIE", "H100 SXM"]
+# min_vram_gb = 24
+# max_dph = 2.50
+# min_reliability = 0.98
 
 # Fail-closed backends. With this true, an absent or `backend = "fake"`
 # [ingest.ocr]/[ingest.embed] table is REFUSED at load time instead of quietly
@@ -203,24 +238,6 @@ id = "{program_id}"
 # program whose record you intend to keep.
 # [ingest]
 # require_real_backends = true
-
-# Plain-English Feed translator (trialerror.feed_translate, `trialerror feed
-# translate`). Absent table -> backend = "pending": a translation job builds
-# the envelope and parks it, costing nothing and calling nothing, for an
-# agent to fill with `trialerror feed translate --post-id ... --body "..."`.
-#   backend = "pending"  park envelopes (default; zero cost, zero network)
-#   backend = "fake"     deterministic offline rewrite, for demos and tests
-#   backend = "model"    model-backed; refuses to run without a booked launch,
-#                        and has no generation driver in this build (see
-#                        docs/reviews/AISPEAK_TRANSLATOR_DESIGN.md Section 3)
-# The faithfulness gate always runs its deterministic fidelity tier; the two
-# knobs below only widen what else withholds a translation.
-# [feed.translator]
-# backend = "pending"
-# model = "claude-sonnet-5"
-# faithfulness_min_score = 0.8
-# strict_style = false                # also withhold on register-level style breaks
-# require_faithfulness_score = false  # also withhold anything never judged
 
 # Literature-metadata API clients (trialerror.litapi.config, `trialerror lit ...`).
 # Every field defaults conservatively when this section is absent -- see

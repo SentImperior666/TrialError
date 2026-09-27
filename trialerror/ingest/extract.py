@@ -10,10 +10,9 @@ module SHAPES that work (:func:`build_extraction_judgment_envelope`) and
 accepts a ``judge`` callable (``judge(envelope) -> {"entities": [...],
 "relations": [...], "claims": [...]}``), exactly the
 ``run_hypothesis_verification(..., judge=...)`` shape -- a deterministic
-fake fills it in tests, a real subagent fills it at runtime via ``trialerror
-extract run --judgments-file`` (disk-to-disk, C-0007: "page text never
-transits the orchestrator's context") or the ``extract`` job handler's
-``judgments_path`` payload key (:func:`trialerror.ingest.handlers.run_extract`).
+fake fills it in tests, a real subagent fills it at runtime by calling
+:func:`run_extract_document` directly. (The ``trialerror extract`` CLI group and
+the ``extract`` job handler that used to wrap it were retired in Phase 0.)
 
 **Merge-review queue -- never silent auto-merge** (the cognee/sift-kg
 lesson, mission brief verbatim): extraction never writes directly into
@@ -24,7 +23,7 @@ this shape ("structured landing ... row-per-row with column structure
 preserved"), so this reuses it rather than adding a table (schema is out
 of this lane's ownership -- ``trialerror/stores/schema/`` is the schemav2
 lane's file). :func:`accept_candidate`/:func:`reject_candidate` (and the
-CLI's ``trialerror extract accept/reject``) are the ONLY path from a pending
+DECIDE queue's merge-accept/merge-reject writes) are the ONLY path from a pending
 ``record`` row to a real ``entity``/``relation``/``claim`` row; accept
 always calls :func:`trialerror.stores.bitemporal.assert_fact` for
 relation/claim (bi-temporal, per the mission: "accepted rows written
@@ -462,8 +461,8 @@ def run_extract_document(
     ``kg_extract_chunk_processed`` event, per :func:`_already_processed_chunk_ids`,
     is skipped, so a resumed/re-run call never re-judges the same chunk
     twice). ``on_chunk(totals)`` (if given) is called after each chunk with
-    the running totals so far -- :func:`trialerror.ingest.handlers.run_extract`
-    uses this to call ``ctx.set_checkpoint`` per chunk."""
+    the running totals so far (a caller running it as a job used this to
+    checkpoint per chunk)."""
     chunk_ids = [r["chunk_id"] for r in store.knowledge.execute("SELECT chunk_id FROM chunk WHERE doc_id = ? ORDER BY seq", (doc_id,))]
     already = _already_processed_chunk_ids(store)
     totals = {"chunks_processed": 0, "chunks_skipped": 0, "entities_queued": 0, "relations_queued": 0, "claims_queued": 0}
@@ -498,7 +497,7 @@ def _load_candidate(store: Store, record_id: str) -> dict[str, Any] | None:
 def list_pending(store: Store, *, kind: str | None = None, doc_id: str | None = None, limit: int = 200) -> dict[str, Any]:
     """Every PENDING extraction candidate (optionally filtered by
     ``kind``/``doc_id``) plus every DRAFT merge proposal -- the full
-    merge-review queue :func:`trialerror.cli.extract._cmd_review` renders."""
+    merge-review queue."""
     candidates: list[dict[str, Any]] = []
     rows = store.knowledge.execute(
         "SELECT * FROM record WHERE register_key = ? ORDER BY seq", (EXTRACT_REGISTER_KEY,)
@@ -929,7 +928,7 @@ def reject(store: Store, item_id: str, *, by_launch: str, reason: str | None = N
 
 
 def status(store: Store) -> dict[str, Any]:
-    """Summary counts for ``trialerror extract status`` / the
+    """Summary counts for the
     ``extract_pending_backlog`` doctor check's own reasoning."""
     counts: dict[str, dict[str, int]] = {
         "entity": {"pending": 0, "accepted": 0, "rejected": 0},

@@ -193,7 +193,7 @@
 
           <div class="two-col" style="flex-grow:1; margin-top:12px;">
             <div style="display:flex; flex-direction:column; min-height:0;">
-              <div class="section-head"><span class="h" data-role="search-results-count">0 RESULTS</span><span class="sub">every row carries its own anchor. a row without a citation is a bug, not a result.</span></div>
+              <div class="section-head"><span class="h" data-role="search-results-count">ask a question to search the corpus</span><span class="sub" title="every row carries its own anchor. a row without a citation is a bug, not a result.">every result links to its source</span></div>
               <div class="table-scroll" style="flex-grow:1; overflow-y:auto;" data-role="search-results-list"></div>
             </div>
             <div style="display:flex; flex-direction:column; gap:12px; min-height:0;">
@@ -202,9 +202,8 @@
                 <div class="card-body facet-list" data-role="search-license-facets"><div class="empty">no results yet</div></div>
               </div>
               <div class="card">
-                <div class="card-header"><span class="title">TRY A QUESTION</span></div>
+                <div class="card-header" title="NO RESULTS NEVER READS &quot;0 RESULTS&quot; WITHOUT SAYING WHY."><span class="title">TRY A QUESTION</span></div>
                 <div class="card-body" data-role="search-shortcuts" style="display:flex; flex-direction:column; gap:8px; font-family:var(--font-mono); font-size:11px;"></div>
-                <div class="card-footer">NO RESULTS NEVER READS "0 RESULTS" WITHOUT SAYING WHY.</div>
               </div>
             </div>
           </div>
@@ -331,9 +330,6 @@
               <span class="chip chip--live" style="cursor:pointer;" data-role="feed-order-threaded" title="replies nested under the post they answer">THREADED</span>
               <span class="chip chip--neutral" style="cursor:pointer;" data-role="feed-order-arrived" title="append order -- the raw, unstructured truth">AS IT ARRIVED</span>
               <span class="chip chip--neutral" style="cursor:not-allowed;" title="needs goal-grouping logic this API stage does not provide" aria-disabled="true">GROUPED BY GOAL</span>
-              <span class="note-strip" style="letter-spacing:0.1em; margin-top:8px;">PLAIN ENGLISH</span>
-              <span class="chip chip--live" style="cursor:pointer;" data-role="feed-translation-toggle" title="show the stored plain-English translation beside each post">SIDE BY SIDE</span>
-              <span class="note-strip" data-role="feed-translation-note"></span>
             </div>
             <div class="note-strip" style="margin-top:auto; padding:11px 12px;">POSTS ARE APPEND-ONLY.<br>AUTHORSHIP IS SERVER-DERIVED.</div>
           </div>
@@ -348,7 +344,7 @@
             <div class="write-form-bar" style="display:flex; align-items:center; gap:11px; padding:10px 14px;">
               <span class="prompt" style="font-size:12px; color:var(--live); font-family:var(--font-mono);">&gt;</span>
               <input type="text" class="write-input" data-role="feed-compose-input" style="flex-grow:1;" maxlength="4000" placeholder="transmit a directive to this thread (posts as orchestrator -- authorship is server-derived)">
-              <button type="button" class="btn btn--destructive" disabled title="live mode required" data-role="feed-transmit-btn">TRANSMIT</button>
+              <button type="button" class="btn btn--primary" disabled title="live mode required" data-role="feed-transmit-btn">TRANSMIT</button>
             </div>
             <div class="note-strip" data-role="feed-compose-note" style="padding:0 14px 8px 14px;"></div>
           </div>
@@ -371,7 +367,7 @@
       <section class="panel" id="panel-console" data-panel="console">
         <div class="subbar">
           <span class="t">THE MACHINE</span>
-          <span class="m">everything the old landing page used to be, on one screen you open on purpose</span>
+          <span class="m">session, budget, jobs and launches</span>
           <span class="fill"></span>
           <span class="console-health-tally" data-role="console-health-tally" data-health="ok">&mdash;</span>
           <span class="console-asof" data-role="console-asof">&mdash;</span>
@@ -459,10 +455,18 @@
     memory_stale: "MEMORY REVIEW DUE · NOTHING EXPIRES ON A TIMER",
     prereg_reveal: "PRE-REGISTRATION REVEALS",
     room_escalation: "ROOM ESCALATIONS · FROZEN",
+    webfetch_proposals: "WEB HOSTS · APPROVE ON YOUR MACHINE",
+    offload_backlog: "GPU BACKLOG · RUN THE DEV WORKER",
     acquisition: "ACQUISITIONS · ONLY YOU CAN DELIVER THESE"
   };
   var KIND_ORDER = ["gate_edit", "kg_merge", "memory_conflict", "memory_conflict_candidate",
-    "memory_stale", "prereg_reveal", "room_escalation", "acquisition"];
+    "memory_stale", "prereg_reveal", "room_escalation", "webfetch_proposals", "offload_backlog",
+    "acquisition"];
+  //: kinds decided on the LEXICON page instead of here (E4, design §5) --
+  //: DECIDE draws every item EXCEPT these, and folds their count into the
+  //: "LEXICON CANDIDATES" link in the summary line instead of a row.
+  var TERM_KINDS = ["term_duplicate", "term_conflict"];
+  function isTermKind(kind) { return TERM_KINDS.indexOf(kind) !== -1; }
 
   var GATE_STEPS = ["draft", "submitted", "gated", "union_applied", "registered"];
 
@@ -482,7 +486,6 @@
     bootRetryTimer: null,      // LU-3: backoff retry of the boot fetch
     // per-surface selection state
     feedThreadId: null,
-    feedSideBySide: true,      // PLAIN ENGLISH column on/off (AISPEAK design 4.4)
     // ---- threading (lane C item B; ruling L-C4) ----
     feedOrder: null,           // "threaded" | "arrived" -- read from localStorage at boot
     feedCollapsed: {},         // root_post_id -> true; in-memory, per spec §2.2
@@ -623,7 +626,32 @@
     if (!iso) return "—";
     var d = new Date(iso);
     if (isNaN(d.getTime())) return String(iso).slice(0, 16);
-    return String(d.getUTCHours()).padStart(2, "0") + ":" + String(d.getUTCMinutes()).padStart(2, "0");
+    var hm = String(d.getUTCHours()).padStart(2, "0") + ":" + String(d.getUTCMinutes()).padStart(2, "0");
+    var now = new Date();
+    var sameUtcDay = d.getUTCFullYear() === now.getUTCFullYear() && d.getUTCMonth() === now.getUTCMonth() && d.getUTCDate() === now.getUTCDate();
+    if (sameUtcDay) return hm;
+    return String(d.getUTCMonth() + 1).padStart(2, "0") + "-" + String(d.getUTCDate()).padStart(2, "0") + " " + hm;
+  }
+  /** Cuts a string to ~n chars with an ellipsis; the caller keeps the full
+   * text in `title=` so nothing is actually lost, just kept off the line. */
+  function clip(s, n) {
+    s = String(s);
+    return s.length > n ? s.slice(0, n) + "…" : s;
+  }
+  /** A7: IDs (ART-…, ROOM-…) used to be the most prominent line in the
+   * registry/rooms rows AND wrapped mid-ID (overflow-wrap:anywhere on
+   * `.id`), which is what put a horizontal scrollbar in the DOSSIER
+   * registry pane. The human title/topic is now the prominent line; this
+   * middle-truncates the ID for the quiet second line so it never wraps
+   * or overflows, while the caller still puts the untruncated id in
+   * `title=` so nothing is actually lost. Short ids pass through whole;
+   * an id with no "-" (not one of ours) just keeps its first 8 chars. */
+  function midTruncId(id) {
+    var s = String(id === null || id === undefined ? "" : id);
+    if (s.length <= 16) return s;
+    var dash = s.indexOf("-");
+    if (dash === -1) return s.slice(0, 8);
+    return s.slice(0, dash + 5) + "…" + s.slice(-5);
   }
   function fmtElapsed(iso) {
     if (!iso) return null;
@@ -747,13 +775,16 @@
     wrap.appendChild(fmtScalar(v));
     return wrap;
   }
-  function renderObjectG(obj) {
+  // Display-only: underscores -> spaces. Never changes the underlying key,
+  // only what a human reads on screen (e.g. "request_state" -> "request state").
+  function humanizeKey(k) { return String(k == null ? "" : k).replace(/_/g, " "); }
+  function renderObjectG(obj, humanizeKeys) {
     var keys = Object.keys(obj);
     if (keys.length === 0) return el("div", { "class": "empty", text: "(empty)" });
     var table = el("table", { "class": "kv-table" });
     keys.forEach(function (k) {
       var tr = el("tr", {}, [
-        el("td", { "class": "kv-key", text: k }),
+        el("td", { "class": "kv-key", text: humanizeKeys ? humanizeKey(k) : k }),
         el("td", { "class": "kv-value" }, [renderValueG(obj[k])])
       ]);
       table.appendChild(tr);
@@ -1194,10 +1225,31 @@
       tally.setAttribute("title", reasons);
     }
 
+    // A2: the badge counts what DECIDE actually draws, not the server's raw
+    // `total` -- that total still includes the term_duplicate/term_conflict
+    // rows DECIDE hands off to the LEXICON page (see TERM_KINDS above), so a
+    // badge built from it over-counted the operator's real queue. Blocking
+    // takes priority when there is any; otherwise the badge is a plain "you
+    // have this many to look at" count, and it goes calm (amber, not red)
+    // because none of them are gating anything.
     var determ = panels.determinations || {};
     var determBadge = qs('[data-role="determ-badge"]');
-    if (determ.status === "ok" && determ.total) { determBadge.textContent = String(determ.total); show(determBadge); }
-    else hide(determBadge);
+    var determRailItem = qs('.rail-item.rail-item--decide');
+    var determDrawnCount = 0;
+    var determBlockingCount = 0;
+    if (determ.status === "ok" && Array.isArray(determ.items)) {
+      determDrawnCount = determ.items.filter(function (i) { return !isTermKind(i.kind); }).length;
+      determBlockingCount = determ.blocking_count || 0;
+    }
+    var determBadgeCount = determBlockingCount > 0 ? determBlockingCount : determDrawnCount;
+    if (determ.status === "ok" && determBadgeCount > 0) {
+      determBadge.textContent = String(determBadgeCount);
+      determBadge.classList.toggle("rail-badge--calm", determBlockingCount === 0);
+      show(determBadge);
+    } else {
+      hide(determBadge);
+    }
+    if (determRailItem) determRailItem.classList.toggle("is-blocking", determBlockingCount > 0);
 
     var rooms = panels.rooms || {};
     var anyOpen = rooms.status === "ok" && (rooms.rooms || []).some(function (r) { return r.state === "open"; });
@@ -1236,7 +1288,7 @@
   var DELTA_STATUS = {
     room_dp_scored: ["settled", "✓ CONVERGED"], room_turn: ["pending", "○ TURN"],
     room_created: ["live", "◆ NEW ROOM"], room_converged: ["settled", "✓ CONVERGED"],
-    room_frozen: ["crit", "✗ FROZEN"], room_deliverable_registered: ["settled", "✓ REGISTERED"],
+    room_frozen: ["crit", "✗ FROZEN"], room_closed: ["settled", "✓ CLOSED"], room_deliverable_registered: ["settled", "✓ REGISTERED"],
     feed_post: ["live", "◆ NEW POST"], gate_transition: ["warn", "▲ GATE MOVED"],
     artifact_registered: ["settled", "✓ REGISTERED"], ingest_complete: ["settled", "✓ INGESTED"]
   };
@@ -1336,14 +1388,20 @@
       card.appendChild(el("div", { "class": "card-body empty", text: p ? p.message : "no data" }));
       return;
     }
+    // A2: the same set DECIDE draws (term candidates are LEXICON's), in the
+    // same order; red only while something blocks.
+    var drawn = determDisplayOrder((p.items || []).filter(function (i) { return !isTermKind(i.kind); }));
+    var tone = p.blocking_count > 0 ? "var(--crit-text)" : "var(--warn)";
+    card.classList.toggle("card--accent-crit", p.blocking_count > 0);
+    card.classList.toggle("card--accent-warn", !(p.blocking_count > 0));
     card.appendChild(el("div", { "class": "card-header" }, [
-      el("span", { "class": "title", "style": "color:var(--crit-text);", text: p.total + " AWAITING DECISION" }),
+      el("span", { "class": "title", "style": "color:" + tone + ";", text: drawn.length + " AWAITING DECISION" }),
       el("span", { "class": "fill" }),
-      el("span", { "class": "sub", "style": "color:var(--crit-text);", text: p.blocking_count + " BLOCKING" })
+      el("span", { "class": "sub", "style": "color:" + tone + ";", text: p.blocking_count + " BLOCKING" })
     ]));
     var body = el("div", { "class": "card-body" });
     card.appendChild(body);
-    var top = p.items.find(function (i) { return i.blocking; }) || p.items[0];
+    var top = drawn.filter(function (i) { return i.blocking; })[0] || drawn[0];
     if (!top) { body.appendChild(el("div", { "class": "empty", text: "queue is empty" })); return; }
     body.appendChild(el("div", { "style": "font-size:13px; color:var(--ink-hi); font-weight:600; margin-bottom:6px;", text: determItemTitle(top) }));
     body.appendChild(el("div", { "style": "font-size:12px; line-height:1.5; color:var(--ink);", text: top.consequence }));
@@ -1352,7 +1410,7 @@
     openBtn.addEventListener("click", function () { state.determSelectedId = top.id; switchPanel("determinations"); });
     btnRow.appendChild(openBtn);
     body.appendChild(btnRow);
-    var foot = el("div", { "class": "card-footer" }, [el("span", { text: "SHOWING 1 OF " + p.total + " ITEMS IN THE QUEUE" + (p.total > 1 ? " — OPEN DECIDE FOR THE REST" : "") })]);
+    var foot = el("div", { "class": "card-footer" }, [el("span", { text: "SHOWING 1 OF " + drawn.length + " ITEMS IN THE QUEUE" + (drawn.length > 1 ? " — OPEN DECIDE FOR THE REST" : "") })]);
     card.appendChild(foot);
   }
 
@@ -1564,6 +1622,8 @@
       case "memory_conflict": return item.key;
       case "memory_conflict_candidate": return item.key + " ↔ " + item.target_key;
       case "memory_stale": return item.key + " (" + item.item_kind + ", " + item.overdue_days + "d overdue)";
+      case "offload_backlog": return item.summary;
+      case "webfetch_proposals": return item.summary;
       default: return item.id;
     }
   }
@@ -1889,12 +1949,12 @@
     var transmitBtn = qs('[data-role="feed-transmit-btn"]');
     transmitBtn.disabled = !(writesEnabled() && p.active_thread_id);
     transmitBtn.title = writesEnabled() ? "" : "live mode + a write token are required (static snapshots are read-only)";
+    // A5 12.11: same reason, on screen -- safe while disabled, because a
+    // disabled button's own click listener (wireWriteAction, below) never
+    // fires to overwrite it.
+    showDisabledReason(qs('[data-role="feed-compose-note"]'), transmitBtn);
     if (syncNewThreadEnabled) syncNewThreadEnabled();   // C7: + NEW THREAD, same rule
     unreadCount.textContent = (p.unread_directives || []).length + " UNREAD DIRECTIVES";
-    var withheld = p.translation_withheld_count || 0;
-    qs('[data-role="feed-translation-note"]').textContent = withheld
-      ? withheld + " WITHHELD BY THE FAITHFULNESS GATE"
-      : "GATED; WITHHELD TRANSLATIONS ARE NEVER SHOWN";
     (p.threads || []).forEach(function (t) {
       var row = el("div", { "class": "thread-row" + (t.thread_id === p.active_thread_id ? " is-active" : "") }, [
         el("span", { "class": "name", text: t.title }),
@@ -1916,7 +1976,7 @@
     if ((p.unread_directives || []).length) {
       var dirCard = el("div", { "class": "directive-card" });
       dirCard.appendChild(el("div", { "class": "post-card-head" }, [
-        el("span", { "class": "chip--role", "style": "background:var(--crit-fill); color:var(--bg); font-family:var(--font-mono); font-size:10px; padding:2px 7px; font-weight:600;", text: "OPERATOR" }),
+        el("span", { "class": "chip--role", "style": "background:var(--warn); color:var(--bg); font-family:var(--font-mono); font-size:10px; padding:2px 7px; font-weight:600;", text: "OPERATOR" }),
         el("span", { text: "INBOX · " + p.unread_directives.length + " unread" })
       ]));
       var dirBody = el("div", { "class": "post-body-single" });
@@ -1963,7 +2023,7 @@
       collapsed: state.feedCollapsed,
       replyToId: state.feedReplyTo ? state.feedReplyTo.post_id : null,
       writesEnabled: writesEnabled() && !!p.active_thread_id,
-      buildPostBody: buildPostBody,     // lane b's, unchanged
+      buildPostBody: buildPostBody,
       chip: chip,
       fmtHM: fmtHM,
       onReply: setFeedReplyTo,
@@ -1976,89 +2036,15 @@
     });
   }
 
-  /* Right-hand column, per AISPEAK_TRANSLATOR_DESIGN.md 4.4. Five
-     translation_state values come off the API (see
-     trialerror.dashboard.data._translation_slot); none of them ever renders
-     a body the gate withheld -- the server does not even send that text,
-     so the check below is belt-and-braces, not the only guard. */
-  function translationLabel(t) {
-    var bits = ["PLAIN ENGLISH"];
-    if (t && t.translator_version) bits.push("v" + t.translator_version);
-    if (t && t.faithfulness_score !== null && t.faithfulness_score !== undefined) bits.push("faithfulness " + t.faithfulness_score);
-    if (t && t.created_ts) bits.push(fmtDate(t.created_ts));
-    return bits.join(" · ");
-  }
-
-  function gateReasonLines(t) {
-    var reasons = (t && t.gate_reasons && t.gate_reasons.reasons) || [];
-    return reasons.length ? reasons : ["no reason recorded"];
-  }
-
-  function translateButton(post, label) {
-    var btn = el("button", { type: "button", "class": "btn", text: label });
-    var msg = el("div", { "class": "note-strip", "style": "margin-top:6px;" });
-    btn.disabled = !writesEnabled();
-    btn.title = writesEnabled() ? "enqueue a translation job for this post" : "live mode + a write token are required (static snapshots are read-only)";
-    wireWriteAction(btn, msg, "feed-translate",
-      function () { return { post_id: post.post_id }; },
-      ["post_id"], {},
-      function () { loadFeed(); },
-      function () { loadFeed(); });   // WA-2: repaint on refusal too
-    return el("div", {}, [btn, msg]);
-  }
-
-  function buildPostBody(post, panel) {
-    var st = post.translation_state || (post.translation ? "translated" : "absent");
-    var t = post.translation;
-    var showColumn = state.feedSideBySide;
-
-    if (showColumn && (st === "translated" || st === "ungated") && t && t.body) {
-      var split = el("div", { "class": "post-body-split" });
-      split.appendChild(el("div", { "class": "post-body-col original" }, [
-        el("div", { "class": "label", text: "AS POSTED" }),
-        el("div", { "class": "text", text: post.body })
-      ]));
-      var col = [
-        el("div", { "class": "label", text: translationLabel(t) }),
-        el("div", { "class": "text", text: t.body })
-      ];
-      if (st === "ungated") {
-        col.push(el("div", { "class": "note-strip", text: "NOT GATED — stored before the faithfulness guard existed, or written outside it" }));
-      }
-      split.appendChild(el("div", { "class": "post-body-col translation" }, col));
-      return split;
-    }
-
-    var notes = [el("div", { "class": "text", text: post.body })];
-    if (!panel.translator_table_available) {
-      notes.push(el("div", { "class": "note-strip", "style": "margin-top:8px;", text: "PLAIN ENGLISH — unavailable, this program predates schema v4" }));
-    } else if (!showColumn) {
-      notes.push(el("div", { "class": "note-strip", "style": "margin-top:8px;", text: "PLAIN ENGLISH — column hidden (SIDE BY SIDE is off)" }));
-    } else if (st === "withheld") {
-      notes.push(el("div", { "class": "note-strip", "style": "margin-top:8px; color:var(--crit-text);", text: "PLAIN ENGLISH — translation withheld, faithfulness check failed" }));
-      gateReasonLines(t).forEach(function (r) {
-        notes.push(el("div", { "class": "note-strip", "style": "margin-top:2px;", text: "· " + r }));
-      });
-      notes.push(translateButton(post, "RE-TRANSLATE"));
-    } else if (st === "pending") {
-      notes.push(el("div", { "class": "note-strip", "style": "margin-top:8px;", text: "PLAIN ENGLISH — translation pending, a job is queued for this post" }));
-    } else {
-      notes.push(el("div", { "class": "note-strip", "style": "margin-top:8px;", text: "PLAIN ENGLISH — not yet translated" }));
-      notes.push(translateButton(post, "TRANSLATE ▾"));
-    }
-    return el("div", { "class": "post-body-single" }, notes);
+  /* A post's body is rendered as posted. The plain-English column was retired
+     in Phase 0 (never used). */
+  function buildPostBody(post) {
+    return el("div", { "class": "post-body-single" }, [el("div", { "class": "text", text: post.body })]);
   }
 
   qs('[data-role="feed-order-threaded"]').addEventListener("click", function () { setFeedOrder("threaded"); });
   qs('[data-role="feed-order-arrived"]').addEventListener("click", function () { setFeedOrder("arrived"); });
   paintFeedOrderChips();
-  qs('[data-role="feed-translation-toggle"]').addEventListener("click", function () {
-    state.feedSideBySide = !state.feedSideBySide;
-    this.className = "chip " + (state.feedSideBySide ? "chip--live" : "chip--neutral");
-    this.textContent = state.feedSideBySide ? "SIDE BY SIDE" : "ORIGINAL ONLY";
-    loadFeed();
-  });
-
   wireWriteAction(
     qs('[data-role="feed-transmit-btn"]'),
     qs('[data-role="feed-compose-note"]'),
@@ -2207,11 +2193,30 @@
     }
     btn.disabled = !(enabled && hasDps);
     btn.title = enabled ? "" : "live mode, a write token, and an OPEN room are required";
+    // A5 12.11: the reason a disabled POST TURN carries in `title` is
+    // invisible on a touch device and easy to miss on a desktop one --
+    // put it on screen too. Safe to overwrite unconditionally: while the
+    // button is disabled, the click listener below never fires, so nothing
+    // else writes to this note in the meantime.
+    showDisabledReason(qs('[data-role="room-turn-note"]'), btn);
   }
 
   function loadRooms() {
     guardPanelLoad("rooms", fetchPanel("rooms", { room_id: state.roomsRoomId }).then(renderRooms), loadRooms);
   }
+  //: The room header's status lines, as {tone, text}: a closed room is headed by its close (settled),
+  //: with its freeze kept as a plain "frozen earlier" line; a frozen room by its freeze (critical).
+  function roomHeaderNotes(p) {
+    var notes = [];
+    if (p.close_record) {
+      notes.push({ tone: "settled", text: "CLOSED: " + (p.close_record.reason || "(no reason recorded)") + " (decided by " + (p.close_record.decided_by || "?") + ")" });
+      if (p.frozen_earlier_reason) notes.push({ tone: "plain", text: "frozen earlier: " + p.frozen_earlier_reason });
+    } else if (p.freeze_reason) {
+      notes.push({ tone: "crit", text: "FROZEN: " + p.freeze_reason });
+    }
+    return notes;
+  }
+  var ROOM_NOTE_COLOR = { settled: "var(--settled)", crit: "var(--crit-text)" };
   function renderRooms(p) {
     var list = qs('[data-role="rooms-list"]');
     var count = qs('[data-role="rooms-count"]');
@@ -2228,10 +2233,10 @@
     count.textContent = String((p.rooms || []).length);
 
     (p.rooms || []).forEach(function (r) {
-      var stateEl2 = r.state === "open" ? statusEl("live", "OPEN", { pulse: true }) : r.state === "frozen" ? statusEl("crit", "FROZEN") : statusEl("settled", "CONVERGED");
+      var stateEl2 = r.state === "open" ? statusEl("live", "OPEN", { pulse: true }) : r.state === "frozen" ? statusEl("crit", "FROZEN") : r.state === "closed" ? statusEl("settled", "CLOSED") : statusEl("settled", "CONVERGED");
       var row = el("div", { "class": "room-row" + (r.room_id === p.active_room_id ? " is-active" : "") }, [
-        el("div", { "class": "topline" }, [el("span", { "class": "id", text: r.room_id }), stateEl2]),
-        el("div", { "class": "sub", text: (r.topic || "").slice(0, 60) })
+        el("div", { "class": "topline" }, [el("span", { "class": "title", text: (r.topic || r.room_id).slice(0, 60) }), stateEl2]),
+        el("div", { "class": "id", text: midTruncId(r.room_id), title: r.room_id })
       ]);
       row.addEventListener("click", function () { state.roomsRoomId = r.room_id; loadRooms(); });
       list.appendChild(row);
@@ -2242,9 +2247,13 @@
       setRoomTurnComposeEnabled(false, []);
       return;
     }
-    header.appendChild(el("span", { "class": "t", text: p.active_room.room_id }));
-    header.appendChild(el("span", { "class": "m", text: p.active_room.topic }));
-    if (p.freeze_reason) header.appendChild(el("span", { "class": "m", "style": "color:var(--crit-text);", text: "FROZEN: " + p.freeze_reason }));
+    header.appendChild(el("span", { "class": "t", text: p.active_room.topic || p.active_room.room_id }));
+    header.appendChild(el("span", { "class": "m", text: midTruncId(p.active_room.room_id), title: p.active_room.room_id }));
+    roomHeaderNotes(p).forEach(function (note) {
+      var attrs = { "class": "m", text: note.text };
+      if (ROOM_NOTE_COLOR[note.tone]) attrs.style = "color:" + ROOM_NOTE_COLOR[note.tone] + ";";
+      header.appendChild(el("span", attrs));
+    });
 
     if (p.detail_error) {
       turnsEl.appendChild(el("div", { "class": "warn-callout" }, [el("div", { "class": "head", text: "COULD NOT READ THIS ROOM'S DISCUSSION POINTS" }), el("div", { "class": "body", text: p.detail_error })]));
@@ -2341,9 +2350,18 @@
     });
 
     actions.appendChild(scoreBtn); actions.appendChild(scoreForm);
+    // A2/A5 12.11: a disabled button's title is the operator's only way to
+    // know why -- on a screen, not on hover-only. `canWrite` false covers
+    // BOTH remaining buttons at once, so it collapses to the one read-only
+    // note below rather than repeating itself per button.
+    if (scoreBtn.disabled && canWrite) actions.appendChild(el("div", { "class": "note-strip", text: "SCORE THE ROUND — " + scoreBtn.title }));
     actions.appendChild(freezeBtn); actions.appendChild(freezeForm);
+    if (freezeBtn.disabled && canWrite) actions.appendChild(el("div", { "class": "note-strip", text: "FREEZE AND ESCALATE — " + freezeBtn.title }));
     actions.appendChild(exportBtn);
-    if (!canWrite) actions.appendChild(el("div", { "class": "note-strip", text: "STATIC SNAPSHOT OR NO WRITE TOKEN: THESE ACTIONS ARE READ-ONLY HERE." }));
+    // EXPORT TRANSCRIPT has no callable regardless of write mode, so its
+    // reason stays visible even when writes are on.
+    actions.appendChild(el("div", { "class": "note-strip", text: "EXPORT TRANSCRIPT — " + exportBtn.title }));
+    if (!canWrite) actions.appendChild(el("div", { "class": "note-strip", text: "read-only snapshot — writes are off" }));
     side.appendChild(actions);
 
     setRoomTurnComposeEnabled(canWrite && roomOpen, dps);
@@ -2416,32 +2434,123 @@
      9. DETERMINATIONS
      ========================================================================== */
   function loadDeterminations() { guardPanelLoad("determinations", fetchPanel("determinations").then(renderDeterminations), loadDeterminations); }
+  //: the row body for kinds whose full `consequence` is too long to read in
+  //: the list (A2) -- everything else keeps showing `item.consequence` the
+  //: way the queue always has; the detail pane's WHAT'S BEING ASKED /
+  //: CONSEQUENCE cards still show the full text for every kind, these two
+  //: included.
+  function determItemRowBody(item) {
+    if (item.kind === "offload_backlog") {
+      return (item.pending == null ? "?" : item.pending) + " pending · " + (item.claimed == null ? "?" : item.claimed) + " claimed";
+    }
+    if (item.kind === "webfetch_proposals") {
+      return (item.hosts || []).join(", ");
+    }
+    return item.consequence;
+  }
+
+  //: the drawn items in the order the queue paints them: KIND_ORDER's groups
+  //: first, then any kind this build does not name, by first appearance.
+  //: The default selection and HOME's needs card both read this order, so
+  //: "the first item" is the one at the top of the list, not the server's.
+  function determDisplayOrder(drawn) {
+    var out = [];
+    KIND_ORDER.forEach(function (kind) {
+      drawn.forEach(function (i) { if (i.kind === kind) out.push(i); });
+    });
+    var others = [];
+    drawn.forEach(function (i) { if (KIND_ORDER.indexOf(i.kind) === -1 && others.indexOf(i.kind) === -1) others.push(i.kind); });
+    others.forEach(function (kind) {
+      drawn.forEach(function (i) { if (i.kind === kind) out.push(i); });
+    });
+    return out;
+  }
+
+  //: A5: a disabled button's reason, on screen in its note line. The same
+  //: line carries a write's own result message (wireWriteAction), so an
+  //: enabled button clears only a reason this helper put there -- a refresh
+  //: never wipes "posted" or an error the operator has not read yet.
+  function showDisabledReason(note, btn) {
+    if (!note) return;
+    if (btn.disabled && btn.title) {
+      note.style.color = "";
+      note.textContent = btn.title;
+      note.setAttribute("data-disabled-reason", "1");
+    } else if (note.getAttribute("data-disabled-reason")) {
+      note.textContent = "";
+      note.removeAttribute("data-disabled-reason");
+    }
+  }
+
   function renderDeterminations(p) {
     var list = qs('[data-role="determ-list"]');
     var summary = qs('[data-role="determ-summary"]');
     var detail = qs('[data-role="determ-detail"]');
-    clear(list); clear(detail);
+    clear(list); clear(detail); clear(summary);
     if (!p || p.status !== "ok") { detail.appendChild(el("div", { "class": "warn-callout" }, [el("div", { "class": "body", text: p ? p.message : "no data" })])); return; }
-    summary.textContent = p.blocking_count + " BLOCKING · " + p.total + " OPEN";
-    state.determItemsFlat = [];
-    if (!state.determSelectedId && p.items.length) state.determSelectedId = p.items[0].id;
 
-    KIND_ORDER.forEach(function (kind) {
-      var items = p.items.filter(function (i) { return i.kind === kind; });
+    // A2: term_duplicate/term_conflict are decided on the LEXICON page, not
+    // here -- drawn is everything else, in the order DECIDE always drew it,
+    // plus a trailing generic group for any kind this build does not name.
+    var allItems = p.items || [];
+    var drawn = allItems.filter(function (i) { return !isTermKind(i.kind); });
+    var termCount = allItems.length - drawn.length;
+
+    summary.appendChild(document.createTextNode(p.blocking_count + " BLOCKING · " + drawn.length + " TO DECIDE"));
+    if (termCount > 0) {
+      summary.appendChild(document.createTextNode(" · "));
+      var lexLink = el("button", { type: "button", "class": "link-button", text: termCount + " LEXICON CANDIDATES → LEXICON" });
+      lexLink.addEventListener("click", function () { location.hash = "lexicon"; });
+      summary.appendChild(lexLink);
+    }
+
+    // Default selection: nothing selected, or the selection fell out of the
+    // drawn set on reload (resolved, or reclassified as a term kind) --
+    // land on the first BLOCKING drawn item, else the first drawn item in
+    // display order. Never the raw items array's own first entry: that can
+    // be a term row DECIDE never draws, or a calm row ahead of one that
+    // actually blocks the union.
+    if (!state.determSelectedId || !drawn.some(function (i) { return i.id === state.determSelectedId; })) {
+      var shown = determDisplayOrder(drawn);
+      var firstBlocking = shown.filter(function (i) { return i.blocking; })[0];
+      state.determSelectedId = firstBlocking ? firstBlocking.id : (shown[0] ? shown[0].id : null);
+    }
+
+    state.determItemsFlat = [];
+
+    function paintGroup(label, items) {
       if (!items.length) return;
-      list.appendChild(el("div", { "class": "determ-group-label", "style": "color:" + (items.some(function (i) { return i.blocking; }) ? "var(--crit-text)" : "var(--warn)") + ";", text: KIND_LABELS[kind] }));
+      list.appendChild(el("div", { "class": "determ-group-label", "style": "color:" + (items.some(function (i) { return i.blocking; }) ? "var(--crit-text)" : "var(--warn)") + ";", text: label }));
       items.forEach(function (item) {
         state.determItemsFlat.push(item.id);
         var row = el("div", { "class": "determ-item" + (item.id === state.determSelectedId ? " is-active" : "") });
         row.appendChild(el("div", { "class": "topline" }, [el("span", { "class": "id", text: determItemTitle(item) }), el("span", { "class": "fill" }), item.blocking ? el("span", { "style": "color:var(--crit-text); font-family:var(--font-mono); font-size:10px;", text: "BLOCKING" }) : null]));
-        row.appendChild(el("div", { "class": "body", text: item.consequence }));
+        row.appendChild(el("div", { "class": "body", text: determItemRowBody(item) }));
         row.addEventListener("click", function () { state.determSelectedId = item.id; renderDeterminations(p); });
         row.id = "determ-item-" + item.id.replace(/[^a-zA-Z0-9]/g, "_");
         list.appendChild(row);
       });
+    }
+
+    var handledKinds = {};
+    KIND_ORDER.forEach(function (kind) {
+      handledKinds[kind] = true;
+      paintGroup(KIND_LABELS[kind], drawn.filter(function (i) { return i.kind === kind; }));
     });
 
-    var selected = p.items.find(function (i) { return i.id === state.determSelectedId; });
+    // Any kind this build does not name in KIND_ORDER (and is not a term
+    // kind) used to be silently dropped here -- it is drawn now, grouped by
+    // kind, in the order its kind was first seen, headed by the kind name
+    // itself since there is no human label for it yet.
+    var otherKinds = [];
+    drawn.forEach(function (i) {
+      if (!handledKinds[i.kind] && otherKinds.indexOf(i.kind) === -1) otherKinds.push(i.kind);
+    });
+    otherKinds.forEach(function (kind) {
+      paintGroup(String(kind).toUpperCase(), drawn.filter(function (i) { return i.kind === kind; }));
+    });
+
+    var selected = drawn.filter(function (i) { return i.id === state.determSelectedId; })[0];
     if (!selected) { detail.appendChild(el("div", { "class": "empty", text: "select an item from the queue" })); return; }
     renderDeterminationDetail(detail, selected);
   }
@@ -2449,13 +2558,13 @@
   function renderDeterminationDetail(detail, item) {
     var header = el("div", { "class": "subbar" }, [
       el("span", { "class": "t", text: determItemTitle(item) }),
-      item.blocking ? chip("BLOCKING", "crit") : chip(item.kind, "neutral"),
+      item.blocking ? chip("BLOCKING", "crit") : chip(humanizeKey(item.kind), "neutral"),
       el("span", { "class": "fill" })
     ]);
     detail.appendChild(header);
     var body = el("div", { "class": "panel-body-pad" });
-    var summaryCard = el("div", { "class": "card card--accent-crit" }, [
-      el("div", { "class": "card-header" }, [el("span", { "class": "sub", "style": "color:var(--crit-text); letter-spacing:0.12em;", text: "WHAT'S BEING ASKED" })]),
+    var summaryCard = el("div", { "class": "card " + (item.blocking ? "card--accent-crit" : "card--accent-warn") }, [
+      el("div", { "class": "card-header" }, [el("span", { "class": "sub", "style": "color:" + (item.blocking ? "var(--crit-text)" : "var(--warn)") + "; letter-spacing:0.12em;", text: "WHAT'S BEING ASKED" })]),
       el("div", { "class": "card-body", "style": "font-size:14px; color:var(--ink-hi); line-height:1.5;", text: (item.text || item.reason || item.consequence) })
     ]);
     body.appendChild(summaryCard);
@@ -2491,7 +2600,11 @@
     var actionsBody = el("div", { "class": "card-body", "style": "display:flex; flex-direction:column; gap:10px;" });
     actionsBody.appendChild(buildDeterminationActions(item));
     actions.appendChild(actionsBody);
-    actions.appendChild(el("div", { "class": "card-footer", text: "USE THE CLI VERB THIS ITEM'S KIND MAPS TO FOR ANYTHING NOT WIRED HERE (trialerror gate / trialerror extract / trialerror source / trialerror prereg / trialerror rooms / trialerror memory)." }));
+    actions.appendChild(el("div", {
+      "class": "card-footer",
+      text: "Anything not offered here is done from the command line.",
+      title: "USE THE CLI VERB THIS ITEM'S KIND MAPS TO FOR ANYTHING NOT WIRED HERE (trialerror gate / trialerror source / trialerror prereg / trialerror rooms / trialerror memory).",
+    }));
     body.appendChild(actions);
     detail.appendChild(body);
   }
@@ -2551,7 +2664,7 @@
       }
       return;
     }
-    container.appendChild(renderObjectG(item));
+    container.appendChild(renderObjectG(item, true));
   }
 
   //: item.kind -> a one-line reason a kind's buttons stay disabled --
@@ -2559,9 +2672,11 @@
   //: real callable exists but resolving it wasn't in this build's named
   //: write-action list (see trialerror.dashboard.writes' own module docstring).
   var DETERM_DISABLED_REASONS = {
-    room_escalation: "resolve from the Rooms panel instead (post a turn on the frozen room's discussion point, or converge-check) -- no direct \"resolve escalation\" callable exists.",
+    room_escalation: "decide from the CLI: once the operator decides to close the room, `trialerror room close --id <room> --reason <words> --decided-by <decision ref> --by-launch <launch>` records it and the room leaves this queue -- the decision's reference is not something a dashboard button can supply.",
     memory_conflict_candidate: "judge from the CLI (`trialerror memory judge --relation <id> --verb <verb> --actor <you>`) -- a verdict carries the judge's identity, which a dashboard button cannot supply.",
     memory_stale: "review from the CLI (`trialerror memory reviewed <id>`) -- a review is an assertion that a person looked, so it is not a button.",
+    offload_backlog: "run the GPU worker on DEV -- there is no dashboard callable that drains a machine-local queue.",
+    webfetch_proposals: "run `te-webfetch.sh review` on the machine that holds the fetch process -- approval of a host is a decision made there, not here.",
   };
 
   /** Mark a write button as needing TWO clicks (the artboard's rule:
@@ -2732,18 +2847,36 @@
         loadDeterminations   // WA-2
       );
     } else if (item.kind === "acquisition") {
+      // OTHER TRANSITION used to sit beside MARK DELIVERED, always
+      // `disabled`, naming a verb ("trialerror ingest request --to <state>")
+      // this dashboard was never going to wire -- a button that only ever
+      // says no is not a control. A5 drops it; the CLI verb it named lives
+      // on in the 'wanted' note below, where it is the actual next step.
       var launchOpt = launchField("your launch_id (optional)");
       var canDeliver = writable && item.request_state === "requested";
       var deliverBtn = el("button", { type: "button", "class": "btn btn--primary", text: "MARK DELIVERED" });
       deliverBtn.disabled = !canDeliver;
-      deliverBtn.title = canDeliver || !writable ? "" : ("only legal from request_state='requested' -- this source is " + item.request_state);
-      var otherBtn = el("button", {
-        type: "button", "class": "btn btn--secondary", disabled: "disabled",
-        title: "only the delivered transition is wired from the dashboard -- use `trialerror ingest request --to <state>` for others.",
-        text: "OTHER TRANSITION",
-      });
       wrap.appendChild(el("div", { "class": "write-form-row" }, [launchOpt]));
-      wrap.appendChild(el("div", { "class": "btn-row" }, [deliverBtn, otherBtn]));
+      wrap.appendChild(el("div", { "class": "btn-row" }, [deliverBtn]));
+      // 12.11, on screen (A5): one reason, chosen for what is actually true
+      // of this row -- the global write gate first (it explains every
+      // other disabled control on this pane too), then the state itself.
+      if (!writable) {
+        deliverBtn.title = "static snapshot or no write token";
+        wrap.appendChild(el("div", { "class": "note-strip", text: "read-only snapshot — writes are off" }));
+      } else if (item.request_state === "wanted") {
+        var wantedNote = "wanted — nobody has asked for this yet; request it with `trialerror ingest request --source-id " + item.id + " --to requested`";
+        deliverBtn.title = wantedNote;
+        wrap.appendChild(el("div", { "class": "note-strip", text: wantedNote }));
+      } else if (!canDeliver) {
+        // Defensive: A3 filters the acquisitions list to 'wanted' and
+        // 'requested' rows, so this arm should be unreachable, but a future
+        // change to that filter must not silently ship a button with no
+        // stated reason (12.11).
+        var otherStateNote = "MARK DELIVERED — only legal from request_state='requested' -- this source is " + item.request_state;
+        deliverBtn.title = otherStateNote;
+        wrap.appendChild(el("div", { "class": "note-strip", text: otherStateNote }));
+      }
       wireWriteAction(
         deliverBtn, msg, "acquisition-delivered",
         function () { return { source_id: item.id, launch_id: launchOpt.value }; },
@@ -2926,8 +3059,8 @@
     var registry = (p.registry || []).filter(function (a) { return state.dossierTypeFilter === "ALL" || a.type === state.dossierTypeFilter; });
     registry.forEach(function (a) {
       var row = el("div", { "class": "registry-row" + (a.artifact_id === p.active_artifact_id ? " is-active" : "") }, [
-        el("div", { "class": "topline" }, [el("span", { "class": "id", text: a.artifact_id }), el("span", { "style": "color:var(--ink-3); font-size:10px;", text: a.status })]),
-        el("div", { "class": "sub", text: a.title })
+        el("div", { "class": "topline" }, [el("span", { "class": "title", text: a.title || a.artifact_id }), el("span", { "style": "color:var(--ink-3); font-size:10px;", text: a.status })]),
+        el("div", { "class": "id", text: midTruncId(a.artifact_id), title: a.artifact_id })
       ]);
       row.addEventListener("click", function () { state.dossierArtifactId = a.artifact_id; loadDossier(); });
       registryList.appendChild(row);
@@ -2936,8 +3069,8 @@
     if (!p.artifact) { detail.appendChild(el("div", { "class": "empty", text: "no artifacts registered yet" })); return; }
     var a = p.artifact;
     var header = el("div", { "class": "subbar" }, [
-      el("span", { "class": "t", "style": "font-family:var(--font-mono);", text: a.artifact_id }),
-      el("span", { "class": "t", "style": "font-weight:400;", text: a.title }),
+      el("span", { "class": "t", text: a.title || a.artifact_id }),
+      el("span", { "class": "m", text: midTruncId(a.artifact_id), title: a.artifact_id }),
       el("span", { "class": "m", text: a.type + ", " + a.status })
     ]);
     detail.appendChild(header);
@@ -2955,7 +3088,7 @@
       Object.keys(p.context_frame).forEach(function (k) { grid.appendChild(el("span", { "class": "k", text: k.replace(/_/g, " ").toUpperCase() })); grid.appendChild(el("span", { text: String(p.context_frame[k]) })); });
       frameBody.appendChild(grid);
     } else {
-      frameBody.appendChild(el("div", { "class": "empty", text: "context_frame is not populated on this artifact yet (attrs.context_frame has no writer for most artifacts today)." }));
+      frameBody.appendChild(el("div", { "class": "empty", text: "Not recorded for this artifact.", title: "context_frame is not populated on this artifact yet (attrs.context_frame has no writer for most artifacts today)." }));
     }
     frameCard.appendChild(frameBody);
     body.appendChild(frameCard);
@@ -3047,7 +3180,11 @@
     lnBody.appendChild(el("div", { "class": "kv-mini" }, [el("span", { "class": "k", text: "REGISTERS" }), el("span", { "class": "v", text: (lin.registers_records || 0) + " RECORDS" })]));
     lnBody.appendChild(el("div", { "class": "kv-mini" }, [el("span", { "class": "k", text: "DISCHARGES" }), el("span", { "class": "v", text: (lin.discharges_criteria || []).map(function (c) { return c.criterion_id; }).join(", ") || "—" })]));
     lineageCard.appendChild(lnBody);
-    if (lin.note) lineageCard.appendChild(el("div", { "class": "lineage-note" }, [el("span", { "style": "color:var(--warn); font-family:var(--font-mono); font-size:10px;", text: "▲" }), el("span", { "style": "font-size:11px; line-height:1.5; color:var(--ink);", text: lin.note })]));
+    if (lin.note) {
+      var lineageNoteAttrs = { "style": "font-size:11px; line-height:1.5; color:var(--ink);", text: lin.note };
+      if (lin.note_detail) lineageNoteAttrs.title = lin.note_detail;
+      lineageCard.appendChild(el("div", { "class": "lineage-note" }, [el("span", { "style": "color:var(--warn); font-family:var(--font-mono); font-size:10px;", text: "▲" }), el("span", lineageNoteAttrs)]));
+    }
     right.appendChild(lineageCard);
     twoCol.appendChild(right);
 
@@ -3118,7 +3255,12 @@
     var seam = qs('[data-role="lexicon-seam"]');
     var detail = qs('[data-role="lexicon-detail"]');
     clear(idxList); clear(kindChips); clear(seam); clear(detail);
-    if (!p || p.status !== "ok") { idxList.appendChild(el("div", { "class": "warn-callout" }, [el("div", { "class": "body", text: p ? p.message : "no data" })])); return; }
+    if (!p || p.status !== "ok") {
+      var lexiconWarnAttrs = { "class": "body", text: p ? p.message : "no data" };
+      if (p && p.message_detail) lexiconWarnAttrs.title = p.message_detail;
+      idxList.appendChild(el("div", { "class": "warn-callout" }, [el("div", lexiconWarnAttrs)]));
+      return;
+    }
 
     LEXICON_FILTERS.forEach(function (f) {
       var c = el("span", { "class": "chip" + (state.lexiconFilter === f.key ? " chip--live" : " chip--neutral"), "style": "cursor:pointer;", text: f.label });
@@ -3133,7 +3275,7 @@
     if (counts.definition_claims_unprojected) {
       seam.appendChild(el("div", { "class": "warn-callout", "style": "margin-top:8px;" }, [
         el("div", { "class": "head", text: "DEFINITION CLAIMS AWAITING PROJECTION" }),
-        el("div", { "class": "body", text: counts.definition_claims_unprojected + " live definition claim(s) have no term_sense_evidence row yet -- the migration-from-proxy backlog." })
+        el("div", { "class": "body", text: counts.definition_claims_unprojected + " definition claim(s) have no evidence link yet.", title: counts.definition_claims_unprojected + " live definition claim(s) have no term_sense_evidence row yet -- the migration-from-proxy backlog." })
       ]));
     }
 
@@ -3415,7 +3557,9 @@
       return;
     }
     if (p.status === "awaiting_migration") {
-      bodyRoot.appendChild(el("div", { "class": "warn-callout" }, [el("div", { "class": "head", text: "AWAITING MIGRATION" }), el("div", { "class": "body", text: p.message })]));
+      var courseWarnAttrs = { "class": "body", text: p.message };
+      if (p.message_detail) courseWarnAttrs.title = p.message_detail;
+      bodyRoot.appendChild(el("div", { "class": "warn-callout" }, [el("div", { "class": "head", text: "AWAITING MIGRATION" }), el("div", courseWarnAttrs)]));
       return;
     }
     var discharged = p.criteria.filter(function (c) { return c.state === "discharged"; }).length;
@@ -3424,14 +3568,16 @@
     sub.textContent = discharged + "/" + p.criteria.length + " criteria discharged";
 
     var goalCard = el("div", { "class": "card goal-card" });
-    goalCard.appendChild(el("div", { "class": "goal-col" }, [
+    goalCard.appendChild(el("div", {
+      "class": "goal-col",
+      title: "No coverage/theory/validation rollups here: this API stage only computes phases' own total/discharged counts, honestly. See docs/DASHBOARD_V2_API.md §7.",
+    }, [
       el("span", { "class": "k", text: "CRITERIA" }),
       el("span", { "class": "v", text: discharged + " discharged, " + open + " open, " + blocked + " blocked, of " + p.criteria.length + " total" })
     ]));
     var phasesCol = el("div", { "class": "phases-col" });
     p.phases.forEach(function (ph) { phasesCol.appendChild(el("span", { "style": "font-family:var(--font-mono); font-size:10.5px; color:var(--ink-2);" }, [el("span", { "style": "color:var(--ink-hi);", text: ph.phase }), document.createTextNode(": " + ph.discharged + "/" + ph.total)])); });
     goalCard.appendChild(phasesCol);
-    goalCard.appendChild(el("div", { "class": "note-col" }, [el("span", { "class": "note-strip", text: "No coverage/theory/validation rollups here: this API stage only computes phases' own total/discharged counts, honestly. See docs/DASHBOARD_V2_API.md §7." })]));
     bodyRoot.appendChild(goalCard);
 
     var spineCard = el("div", { "class": "card" });
@@ -3478,13 +3624,33 @@
     var driftBody = el("div", { "class": "card-body", "style": "display:flex; flex-direction:column; gap:11px; overflow-y:auto;" });
     (p.drift_log || []).forEach(function (d) {
       var cc = d.course_check || {};
-      var onCourse = cc.on_course !== false;
+      var isStringCC = typeof cc === "string";
+      var drifted = !isStringCC && cc.drift_flagged === true;
+      var kvParts = [];
+      if (!isStringCC) {
+        ["instance", "build_vs_theory", "drift"].forEach(function (key) {
+          var v = cc[key];
+          if (v === undefined || v === null || v === "") return;
+          var full = String(v);
+          kvParts.push({ key: key, full: full, short: clip(full, 120) });
+        });
+      }
+      var entryChildren = [
+        el("div", { "style": "font-family:var(--font-mono); font-size:10px; color:var(--ink-3);", text: (d.ts ? fmtDate(d.ts) + " · " : "") + (d.session_id || "") + " · " + d.source })
+      ];
+      if (kvParts.length) {
+        var kvLine = el("div", { "style": "font-family:var(--font-mono); font-size:10px; color:var(--ink-3);" });
+        kvParts.forEach(function (part, i) {
+          if (i > 0) kvLine.appendChild(document.createTextNode("  ·  "));
+          kvLine.appendChild(el("span", { title: part.full, text: part.key + ": " + part.short }));
+        });
+        entryChildren.push(kvLine);
+      }
+      var quoteText = isStringCC ? cc : (cc.raw || cc.instance || "no text recorded");
+      entryChildren.push(el("div", { "class": "quote", text: quoteText }));
       driftBody.appendChild(el("div", { "class": "drift-entry" }, [
-        el("span", { "class": "tag", "style": "color:" + (onCourse ? "var(--settled)" : "var(--warn)") + ";", text: onCourse ? "✓" : "▲" }),
-        el("div", {}, [
-          el("div", { "style": "font-family:var(--font-mono); font-size:10px; color:var(--ink-3);", text: (d.ts ? fmtDate(d.ts) + " · " : "") + (d.session_id || "") + " · " + d.source }),
-          el("div", { "class": "quote", text: JSON.stringify(cc) })
-        ])
+        el("span", { "class": "tag", "style": "color:" + (drifted ? "var(--warn)" : "var(--settled)") + ";", text: drifted ? "▲" : "✓" }),
+        el("div", {}, entryChildren)
       ]));
     });
     if (!(p.drift_log || []).length) driftBody.appendChild(el("div", { "class": "empty", text: "no course checks recorded yet" }));

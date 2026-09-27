@@ -29,10 +29,34 @@ that function's own docstring: "Destination state: ``gated`` for
 ``PASS``/``PASS_WITH_EDITS``, ``failed`` for ``FAIL``"). Both readings were
 legal under the encoded graph below (``submitted``'s legal destinations are
 ``{gated, failed}`` either way) — this note's WORDING was wrong, not the
-graph or the code. ``failed`` and ``registered`` are BOTH terminal (no
+graph or the code. ``failed`` and ``registered`` were BOTH terminal (no
 outgoing edges) — once a gate is union_applied its only legal destination
 is ``registered`` (fact 4 above forbids inventing a "failed after
 union_applied" escape hatch the design never names).
+
+Two guarded edges to ``registered`` were added later, because a result that
+could not go through the normal path (a gate suite that failed on something the
+artifact itself discloses; a critic's FAIL verdict) stayed unregistered and so
+off the record:
+
+- ``gated -> registered``, legal ONLY through
+  :func:`trialerror.artifacts.gates.register_with_deviation`: the gate suite
+  failed on something the artifact itself discloses and the operator decided
+  to register it anyway.
+- ``failed -> registered``, legal ONLY through
+  :func:`trialerror.artifacts.gates.register_failed`: the critic's verdict
+  was FAIL, or the gate reached ``failed`` through
+  :func:`trialerror.artifacts.gates.fail_on_reproduction` (the operator's
+  decision on a gate-suite reproduction that read ``mismatch``, over the
+  existing ``gated -> failed`` edge), and the operator decided the failure
+  belongs on the record.
+
+Both edges are in the graph so that the doctor check that validates every
+recorded transition against it
+(``check_gate_illegal_transition_history``) passes on the rows those two
+functions write. ``advance_gate`` still refuses both: a caller reaching them
+through the generic mutation path is told to use the named functions. Only
+``registered`` is terminal now, since ``failed`` has an outgoing edge.
 """
 
 from __future__ import annotations
@@ -55,17 +79,17 @@ STATES: tuple[str, ...] = ("draft", "submitted", "gated", "union_applied", "regi
 TERMINAL_PASS_STATE = "union_applied"
 
 #: States with no legal outgoing edge at all.
-TERMINAL_STATES: frozenset[str] = frozenset({"registered", "failed"})
+TERMINAL_STATES: frozenset[str] = frozenset({"registered"})
 
 #: ``from_state -> {legal to_state, ...}``. See module TRIALERROR-DEV-NOTE for
 #: the reasoning behind every edge (and every state's exclusion once here).
 LEGAL_TRANSITIONS: dict[str, frozenset[str]] = {
     "draft": frozenset({"submitted", "failed"}),
     "submitted": frozenset({"gated", "failed"}),
-    "gated": frozenset({"union_applied", "failed"}),
+    "gated": frozenset({"union_applied", "failed", "registered"}),  # registered: register_with_deviation only
     "union_applied": frozenset({"registered"}),
     "registered": frozenset(),
-    "failed": frozenset(),
+    "failed": frozenset({"registered"}),  # registered: register_failed only
 }
 
 # Every state named in the CHECK constraint has an (possibly empty) entry

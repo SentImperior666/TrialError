@@ -1,0 +1,17 @@
+{
+  "id": "https://openalex.org/W9000000009",
+  "doi": "https://doi.org/10.9999/x1",
+  "title": "An Unrelated Evaluation of Boards",
+  "publication_year": 1985,
+  "type": "article",
+  "ids": {"openalex": "https://openalex.org/W9000000009", "doi": "https://doi.org/10.9999/x1"},
+  "authorships": [
+    {"author_position": "first", "author": {"id": "https://openalex.org/A9000000009", "display_name": "F. Someone"}}
+  ],
+  "primary_location": {"source": {"display_name": "Board Quarterly"}},
+  "open_access": {"is_oa": false, "oa_url": null},
+  "cited_by_count": 3,
+  "counts_by_year": [],
+  "abstract_inverted_index": {"Boards": [0], "are": [1], "evaluated.": [2]},
+  "referenced_works": []
+}

@@ -53,6 +53,7 @@ from trialerror.ingest.backends import (
     load_embed_backend,
     load_query_embed_backend,
 )
+from trialerror.lens.link import assignment_rows_for_launch
 from trialerror.retrieve.errors import (
     QUERY_EMBED_UNRUNNABLE_CODE,
     ChunkNotFoundError,
@@ -460,18 +461,22 @@ def _excluded_kinds_present(store: Store) -> bool:
 
 def _slice_from_lens_launch(store: Store, launch_id: str | None) -> list[str] | None:
     """The slice a lens booking declares by BEING LINKED to its assignment
-    rows (``lens_assignment.lens_launch_id``, ops schema-v10).
+    rows (``lens_assignment_launch`` since ops schema-v11, falling back to
+    ``lens_assignment.lens_launch_id`` from v10).
 
     The third way a launch names a slice, and the only one that does not
     depend on what the caller put in ``attrs``: ``budget book --assign-id``
     writes the link from the assignment side, so a booking made without the
-    exported attrs still resolves. ``None`` when no row names this launch --
-    a launch nothing was assigned to is not a lens launch."""
+    exported attrs still resolves. Read through
+    :func:`trialerror.lens.link.assignment_rows_for_launch` (lane R0-B item
+    3) so a lens's SECOND launch -- a later phase, a re-spawn -- resolves to
+    the same slice as its first instead of to nothing: the link table
+    accumulates, the column keeps the first binding, and this reads both.
+    ``None`` when no row names this launch -- a launch nothing was assigned
+    to is not a lens launch."""
     if not launch_id:
         return None
-    rows = store.ops.execute(
-        "SELECT slice_spec FROM lens_assignment WHERE lens_launch_id = ?", (launch_id,)
-    ).fetchall()
+    rows = assignment_rows_for_launch(store.ops, launch_id, columns="slice_spec")
     if not rows:
         return None
     doc_ids: list[str] = []
@@ -539,8 +544,9 @@ def launch_slice_doc_ids(store: Store, launch_id: str | None) -> list[str] | Non
     ``lens/checks.py::_slice_docs_for_launch`` exactly so the enforcement
     and the audit resolve the same slice for the same launch:
     ``attrs.slice_doc_ids``; the ``assign_ids`` a bookable row carries; the
-    ``roster_id`` it also carries; and the ``lens_assignment.lens_launch_id``
-    link ``budget book --assign-id`` writes from the assignment side.
+    ``roster_id`` it also carries; and the assignment-side link ``budget
+    book --assign-id`` writes (``lens_assignment_launch``, plus the legacy
+    ``lens_assignment.lens_launch_id`` column).
     Reading only the first would leave the scope engaged for no launch on
     the shipped booking path, since ``lens/export.py`` emits the next two --
     and reading only the attrs would leave it off for a booking made from
@@ -796,6 +802,16 @@ def _build_result_row(
         "citation": {
             "source_id": source["source_id"],
             "title": source["title"],
+            # F21 (lane FB-acq item 6): a hit's citation block named the
+            # source only by its internal ``source_id`` and its title, so
+            # nothing a caller could paste into a bibliography, a lookup or
+            # another tool came back with the result -- although the source
+            # row was already in hand (``_fetch_chunk_context`` selects it
+            # whole). Always present, ``None`` when the source carries none:
+            # an absent key and a null one are different findings, and a
+            # reader should not have to guess which it got.
+            "doi": source.get("doi"),
+            "arxiv_id": source.get("arxiv_id"),
             "license_tier": source["license_tier"],
             "anchor": {
                 "anchor_id": anchor["anchor_id"],
@@ -1144,9 +1160,16 @@ def _build_summary_result_row(
     """
     source_doc_ids = json.loads(row["source_doc_ids"])
     cited_sources: list[dict[str, Any]] = []
+    # F21 (lane FB-acq item 6): the PRIMARY cited source's row, kept whole for
+    # the citation block's external ids. The ``cited_sources`` entries keep
+    # exactly their four keys -- they are a list of what a summary drew on,
+    # not a citation block each.
+    primary_source: dict[str, Any] | None = None
     for doc_id in source_doc_ids:
         doc = store_get(store, "document", pk_column="doc_id", pk_value=doc_id)
         source = store_get(store, "source", pk_column="source_id", pk_value=doc["source_id"]) if doc else None
+        if not cited_sources:
+            primary_source = dict(source) if source else None
         cited_sources.append(
             {
                 "doc_id": doc_id,
@@ -1179,6 +1202,8 @@ def _build_summary_result_row(
         "citation": {
             "source_id": primary["source_id"],
             "title": primary["title"],
+            "doi": (primary_source or {}).get("doi"),
+            "arxiv_id": (primary_source or {}).get("arxiv_id"),
             "license_tier": primary["license_tier"],
             "anchor": None,
             "quote": citation_quote(body, fenced=fenced),

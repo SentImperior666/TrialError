@@ -8,9 +8,8 @@ import json
 
 from trialerror.cli import main
 from trialerror.cli import summarize as cli_summarize
-from trialerror.jobs.worker import run_one
 
-from tests._summarize_fixtures import bootstrap_launch, build_small_corpus
+from tests._summarize_fixtures import build_small_corpus
 
 
 def _call(argv, capsys):
@@ -88,7 +87,7 @@ def test_run_with_judgments_file(store, program_root, platform_root, capsys):
     assert env["result"]["summary"]["body"] == "An overview supplied via judgments file."
 
 
-def test_run_missing_subject_id_without_batch_is_a_structured_error(program_root, platform_root, capsys):
+def test_run_missing_subject_id_is_a_structured_error(program_root, platform_root, capsys):
     rc, env = _call(
         ["summarize", "run", "--by-launch", "LNCH-x", "--program-root", str(program_root), "--platform-root", str(platform_root)],
         capsys,
@@ -136,68 +135,6 @@ def test_run_unnormalized_document_is_a_summarize_refused_error(store, program_r
     )
     assert rc == 1
     assert env["error"]["code"] == "summarize_refused"
-
-
-# ---------------------------------------------------------------------------
-# run --batch -- enqueues a job on the M2 ledger
-# ---------------------------------------------------------------------------
-
-
-def test_run_batch_enqueues_a_job_that_a_worker_can_drain(store, program_root, platform_root, capsys):
-    corpus = build_small_corpus(store)
-    store.close()
-
-    judgments_file = program_root / "batch_judgments.json"
-    judgments_file.write_text(
-        json.dumps({corpus["open_doc_id"]: "batch overview one", corpus["restricted_doc_id"]: "batch overview two"}),
-        encoding="utf-8",
-    )
-
-    rc, env = _call(
-        [
-            "summarize", "run", "--batch", "--by-launch", corpus["launch_id"],
-            "--judgments-file", str(judgments_file), "--program-root", str(program_root), "--platform-root", str(platform_root),
-        ],
-        capsys,
-    )
-    assert rc == 0
-    assert env["result"]["status"] == "enqueued"
-    job_id = env["result"]["job"]["job_id"]
-    assert env["result"]["job"]["kind"] == "custom"
-
-    from trialerror.stores.store import open_store
-
-    worker_store = open_store(program_root, platform_root=platform_root)
-    try:
-        result = run_one(worker_store, job_id=job_id, kind="custom")
-        assert result["status"] == "complete"
-        from trialerror.summarize.api import get_summary
-
-        assert get_summary(worker_store, subject_kind="document", subject_id=corpus["open_doc_id"])["body"] == "batch overview one"
-        assert get_summary(worker_store, subject_kind="document", subject_id=corpus["restricted_doc_id"])["body"] == "batch overview two"
-    finally:
-        worker_store.close()
-
-
-def test_run_batch_collection_is_a_structured_error(program_root, platform_root, capsys):
-    rc, env = _call(
-        [
-            "summarize", "run", "--batch", "--subject-kind", "collection", "--by-launch", "LNCH-x",
-            "--program-root", str(program_root), "--platform-root", str(platform_root),
-        ],
-        capsys,
-    )
-    assert rc == 1
-    assert env["error"]["code"] == "batch_collection_unsupported"
-
-
-def test_run_batch_missing_by_launch_is_a_structured_error(program_root, platform_root, capsys):
-    rc, env = _call(
-        ["summarize", "run", "--batch", "--program-root", str(program_root), "--platform-root", str(platform_root)],
-        capsys,
-    )
-    assert rc == 1
-    assert env["error"]["code"] == "missing_by_launch"
 
 
 # ---------------------------------------------------------------------------

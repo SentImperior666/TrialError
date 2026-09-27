@@ -12,7 +12,7 @@ so those four build their own small SQL directly against ``store.knowledge``
 implementation of a write is not" convention
 ``trialerror.summarize.api.find_stale_or_missing_document_summaries``'s own
 TRIALERROR-DEV-NOTE states for exactly this reason, and
-``trialerror.feed_translate.checks``/``trialerror.lexicon.checks`` reuse
+``trialerror.lexicon.checks`` reuses
 without sharing a module either. Every MUTATING verb requires ``--by-launch``
 (design Section 7's closing sentence) except ``reindex`` (FTS maintenance;
 ``trialerror.lexicon.api.reindex_all`` takes no launch -- it changes no

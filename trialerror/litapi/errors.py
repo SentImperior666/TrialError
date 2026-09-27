@@ -47,7 +47,14 @@ class ProviderTransportError(LitApiError):
     left at their ``None`` default). Callers (``trialerror.litapi.client``,
     ``trialerror/cli/lit.py``) key off ``host is not None`` to report the
     more actionable ``transport_unreachable`` code/details instead of a
-    generic one."""
+    generic one.
+
+    ``retry_after_s`` (lane FB-acq item 2) is the provider's OWN answer to
+    "how long should you wait", parsed from the response's ``Retry-After``
+    header (:func:`trialerror.litapi.providers.base.parse_retry_after`) and
+    ``None`` when the provider named no wait. It is the difference between a
+    caller that can tell the user when to try again and one that can only say
+    "it failed"."""
 
     def __init__(
         self,
@@ -57,12 +64,14 @@ class ProviderTransportError(LitApiError):
         status_code: int | None = None,
         host: str | None = None,
         scheme: str | None = None,
+        retry_after_s: float | None = None,
     ):
         super().__init__(message)
         self.provider = provider
         self.status_code = status_code
         self.host = host
         self.scheme = scheme
+        self.retry_after_s = retry_after_s
 
 
 class ProviderNotFoundError(LitApiError):

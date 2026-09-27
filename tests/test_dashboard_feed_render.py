@@ -91,8 +91,6 @@ def _post(pid, *, author, ts, body, depth=0, root=None, parent=None, missing=Fal
         "depth": depth,
         "root_post_id": root or pid,
         "reply_count": replies,
-        "translation": None,
-        "translation_state": "absent",
     }
 
 
@@ -118,8 +116,6 @@ def tree_panel() -> dict:
         "order_threaded": ["P1", "P2", "P3", "P4", "P5"],
         "threads": [],
         "unread_directives": [],
-        "translator_table_available": True,
-        "translation_withheld_count": 0,
     }
 
 
@@ -135,7 +131,6 @@ def deep_panel() -> dict:
         "status": "ok",
         "posts": posts,
         "order_threaded": [p["post_id"] for p in posts],
-        "translator_table_available": True,
     }
 
 
@@ -345,29 +340,28 @@ def test_an_orphan_renders_at_root_level_with_the_flag_visible():
 
 
 # ---------------------------------------------------------------------------
-# lane b's translation column, through threading
+# the injected body renderer, through threading
 # ---------------------------------------------------------------------------
 
 
 @requires_node
-def test_feed_translation_column_survives_threading():
-    """Sweep-named test. Lane b's ``buildPostBody`` is called unchanged for
-    every card and its node is appended as-is; the only thing threading does
-    to a translated post at depth >= 3 is put ``is-stacked`` on the CARD, so
-    dashboard.css collapses the two columns into one column instead of two
-    twenty-character ones. The body itself is never rebuilt here -- which is
+def test_injected_body_renderer_survives_threading():
+    """The page's ``buildPostBody`` is called unchanged for every card and its
+    node is appended as-is; the only thing threading does to a post at depth
+    >= 3 is put ``is-stacked`` on the CARD. The body itself is never rebuilt
+    here -- which is
     what this asserts: the injected renderer's own node, with its own class
     and its own text, is what ends up in the tree."""
     ctx = dict(LIVE_CTX, buildPostBody={
         "__fn": "buildPostBody",
-        "__node": {"tag": "div", "class": "post-body-split", "text": "PLAIN ENGLISH BODY"},
+        "__node": {"tag": "div", "class": "post-body-split", "text": "INJECTED BODY"},
     })
     tree = run_harness("renderStream", [deep_panel(), ctx])["tree"]
 
     for card in cards(tree):
         split = [n for n in find_all(card, lambda n: "post-body-split" in n.get("classes", []))]
         assert len(split) == 1, card["attrs"]["data-post-id"]
-        assert split[0]["text"] == "PLAIN ENGLISH BODY"
+        assert split[0]["text"] == "INJECTED BODY"
 
     stacked = {c["attrs"]["data-post-id"]: "is-stacked" in c["classes"] for c in cards(tree)}
     assert stacked == {

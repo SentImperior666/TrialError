@@ -108,6 +108,10 @@ def test_cmd_lookup_doi_ok(monkeypatch):
             },
             "providers_succeeded": ["stub"],
             "providers_failed": [],
+            # lane FB-acq item 2: one entry per provider ASKED, whatever it
+            # answered. The stub client builds its LookupResult by hand and so
+            # reports none, which is exactly what an empty dict says.
+            "provider_outcomes": {},
         },
         "nextActions": [],
         "meta": {},
@@ -173,7 +177,11 @@ def test_cmd_citations_ok(monkeypatch):
     assert env["ok"] is True
     assert env["result"]["provider"] == "stub"
     assert env["result"]["items"] == [
-        {"title": "Citer", "doi": None, "arxiv_id": None, "year": None, "authors": [], "external_ids": {}}
+        {
+            "title": "Citer", "doi": None, "arxiv_id": None, "year": None, "authors": [], "external_ids": {},
+            # lane SI item A1: two new CitationEdge keys
+            "work_type": None, "citation_count": None,
+        }
     ]
 
 
@@ -201,6 +209,112 @@ def test_load_program_config_raw_reads_real_config(tmp_path):
     )
     raw = cli_lit._load_program_config_raw(tmp_path)
     assert raw["litapi"]["openalex"]["mailto"] == "me@example.org"
+
+
+# ---------------------------------------------------------------------------
+# lane FB-acq item 2: the error CODE now distinguishes rate-limited from
+# not-found from unreachable, reading details["provider_outcomes"].
+# ---------------------------------------------------------------------------
+
+
+def _failed(message, **details):
+    return AllProvidersFailedError(message, details=details)
+
+
+class _FailingClient:
+    def __init__(self, exc):
+        self._exc = exc
+
+    def lookup_doi(self, doi):
+        raise self._exc
+
+    def lookup_arxiv(self, arxiv_id):
+        raise self._exc
+
+    def search(self, query, *, limit=10):
+        raise self._exc
+
+    def get_citations(self, identifier, *, limit=100, offset=0):
+        raise self._exc
+
+
+def test_cmd_lookup_rate_limited_plus_not_found_is_code_rate_limited(monkeypatch):
+    """FAILS BEFORE this lane: both of these came out as the generic
+    AllProvidersFailedError, with the 429 only inside a message string."""
+    exc = _failed(
+        "no provider returned a record",
+        failures=[{"provider": "openalex", "error": "HTTP 429", "code": "rate_limited", "status_code": 429,
+                   "retry_after_s": 30.0}],
+        provider_outcomes={
+            "openalex": {"outcome": "rate_limited", "status_code": 429, "retry_after_s": 30.0, "keyed": False},
+            "semanticscholar": {"outcome": "not_found", "status_code": 404, "retry_after_s": None, "keyed": True},
+        },
+    )
+    monkeypatch.setattr(cli_lit, "_build_client", lambda args: _FailingClient(exc))
+
+    env = cli_lit._cmd_lookup(_Args(doi="10.1000/example", arxiv_id=None))
+
+    assert env["error"]["code"] == "rate_limited"
+    po = env["error"]["details"]["provider_outcomes"]
+    assert po["semanticscholar"]["outcome"] == "not_found"  # BOTH providers are named
+    assert env["nextActions"] == [
+        {"kind": "shell", "argv": ["trialerror", "doctor", "--only", "litapi_providers_ready"],
+         "description": "rate-limited (openalex); keyless providers: openalex -- configure a key file "
+                        "or retry after 30s"},
+    ]
+
+
+def test_cmd_lookup_every_provider_not_found_is_code_record_not_found(monkeypatch):
+    exc = _failed(
+        "no provider returned a record",
+        failures=[],
+        provider_outcomes={
+            "openalex": {"outcome": "not_found"},
+            "semanticscholar": {"outcome": "not_found"},
+        },
+    )
+    monkeypatch.setattr(cli_lit, "_build_client", lambda args: _FailingClient(exc))
+
+    env = cli_lit._cmd_lookup(_Args(doi="10.1000/example", arxiv_id=None))
+
+    assert env["error"]["code"] == "record_not_found"
+    assert env["nextActions"] == []
+
+
+def test_cmd_lookup_mixed_failures_keep_the_generic_code(monkeypatch):
+    exc = _failed(
+        "no provider returned a record",
+        failures=[{"provider": "openalex", "error": "HTTP 500", "status_code": 500}],
+        provider_outcomes={
+            "openalex": {"outcome": "http_error", "status_code": 500},
+            "semanticscholar": {"outcome": "rate_limited", "status_code": 429},
+        },
+    )
+    monkeypatch.setattr(cli_lit, "_build_client", lambda args: _FailingClient(exc))
+
+    env = cli_lit._cmd_lookup(_Args(doi="10.1000/example", arxiv_id=None))
+
+    assert env["error"]["code"] == "AllProvidersFailedError"
+    assert env["error"]["details"]["provider_outcomes"]["semanticscholar"]["outcome"] == "rate_limited"
+
+
+def test_cmd_search_and_citations_share_the_rate_limited_mapping(monkeypatch):
+    exc = _failed(
+        "no provider could search",
+        failures=[],
+        provider_outcomes={"openalex": {"outcome": "rate_limited", "status_code": 429, "keyed": True}},
+    )
+    monkeypatch.setattr(cli_lit, "_build_client", lambda args: _FailingClient(exc))
+
+    assert cli_lit._cmd_search(_Args(query="q", limit=10))["error"]["code"] == "rate_limited"
+    citations = cli_lit._cmd_citations(_Args(identifier="10.1000/example", limit=20, offset=0))
+    assert citations["error"]["code"] == "rate_limited"
+    assert "keyless providers: none" in citations["nextActions"][0]["description"]
+
+
+def test_pacing_dir_is_under_the_program_root_and_none_without_one(tmp_path):
+    assert cli_lit._pacing_dir(None) is None
+    assert cli_lit._pacing_dir(tmp_path) == tmp_path / "data" / "litapi_pacing"
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +509,103 @@ def test_cmd_acquire_all_metadata_providers_transport_unreachable_overrides_queu
     assert fake_store.closed is True
 
 
+def test_cmd_acquire_unresolved_is_its_own_refusal_not_a_queued_ok(monkeypatch, tmp_path):
+    """F18: trialerror.ingest.acquire files NO row when a provider did not
+    answer, and the CLI must say so in its own code -- an ok='queued' envelope
+    would read as "no open-access copy exists"."""
+    import types
+
+    fake_store = _FakeStore()
+    monkeypatch.setattr("trialerror.stores.store.open_store", lambda *a, **kw: fake_store)
+    fake_result = types.SimpleNamespace(
+        outcome="unresolved",
+        source={},
+        metadata_providers=["openalex"],
+        metadata_failures=[],
+        oa_legs=[
+            {"provider": "arxiv", "outcome": "not_attempted"},
+            {"provider": "unpaywall", "outcome": "rate_limited", "status_code": 429, "retry_after_s": 2.0},
+        ],
+    )
+    monkeypatch.setattr("trialerror.ingest.acquire.acquire", lambda *a, **kw: fake_result)
+    args = _Args(program_root=str(tmp_path), doi="10.1000/example", arxiv_id=None, launch_id="LNCH-1", yes=False)
+
+    env = cli_lit._cmd_acquire(args)
+
+    assert env["ok"] is False
+    assert env["error"]["code"] == "oa_resolution_unresolved"
+    assert "unpaywall=rate_limited HTTP 429" in env["error"]["message"]
+    assert "not \"no open-access copy exists\"" in env["error"]["message"]
+    assert env["error"]["details"]["retryable"] is True
+    assert env["error"]["details"]["oa_legs"] == fake_result.oa_legs
+    assert env["nextActions"] == [
+        {"kind": "shell",
+         "argv": ["trialerror", "lit", "acquire", "--doi", "10.1000/example", "--launch-id", "LNCH-1"],
+         "description": "retry after 2s"},
+    ]
+    assert fake_store.closed is True
+
+
+def test_cmd_acquire_unresolved_without_a_retry_after_says_retry_later(monkeypatch, tmp_path):
+    import types
+
+    monkeypatch.setattr("trialerror.stores.store.open_store", lambda *a, **kw: _FakeStore())
+    fake_result = types.SimpleNamespace(
+        outcome="unresolved", source={}, metadata_providers=["openalex"], metadata_failures=[],
+        oa_legs=[{"provider": "arxiv", "outcome": "http_error", "status_code": 503}],
+    )
+    monkeypatch.setattr("trialerror.ingest.acquire.acquire", lambda *a, **kw: fake_result)
+    args = _Args(program_root=str(tmp_path), doi=None, arxiv_id="2101.00001", launch_id="LNCH-1", yes=False)
+
+    env = cli_lit._cmd_acquire(args)
+
+    assert env["error"]["details"]["retryable"] is True
+    assert env["nextActions"][0]["description"] == "retry later"
+    assert env["nextActions"][0]["argv"][3] == "--arxiv"
+
+
+def test_cmd_acquire_unresolved_not_retryable_points_at_the_readiness_check(monkeypatch, tmp_path):
+    """A 406 will be answered the same way next time, so "run it again" is not
+    the action -- the readiness check is."""
+    import types
+
+    monkeypatch.setattr("trialerror.stores.store.open_store", lambda *a, **kw: _FakeStore())
+    fake_result = types.SimpleNamespace(
+        outcome="unresolved", source={}, metadata_providers=["openalex"], metadata_failures=[],
+        oa_legs=[{"provider": "unpaywall", "outcome": "http_error", "status_code": 406}],
+    )
+    monkeypatch.setattr("trialerror.ingest.acquire.acquire", lambda *a, **kw: fake_result)
+    args = _Args(program_root=str(tmp_path), doi="10.1000/example", arxiv_id=None, launch_id="LNCH-1", yes=False)
+
+    env = cli_lit._cmd_acquire(args)
+
+    assert env["error"]["details"]["retryable"] is False
+    assert env["nextActions"][0]["argv"] == ["trialerror", "doctor", "--only", "litapi_providers_ready"]
+
+
+def test_cmd_acquire_unresolved_and_nothing_reachable_still_answers_transport_unreachable(monkeypatch, tmp_path):
+    """The all-unreachable case keeps its own, more actionable code and its
+    wording -- with the legs added to the details."""
+    import types
+
+    monkeypatch.setattr("trialerror.stores.store.open_store", lambda *a, **kw: _FakeStore())
+    fake_result = types.SimpleNamespace(
+        outcome="unresolved", source={}, metadata_providers=[],
+        metadata_failures=[
+            {"provider": "arxiv", "error": "arxiv: transport unreachable", "code": "transport_unreachable",
+             "host": "export.arxiv.org", "scheme": "https"},
+        ],
+        oa_legs=[{"provider": "arxiv", "outcome": "transport_unreachable"}],
+    )
+    monkeypatch.setattr("trialerror.ingest.acquire.acquire", lambda *a, **kw: fake_result)
+    args = _Args(program_root=str(tmp_path), doi=None, arxiv_id="2101.00001", launch_id="LNCH-1", yes=False)
+
+    env = cli_lit._cmd_acquire(args)
+
+    assert env["error"]["code"] == "transport_unreachable"
+    assert env["error"]["details"]["oa_legs"] == fake_result.oa_legs
+
+
 def test_cmd_acquire_queued_with_some_providers_succeeding_is_not_overridden(monkeypatch, tmp_path):
     """Guards against over-triggering: a genuinely empty request-queue
     outcome where at least one provider DID succeed at metadata (or where
@@ -426,3 +637,245 @@ def test_cmd_acquire_queued_with_some_providers_succeeding_is_not_overridden(mon
 
     assert env["ok"] is True
     assert env["result"]["outcome"] == "queued"
+
+
+# ---------------------------------------------------------------------------
+# lit investigate run / verdict / render (lane SI part B)
+# ---------------------------------------------------------------------------
+
+
+def test_register_wires_investigate_subcommands():
+    """FAILS BEFORE lane SI part B: there was no ``investigate`` group."""
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="group")
+    cli_lit.register(subparsers)
+
+    run = parser.parse_args(
+        ["lit", "investigate", "run", "--seeds-file", "seeds.jsonl", "--out-dir", "dossiers", "--launch-id", "L1",
+         "--max-calls-per-seed", "3", "--resume", "--no-cache", "--arxiv-neighbours",
+         "--delivered-manifest", "delivered.tsv"]
+    )
+    assert (run.lit_cmd, run.investigate_cmd) == ("investigate", "run")
+    assert (run.seeds_file, run.out_dir, run.launch_id, run.max_calls_per_seed) == ("seeds.jsonl", "dossiers", "L1", 3)
+    assert run.resume and run.no_cache and run.arxiv_neighbours and run.delivered_manifest == "delivered.tsv"
+    plain = parser.parse_args(["lit", "investigate", "run", "--seeds-file", "s", "--out-dir", "d", "--launch-id", "L"])
+    assert (plain.max_calls_per_seed, plain.resume, plain.no_cache, plain.arxiv_neighbours) == (None, False, False, False)
+
+    verdict = parser.parse_args(
+        ["lit", "investigate", "verdict", "--dossier", "d.json", "--verdict", "SUBSTITUTE-WITH",
+         "--substitute-doi", "10.1/x", "--reason-code", "consolidated", "--detail-json", "detail.json",
+         "--supersede", "--launch-id", "L1"]
+    )
+    assert (verdict.investigate_cmd, verdict.verdict, verdict.substitute_doi) == ("verdict", "SUBSTITUTE-WITH", "10.1/x")
+    assert verdict.supersede and verdict.reason_code == "consolidated" and verdict.detail_json == "detail.json"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["lit", "investigate", "verdict", "--dossier", "d", "--verdict", "FETCH", "--launch-id", "L"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["lit", "investigate", "verdict", "--dossier", "d", "--verdict", "SUBSTITUTE-WITH", "--launch-id", "L",
+             "--substitute-doi", "10.1/x", "--substitute-isbn", "0306406152"]
+        )
+
+    render = parser.parse_args(["lit", "investigate", "render", "--list-id", "list-1", "--format", "json"])
+    assert (render.investigate_cmd, render.list_id, render.render_format) == ("render", "list-1", "json")
+    assert parser.parse_args(["lit", "investigate", "render", "--list-id", "x"]).render_format == "lines"
+
+
+def _investigate_env(monkeypatch, store, transport):
+    """A launch in the temp store, the run's providers over ``transport`` and
+    the run's year pinned (the author-works URL carries it)."""
+    from tests import _investigate_fixtures as fx
+    from tests._ingest_fixtures import bootstrap_launch
+
+    launch = bootstrap_launch(store)
+    monkeypatch.setattr(cli_lit, "_investigate_providers", lambda program_root, cfg: fx.providers(transport))
+    monkeypatch.setattr("trialerror.litapi.investigate._current_year", lambda: fx.YEAR)
+    return launch
+
+
+def _run_args(program_root, platform_root, seeds_file, out_dir, launch_id, **kw):
+    fields = dict(
+        program_root=str(program_root), platform_root=str(platform_root), seeds_file=str(seeds_file),
+        out_dir=str(out_dir), launch_id=launch_id, max_calls_per_seed=None, resume=False, no_cache=False,
+        arxiv_neighbours=False, delivered_manifest=None,
+    )
+    fields.update(kw)
+    return _Args(**fields)
+
+
+def test_cmd_investigate_run_retry_earns_one_resume_action_that_parses(monkeypatch, store, program_root, platform_root, tmp_path):
+    from trialerror.cli import build_parser
+    from trialerror.litapi.transport import FakeTransport
+    from tests import _investigate_fixtures as fx
+
+    transport = FakeTransport()
+    fx.route_widgets(transport)
+    transport.add_response(fx.oa_doi_url(fx.GADGETS_DOI), fx.status(429))
+    transport.add_response(fx.s2_paper_url(f"DOI:{fx.GADGETS_DOI}"), fx.status(503))
+    for query in ("A Theory of Gadgets", "a theory of gadgets"):
+        transport.add_response(fx.oa_search_url(query), fx.status(429))
+        transport.add_response(fx.s2_search_url(query), fx.status(429))
+    launch = _investigate_env(monkeypatch, store, transport)
+    seeds = fx.write_seeds(tmp_path / "seeds.jsonl", [fx.seed_row(fx.WIDGETS_SEED), fx.seed_row(fx.GADGETS_SEED)])
+
+    env = cli_lit._cmd_investigate_run(
+        _run_args(program_root, platform_root, seeds, tmp_path / "out", launch, max_calls_per_seed=7)
+    )
+
+    assert env["ok"] is True, env
+    assert env["command"] == "lit.investigate.run"
+    result = env["result"]
+    assert result["states"] == {"held": 0, "wrong_identifier": 0, "retry": 1, "need_info": 0, "open": 1}
+    assert result["thresholds"]["max_calls_per_seed"] == 7
+    assert result["calls_used"] == 7  # widgets 5 (lookup + 4 gather), gadgets 2 (lookup + search)
+    assert set(result["providers"]) == {"openalex", "semanticscholar"}
+    [action] = env["nextActions"]
+    argv = action["argv"]
+    assert argv[:4] == ["trialerror", "lit", "investigate", "run"] and "--resume" in argv
+    assert argv[argv.index("--max-calls-per-seed") + 1] == "7"
+    parsed = build_parser().parse_args(argv[1:])
+    assert parsed.resume and parsed.launch_id == launch and parsed.program_root == str(program_root)
+
+
+def test_cmd_investigate_run_refuses_a_bad_seeds_file_and_an_unknown_launch(monkeypatch, store, program_root, platform_root, tmp_path):
+    from trialerror.litapi.transport import FakeTransport
+    from tests import _investigate_fixtures as fx
+
+    transport = FakeTransport()
+    launch = _investigate_env(monkeypatch, store, transport)
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text('{"list_id": "list 1", "row_id": "r", "seed_raw": "x"}\n', encoding="utf-8")
+
+    env = cli_lit._cmd_investigate_run(_run_args(program_root, platform_root, bad, tmp_path / "out", launch))
+    assert env["ok"] is False and env["error"]["code"] == "seeds_file_invalid"
+    assert env["error"]["details"]["problems"]
+
+    good = fx.write_seeds(tmp_path / "seeds.jsonl", [fx.seed_row(fx.WIDGETS_SEED)])
+    env = cli_lit._cmd_investigate_run(_run_args(program_root, platform_root, good, tmp_path / "out", "LNCH-nobody"))
+    assert env["ok"] is False and env["error"]["code"] == "XidTargetMissingError"
+    assert transport.calls == []
+
+
+def test_cmd_investigate_run_arxiv_neighbours_without_an_index_is_a_stated_skip(monkeypatch, store, program_root, platform_root, tmp_path):
+    from trialerror.litapi.transport import FakeTransport
+    from tests import _investigate_fixtures as fx
+
+    transport = FakeTransport()
+    fx.route_widgets(transport)
+    launch = _investigate_env(monkeypatch, store, transport)
+    seeds = fx.write_seeds(tmp_path / "seeds.jsonl", [fx.seed_row(fx.WIDGETS_SEED, question="What are widgets for?")])
+
+    env = cli_lit._cmd_investigate_run(
+        _run_args(program_root, platform_root, seeds, tmp_path / "out", launch, arxiv_neighbours=True)
+    )
+
+    assert env["ok"] is True, env
+    neighbours = env["result"]["arxiv_neighbours"]
+    assert (neighbours["requested"], neighbours["ran"]) == (True, False)
+    assert neighbours["skipped"].startswith("--arxiv-neighbours skipped: no arXiv semantic index")
+    assert any("--arxiv-neighbours skipped: no arXiv semantic index" in w["message"] for w in env["warnings"])
+    assert env["result"]["investigated"] == 1  # the run itself went ahead
+
+
+def test_cmd_investigate_run_arxiv_neighbours_over_a_built_index(monkeypatch, store, program_root, platform_root, tmp_path):
+    """One pass over the local index for the distinct questions, attached to
+    every dossier of this run by its question (fake query encoder, 8-row
+    synthetic index)."""
+    import json as _json
+    from pathlib import Path
+
+    from trialerror.arxiv_index.encoder import FakeQueryEncoder
+    from trialerror.litapi.transport import FakeTransport
+    from tests import _investigate_fixtures as fx
+    from tests._arxiv_index_fixtures import write_small_fixture_zip
+
+    zip_path = write_small_fixture_zip(tmp_path / "fixture.zip", n=8, dims=8)
+    built = cli_lit._cmd_arxiv_index_build(
+        _Args(program_root=str(program_root), platform_root=str(platform_root), zip_path=str(zip_path), db_path=None,
+              dims=8, batch_size=4, member_glob=None, min_free_gb=0.001, job_id=None, launch_id=None, detach=False)
+    )
+    assert built["ok"] is True, built
+    monkeypatch.setattr(cli_lit, "_build_query_encoder", lambda litapi_cfg, program_root: FakeQueryEncoder(dims=8))
+    transport = FakeTransport()
+    fx.route_widgets(transport)
+    fx.route_wrong_doi(transport)
+    launch = _investigate_env(monkeypatch, store, transport)
+    seeds = fx.write_seeds(
+        tmp_path / "seeds.jsonl",
+        [fx.seed_row(fx.WIDGETS_SEED, question="What are widgets for?"),
+         fx.seed_row(fx.WRONG_DOI_SEED, row_id="row-2", question="What are widgets for?")],
+    )
+
+    env = cli_lit._cmd_investigate_run(
+        _run_args(program_root, platform_root, seeds, tmp_path / "out", launch, arxiv_neighbours=True)
+    )
+
+    assert env["ok"] is True, env
+    assert env["result"]["arxiv_neighbours"]["ran"] is True
+    assert env["result"]["arxiv_neighbours"]["questions"] == 1
+    for dossier_ref in env["result"]["dossiers"]:
+        dossier = _json.loads(Path(dossier_ref["dossier_path"]).read_text(encoding="utf-8"))
+        neighbours = dossier["evidence"]["arxiv_neighbours"]
+        assert len(neighbours) == 8  # k=10 over an 8-row index
+        assert {"arxiv_id", "score", "title"} <= set(neighbours[0])
+
+
+def test_cmd_investigate_verdict_and_render_envelopes(monkeypatch, store, program_root, platform_root, tmp_path):
+    import json as _json
+
+    from trialerror.litapi.transport import FakeTransport
+    from tests import _investigate_fixtures as fx
+
+    transport = FakeTransport()
+    fx.route_widgets(transport)
+    fx.route_wrong_doi(transport)
+    launch = _investigate_env(monkeypatch, store, transport)
+    (program_root / "trialerror.toml").write_text(
+        '[program]\nid = "PROG-test"\n\n[litapi.investigate]\nfoundational_before = 1980\n', encoding="utf-8"
+    )
+    seeds = fx.write_seeds(
+        tmp_path / "seeds.jsonl",
+        [fx.seed_row(fx.WIDGETS_SEED, question="What are widgets for?"),
+         fx.seed_row(fx.WRONG_DOI_SEED, list_id="list-2", question="What are widgets for?")],
+    )
+    run = cli_lit._cmd_investigate_run(_run_args(program_root, platform_root, seeds, tmp_path / "out", launch))
+    assert run["ok"] is True, run
+    assert run["result"]["thresholds"]["foundational_before"] == 1980  # read from [litapi.investigate]
+    paths = {d["seed_raw"]: d["dossier_path"] for d in run["result"]["dossiers"]}
+    detail = tmp_path / "detail.json"
+    detail.write_text(_json.dumps({"why": "the primary study"}), encoding="utf-8")
+
+    def verdict_args(seed_raw, word, **kw):
+        fields = dict(program_root=str(program_root), platform_root=str(platform_root), dossier=paths[seed_raw],
+                      verdict=word, substitute_doi=None, substitute_arxiv=None, substitute_isbn=None,
+                      reason_code=None, detail_json=None, supersede=False, launch_id=launch)
+        fields.update(kw)
+        return _Args(**fields)
+
+    refused = cli_lit._cmd_investigate_verdict(verdict_args(fx.WRONG_DOI_SEED, "REQUEST", detail_json=str(detail)))
+    assert refused["ok"] is False and refused["error"]["code"] == "resolution_not_requestable"
+
+    recorded = cli_lit._cmd_investigate_verdict(verdict_args(fx.WIDGETS_SEED, "REQUEST", detail_json=str(detail)))
+    assert recorded["ok"] is True, recorded
+    assert recorded["command"] == "lit.investigate.verdict"
+    assert recorded["result"]["detail"] == {"why": "the primary study", "history": []}
+
+    not_an_object = tmp_path / "list.json"
+    not_an_object.write_text("[1, 2]", encoding="utf-8")
+    bad_detail = cli_lit._cmd_investigate_verdict(verdict_args(fx.WIDGETS_SEED, "DROP", detail_json=str(not_an_object)))
+    assert bad_detail["ok"] is False and bad_detail["error"]["code"] == "detail_invalid"
+
+    lines = cli_lit._cmd_investigate_render(
+        _Args(program_root=str(program_root), platform_root=str(platform_root), list_id="list-1", render_format="lines")
+    )
+    assert lines["ok"] is True, lines
+    assert lines["result"]["lines"] == [
+        "row-1 · What are widgets for?",
+        "  FETCH Cat Writer & Dan Other, A Study of Widgets, 1986, doi:10.9999/widgets · paywalled · WHY: the primary study",
+        "(held 0 · dropped 0 · substituted 0)",
+    ]
+    wrong = cli_lit._cmd_investigate_render(
+        _Args(program_root=str(program_root), platform_root=str(platform_root), list_id="list-2", render_format="json")
+    )
+    assert wrong["ok"] is False and wrong["error"]["code"] == "render_refused"
+    assert wrong["error"]["details"]["rows"][0]["seeds"][0]["seed_raw"] == fx.WRONG_DOI_SEED

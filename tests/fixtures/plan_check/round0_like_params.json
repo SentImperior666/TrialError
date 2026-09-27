@@ -1,0 +1,9 @@
+{"round": "R-TEST-0", "arm_mode": "per_lens", "control_count": 1,
+ "roster": ["L1 lens-a", "L2 lens-b", "L3 lens-c", "L4 lens-d", "B lens-buster",
+            "K lens-e (neutral name; the K = control mapping lives only in control_lens_names)"],
+ "control_lens_names": ["lens-e", "lens-e-b"],
+ "cards": {"L1": ["MISMATCH", "TRANSFER"], "L2": ["TRANSFER", "FAILURE-FIRST"], "L3": ["FAILURE-FIRST", "MISMATCH"],
+           "L4": ["TRANSFER", "MISMATCH"], "B": ["NEGATE"], "K": []},
+ "seeds": {"assign": "R-TEST-0-assign-x", "rooms": "R-TEST-0-rooms-x", "judged": "R-TEST-0-judged-x", "plants": "R-TEST-0-plants-x"},
+ "reference_set_hashes": {"R1": "rule", "R2": "rule", "R3": "sha256 x", "R4": "sha256 y", "R5": "route a"},
+ "plants": {"per_batch": {"area_rewrites": 5, "paraphrases": 5}}}

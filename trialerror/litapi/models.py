@@ -39,6 +39,7 @@ __all__ = [
     "arxiv_to_doi",
     "normalize_title",
     "looks_like_identifier",
+    "provider_extra",
 ]
 
 _DOI_PREFIX_RE = re.compile(r"^\s*(doi\s*:\s*|https?://(dx\.)?doi\.org/)", re.IGNORECASE)
@@ -190,6 +191,28 @@ class WorkRecord:
         }
 
 
+def provider_extra(record: WorkRecord, provider: str, key: str) -> Any:
+    """One provider's extra ``key`` from ``record.other``, whichever shape the
+    record is in (lane SI item A1).
+
+    A record served by exactly one provider keeps that provider's extras flat
+    (``other[key]``); once :func:`trialerror.litapi.reconcile.merge_one` merges
+    two or more records the extras are nested per provider
+    (``other[provider][key]``). A reader that indexed one shape would silently
+    read ``None`` from the other, so every reader goes through here. ``None``
+    when the provider did not contribute to the record or did not carry
+    ``key``."""
+    other = record.other or {}
+    if list(record.providers) == [provider]:
+        return other.get(key)
+    if provider not in record.providers:
+        return None
+    nested = other.get(provider)
+    if isinstance(nested, dict):
+        return nested.get(key)
+    return None
+
+
 @dataclass
 class CitationEdge:
     """One entry in a citations listing (a paper citing, or cited by, the
@@ -203,6 +226,13 @@ class CitationEdge:
     year: int | None = None
     authors: list[str] = field(default_factory=list)
     external_ids: dict[str, str] = field(default_factory=dict)
+    #: Lane SI item A1: the provider's own work type for this edge (OpenAlex
+    #: ``type`` verbatim; Semantic Scholar's first ``publicationTypes`` entry,
+    #: lower-cased), ``None`` when the provider gave none.
+    work_type: str | None = None
+    #: Lane SI item A1: how often THIS edge's work is cited, per the provider
+    #: that served the page (OpenAlex ``cited_by_count``, S2 ``citationCount``).
+    citation_count: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -212,6 +242,8 @@ class CitationEdge:
             "year": self.year,
             "authors": list(self.authors),
             "external_ids": dict(self.external_ids),
+            "work_type": self.work_type,
+            "citation_count": self.citation_count,
         }
 
 
@@ -229,6 +261,13 @@ class CitationsPage:
     limit: int
     total: int | None = None
     has_more: bool = False
+    #: Lane SI item A2: one entry for EVERY provider the client asked before
+    #: (and including) the one that served this page -- the same
+    #: ``{provider: {outcome, ...}}`` shape as
+    #: :attr:`trialerror.litapi.client.LookupResult.provider_outcomes`. Empty
+    #: when a provider method is called directly rather than through
+    #: :class:`~trialerror.litapi.client.LitApiClient`.
+    provider_outcomes: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -238,4 +277,5 @@ class CitationsPage:
             "limit": self.limit,
             "total": self.total,
             "has_more": self.has_more,
+            "provider_outcomes": {k: dict(v) for k, v in self.provider_outcomes.items()},
         }

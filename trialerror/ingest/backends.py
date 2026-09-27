@@ -575,6 +575,7 @@ def plan_page_ranges(
     dpi: float = DEFAULT_BOUNDED_DPI,
     max_range_pixels: float = DEFAULT_MAX_RANGE_PIXELS,
     safety: float = RANGE_PIXEL_SAFETY,
+    max_range_pages: int | None = None,
 ) -> list[PageRange]:
     """Tile ``0..len(boxes)-1`` into ranges no bigger than the pixel budget.
 
@@ -604,7 +605,14 @@ def plan_page_ranges(
     document: the unchunked path, reachable by config, which is what makes
     the chunked path auditable against the behaviour it replaced. An empty
     document plans no ranges at all.
+
+    ``max_range_pages`` (the vast.ai executor's ``[vastai.ocr]
+    max_range_pages``) caps the ONE length after the pixel budget has set it,
+    including the no-bound case. ``None``, the default, is the DEV behaviour,
+    unchanged; a value below 1 is a ``ValueError``.
     """
+    if max_range_pages is not None and int(max_range_pages) < 1:
+        raise ValueError(f"max_range_pages must be >= 1 (or None), not {max_range_pages!r}")
     total = len(boxes)
     if total <= 0:
         return []
@@ -614,9 +622,10 @@ def plan_page_ranges(
             float(height_pt) / _POINTS_PER_INCH * dpi
         )
         max_area = max(max_area, area)
-    if max_range_pixels <= 0 or max_area <= 0 or safety <= 0:
+    no_bound = max_range_pixels <= 0 or max_area <= 0 or safety <= 0
+    if no_bound and max_range_pages is None:
         return [PageRange(0, total - 1)]
-    per_range = int(float(max_range_pixels) // (max_area * float(safety)))
+    per_range = total if no_bound else int(float(max_range_pixels) // (max_area * float(safety)))
     # At least one page per range, always. A budget smaller than a single
     # page cannot be honoured by any plan -- the alternative to one page per
     # invocation is no invocation at all -- so the bound is EXCEEDED rather
@@ -628,6 +637,8 @@ def plan_page_ranges(
     # where a budget read as megabytes shows up -- as an absurd range count,
     # not as a named refusal.
     length = max(1, per_range)
+    if max_range_pages is not None:
+        length = min(length, int(max_range_pages))
     return [
         PageRange(first, min(first + length - 1, total - 1))
         for first in range(0, total, length)
@@ -1075,7 +1086,7 @@ class RealMarkerOcrBackend:
                 # The probe brackets the INVOCATION and nothing else: the
                 # cache read above and the parse below are this process's own
                 # work, and folding them in would attribute them to marker.
-                with _PeakRssProbe() as probe:
+                with self._peak_rss_probe() as probe:
                     text = self._run_marker(
                         input_path,
                         work_dir / f"r{page_range.first:06d}-{page_range.last:06d}",
@@ -1153,6 +1164,16 @@ class RealMarkerOcrBackend:
             planning_dpi=self.planning_dpi,
             planning_dpi_source=self.planning_dpi_source,
         )
+
+    def _peak_rss_probe(self) -> Any:
+        """The context that brackets ONE range's invocation and reports its
+        ``peak_rss_bytes`` / ``source`` afterwards (lane FB-8b item 2).
+
+        A seam: this machine's :class:`_PeakRssProbe` by default. A backend
+        whose ``_run_marker`` runs somewhere else (the vast.ai executor)
+        returns a probe that reports the REMOTE invocation's own peak --
+        measured here, it would be the local ``ssh`` child's."""
+        return _PeakRssProbe()
 
     def _require_page_range_flag(self) -> None:
         """Probe ``marker_single --help`` once and refuse if the flag this
@@ -1762,12 +1783,39 @@ def fake_stage_backend_warning(stage_backend: dict[str, Any] | None) -> dict[str
     }
 
 
+#: ``[ingest.ocr] executor``: where DEV's marker runs. Absent means
+#: ``"local"`` -- this machine, exactly as before the key existed.
+OCR_EXECUTOR_LOCAL = "local"
+#: A rented vast.ai GPU. Built only by the DEV offload worker
+#: (``trialerror.offload.worker.ConfigDevBackends``), which has the whole toml
+#: and the backend-config-root the vast.ai settings need.
+OCR_EXECUTOR_VASTAI = "vastai"
+OCR_EXECUTORS = (OCR_EXECUTOR_LOCAL, OCR_EXECUTOR_VASTAI)
+
+
 def load_ocr_backend(config: dict[str, Any]) -> OcrBackend:
     """``config`` = the program's ``trialerror.toml`` ``[ingest.ocr]`` table
     (a plain dict; ``trialerror.util.config.ProgramConfig`` hands these through
     generically per M0's own "fields read generically" note). Defaults to
     the fake backend when unconfigured, so a fresh scaffold works with no
-    setup."""
+    setup.
+
+    ``executor`` absent or ``"local"`` changes nothing. An unknown executor is
+    refused by name; ``"vastai"`` is refused HERE by name too, because only
+    the DEV offload worker builds that backend (it needs the whole toml and
+    the backend-config-root)."""
+    executor = config.get("executor", OCR_EXECUTOR_LOCAL)
+    if executor not in OCR_EXECUTORS:
+        raise ValueError(
+            f"unknown ingest.ocr.executor {executor!r} (choices: {', '.join(repr(e) for e in OCR_EXECUTORS)}); "
+            "absent means 'local'"
+        )
+    if executor == OCR_EXECUTOR_VASTAI:
+        raise ValueError(
+            "ingest.ocr.executor = 'vastai' runs only inside the DEV offload worker "
+            "(`trialerror offload worker --backend-config-root <dev root>`), which builds the vast.ai "
+            "backend from the whole trialerror.toml; this caller has only the [ingest.ocr] table"
+        )
     backend_name = config.get("backend", "fake")
     if backend_name == "fake":
         return FakeOcrBackend()

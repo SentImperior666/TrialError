@@ -1,8 +1,8 @@
 """``trialerror.rooms.state_machine`` — the room state graph, standalone (no
 store needed: pure data + two pure functions). Same exhaustive-enumeration
 approach ``tests/test_artifacts_state_machine.py`` uses (no ``hypothesis``
-dependency declared in ``pyproject.toml``): with only 3 states, the full
-3x3=9 pair matrix is enumerated directly rather than sampled.
+dependency declared in ``pyproject.toml``): with only 4 states, the full
+4x4=16 pair matrix is enumerated directly rather than sampled.
 """
 
 from __future__ import annotations
@@ -21,25 +21,33 @@ from trialerror.rooms.state_machine import (
 )
 
 
-def test_states_are_exactly_open_converged_frozen():
-    assert STATES == ("open", "converged", "frozen")
+def test_states_are_exactly_open_converged_frozen_closed():
+    assert STATES == ("open", "converged", "frozen", "closed")
 
 
-def test_converged_and_frozen_are_the_only_terminal_states():
-    assert TERMINAL_STATES == {"converged", "frozen"}
+def test_converged_and_closed_are_the_only_terminal_states():
+    assert TERMINAL_STATES == {"converged", "closed"}
     for s in TERMINAL_STATES:
         assert LEGAL_TRANSITIONS[s] == frozenset()
 
 
-@pytest.mark.parametrize("from_state,to_state", [("open", "converged"), ("open", "frozen")])
+def test_frozen_has_exactly_one_legal_destination_closed():
+    assert LEGAL_TRANSITIONS["frozen"] == frozenset({"closed"})
+
+
+def test_closed_is_reached_only_from_frozen():
+    assert {f for f, targets in LEGAL_TRANSITIONS.items() if "closed" in targets} == {"frozen"}
+
+
+@pytest.mark.parametrize("from_state,to_state", [("open", "converged"), ("open", "frozen"), ("frozen", "closed")])
 def test_every_named_legal_edge_is_legal(from_state, to_state):
     assert is_legal_transition(from_state, to_state) is True
     assert_legal_transition(from_state, to_state)  # must not raise
 
 
-def test_exhaustive_9_pair_matrix_agrees_with_the_legal_set():
+def test_exhaustive_16_pair_matrix_agrees_with_the_legal_set():
     all_pairs = list(itertools.product(STATES, STATES))
-    assert len(all_pairs) == 9
+    assert len(all_pairs) == 16
 
     legal_pairs = {(f, t) for f, targets in LEGAL_TRANSITIONS.items() for t in targets}
     illegal_pairs = set(all_pairs) - legal_pairs

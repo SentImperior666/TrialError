@@ -33,6 +33,7 @@ failures, rather than absences, which are not.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -71,6 +72,8 @@ __all__ = [
     "embeddable_text",
     "offload_ocr_result",
     "offload_embed_vectors",
+    "OFFSITE_OCR_EVENT_TYPE",
+    "UNHASHED_OCR_KEYS",
 ]
 
 #: design section 4 step 5: ``retry_delay_s=1800``. Half an hour is the
@@ -84,6 +87,23 @@ EMBED_INPUT_NAME = "chunks.jsonl"
 EMBED_OUTPUT_NAME = "vectors.jsonl"
 
 _SAFE_SUFFIX_RE = re.compile(r"^\.[A-Za-z0-9]{1,12}\Z")
+
+#: The event the queue side appends when it folds an OCR result that ran
+#: off-site, i.e. whose ``result.json`` carries a ``vastai`` block (vast.ai
+#: design 9.6, operator answer O9). One per published result: a retried fold
+#: of the same result finds its event and appends nothing.
+OFFSITE_OCR_EVENT_TYPE = "offload_ocr_offsite"
+
+#: ``[ingest.ocr]`` keys that are queue-side switches rather than a statement
+#: about how the pages are produced. They are left out of ``config_hash``, so
+#: turning one on or off neither discards a published result nor re-queues
+#: finished work (SEC-2). With none of them set, the hash is byte-identical
+#: to what it always was.
+UNHASHED_OCR_KEYS = frozenset({"record_offsite_ocr_events"})
+
+#: The largest ``vastai`` block copied into the event whole; a bigger one is
+#: recorded by its key names and digest only.
+_OFFSITE_BLOCK_MAX_BYTES = 16_384
 
 
 def _read_input_under_program_root(program_root: Path | str, raw_path: Path | str) -> bytes:
@@ -528,6 +548,85 @@ def _handle_worker_error(
 
 
 # ---------------------------------------------------------------------------
+# the OCR marker's licence stamp and the off-site record (vast.ai design 2.2, 9.6)
+# ---------------------------------------------------------------------------
+def _licence_stamp(store, doc: dict[str, Any]) -> dict[str, Any]:
+    """``{"license_tier", "source_id"}`` for an OCR marker's ``expect``, with
+    one store read: the document row is already in hand, so only its
+    source's ``license_tier`` is looked up. ``None`` values when the source
+    cannot be resolved (the foreign key makes that impossible through the
+    write API); a worker that sends documents off-site then refuses the job
+    as ``tier-missing`` unless its sha256 is named, which is the safe side."""
+    source_id = doc.get("source_id")
+    tier = None
+    if source_id:
+        row = store.knowledge.execute(
+            "SELECT license_tier FROM source WHERE source_id = ?", (source_id,)
+        ).fetchone()
+        if row is not None:
+            tier = row[0]
+    return {
+        "license_tier": str(tier) if tier else None,
+        "source_id": str(source_id) if source_id else None,
+    }
+
+
+def _hashed_ocr_config(ocr_cfg: dict[str, Any] | None) -> dict[str, Any]:
+    """The part of ``[ingest.ocr]`` that ``config_hash`` covers: everything
+    but :data:`UNHASHED_OCR_KEYS`."""
+    return {k: v for k, v in (ocr_cfg or {}).items() if k not in UNHASHED_OCR_KEYS}
+
+
+def _record_offsite_ocr(store, *, job_id: str, manifest: dict[str, Any], result: dict[str, Any]) -> dict[str, Any] | None:
+    """O9: append ONE :data:`OFFSITE_OCR_EVENT_TYPE` event for a published OCR
+    result whose ``result.json`` carries a ``vastai`` block (a non-empty JSON
+    object), through the store's own event table. Returns the row written, or
+    ``None`` when the result ran on the worker's own GPU or its event is
+    already there.
+
+    The payload names the document from the sandbox's OWN manifest (SEC-1:
+    the doc id, the source, the licence tier stamped at queue time, the input
+    sha256 and size) and copies the worker's ``vastai`` block beside it. The
+    block's canonical sha256 is the de-duplication key, so a fold that is
+    retried after the event landed appends nothing, while a job that was
+    re-queued and ran off-site again gets a second event, as it should."""
+    block = result.get("vastai")
+    if not isinstance(block, dict) or not block:
+        return None
+    from trialerror.events.api import append_event
+
+    canonical = json.dumps(block, sort_keys=True, ensure_ascii=False, default=str)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    seen = store.ops.execute(
+        "SELECT 1 FROM event WHERE type = ? AND json_extract(payload, '$.job_id') = ? "
+        "AND json_extract(payload, '$.vastai_sha256') = ? LIMIT 1",
+        (OFFSITE_OCR_EVENT_TYPE, job_id, digest),
+    ).fetchone()
+    if seen is not None:
+        return None
+    expect = manifest.get("expect") if isinstance(manifest.get("expect"), dict) else {}
+    inputs = manifest.get("inputs") if isinstance(manifest.get("inputs"), list) else []
+    first = inputs[0] if inputs and isinstance(inputs[0], dict) else {}
+    if len(canonical.encode("utf-8")) <= _OFFSITE_BLOCK_MAX_BYTES:
+        copied: dict[str, Any] = block
+    else:
+        copied = {"truncated": True, "keys": sorted(str(k) for k in block)[:64]}
+    payload = {
+        "job_id": job_id,
+        "doc_id": manifest.get("doc_id"),
+        "source_id": expect.get("source_id"),
+        "license_tier": expect.get("license_tier"),
+        "input_sha256": first.get("sha256"),
+        "input_bytes": first.get("bytes"),
+        "worker_id": result.get("worker_id"),
+        "finished_ts": result.get("finished_ts"),
+        "vastai_sha256": digest,
+        "vastai": copied,
+    }
+    return append_event(store, event_type=OFFSITE_OCR_EVENT_TYPE, payload=payload)
+
+
+# ---------------------------------------------------------------------------
 # the two stage entry points the handlers call
 # ---------------------------------------------------------------------------
 def offload_ocr_result(ctx, *, doc: dict[str, Any], raw_path: Path, ocr_cfg: dict[str, Any]):
@@ -557,6 +656,11 @@ def offload_ocr_result(ctx, *, doc: dict[str, Any], raw_path: Path, ocr_cfg: dic
         # never fires for it. An absent number is not checked rather than
         # checked against zero, in both directions.
         "page_count": int(declared_pages) if isinstance(declared_pages, int) and declared_pages > 0 else None,
+        # vast.ai design 2.2: the source's licence tier, so a worker that may
+        # send documents off-site can decide on the manifest alone. ``expect``
+        # is not part of ``config_hash`` (only the ``[ingest.ocr]`` table is),
+        # so stamping it re-queues nothing that is already queued or done.
+        **_licence_stamp(ctx.store, doc),
     }
 
     def build_inputs() -> list[tuple[str, bytes]]:
@@ -566,7 +670,7 @@ def offload_ocr_result(ctx, *, doc: dict[str, Any], raw_path: Path, ocr_cfg: dic
         ctx,
         stage="ocr",
         doc_id=doc.get("doc_id"),
-        config=ocr_cfg,
+        config=_hashed_ocr_config(ocr_cfg),
         expect=expect,
         build_inputs=build_inputs,
     )
@@ -583,6 +687,8 @@ def offload_ocr_result(ctx, *, doc: dict[str, Any], raw_path: Path, ocr_cfg: dic
         raise _reject(root, job_id, manifest, f"unreadable {OCR_OUTPUT_NAME}: {exc}") from exc
     if not pages:
         raise _reject(root, job_id, manifest, f"{OCR_OUTPUT_NAME} contains no pages")
+    if ocr_cfg.get("record_offsite_ocr_events", True) is not False:
+        _record_offsite_ocr(ctx.store, job_id=job_id, manifest=manifest, result=result)
     ctx.set_checkpoint({"offload": "published", "ocr_pages": len(pages), "job_id": job_id})
     return OcrResult(
         pages=pages,
