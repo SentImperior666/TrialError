@@ -158,7 +158,7 @@
         }));
       }
       if (!shown.length) {
-        wrap.appendChild(empty(needle ? "no claim in this page of the index matches that filter" : "no live claims yet"));
+        wrap.appendChild(empty(needle ? "no claim in this page of the index matches that filter" : "No claims have been extracted yet — extraction has not run."));
         return wrap;
       }
       shown.forEach(function (r) {
@@ -324,7 +324,11 @@
       if (!verdicts.length && !edges.length) {
         body.push(empty("0 EDGES · THE GENERAL PROVENANCE GRAPH IS EMPTY"));
       }
-      if (argues.note) body.push(h("div", { "class": "note-strip", text: argues.note }));
+      if (argues.note) {
+        var arguesNoteAttrs = { "class": "note-strip", text: argues.note };
+        if (argues.note_detail) arguesNoteAttrs.title = argues.note_detail;
+        body.push(h("div", arguesNoteAttrs));
+      }
 
       // 12.11: a control drawn disabled says why. No callable exists for
       // either verb, so neither is given a handler -- not even a no-op.
@@ -344,7 +348,9 @@
         // L-C5's two-step: the region is not drawn, and the page says which
         // read is missing rather than showing an empty box that reads
         // "no term conflicts".
-        body.push(h("div", { "class": "note-strip", text: "TERM-SENSE CONFLICTS: " + omitted.message }));
+        var omittedNoteAttrs = { "class": "note-strip", text: "TERM-SENSE CONFLICTS: " + omitted.message };
+        if (omitted.message_detail) omittedNoteAttrs.title = omitted.message_detail;
+        body.push(h("div", omittedNoteAttrs));
       } else if (panel.term_conflicts) {
         // Labels read the keys `lexicon.api.conflicts_for_claim` actually
         // returns. Lane c wrote `c.term`/`c.reason` before that read existed,

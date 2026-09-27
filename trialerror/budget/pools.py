@@ -31,6 +31,7 @@ from typing import Any, Mapping, Sequence
 
 from trialerror.budget.errors import (
     LaunchNotOwnedError,
+    LensNameRefusedError,
     ModelPolicyViolationError,
     NoOpenSessionError,
     UnknownAssignmentError,
@@ -51,6 +52,10 @@ __all__ = [
     "book_launch",
     "link_launch_to_assignments",
     "resolve_assignment_ids",
+    "resolve_lens_name",
+    "lens_names_for_assignments",
+    "LENS_NAME_MAX_LEN",
+    "PHASE_LABEL_MAX_LEN",
     "check_booking_preconditions",
     "heartbeat_launch",
     "reconcile_launch",
@@ -71,6 +76,18 @@ __all__ = [
 
 #: Design Section 4.3: ``booking_ttl_s INTEGER NOT NULL DEFAULT 3600``.
 DEFAULT_BOOKING_TTL_S = 3600
+
+#: The bounds on a DECLARED lens name (lane R0-B item 1). Deliberately thin:
+#: the names are the programme's, not the harness's, so the only things
+#: refused are the shapes that cannot be a name at all -- empty after strip,
+#: longer than a column's worth, or carrying a newline (a name that prints as
+#: two lines in every room transcript and doctor message that quotes it).
+LENS_NAME_MAX_LEN = 120
+
+#: The bound on a ``phase`` label, which is free text an operator chooses to
+#: tell one of a lens's bindings from another ("derivation", a re-spawn's
+#: reason). Shorter than a name because it is a tag, not an identity.
+PHASE_LABEL_MAX_LEN = 40
 
 _LIVE_STATES = ("PROVISIONAL", "RUNNING")
 
@@ -496,20 +513,135 @@ def resolve_assignment_ids(store: Store, assign_ids: Sequence[str] | None) -> li
     return ids
 
 
-def link_launch_to_assignments(store: Store, *, launch_id: str, assign_ids: Sequence[str]) -> list[str]:
-    """Record ``launch_id`` as the lens launch of each named assignment row.
+def _validate_label(value: str, *, field: str, max_len: int) -> str:
+    """The shared shape check for a declared ``lens_name``/``phase``:
+    non-empty after strip, at most ``max_len`` characters, no newline.
+    Returns the stripped value."""
+    text = str(value).strip()
+    if not text:
+        raise LensNameRefusedError(f"book_launch: {field} must not be empty (got {value!r})")
+    if len(text) > max_len:
+        raise LensNameRefusedError(
+            f"book_launch: {field} must be at most {max_len} characters, got {len(text)}"
+        )
+    if "\n" in text or "\r" in text:
+        raise LensNameRefusedError(f"book_launch: {field} must not contain a newline (got {text!r})")
+    return text
+
+
+def lens_names_for_assignments(store: Store, assign_ids: Sequence[str]) -> list[str]:
+    """The distinct lens names the named assignment rows resolve to, through
+    their own ``lens_roster`` rows. Sorted, and empty when the ids name
+    nothing (which :func:`resolve_assignment_ids` has already refused by the
+    time this runs inside a booking)."""
+    ids = [str(a) for a in assign_ids]
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    rows = store.ops.execute(
+        f"SELECT DISTINCT r.lens_name AS lens_name FROM lens_assignment a "
+        f"JOIN lens_roster r ON r.roster_id = a.roster_id "
+        f"WHERE a.assign_id IN ({placeholders})",
+        ids,
+    ).fetchall()
+    return sorted({str(row["lens_name"]) for row in rows if row["lens_name"]})
+
+
+def resolve_lens_name(
+    store: Store, *, lens_name: str | None, assign_ids: Sequence[str], phase: str | None = None
+) -> tuple[str | None, str | None]:
+    """Judge a booking's DECLARED lens name and phase label against its
+    assignment rows, and return the ``(lens_name, phase)`` to record.
+
+    Lane R0-B item 1. A room seat that is not a roster lens of the round --
+    a fresh participant launch per turn -- had no way to say who it was:
+    ``launch.attrs.lens_name`` was written only by the lens-export path, so
+    the rooms API counted that seat's second turn as a different author and
+    refused its ``closure`` with "this author has not spoken on it yet". A
+    declared name is that seat's way to say it.
+
+    The assignment rows stay AUTHORITATIVE where there are any: they are
+    what the seeded draw wrote. A name that agrees with them is accepted and
+    changes nothing; a name that disagrees is refused
+    (:class:`LensNameRefusedError`) rather than recorded, because a launch
+    that claims one lens while holding another's slice is a launch that
+    every later reading of the round gets wrong twice over.
+
+    ``phase`` is meaningless without assignment rows to bind -- it labels a
+    link row, and a booking that binds nothing has none -- so that
+    combination is refused rather than silently dropped."""
+    name = _validate_label(lens_name, field="lens_name", max_len=LENS_NAME_MAX_LEN) if lens_name is not None else None
+    label = _validate_label(phase, field="phase", max_len=PHASE_LABEL_MAX_LEN) if phase is not None else None
+    if label is not None and not assign_ids:
+        raise LensNameRefusedError(
+            "book_launch: phase labels the link rows a booking writes to its lens_assignment rows, so "
+            f"phase={label!r} without any assign_ids labels nothing -- pass the assign ids this launch "
+            "covers (CLI: repeat `--assign-id`), or drop the phase"
+        )
+    if name is not None and assign_ids:
+        assigned = lens_names_for_assignments(store, assign_ids)
+        if assigned and name not in assigned:
+            raise LensNameRefusedError(
+                f"book_launch: lens_name={name!r} disagrees with the assignment rows this booking "
+                f"covers, which belong to {assigned!r}. The assignment rows are what the seeded draw "
+                "wrote and they are authoritative -- book under that name, or pass the assign ids of "
+                "the lens you meant"
+            )
+    return name, label
+
+
+def link_launch_to_assignments(
+    store: Store,
+    *,
+    launch_id: str,
+    assign_ids: Sequence[str],
+    phase: str | None = None,
+    now_ts: str | None = None,
+) -> list[str]:
+    """Bind ``launch_id`` to each named assignment row -- ADDITIVELY.
 
     Validates through :func:`resolve_assignment_ids` first, so a direct
     caller gets the same refusal :func:`book_launch` takes before it writes
-    anything."""
+    anything.
+
+    Lane R0-B item 3. Two writes, and the difference between them is the
+    whole point:
+
+    - a row in ``lens_assignment_launch`` (ops schema-v11) per assign id,
+      carrying the ``phase`` label if one was declared. Idempotent on the
+      table's ``(assign_id, launch_id)`` PK, so re-booking the same pair
+      binds nothing twice.
+    - ``lens_assignment.lens_launch_id``, set ONLY where it is still NULL.
+      FIRST BINDING WINS. That column is the join a lens's records and its
+      feed post hang off, and it used to be overwritten by every later
+      booking for the same lens -- so a round that spawned its lenses again
+      for a second phase had to choose between moving the first phase's join
+      and leaving the second phase unbound. Neither is a true statement
+      about the round; accumulating in the link table and freezing the
+      column is."""
+    from trialerror.lens.link import LINK_TABLE
+
     ids = resolve_assignment_ids(store, assign_ids)
     if not ids:
         return []
+    ts = now_ts or now()
     for assign_id in ids:
-        update(
-            store, "lens_assignment", pk_column="assign_id", pk_value=assign_id,
-            changes={"lens_launch_id": launch_id},
-        )
+        existing = store.ops.execute(
+            f"SELECT 1 FROM {LINK_TABLE} WHERE assign_id = ? AND launch_id = ?",
+            (assign_id, launch_id),
+        ).fetchone()
+        if existing is None:
+            insert(
+                store,
+                LINK_TABLE,
+                {"assign_id": assign_id, "launch_id": launch_id, "phase": phase, "bound_ts": ts},
+            )
+        row = get(store, "lens_assignment", pk_column="assign_id", pk_value=assign_id)
+        if row is not None and row.get("lens_launch_id") is None:
+            update(
+                store, "lens_assignment", pk_column="assign_id", pk_value=assign_id,
+                changes={"lens_launch_id": launch_id},
+            )
     return ids
 
 
@@ -528,6 +660,8 @@ def book_launch(
     workpackage: str | None = None,
     attrs: Mapping[str, Any] | None = None,
     assign_ids: Sequence[str] | None = None,
+    lens_name: str | None = None,
+    phase: str | None = None,
     policy: Mapping[str, str] | None = None,
     override_ruling_id: str | None = None,
     now_ts: str | None = None,
@@ -565,6 +699,15 @@ def book_launch(
     link is written only for a booking that was actually created
     (PROVISIONAL): a REFUSED booking never runs, and a slice pointing at one
     would claim it did.
+
+    ``lens_name`` declares WHO this launch is (lane R0-B item 1), recorded as
+    ``launch.attrs.lens_name`` -- the same key the lens export writes, and
+    the identity the rooms API counts turns by. It is how a seat that is not
+    a roster lens, spawned fresh for each turn, is still one author across
+    its turns. Judged against the assignment rows by
+    :func:`resolve_lens_name` before anything is written. ``phase`` labels
+    the link rows a lens's SECOND (third, …) booking writes, and is refused
+    without ``assign_ids`` to label.
     """
     session = check_booking_preconditions(
         store,
@@ -579,6 +722,12 @@ def book_launch(
     # Rung 2c (fix pass B-1): the assign ids are resolved before anything is
     # created. Validating them after the insert made a refusal a booking.
     resolved_assign_ids = resolve_assignment_ids(store, assign_ids)
+    # Rung 2d (lane R0-B item 1), for the same reason as 2c: a declared name
+    # that contradicts the assignment rows is a refusal, and a refusal may
+    # not leave a PROVISIONAL launch holding pool headroom behind it.
+    resolved_lens_name, resolved_phase = resolve_lens_name(
+        store, lens_name=lens_name, assign_ids=resolved_assign_ids, phase=phase
+    )
 
     ts = now_ts or now()
     launch_id = new_id("LNCH")
@@ -607,6 +756,8 @@ def book_launch(
     attrs_dict: dict[str, Any] = dict(attrs) if attrs else {}
     if override_ruling_id:
         attrs_dict["override_ruling_id"] = override_ruling_id
+    if resolved_lens_name is not None:
+        attrs_dict["lens_name"] = resolved_lens_name
 
     row = {
         "launch_id": launch_id,
@@ -633,7 +784,10 @@ def book_launch(
     }
     insert(store, "launch", row)
     if resolved_assign_ids and state == "PROVISIONAL":
-        link_launch_to_assignments(store, launch_id=launch_id, assign_ids=resolved_assign_ids)
+        link_launch_to_assignments(
+            store, launch_id=launch_id, assign_ids=resolved_assign_ids,
+            phase=resolved_phase, now_ts=ts,
+        )
 
     return BookResult(
         ok=(state == "PROVISIONAL"),

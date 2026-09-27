@@ -465,6 +465,33 @@ def test_session_readiness_callout_is_first_and_verbatim():
 
 
 @requires_node
+def test_session_card_shows_the_disabled_action_reasons_on_screen():
+    """A5, 12.11: CLOSE SESSION and RENDER HANDOFF are ALWAYS disabled (no
+    ``writesEnabled()`` in this file to gate them). Each keeps its full
+    developer-facing reason in the button's `title` (a tooltip, invisible
+    until hover) -- A8 moves the on-screen note to a short operator sentence
+    that just says the action is a CLI ritual, rather than repeating the
+    implementation detail on screen."""
+    panel = session_panel()
+    tree = run_harness("renderSessionCard", [panel, {"nowMs": NOW_MS}])["tree"]
+    buttons = by_tag(tree, "button")
+    close_btn = one([b for b in buttons if b["text"] == "CLOSE SESSION"], "CLOSE SESSION button")
+    handoff_btn = one([b for b in buttons if b["text"] == "RENDER HANDOFF"], "RENDER HANDOFF button")
+    assert close_btn["attrs"].get("disabled") == "disabled"
+    assert handoff_btn["attrs"].get("disabled") == "disabled"
+    close_reason = close_btn["attrs"]["title"]
+    handoff_reason = handoff_btn["attrs"]["title"]
+    assert close_reason and handoff_reason
+
+    notes = [n["text"] for n in by_class(tree, "note-strip")]
+    assert any(t == "CLOSE SESSION — done from the command line (it runs the course check)" for t in notes), notes
+    assert any(t == "RENDER HANDOFF — done from the command line" for t in notes), notes
+    # the full reasons stay off-screen, in the buttons' titles only
+    assert not any(close_reason in t for t in notes), notes
+    assert not any(handoff_reason in t for t in notes), notes
+
+
+@requires_node
 def test_session_invariant_violation_uses_crit_band():
     tree = run_harness("renderSessionCard", [
         {"status": "invariant_violation", "message": "2 sessions are open"}, {"nowMs": NOW_MS},
@@ -1318,3 +1345,27 @@ def test_pools_card_shows_no_composition_when_nothing_was_measured():
     subs = [e["text"] for e in by_class(tree, "meter-sub")]
     assert not [s for s in subs if s.startswith("measured ·")]
     assert one([s for s in subs if s.startswith("provenance ·")], "provenance line") == "provenance · 3 manual"
+
+
+# ===========================================================================
+# A4 -- parseTs reads epoch numbers (seconds or ms) and digit-only strings,
+# not just ISO text. Live data handed CONSOLE pools an epoch-seconds
+# `resets_at`, which used to fail Date.parse and print the raw number instead
+# of "resets in 1h 20m".
+# ===========================================================================
+@requires_node
+def test_parse_ts_reads_epoch_seconds_and_ms_numbers():
+    assert node_json("return TE.parseTs(1790445600);") == 1790445600000
+    # already-ms epoch (>= 1e12) passes through unscaled.
+    assert node_json("return TE.parseTs(1790445600000);") == 1790445600000
+
+
+@requires_node
+def test_parse_ts_reads_digit_only_strings_the_same_way():
+    assert node_json('return TE.parseTs("1790445600");') == 1790445600000
+    assert node_json('return TE.parseTs("1790445600000");') == 1790445600000
+
+
+@requires_node
+def test_parse_ts_leaves_iso_strings_unchanged():
+    assert node_json('return TE.parseTs("2026-09-27T18:00:00.000Z");') == 1790532000000

@@ -1,0 +1,8 @@
+row-1 · What are widgets for?
+  FETCH Cat Writer & Dan Other, A Study of Widgets, 1986, doi:10.9999/widgets · paywalled · WHY: the primary study
+  ASK Which work on widget lore is meant, and by whom?
+row-2 · Where did gadget theory come from?
+  FETCH-FOUNDATIONAL Gus Early, A Theory of Gadgets, 1969, doi:10.9999/gadgets · open · founds: gadget theory · reason: own-text
+  FETCH Ann Reviewer, A Review of Widget Studies, 2015, doi:10.9999/widgets.review · paywalled · WHY: the review consolidates the study
+row-3 · What has already been read?
+(held 1 · dropped 1 · substituted 1)

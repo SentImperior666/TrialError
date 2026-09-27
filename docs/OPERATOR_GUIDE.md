@@ -57,22 +57,23 @@ that parser recognizes.
 |---|---|---|
 | `program` | `init` | Scaffolds a fresh program: `trialerror program init <name> [--dir <path>]` (default `--dir`: `./<name>` under CWD). Writes a commented starter `trialerror.toml`, the design's per-program layout (`raw/`, `archive/`, `memory/`, `law/`, `handoffs/`, `artifacts/`, `requests/`), and runs the initial migration. Refuses (`already_scaffolded`) rather than overwrite an existing `trialerror.toml`. `list`/`info` (named in the design doc) are NOT implemented — v0 has no cross-program registry to back them; see `trialerror/cli/program.py`'s own docstring. |
 | `session` | `boot`, `close`, `render-handoff`, `status`, `abandon` | `boot` reuses an already-open session idempotently unless `--fresh`; first-ever boot needs `--create-account <label>`. `close` requires `--course-check '<json>'` and **refuses** on dangling launches, an unread inbox, or a stale law-digest pin. `abandon` is a real fifth verb not named in the design doc's table — for marking a crashed/never-closed session `abandoned`. |
-| `budget` | `book`, `heartbeat`, `reconcile`, `status`, `check`, `pools`, `snapshot-ingest`, `calibrate`, `rollup`, `quota` | **`book --session-id` and `--program-id` are optional**: with neither flag it books under the program's single OPEN session (bound at `session boot`) and under `[program] id` from `trialerror.toml`, reporting which of the two it resolved in `result.resolved_from` (`flag` | `open_session` | `config`) — a booking that silently chose its own session is otherwise indistinguishable in the envelope from one that was told which. With no open session it refuses naming both ways out; with **more than one** it refuses by name (`multiple_open_sessions`) rather than picking, because that is exactly the state that produces bookings nothing can reconcile; a program with no readable `[program] id` refuses (`program_id_unresolved`). Explicit flags always win. The MCP `book_launch` tool takes the same defaults and no longer requires `program_id`. `book --assign-id A` (repeatable) links a lens booking to the `lens_assignment` rows it covers — see *Ideation rounds* below. `book` returns a `launch_id` token (also in `meta.prompt_fragment`) and refuses without an open session or against model policy — but **not** for a missing pool: with no `budget_pool` row configured for the account/model-class yet, `book` books unconditionally as `PROVISIONAL` (pools only start capping once one exists via `pools --create`). `pools --create` makes a new pool; without `--create` it lists. `reconcile --spawned-model <model>` records what the launch ACTUALLY ran on in `launch.attrs.spawned_model` — the post-hoc half of the spawn gate's `agent_model_matches_booking` guard, and what the doctor check of that name reads; without it a launch simply makes no claim about its model. `rollup` sums est/actual tokens over a `parent_launch` tree. **`heartbeat --launch-id L`** is what a still-running launch says instead of reconciling early: it refreshes that booking's `booked_ts` and NOTHING else (not `est_tokens`, not `booking_ttl_s`, not the state), so a launch that outlived the TTL guessed for it stops reading as past-TTL. Refused unless the program's OPEN session is the one that booked it (`no_open_session` / `launch_not_owned`), refused with `multiple_open_sessions` when two sessions are open (a heartbeat needs one session to speak for the booking, and this is the state that produces orphan-looking bookings in the first place), refused for a settled booking, and every refresh writes a `launch_heartbeat` event — a TTL that keeps moving must be visible in the ledger. **`status --account-id` is optional**: with no flag it reads the account the program's OPEN session is bound to (`session.account_id`, the same row every booking reads), reporting which it used in `account_resolved_from`. With no open session it refuses naming both ways out (the flag, or `session boot`); with more than one open session it surfaces that refusal rather than picking one. Each pool also carries **`visible_headroom_to_soft`** (`max(soft_cap − projected, 0) / billed_multiplier` — the headroom in the unit a booking's `--est-tokens` is written in, not the plan meter's) and **`binding_limit`** (`soft` until the soft line is crossed, then `hard`); the envelope's top-level `binding_limit` names the tightest pool of the account, or is `null` for an account with no pool at all (uncapped and unmeasured, which is not the same as unlimited). **`check`** prints `status` and `quota` in one envelope with that binding limit named in a sentence; it composes the two and adds no arithmetic of its own, and with nothing captured the quota half degrades to `available: false` plus its own note rather than failing. |
+| `budget` | `book`, `heartbeat`, `reconcile`, `status`, `check`, `pools`, `snapshot-ingest`, `calibrate`, `rollup`, `quota` | **`book --session-id` and `--program-id` are optional**: with neither flag it books under the program's single OPEN session (bound at `session boot`) and under `[program] id` from `trialerror.toml`, reporting which of the two it resolved in `result.resolved_from` (`flag` | `open_session` | `config`) — a booking that silently chose its own session is otherwise indistinguishable in the envelope from one that was told which. With no open session it refuses naming both ways out; with **more than one** it refuses by name (`multiple_open_sessions`) rather than picking, because that is exactly the state that produces bookings nothing can reconcile; a program with no readable `[program] id` refuses (`program_id_unresolved`). Explicit flags always win. The MCP `book_launch` tool takes the same defaults and no longer requires `program_id`. `book --assign-id A` (repeatable) links a lens booking to the `lens_assignment` rows it covers, additively — the first binding of a row is never overwritten, and `--phase LABEL` names which binding this is (refused without `--assign-id`). `book --lens-name NAME` declares who the launch IS (`launch.attrs.lens_name`), which is the identity a room counts turns by; with `--assign-id` the assignment rows stay authoritative and a disagreeing name refuses the booking outright. See *Ideation rounds* below. `book` returns a `launch_id` token (also in `meta.prompt_fragment`) and refuses without an open session or against model policy — but **not** for a missing pool: with no `budget_pool` row configured for the account/model-class yet, `book` books unconditionally as `PROVISIONAL` (pools only start capping once one exists via `pools --create`). `pools --create` makes a new pool; without `--create` it lists. `reconcile --spawned-model <model>` records what the launch ACTUALLY ran on in `launch.attrs.spawned_model` — the post-hoc half of the spawn gate's `agent_model_matches_booking` guard, and what the doctor check of that name reads; without it a launch simply makes no claim about its model. `rollup` sums est/actual tokens over a `parent_launch` tree. **`heartbeat --launch-id L`** is what a still-running launch says instead of reconciling early: it refreshes that booking's `booked_ts` and NOTHING else (not `est_tokens`, not `booking_ttl_s`, not the state), so a launch that outlived the TTL guessed for it stops reading as past-TTL. Refused unless the program's OPEN session is the one that booked it (`no_open_session` / `launch_not_owned`), refused with `multiple_open_sessions` when two sessions are open (a heartbeat needs one session to speak for the booking, and this is the state that produces orphan-looking bookings in the first place), refused for a settled booking, and every refresh writes a `launch_heartbeat` event — a TTL that keeps moving must be visible in the ledger. **`status --account-id` is optional**: with no flag it reads the account the program's OPEN session is bound to (`session.account_id`, the same row every booking reads), reporting which it used in `account_resolved_from`. With no open session it refuses naming both ways out (the flag, or `session boot`); with more than one open session it surfaces that refusal rather than picking one. Each pool also carries **`visible_headroom_to_soft`** (`max(soft_cap − projected, 0) / billed_multiplier` — the headroom in the unit a booking's `--est-tokens` is written in, not the plan meter's) and **`binding_limit`** (`soft` until the soft line is crossed, then `hard`); the envelope's top-level `binding_limit` names the tightest pool of the account, or is `null` for an account with no pool at all (uncapped and unmeasured, which is not the same as unlimited). **`check`** prints `status` and `quota` in one envelope with that binding limit named in a sentence; it composes the two and adds no arithmetic of its own, and with nothing captured the quota half degrades to `available: false` plus its own note rather than failing. |
 | `law` | `append`, `lookup`, `digest`, `verify`, `diff-foreign` | `append` and the digest regeneration are one atomic write — there is no way to add a ruling without the digest moving in lockstep. `verify --pin vNN@date` is the exact check the spawn gate runs. `diff-foreign` lists rulings appended (by any session/account) since a given pin. |
 | `events` | `append`, `tail`, `export` | Free-form `--type` key + JSON `--payload`; a secret-redaction pass runs before every write. `export` renders byte-stable jsonl, optionally `--split-by-workpackage`. |
-| `feed` | `post`, `threads`, `read`, `translate`, `translations` | Full-text agent voices. Authorship is **never** a free-text flag — it's derived from `--launch-id` (or, if omitted, the open session as `orchestrator:<session_id>`). `post --new-thread <title>` opens a thread (requires `--launch-id`); `post --thread-id <id>` posts into an existing one. `translate` ENQUEUES a plain-English translation job for `--post-id` / `--thread-id` / `--pending` (it never translates inline and never calls a model); `translations` reads what was stored, `--gate-status fail` listing what the faithfulness gate withheld. |
+| `feed` | `post`, `threads`, `read` | Full-text agent voices. Authorship is **never** a free-text flag — it's derived from `--launch-id` (or, if omitted, the open session as `orchestrator:<session_id>`). `post --new-thread <title>` opens a thread (requires `--launch-id`); `post --thread-id <id>` posts into an existing one. The plain-English translator was retired in Phase 0 (never used). |
 | `inbox` | `post`, `read` | `inbox post` is the user's one API-backed write path — no hand-appended files. `read` marks items read unless `--no-mark-read`. |
 | `ingest` | `add-source`, `add`, `doctor`, `rechunk`, `re-embed`, `retract`, `purge-embeddings`, `reindex-fulltext`, `reindex-vectors`, `quality`, `status`, `request`, `requests-md` | `add-source` registers + dedups on `content_sha256`. `add` acquires a document under a source and enqueues the first pipeline stage (`normalize` or `ocr`, by media type) — refuses past a page-count cost threshold (default 50) unless `--yes`. **A registered document is not a searchable one**: `add`'s result carries `searchable: false` and the `pending_stage` a worker still has to run, and its `nextActions` name the job plus the small-batch way to run it inline (`jobs start-worker --foreground --job-id <id>`). `lit acquire` says the same two things from the same place, and an `acquired` outcome whose source deduped onto an already-ingested document is the one case that reports `searchable: true`. There is no `--drain` flag: running the queue stays the queue's own verb. When the enqueued stage is `ocr`, the result also carries `stage_backend` (which backend will read this document's pages), and an envelope **`warnings`** entry — never stderr — fires when that backend is the deterministic stand-in or `[ingest.ocr]` is absent altogether, naming `[ingest.ocr]` and the `require_real_backends` / per-stage `require_real` keys that would refuse it outright. `lit acquire` mirrors the same warning from the same place. `doctor` runs just the 7 ingest-specific checks. `rechunk`/`re-embed` re-enqueue one stage (both refuse a retracted document — they would re-derive exactly what the retraction removed; re-ingest the raw file instead, which makes a new document). **`re-embed` only ever ADDS rows, for the configured `model_key`** — a run that dies halfway must never leave chunks with no embedding at all — so after a backend change the superseded key's rows are still in `emb` and **`purge-embeddings` is the companion step that takes them out**, once the new key is known to be complete. **`retract --doc-id D --launch-id L --reason "…"`** is the corpus's undo: it removes every derived row (element, chunk, `emb` rows no other document shares, `quote_anchor`, `chunk_fts`, `vec_chunks__*`), the derived archive text and any derived PDF tree, and the document's entries in the full-text index — the `document` and `source` rows STAY, and a retraction record + a `document_retracted` event carry the reason. Idempotent; refused without `--launch-id`, for an unknown doc, or while `claim` rows are anchored in the document. It also **cancels the document's own queued work** — every pending/paused/failed job of that document is settled `abandoned` with the retraction's reason and listed in `jobs_cancelled` — and **names what it could not cancel**: a job a worker is holding (`claimed`/`running`) rides `jobs_held` with its worker and a `jobs_note`, because settling it would let that worker complete a row the ledger had already closed, and the run-time guard fires at CLAIM, so that one stage will finish against the document you just withdrew. Pause it, then `jobs abandon`. On a DjVu document `raw_path` points at the derived PDF this removes, so the surviving row dangles by design — the event's `raw_path_removed` names it. **`purge-embeddings --model-key K --launch-id L [--doc-id D] [--dry-run]`** removes every `emb` row stamped with a SUPERSEDED embed `model_key` plus that key's `vec_chunks__*` entries, one transaction per document, and reports `{model_key, documents, rows_deleted, index_entries_deleted, chunks_now_without_any_embedding, dry_run}` with an `embeddings_purged` event; refused for the key `[ingest.embed]` configures (that one is the live search surface) and without a registered `--launch-id`; `--dry-run` counts and touches nothing; idempotent. This is what clears a `fake_backend_rows` failure after a real-backend migration — check `chunks_now_without_any_embedding` is 0 before you trust the corpus. `reindex-fulltext` rebuilds the tantivy index from `chunk`. **`reindex-vectors --model-key K --launch-id L [--dry-run]`** is its vector counterpart and the companion it is NOT: `reindex-fulltext` rebuilds a file-backed index beside the database and so needs no launch, while this one rewrites `vec_chunks__<key>` rows INSIDE `knowledge.db` from that key's `emb` rows and replaces the key's live semantic-search surface, so it is XID-attributed like every other write verb. One entry per chunk the key has embedded, delete-and-refill in ONE transaction (an interrupted rebuild leaves the old partial index, never an empty one), the `vec_index_registry` row brought up to date, and a `vectors_reindexed` event; reports `{model_key, emb_rows, vec_rows_before, vec_rows_after, dry_run}`. Refused without a registered `--launch-id`, for a key this program has never embedded or indexed under, for a key whose `emb` rows disagree about `dims`, and for an existing `vec0` table this connection cannot read; `--dry-run` projects the counts and touches nothing; idempotent. This is the repair for a `vector_index_stale` finding — a corpus whose embeddings exist and whose vector index does not answer for them. `quality` measures extraction quality read-only — `--doc-id` for one document, `--all [--sample N --seed S] [--worst N]` for the corpus (see "Extraction quality" below). `status` also carries two additive keys: `quality` (that document's four numbers and the thresholds they were judged against) and `pipeline` (the stage chain, a derived `pipeline_state`, and the next action). `request` drives the acquisition-queue state machine; `requests-md` renders `requests/REQUESTS.md`. |
 | `jobs` | `list`, `start-worker`, `tick`, `kick`, `pause`, `resume`, `abandon`, `retry`, `logs` | See **Detached jobs** below. `abandon --reason` settles a cancellable job terminally on purpose; **`retry <job_id> --reason "…" [--by-launch L] [--max-attempts N] [--clear-checkpoint]`** is the way back out of that state — the only one, and it accepts `failed` and `abandoned` and nothing else. |
-| `offload` | `worker`, `worker-control`, `worker-status`, `reclaim`, `kick`, `status`, `doctor` | The GPU offload queue — a file-tree protocol between the program that owns the corpus and the machine that owns the card. One verb runs on the **worker** machine and the rest on the **queue** side. `worker [--remote ALIAS | --queue-root PATH] [--stay] [--poll-interval-s S] [--max-jobs N] [--max-polls N] [--worker-id ID] [--backend-config-root ROOT] [--work-root PATH] [--lock-path PATH] [--batch-size N] [--keep-resident]` claims jobs and runs the real local backends against them; the lock file makes it single-instance per work root. `worker-status [--worker-id ID] [--queue-root PATH] [--heartbeat-interval-s S]` reads back what each worker last said it was doing — state, progress, pace, ETA, beat age — and is what to check before concluding a run is wedged: a worker silent for longer than the lost window (2× its beat interval + 60 s) is *lost*, which is the ordinary closed-laptop state. **`worker-control --worker-id ID --by-launch L (--pause | --resume | --stop | --clear) [--job-id J] [--even-if-absent]`** is the cooperative interface, and cooperative is literal: nothing here kills a process. The worker acts at its next checkpoint — between embed batches, and between OCR page ranges — so a stop lands on a unit boundary with the claim handed back and the GPU minutes already spent kept. `--by-launch` is required (ruling L-E4): a control act is somebody's act. `reclaim [--expiry-s S]` returns claims whose heartbeat stopped (default 3600 s) so the work can be claimed again; `kick` adopts interrupted publishes, un-delays parked jobs whose result landed and sweeps completed ones; `status` prints the queue's counts (what the status wrapper shows), with retried markers counted separately under `retried`; `doctor` runs this subsystem's own checks in one place, the way `ingest doctor` does. Every verb takes `--program-root`. See **Detached jobs** and **OCR page-range chunking** below. |
+| `offload` | `worker`, `worker-control`, `worker-status`, `reclaim`, `kick`, `status`, `doctor` | The GPU offload queue — a file-tree protocol between the program that owns the corpus and the machine that owns the card. One verb runs on the **worker** machine and the rest on the **queue** side. `worker [--remote ALIAS | --queue-root PATH] [--stay] [--poll-interval-s S] [--max-jobs N] [--max-polls N] [--worker-id ID] [--backend-config-root ROOT] [--work-root PATH] [--lock-path PATH] [--batch-size N] [--keep-resident] [--log-file PATH] [--keep-range-cache]` claims jobs and runs the real local backends against them; the lock file makes it single-instance per work root. `--log-file PATH` appends each log line, UTC-stamped, as it happens: the envelope carries the whole log only when the run ENDS, which is too late to watch a vast.ai lease that is already billing. `--keep-range-cache` keeps a chunked OCR job's range cache (`<work-root>/_ranges/<job-id>/`, marker's own text per range) after the document is published instead of removing it — for a canary that must answer a question about the raw output; the kept directory is still that job id's resume cache, so remove it before re-running the same job. `worker-status [--worker-id ID] [--queue-root PATH] [--heartbeat-interval-s S]` reads back what each worker last said it was doing — state, progress, pace, ETA, beat age — and is what to check before concluding a run is wedged: a worker silent for longer than the lost window (2× its beat interval + 60 s) is *lost*, which is the ordinary closed-laptop state. **`worker-control --worker-id ID --by-launch L (--pause | --resume | --stop | --clear) [--job-id J] [--even-if-absent]`** is the cooperative interface, and cooperative is literal: nothing here kills a process. The worker acts at its next checkpoint — between embed batches, and between OCR page ranges — so a stop lands on a unit boundary with the claim handed back and the GPU minutes already spent kept. `--by-launch` is required (ruling L-E4): a control act is somebody's act. `reclaim [--expiry-s S]` returns claims whose heartbeat stopped (default 3600 s) so the work can be claimed again; `kick` adopts interrupted publishes, un-delays parked jobs whose result landed and sweeps completed ones; `status` prints the queue's counts (what the status wrapper shows), with retried markers counted separately under `retried`; `doctor` runs this subsystem's own checks in one place, the way `ingest doctor` does. Every verb takes `--program-root`. See **Detached jobs** and **OCR page-range chunking** below. |
+| `vastai` | `approve-ocr`, `approve-high`, `plan`, `ssh-probe`, `run`, `ledger`, `reap`, `lock-deps` | A rented vast.ai GPU, for two lanes; every verb takes `--backend-config-root ROOT`, and `--program-root ROOT` is the same flag (the public copy's name). **The embedding lane** (the public TrialError copy's embedding backend, `docs/VASTAI_EMBED_DESIGN.md`, switched on by `[ingest.embed] gpu = "vastai"`): `plan [--max-jobs N]`, without `--input`, is its read-only plan: one offer search, then the selection, the TTL and the worst-case dollars for the pending embed jobs. `run [--max-jobs N]` is its renting verb, under its own guards (the tier, the per-job cap, the hard TTL, the high-tier approval): it creates one instance, embeds the pending embed markers of the offload queue and destroys the instance, always; a failure after the rental is `vastai_run_failed`, and the lease has destroyed its instance on the way out (confirm with `reap --dry-run`). `reap [--dry-run]` is its reaper: it destroys this root's TrialError-tagged instances that are past their deadline or orphaned, and never one whose OCR lease is live. **The OCR lane**, run on the **worker** machine against its backend-config-root: no OCR command rents anything; only `offload worker` with `[ingest.ocr] executor = "vastai"` does. **`approve-ocr [--days D] [--max-total-usd X] [--max-job-usd Y]`** is the operator's act: it refuses without an interactive terminal, prints what may leave and the spend envelope, asks for a typed challenge, and writes a signed, expiring approval that seals the current `[vastai.egress]` table. `approve-high --hours H --max-job-usd X` approves the high GPU tier for at most 24 h; it writes `vastai-high-tier.approval` beside the key file (`[vastai] api_key_path`; with no key path, under `<root>/keys/`), and every reader (the embedding lane's `run`, the OCR pricing, `plan`, the doctor's `vastai_high_tier`) reads it there or, when only an approval written before round 4 lies under `<root>/keys/`, that one. `plan --input PDF [--json]` is the dry run for one document: its range plan, the RAM floor, one read-only offer search, the ranked offers, the TTL, the worst case and which caps pass. `ledger [--since ISO] [--job-id ID] [--json]` prints the run ledger and reports torn lines. `reap --ocr [--dry-run]` is the OCR lane's reaper: it destroys only this root's OCR instances (`VOCR-`) that are past their deadline or have no live record, never an embedding lane's (`VAST-`). `lock-deps [--pins P] [--out O]` writes the hashed requirements lock the instance installs from. **`ssh-probe [--rent] [--max-usd X] [--max-minutes M] [--auth-grace-s S] [--min-cpu-ram-gb G] [--log-file PATH] [--json]`** answers one question live for a few cents, and is a **dry run without `--rent`**: it rents the cheapest offer this root's host requirements admit, waits for the instance, attempts ssh with the bounded auth grace while keeping an allow-list of `ssh -v` lines (the identity file, the local and remote ssh versions, the OFFERED key fingerprints, the server's replies -- never a private half), runs `nvidia-smi -L` if it gets in, then destroys and confirms. It ships no document and runs no bootstrap, and it refuses without `--max-usd`, above `[vastai] max_job_usd` or `max_run_usd`, and on a high tier without that tier's approval. An instance that never reaches `running` is the verdict `host-failure` in a normal envelope -- destroyed, confirmed destroyed and written to the ledger like any other outcome -- and the probe's own error text passes the same `ssh -v` allow-list as the lines it keeps. Use it when the canary stops at `key-missing` while the account's key list says the identity is registered. See **OCR on a rented GPU (vast.ai)** below. |
 | `query` | `search`, `quote`, `similar`, `stats` | The same retrieval engine the `trialerror-knowledge` MCP server serves live agents. `search --unfenced` is the one CLI-only, human-flagged escape hatch past the commercial-license serving fence — the MCP `search` tool never exposes it. **A search that returns nothing explains itself**: when the result set is empty, the query is not blank and the full-text tier actually ran, `stats` gains a per-term candidate count (at most 8 terms, through the same backend that served the search) and the list of terms no chunk matches. Both counts are scoped to the filters the search itself ran under (`--source-id`, `--kind`, `--license-tier`, `--year`, and a launch's declared slice), so a zero means "nothing under these filters", not "nothing in the corpus". Every lexical backend ANDs a multi-term query, so one unknown term — a typo, a term of art this corpus does not use — returns nothing for a query whose other terms have hundreds of hits. The envelope's `nextActions` then carries the same search with exactly those terms dropped (the largest subset that can match), and nothing is emitted when every term is dead or when no single term is at fault. The MCP `search` tool inherits both keys; its input schema is unchanged. |
 | `verify` | `citecheck`, `hypothesis`, `reproduce` | `citecheck <file\|claim-set.json\|artifact_id> --by-launch X` — mechanical pass first (6-word-shingle/number match + anchor resolve), unresolved pairs escalate (supply `--judgments-file` or they come back `escalation_selected`/`escalation_not_sampled`). `hypothesis` REQUIRES `--judgments-file` covering every retrieved chunk (this process never calls an LLM itself — judgments are supplied by the caller). `reproduce <verdict_id>` re-runs a verdict's `reproduction_ref` script and byte-compares its sha. |
-| `prereg` | `commit`, `reveal`, `status` | `commit` hash-locks a procedure+params blind, escrowed under the **platform** tree (`~/.trialerror/escrow/<program>/`, outside the program repo — a physical, not conventional, blind). `reveal` tamper-checks against the committed hash before copying content into the program tree. |
-| `artifact` | `create`, `register`, `list`, `show` | `create` makes a `draft` row. `register` is refused for a `gated=1` template type unless its gate is in `union_applied`. |
-| `gate` | `open`, `submit`, `verdict`, `apply-union`, `verify-edit`, `advance` | The state machine: `draft → submitted → gated|failed → union_applied → registered`. `advance` is the generic low-level entry point (refuses any illegal edge); the others are named shortcuts for specific legal transitions. `apply-union` is the terminal-pass gate: it enforces verdict ∈ {PASS, PASS_WITH_EDITS}, every **blocking** edit `verified=true`, and `reproduction_status != mismatch`. |
+| `prereg` | `commit`, `check`, `reveal`, `status` | `commit` hash-locks a procedure+params blind, escrowed under the **platform** tree (`~/.trialerror/escrow/<program>/`, outside the program repo — a physical, not conventional, blind). `reveal` tamper-checks against the committed hash before copying content into the program tree. `commit --plan-suite` checks the plan against the round's gate requirements before anything is written, and `check` is the same check as a dry run — see *Checking a round's plan before it is pre-registered* below. |
+| `artifact` | `create`, `register`, `list`, `show` | `create` makes a `draft` row. `register` is refused for a `gated=1` template type unless its gate is in `union_applied` — or unless the operator decided otherwise and it is run with `--with-deviation` or `--as-failed` (a critic's `FAIL`, or a gate failed by `gate fail-reproduction`; see *Registering a result whose gate did not pass cleanly* below). `show` and `list` carry each artifact's `disposition`. |
+| `gate` | `open`, `submit`, `verdict`, `apply-union`, `verify-edit`, `advance`, `fail-reproduction` | The state machine: `draft → submitted → gated|failed → union_applied → registered`. `advance` is the generic low-level entry point (refuses any illegal edge); the others are named shortcuts for specific legal transitions. `fail-reproduction` is the operator's decision that a `gated` gate whose reproduction read `mismatch` is a failed result (see *A gate the critic passed but whose reproduction failed* below). `apply-union` is the terminal-pass gate: it enforces verdict ∈ {PASS, PASS_WITH_EDITS}, every **blocking** edit `verified=true`, and `reproduction_status != mismatch`. |
 | `memory` | `search`, `put`, `sync-export`, `sync-import`, `merge`, `candidates`, `judge`, `stale`, `reviewed` | `search --id <item_id>` fetches one item's full body (the progressive-disclosure "step 2"); `search --boot-bundle` returns the same L0-index-plus-targeted-abstracts payload session boot injects. `put` upserts by `(key, account)`. `sync-export`/`sync-import` round-trip `memory/*.md` for git sync; a merge conflict from `sync-import` is never auto-resolved — list it with bare `memory merge`, resolve with `--group <id> --keep left\|right\|both`. `candidates`/`judge` are the 2026-09 mining adoption (engram-F4): every `put` runs a BM25 pass over existing items and files anything similar as an **unjudged, advisory** candidate — the save is never blocked, delayed, or altered, and no machine writes a verdict (`judge --actor-kind system` is refused; an agent rules under its own name). `stale`/`reviewed` are engram-F5: `stale` computes, per item kind, whether a review half-life has elapsed (rule 365d, fact/lesson 180d, preference/index 90d) and `reviewed <id>` records that you looked and left it standing. Decay **only surfaces** — nothing expires, unpins, or downgrades on a timer. |
-| `lens` | `roster`, `stratify`, `assign`, `log`, `slice-distances`, `intake`, `export`, `screen`, `recheck` | AMENDMENT-3 ideation machinery, generalized (the round's own mechanics — what a plant tests, what a judge sees, what a record must carry — have their own section, *Ideation rounds*, below). `stratify` is a dry-run score+tercile-cut (no write); `assign` does the real seeded quota draw and writes `lens_assignment` rows (default weights 40/40/20 near/moderate/far, far-arm floor 2). **`assign --arm-per-lens`** switches the semantics: the weights then split the ROSTER across the arms rather than each lens's own slice, so every lens gets ONE arm and draws its whole slice from it (roster 6 → 3 near / 1 moderate / 2 far; roster 12 → 5/5/2), the `assumption_buster` seat is pre-placed far and the `control` seat lands in the modal arm, and `--far-floor` counts far LENSES instead of far slices. `roster --add --seat control` is the matched-budget measurement seat (no card, no `requirements` field); `--recipe-card CARD` is repeatable and **order-preserving** — it is the lens's seeded card block — and a control seat carrying a card is refused. `log` returns the round's assignment rows AND its per-lens reconciliation — `rows` (one per assigned lens, with `posted`, `n_ideas`, `n_feed_posts` and the lens's own launch), `n_lenses` and `offenders`, each offender saying why — which is the shape the `aiif_round` gate suite's `lens_log_reconciled` check consumes. `intake --round-id R --records FILE --author-launch L [--assign-id A ...] [--arm ARM]` writes a lens's returned records as `idea` rows, validating the whole file before writing any of it. `export` hands back rows shaped for `budget book`, with `arm_mode`, `arm`, `recipe_cards` and `assign_ids` in `attrs`. **`screen`** is the novelty screen, in three separate invocations because they run in three different launches. `screen --mechanical` (no model, incremental) merges near-duplicates at cosine >= 0.92 *with the same home cell*, flags records sitting on an inventory row at the same threshold, records `d_prov`/`d_home`/`leap`/`H_prior` and within-round terciles, retrieves prior art stratified 40/40/20 (far floor 2), queries the external index under `--external-query-mode none|neutral_abstract|statement` paired with `--external-provider none|arxiv-index|litapi` — the mode says what text may leave the machine, the provider says where it goes, and naming one without the other is refused rather than half-done (every query logged as a `novelty_external_query` event with its launch and its mode, logged even when the provider raises) — and reports declared-operation entropy, the pairwise-similarity distribution and template mass against `--alarms` (descriptive when none are pre-registered). It writes one dossier per record and an adjudication draft under `artifacts/rounds/<round>/`; re-running screens only what arrived since. `screen --judged-prep --seed S` reads those dossiers back and builds the judge's batch: scope = flagged + retrieval hits + a seeded 20% sample of the rest, envelopes carrying raw record fields and retrieved text only (no rationale, seat, card or assumed circle, and self-assessment sentences stripped), five inventory plants and five paraphrase plants shuffled in among them, and a 10% second-judge sample. `screen --record-verdicts FILE --launch-id L` takes the discrete labels back (`same/variant/recombination/new-mechanism/unscreenable` against the inventory, `stated/implied/adjacent/absent` against corpus and external hits), scores the plants FIRST, writes `verdict` rows with `procedure=custom`, `procedure_version=novelty-v2` and the round's `--prereg-id`, and consolidates **every survivor** — the judged ones under their labels, the rest under the mechanical `no-close-neighbour`/`unjudged` pair written as its own row, because Phase 5 rooms every consolidated idea and nothing is pruned on a proxy. An idea that WAS scoped and came back unlabelled is the one case that is not consolidated: those ids are reported in `unlabelled_scope`, and a share above 10% caveats the batch. `prereg_compliant` is stamped only when `--executed-procedure` / `--executed-procedure-file` (with `--executed-params`) names what the round actually ran — otherwise the column stays NULL and the envelope says why, and a mismatch says WHICH of the two hashes disagreed. A second recording for the same subjects is refused unless `--supersede` is passed, and the superseding rows name the rows they replace. **A missed inventory plant fails the batch**: status `reopened_with_caveat`, the labels still written and marked, nothing consolidated. Distances are recorded and never thresholded into "novel" — an unjudged record reads `no-close-neighbour, unjudged`, which is not `new-mechanism`. **`screen --baseline`** is a read-only pass over a round's records giving each one's corpus nearest-neighbour cosine and the distribution over any `--status`/`--where` subset, with the percentile convention named in the output; **`slice-distances`** evaluates a pre-registered "farthest from the nearest home medoid" rule and hashes the picks — both are in *Ideation rounds* below. **`recheck --round-id R`** enqueues the scheduled convergent-discovery pass as a `custom` ledger job (`handler: convergent_recheck`) rather than running it inline: it is a whole-round pass, it reaches an external index when a mode names one, and it is meant to be resumable, which is what the job ledger is for and what a CLI process that exits is not. The pass re-retrieves every non-`raw` record of the round against the corpus AS IT STANDS NOW (and, under `--external-query-mode` paired with `--external-provider`, the external index), compares what it finds with what that record's own dossier already recorded, and writes anything new onto `idea.convergent_with` with an `idea_convergent_linked` event beside it. **It never re-scores**: not a label, not a status, not a verdict row — a convergence found after a round closed is logged, never applied, and the only write the handler can reach is that one column. `merged` and `eliminated` rows are re-checked too (they stay in the reference sets forever, and an eliminated idea whose twin surfaces later is exactly the finding this pass exists to log); `--status` narrows that, `--idea-id` names records outright — and the status filter applies to a named list too, because naming a record does not screen it. **A record with no novelty dossier on file is refused**, with the reason carried in the job checkpoint and the rest of the round still re-checked: "new" is measured against what the screen recorded, so with nothing recorded every neighbour comes back as a convergent discovery, which is the screen run late under another name. `--allow-unscreened` takes that reading deliberately and lifts the status filter with it. The job checkpoints per record, so a paused run does not re-issue an external query it has already made. Run it with `jobs start-worker --job-id <JOB-id>`, or leave it for an open-queue worker. |
-| `room` | `create`, `status`, `post`, `score`, `stance`, `extracts`, `freeze`, `converge-check`, `export`, `admission-order` | The brainstorm-rooms runtime. `create` opens a room over 2-3 participants and its discussion points; `post` appends one turn; `score` records the moderator's judgment; `converge-check` reports (or, with `--apply`, applies) the `open → converged` transition at the fixed **>90% agreement bar**, refusing unless EVERY idea point is at or above it. The framework procedure is add-only on top of that and off unless asked for. `create --blind-first-turn` makes round 1 simultaneous: no participant envelope carries a prior turn until round 1 is complete. `post --kind position|question|closure` records the turn's kind, and a `closure` in the author's OWN first round on a point is refused — weak entailment first. `create --rank-all` appends one procedural `RANK-ALL` point; each participant files a complete ranking and a discrete per-point stance through `stance --file` (refused whole if it does not cover every point on both criteria), and `converge-check --apply` refuses until every seat has filed. Once stances exist, **`score` takes `--label` and refuses `--agreement-pct`**: the number is computed from the structured stances (per criterion, the modal share; the WEAKER criterion binds, because the rule is both-or-eliminated) and the judge's job is the discrete label, which is stated first in the result and in the event. `extracts --file` records the neutral extract pass for a point — one extract per turn, all five fields, refused if partial — after which the moderator's envelope carries the extracts and withholds the raw prose; `score --require-extracts` turns a missing pass into a refusal. `create --buster <participant>` names the assumption-buster seat so its recorded position is re-injected VERBATIM into its own envelopes. `author_launch` is dropped from every moderator envelope. NEITHER ownership is checked by LENS NAME at `create` and again at `score` — a re-spawned lens posts under a new launch id every turn, so the launch comparison alone never fires twice for the same lens. **`admission-order --round-id R --seed S`** is the order every consolidated idea of a round is roomed in: a seeded draw stratified on (arm, card), packed into rooms of 6 in batches of 4-8 (the charter band, overridable with `--no-enforce-batch-band`), the trailing partial room carried as the remainder in that same order. Each cell's members are sorted before the seeded shuffle, so the same pool handed over in a different order draws the same order and the same hash. A pool smaller than ONE room seats nobody: every record is carried in the remainder and the result says so in a `note` naming `--ideas-per-room` (a two-idea dry run is a declared room size of 2, not a failed draw). Nothing from a dossier is a parameter of it, and its `hash` is what a round escrows so the order it ran can be compared with the order it committed to. That escrow is a SECOND `prereg commit`, taken after the judged screen and before the first room opens: the pool is the round's consolidated records, so the order does not exist at frame time, and a hash in the frame-time params is either invented or back-filled. The `aiif_round` gate suite reads either place and names which one it read. |
+| `lens` | `roster`, `stratify`, `assign`, `log`, `slice-distances`, `intake`, `export`, `screen`, `recheck` | AMENDMENT-3 ideation machinery, generalized (the round's own mechanics — what a plant tests, what a judge sees, what a record must carry — have their own section, *Ideation rounds*, below). `stratify` is a dry-run score+tercile-cut (no write); `assign` does the real seeded quota draw and writes `lens_assignment` rows (default weights 40/40/20 near/moderate/far, far-arm floor 2). **`assign --arm-per-lens`** switches the semantics: the weights then split the ROSTER across the arms rather than each lens's own slice, so every lens gets ONE arm and draws its whole slice from it (roster 6 → 3 near / 1 moderate / 2 far; roster 12 → 5/5/2), the `assumption_buster` seat is pre-placed far and the `control` seat lands in the modal arm, and `--far-floor` counts far LENSES instead of far slices. **`assign --slice-salt {roster-id,lens-name}`** says what the seeded draw is a function of: `roster-id` (the default, and what every round before the flag ran under) salts each lens's stream with its minted `roster_id` and processes the roster in insertion order, so re-adding a row moves the draw; `lens-name` salts with `<round-id>::<lens-name>` and processes the roster in ascending lens name, so the draw depends on the design and not on minted ids (names must then be unique in the round, and a repeat is refused before anything is written). The scheme is recorded in every row's `slice_spec.salt_scheme`, reported by `log`/`export`/`slice-distances`, and absent means `roster-id` — see *What the slice draw depends on* below. **`assign --plan-file PATH --launch-id L`** writes the rows a planner's plan file lists instead of drawing them: every check first, one transaction, a read-back that rolls everything back on any difference, and none of the draw flags accepted — see *Writing slices a planner chose* below. `roster --add --seat control` is the matched-budget measurement seat (no card, no `requirements` field); `--recipe-card CARD` is repeatable and **order-preserving** — it is the lens's seeded card block — and a control seat carrying a card is refused. `log` returns the round's assignment rows AND its per-lens reconciliation — `rows` (one per assigned lens, with `posted`, `n_ideas`, `n_feed_posts` and the lens's own launch), `n_lenses` and `offenders`, each offender saying why — which is the shape the `aiif_round` gate suite's `lens_log_reconciled` check consumes. `intake --round-id R --records FILE --author-launch L [--assign-id A ...] [--arm ARM]` writes a lens's returned records as `idea` rows, validating the whole file before writing any of it. `export` hands back rows shaped for `budget book`, with `arm_mode`, `arm`, `recipe_cards` and `assign_ids` in `attrs`. **`screen`** is the novelty screen, in three separate invocations because they run in three different launches. `screen --mechanical` (no model, incremental) merges near-duplicates at cosine >= 0.92 *with the same home cell*, flags records sitting on an inventory row at the same threshold, records `d_prov`/`d_home`/`leap`/`H_prior` and within-round terciles, retrieves prior art stratified 40/40/20 (far floor 2), queries the external index under `--external-query-mode none|neutral_abstract|statement` paired with `--external-provider none|arxiv-index|litapi` — the mode says what text may leave the machine, the provider says where it goes, and naming one without the other is refused rather than half-done (every query logged as a `novelty_external_query` event with its launch and its mode, logged even when the provider raises) — and reports declared-operation entropy, the pairwise-similarity distribution and template mass against `--alarms` (descriptive when none are pre-registered). It writes one dossier per record and an adjudication draft under `artifacts/rounds/<round>/`; re-running screens only what arrived since. `screen --judged-prep --seed S` reads those dossiers back and builds the judge's batch: scope = flagged + retrieval hits + a seeded 20% sample of the rest, envelopes carrying raw record fields and retrieved text only (no rationale, seat, card or assumed circle, and self-assessment sentences stripped), five inventory plants and five paraphrase plants shuffled in among them, and a 10% second-judge sample. `screen --record-verdicts FILE --launch-id L` takes the discrete labels back (`same/variant/recombination/new-mechanism/unscreenable` against the inventory, `stated/implied/adjacent/absent` against corpus and external hits), scores the plants FIRST, writes `verdict` rows with `procedure=custom`, `procedure_version=novelty-v2` and the round's `--prereg-id`, and consolidates **every survivor** — the judged ones under their labels, the rest under the mechanical `no-close-neighbour`/`unjudged` pair written as its own row, because Phase 5 rooms every consolidated idea and nothing is pruned on a proxy. An idea that WAS scoped and came back unlabelled is the one case that is not consolidated: those ids are reported in `unlabelled_scope`, and a share above 10% caveats the batch. `prereg_compliant` is stamped only when `--executed-procedure` / `--executed-procedure-file` (with `--executed-params`) names what the round actually ran — otherwise the column stays NULL and the envelope says why, and a mismatch says WHICH of the two hashes disagreed. A second recording for the same subjects is refused unless `--supersede` is passed, and the superseding rows name the rows they replace. **A missed inventory plant fails the batch**: status `reopened_with_caveat`, the labels still written and marked, nothing consolidated. Distances are recorded and never thresholded into "novel" — an unjudged record reads `no-close-neighbour, unjudged`, which is not `new-mechanism`. **`screen --baseline`** is a read-only pass over a round's records giving each one's corpus nearest-neighbour cosine and the distribution over any `--status`/`--where` subset, with the percentile convention named in the output; **`slice-distances`** evaluates a pre-registered "farthest from the nearest home medoid" rule and hashes the picks — both are in *Ideation rounds* below. **`recheck --round-id R`** enqueues the scheduled convergent-discovery pass as a `custom` ledger job (`handler: convergent_recheck`) rather than running it inline: it is a whole-round pass, it reaches an external index when a mode names one, and it is meant to be resumable, which is what the job ledger is for and what a CLI process that exits is not. The pass re-retrieves every non-`raw` record of the round against the corpus AS IT STANDS NOW (and, under `--external-query-mode` paired with `--external-provider`, the external index), compares what it finds with what that record's own dossier already recorded, and writes anything new onto `idea.convergent_with` with an `idea_convergent_linked` event beside it. **It never re-scores**: not a label, not a status, not a verdict row — a convergence found after a round closed is logged, never applied, and the only write the handler can reach is that one column. `merged` and `eliminated` rows are re-checked too (they stay in the reference sets forever, and an eliminated idea whose twin surfaces later is exactly the finding this pass exists to log); `--status` narrows that, `--idea-id` names records outright — and the status filter applies to a named list too, because naming a record does not screen it. **A record with no novelty dossier on file is refused**, with the reason carried in the job checkpoint and the rest of the round still re-checked: "new" is measured against what the screen recorded, so with nothing recorded every neighbour comes back as a convergent discovery, which is the screen run late under another name. `--allow-unscreened` takes that reading deliberately and lifts the status filter with it. The job checkpoints per record, so a paused run does not re-issue an external query it has already made. Run it with `jobs start-worker --job-id <JOB-id>`, or leave it for an open-queue worker. |
+| `room` | `create`, `status`, `post`, `score`, `stance`, `extracts`, `freeze`, `close`, `converge-check`, `export`, `admission-order` | The brainstorm-rooms runtime. `create` opens a room over 2-3 participants and its discussion points; `post` appends one turn; `score` records the moderator's judgment; `freeze` escalates an `open` room to the operator, and `close` records the operator's decision to close a `frozen` one (see *Closing a frozen room* below); `converge-check` reports (or, with `--apply`, applies) the `open → converged` transition at the fixed **>90% agreement bar**, refusing unless EVERY idea point is at or above it. The framework procedure is add-only on top of that and off unless asked for. `create --blind-first-turn` makes round 1 simultaneous: no participant envelope carries a prior turn until round 1 is complete. `post --kind position|question|closure` records the turn's kind, and a `closure` in the author's OWN first round on a point is refused — weak entailment first. `create --rank-all` appends one procedural `RANK-ALL` point; each participant files a complete ranking and a discrete per-point stance through `stance --file` (refused whole if it does not cover every point on both criteria), and `converge-check --apply` refuses until every seat has filed. Once stances exist, **`score` takes `--label` and refuses `--agreement-pct`**: the number is computed from the structured stances (per criterion, the modal share; the WEAKER criterion binds, because the rule is both-or-eliminated) and the judge's job is the discrete label, which is stated first in the result and in the event. `extracts --file` records the neutral extract pass for a point — one extract per turn, all five fields, refused if partial — after which the moderator's envelope carries the extracts and withholds the raw prose; `score --require-extracts` turns a missing pass into a refusal. `create --buster <participant>` names the assumption-buster seat so its recorded position is re-injected VERBATIM into its own envelopes. `author_launch` is dropped from every moderator envelope. NEITHER ownership is checked by LENS NAME at `create` and again at `score` — a re-spawned lens posts under a new launch id every turn, so the launch comparison alone never fires twice for the same lens. **Spawning one agent per turn**: book each turn's launch with `budget book --lens-name <seat>`, naming the seat it writes as. A room counts turns, rounds, blind-first-turn envelopes and final stances by that name, so a seat that is a different launch every turn is still ONE author across them — its round-2 `closure` is admitted, and `room_turn.author_launch` records the launch that actually wrote it rather than the seat's first one. A launch that declares no name keeps answering by launch id exactly as before. When a room declares its participants, a declared name that is not one of them is refused by name (the refusal lists the room's seats): the name is the identity the room counts by, so an unseated one would post as an author the room does not have. **`admission-order --round-id R --seed S`** is the order every consolidated idea of a round is roomed in: a seeded draw stratified on (arm, card), packed into rooms of 6 in batches of 4-8 (the charter band, overridable with `--no-enforce-batch-band`), the trailing partial room carried as the remainder in that same order. Each cell's members are sorted before the seeded shuffle, so the same pool handed over in a different order draws the same order and the same hash. A pool smaller than ONE room seats nobody: every record is carried in the remainder and the result says so in a `note` naming `--ideas-per-room` (a two-idea dry run is a declared room size of 2, not a failed draw). Nothing from a dossier is a parameter of it, and its `hash` is what a round escrows so the order it ran can be compared with the order it committed to. That escrow is a SECOND `prereg commit`, taken after the judged screen and before the first room opens: the pool is the round's consolidated records, so the order does not exist at frame time, and a hash in the frame-time params is either invented or back-filled. The `aiif_round` gate suite reads either place and names which one it read. |
 | `term` | `propose`, `accept`, `reject`, `decide`, `merge`, `supersede`, `retire`, `review`, `mark-reviewed`, `scan`, `backfill-records`, `backfill-claims`, `relink`, `reindex`, `list`, `show`, `status` | The lexicon term store (`docs/reviews/LANE_E_TERM_STORE_DESIGN.md`). `propose --lemma --gloss --evidence <kind:id>...` needs at least one evidence token (`anchor:`/`record:`/`claim:`/`idea:`) or refuses (`SenseWithoutEvidenceError`) — the quote-grounding law applied to the lexicon; `--status current` runs the same accept path a later `accept` would. `decide <REL-...> --decision same_as\|variant_of\|scoped\|not_conflict\|unrelated\|rejected` resolves one pending conflict/duplicate candidate — `scoped` needs a repeatable `--disambiguator SENSE=text` for every member sense, `not_conflict` needs `--into SENSE`. `merge <TERM> --into <TERM>` folds the first into the second in one launch-attributed step. `retire` accepts a SENSE id only in this build — a TERM id is refused by name (`term_retire_not_implemented`; `lexicon.api` exposes no term-level retire yet). `scan`, `backfill-records`, `backfill-claims` and `relink` are E2 seams: until `trialerror.lexicon.{scan,candidates,backfill}` land, each reports `{"status":"unavailable",...}` rather than crashing or silently doing nothing. Every mutating verb requires `--by-launch` except `reindex` (FTS maintenance only). |
 | `sidecar` | `start`, `status`, `stop` | Supervises the long-lived helper processes this program needs running — today the embedding server the `llama_server` query backend talks to. The argv comes from `[sidecars.<name>]` and the verbs take a NAME, so there is no `--cmd` and nothing reaches a shell. `start` is idempotent (a live recorded process is reported, not duplicated); `status` is also the supervisor — it restarts a `restart = "always"` sidecar it finds dead, and `--no-restart` reports without touching anything; `stop` is SIGTERM then SIGKILL after `--grace-s`, only ever against the pid this program recorded *and* still owns (the recorded pid is checked against the kernel's start time and argv for it, so a recycled pid is never signalled), with every wait bounded. State and logs live under the program's gitignored `run/` dir. See "Sidecars" below, and `trialerror doctor --only sidecar_alive`. |
 | `obs` | `status`, `start-phoenix`, `smoke`, `audit-digest` | The first three no-op gracefully if the `obs` extra isn't installed. `start-phoenix` launches a detached local `phoenix serve` (the same detach technique as job workers: `DETACHED_PROCESS \| CREATE_NEW_PROCESS_GROUP` on Windows, `start_new_session=True` — i.e. `setsid()` — on POSIX). `smoke` emits one span of each of the four kinds (launch/retrieval/verification/job) and reports whether they flushed. `audit-digest` needs no extra at all: it builds one deterministic, verdict-free digest of a day of agent activity — see **The activity digest** below. |
@@ -262,8 +263,7 @@ index-entry rule (arXiv:2608.27454): every `l0_abstract` states
 **PROBLEM + ROOT CAUSE + FIX** in one or two sentences — never a topic label.
 Bodies: root cause, not symptom; exact command sequences as run; update rather
 than duplicate (`put` upserts by `(key, account)` — reuse the key); 10-30
-lines. The `/close` skill carries a worked `memory put` example and `/boot`
-reads the index under the same rule. Not enforced in code — `put` accepts any
+lines. The retired `/close` and `/boot` skills carried this rule too. Not enforced in code — `put` accepts any
 string — so it is a review rule for the operator and for the close ritual. Two
 code follow-ups are tracked separately and will surface items rather than
 rewrite them: save-time conflict candidates (advisory only) and age-based
@@ -273,20 +273,22 @@ rewrite them: save-time conflict candidates (advisory only) and age-based
 
 Both are hand-rolled stdio JSON-RPC 2.0 servers (`trialerror/mcp/protocol.py`) implementing the
 MCP 2025-06-18 spec's tools-only subset directly — no `resources`/`prompts`/`sampling`.
-Tool-count is asserted in tests (`trialerror-ops` = 12, `trialerror-knowledge` = 12 — design
-§5.1's original 11 plus lane e's E3 step, which added the read-only `term_lookup`), matching the
-design's own per-context tool-ceiling reasoning (§5.1): attach subagents (Fable-tier, C-0088) to
+Tool-count is asserted in tests (`trialerror-ops` = 3, `trialerror-knowledge` = 8; the exact
+names are asserted too), matching the design's own per-context tool-ceiling reasoning (§5.1): attach subagents (Fable-tier, C-0088) to
 only the one server they need.
 
-**`trialerror-knowledge`** (read-only, 12 tools) — `search`, `get_chunk`, `get_source`,
-`get_document_outline`, `resolve_quote`, `similar`, `graph_neighbors`, `corpus_stats`,
-`memory_search`, `list_requests`, `poll_job`, `term_lookup` (lane e E3: look up one lexicon
+**`trialerror-knowledge`** (read-only, 8 tools) — `search`, `get_chunk`, `get_source`,
+`get_document_outline`, `resolve_quote`, `similar`, `corpus_stats`,
+`term_lookup` (lane e E3: look up one lexicon
 term by lemma or term_id — senses, aliases, open-conflict flag; anchor-backed evidence
 excerpts fenced by the anchor's source license_tier exactly like `search`/`get_chunk`).
 
-**`trialerror-ops`** (side-effecting, 12 tools) — `session_status`, `budget_status`,
-`book_launch`, `reconcile_launch`, `append_event`, `post_feed`, `read_inbox`, `law_lookup`,
-`register_artifact`, `gate_advance`, `prereg_commit`, `record_verdict`.
+**`trialerror-ops`** (side-effecting, 3 tools) — `session_status`, `book_launch`, `read_inbox`.
+
+The other 13 tools (knowledge: `graph_neighbors`, `memory_search`, `list_requests`, `poll_job`; ops:
+`budget_status`, `reconcile_launch`, `append_event`, `post_feed`, `law_lookup`, `register_artifact`,
+`gate_advance`, `prereg_commit`, `record_verdict`) were retired in Phase 0 (never used). They are
+restorable from git.
 
 ### Registering them with Claude Code
 
@@ -339,6 +341,9 @@ done on this build** (see **What's unverified** below); everything above is exer
 by real-subprocess tests (`tests/test_mcp_ops_protocol.py`,
 `tests/test_mcp_knowledge_protocol.py`, `tests/test_spawn_gate_hook.py`), never a live
 Claude Code round trip.
+
+Skills: `gate-critic` and `sandbox-audit`. The other skills were retired in Phase 0 (never used). They are
+restorable from git.
 
 ## The enforcement model — what refuses what
 
@@ -844,6 +849,12 @@ fail (a dead embedding sidecar costs the vector tier, which every retrieval surf
 degrades from and says so), naming each configured sidecar that is not running or not
 answering.
 
+## Web fetch — frozen since Phase 0
+
+Frozen since Phase 0. It is kept for its no-evasion egress code, with no new features. It
+unfreezes only on the render-tier trigger (design §6). No code changed: the `webfetch` CLI
+group, its handlers and its doctor checks all still run.
+
 ## Extraction quality — measure first, refuse second
 
 Every stage of this pipeline can succeed on a document whose text is unusable. A
@@ -1285,6 +1296,147 @@ a worker that has not been restarted keeps running documents in one invocation e
 Paused large scans are resumed from the queue side with `trialerror jobs resume --job-id <id>`
 once the restarted worker is up.
 
+## OCR on a rented GPU (vast.ai)
+
+The GPU worker can run its OCR on a GPU rented from vast.ai instead of its own card. Only the `marker_single`
+invocation moves: the range planner, the range cache, the page numbering and every check on the markdown that comes
+back still run on the worker machine, and the queue side changes by one manifest field. It is off unless the worker's
+backend-config-root says `[ingest.ocr] executor = "vastai"` (with `backend = "marker"`; `marker_extra_args` that look
+like a path are refused, so no path of the worker machine reaches the host), and even then
+**nothing leaves by default**. Setup, every key and its default: `docs/USER_SETUP.md` section 1b. Design:
+`docs/VASTAI_OCR_DESIGN.md`.
+
+The same `[vastai]` table and account also serve the embedding lane, the public TrialError copy's embedding backend
+(`[ingest.embed] gpu = "vastai"`, `trialerror vastai run`, `docs/VASTAI_EMBED_DESIGN.md`). The two lanes share the key,
+the tiers and the caps they have in common; the OCR lane reads its own `image`, `startup_s`, `safety` and `disk_gb`
+under `[vastai.ocr]`. No OCR command rents: only the worker below does, and `trialerror vastai run` is the embedding
+lane's own renting verb. Each lane has its own reaper (`reap --ocr` for this one), and neither destroys the other's
+live instance.
+
+### The flow, for one job
+
+1. The worker claims an OCR job and reads its manifest. Before the document is even pulled, the **egress decision**
+   runs on the manifest alone (below), together with the spend already booked against this run and the approval
+   (`cap-run`, `cap-approval`). A refusal hands the claim back at once.
+2. After the pull, at the first range the range cache does not already hold, the job is **priced**: the range plan on
+   the vast.ai budgets (`[vastai.ocr] max_range_pixels` and `max_range_pages`), the RAM floor of the largest range, one
+   offer search, and the worst case of each admitted offer (the price per hour, disk included, over the whole TTL, plus
+   bandwidth and the bootstrap download). Every cap and the account's credit are compared with the worst case before
+   anything is created; a refusal here hands the claim back too, with nothing rented.
+3. One instance is rented for this job, with its deadline in its label and a dead man's switch inside it. The stack is
+   checked **before** the document is uploaded: the hashed install, marker's version against
+   `[ingest.ocr] marker_version`, a GPU that torch can see, the RAM scratch (below), a canary page OCR'd and compared
+   with its known text (this first run also downloads the models), the model files against the packaged manifest, and
+   marker's page-range flag.
+4. The document goes up and its sha256 is compared on the host; the ranges run, and each range's markdown comes back
+   with its hash checked and is checked on the worker machine exactly as a local run's is. The instance is destroyed in
+   every case, and the destroy is confirmed by listing the account.
+5. The result is published as usual. Its `result.json` carries a `vastai` block (every lease the job took, instance,
+   host and machine, datacentre and verification flags, country, GPU, remote versions, canary similarity, the scratch
+   used, estimated cost).
+
+`trialerror vastai plan --input <pdf>` shows steps 1 and 2 for a document without renting anything. Run it before
+any real run.
+
+### The egress policy and its seal
+
+A document leaves only when **all** of these hold:
+
+- the worker's `[ingest.ocr] executor = "vastai"`;
+- `[vastai.egress]` names it: its sha256 is in `allow_documents`, or the licence tier the queue side stamped into its
+  manifest (`expect.license_tier`) is in `allow_license_tiers`. `unknown` cannot be named as a tier. A job queued
+  before the queue side stamped tiers carries none and passes only by sha256;
+- with `require_approval = true` (the default), a valid approval seals exactly the current `[vastai.egress]` table:
+  signed with the vast.ai key, bound to this backend-config-root, not expired, lived at most `approval_max_days` (at
+  most 7), and not issued in the future. Only `trialerror vastai approve-ocr` in an interactive terminal writes one.
+  Editing the table afterwards, by hand or by an agent, is not enough to widen what leaves: the next job is refused
+  with `approval-unsealed` until the operator approves again;
+- the document is at most `[vastai.ocr] max_document_mb`.
+
+The host requirements live in the same table: datacentre hosts only, verified hosts only, any country unless
+`allow_geolocations` names some, and the document kept in the container's RAM-backed `/dev/shm`
+(`remote_scratch = "shm"`; `"shm_or_disk"` allows the container disk too, except for the tiers in
+`shm_required_tiers` and for a document with no tier while that list is not empty). With no approval and nothing named — the defaults — every job is refused and nothing is
+rented. The first-run setting is a short `allow_documents` list of sha256s and nothing else.
+
+### How each failure is settled
+
+| class | what happens |
+|---|---|
+| **R**, returned | The claim goes back unrun, no offload attempt is burned, it does not count toward `--max-jobs`, and the job is skipped for the rest of this worker run. It lands in the run summary's **`refused`** bucket with its reason code, and in the ledger as a `refused` row (except `stage-not-served`, the worker's own decision, which writes none). Some R codes (`key-missing`, which an ssh `Permission denied` also gives, and `stack-mismatch`) stop vast.ai use for the rest of the run: every later job is refused at once with `vastai-disabled-for-run`, without a vast.ai call |
+| **F**, fail over | The host failed: the instance never became ready, ssh never came up, a bootstrap step hung past its timeout, torch saw no GPU, marker crashed on the canary page, the host key did not verify, `/dev/shm` was too small for a document that needs it, an upload or a download failed its hash twice, or the instance died. It is destroyed and a fresh one rented, excluding that machine, within `[vastai.ocr] max_leases_per_job` and the caps. Only the ranges not yet cached run again. When the leases run out the job is returned as `hosts-exhausted` (`shm-too-small` when the last host lacked the RAM scratch); when no offer is left once the failed machines are excluded, as `no-offer`. A failed bootstrap **install** names the interpreter it chose on the image (the one that imports the image's torch), that interpreter's version, the environment it installed into (`direct`, `venv` or `user-break-system-packages`) and the pip version, then the first and last 20 lines of the instance's own bootstrap log, each cut to 200 characters -- not the installer's whole message. The full log stays on the instance and dies with it |
+| **E**, error | As for a local failure (marker's non-zero exit, an out-of-memory kill, a range timeout, a missing page-range flag): `error.json`, and the queue side burns one offload attempt. A document that crashes marker every time stops costing GPU minutes after three |
+| **X**, expired | The lease reached its TTL: the watchdog destroys it, the claim goes back unrun, the ranges already produced stay cached, and the worker run ends loudly, as Ctrl+C does |
+
+The reason codes: `approval-missing`, `approval-invalid`, `approval-expired`, `approval-future`,
+`approval-unsealed`, `tier-not-allowed`, `tier-missing`, `document-too-large`, `cap-job`, `cap-run`, `cap-approval`,
+`cap-ttl`, `credit-low`, `no-offer`, `api-error`, `create-failed`, `key-missing`, `stack-mismatch`, `shm-too-small`,
+`hosts-exhausted`, `vastai-disabled-for-run`, `stage-not-served`. Every refusal names what would change the answer.
+
+When a run returned jobs, the worker's final message counts them apart from the published and the failed ones and
+says that they went back unrun: `Queue not empty - N job(s) refused by this worker are left pending (<n> <code>, …);
+the refused bucket says what would change each answer`. The envelope's `refused` bucket, present only when something
+was refused, lists each job with its reason code, message and next actions, and each is also an
+`offload_job_refused` warning. A returned job stays pending on the queue side and is offered again to the next worker
+run.
+
+**`when_refused`** (`[vastai.egress]`, default `"return"`) decides what happens to a document the policy does not
+let leave. `"return"` hands it back, so it waits for a worker without vast.ai or for an approval that names it.
+`"local"` runs it on this machine's own marker instead, with this machine's range budgets, which needs
+`[ingest.ocr] marker_single_exe`; its result carries no `vastai` block, and its ledger `refused` row says
+`routed: "local"`.
+
+**`--stages ocr`** on `trialerror offload worker` (default `ocr,embed`) makes a run take OCR jobs only. A claimed job
+of a stage the run does not serve goes back unrun with `stage-not-served` and is skipped for the run. This is how the
+worker's own GPU stays free for other work while OCR runs on a rented one: the worker never sends an embed job to vast.ai (the embedding lane rents its own GPU with `trialerror vastai run`). Only
+the stages a run serves are checked at start: an OCR-only run needs no `[ingest.embed]`, and `--stages embed` builds
+no vast.ai backend (no runtime-file check, no reap, no vast.ai call).
+
+**v1 is sequential**: one lease at a time, one document after another. More than one lease at a time, and one
+document spread over several hosts, are not in this version.
+
+### The ledger
+
+Every decision is a line in `worker_state_dir()/vastai/ledger.jsonl` on the worker machine: append-only, one JSON
+object per line, flushed and fsynced per row. Rows: `refused` (the document's sha256 and size, the reason code;
+nothing was sent), `intent` (before the instance is created: host, machine, datacentre and verified flags, price,
+worst case), `shipped` (the instance id and the start time, once the upload's hash matched on the host), `outcome`
+(the end time, pages, bytes each way, the scratch used, the estimated cost with the bootstrap download, and the
+result: `returned` when a pause, a stop, a refusal or the end of the run ended the lease, with `ended_by` saying what
+ended it), `approval_minted` (the nonce and the summary,
+never the signature), `reaped` and `destroy_failed`. `trialerror vastai ledger [--since ISO] [--job-id ID] [--json]`
+prints it; a torn last line is reported, never dropped. The cost is an estimate from the offer's prices and the
+lease's length: **vast.ai's invoice is authoritative.**
+
+On the queue side, a folded OCR result that ran off-site also appends one `offload_ocr_offsite` event to the
+program's own event table (the job, the document, its source and licence tier, the input sha256 and size, and the
+result's `vastai` block), so the program's record says which documents left, without depending on the worker
+machine's ledger. `[ingest.ocr] record_offsite_ocr_events = false` on the queue side turns it off; that key is not
+part of the configuration hash, so setting it re-queues nothing.
+
+### What remains where, and for how long
+
+| where | what | how long |
+|---|---|---|
+| The rented host, during the lease | the PDF and the range markdown, in the container's `/dev/shm` (RAM) | the lease, bounded by its TTL |
+| The rented host, if the container disk was allowed and `/dev/shm` was too small | the same, on the container's disk (under `/var/tmp`) | the lease (the worker deletes the scratch before the destroy, best effort), plus an unknown period: vast.ai's destroy deletes the instance and its data, but whether freed blocks are wiped is not documented |
+| The rented host, after a worker crash mid-lease | as above | until the dead man's switch stops the container (TTL + 2 min) or the reaper destroys it |
+| vast.ai's control plane | the label, image name, start-up script, timings, billing; no document data | vast.ai's own retention |
+| The worker machine | the ledger and the run records; the range cache until the job completes | ledger kept; cache removed at completion |
+
+### The reaper, and its schedule
+
+`trialerror vastai reap --ocr --backend-config-root ROOT` is the OCR lane's reaper. It destroys an OCR instance
+(`VOCR-`) of this root that is past its label deadline, has no run record, whose record says finished, or whose owner
+process on this machine is dead, and never an embedding lane's (`VAST-`). Anything else with a `trialerror|` label is
+reported and left alone; `--dry-run` destroys and records nothing. (`trialerror vastai reap` without `--ocr` is the
+embedding lane's reaper, with the public policy; it never destroys an instance whose OCR lease is live.) It runs at
+worker start and at worker exit when the run serves OCR (a start-up reap that cannot list the account is logged
+loudly and the worker goes on), and should also run on a schedule on the worker machine, e.g. every 15 minutes from the
+Task Scheduler. If the machine is off nothing can reap: the label deadline and the dead man's switch still bound GPU
+billing, the container disk keeps billing cents a day until destroyed, and the next doctor run fails on it
+(`vastai_live_instances`, `vastai_ocr_ledger`).
+
 ## The duplicate-candidate gate — three routes, a coverage bar, and the verb that goes back
 
 A duplicate candidate is a `term_relation(verb='same_as', status='pending',
@@ -1469,6 +1621,36 @@ counted, never hidden. The score carries `failures` (the list the batch turns on
 `inventory_failures` (inventory misses, still meaning exactly that), plus `by_kind` and
 `by_set` catch rates. A batch carrying no plant of a failing kind is `unauditable` and fails
 on that ground alone, and `--judged-prep` refuses to build one.
+
+### The derivation phase
+
+A round may run a **derivation phase** after its first judged screen: every seat receives a
+small envelope of records written by OTHER lenses and writes derivative records from them.
+The lens prompt admits that envelope as its ONE declared exception to the rule that a brief
+never carries another lens's ideas, and it admits it only under the exact marker
+`DERIVATION ENVELOPE` — so whatever renders the phase's prompts must emit that string
+verbatim, heading a block of its own, or a lens reading its own instructions correctly will
+refuse the phase and say why. The envelope carries records reduced to the fields every
+record shares (statement, home, assumed circle, declared operation, probe), each under its
+id, chosen by a rule the round fixed before any lens ran and applied identically to every
+seat — the `control` seat included, because a control that sits the phase out is exactly
+what makes the phase's comparison not evaluable. It never carries a label, a verdict, a
+dossier, a distance or a rubric: judgment found inside that block trips the same barrier as
+judgment anywhere else in the prompt, and the lens stops and writes nothing. A derivative
+record names the envelope ids it built on in `parent_ids` and adds `"phase": "derivation"`
+to its `provenance`; both survive `lens intake` onto the stored row, which is what lets a
+round tell its two phases apart afterwards.
+
+A lens's derivation-phase launch is booked with **the SAME `--assign-id`s as its first**, plus
+`--phase derivation`. The first binding is never overwritten: `lens_assignment.lens_launch_id`
+keeps whichever launch bound it first, so the records and the feed post the first phase wrote
+stay joined to their assignment rows, while the new launch is recorded beside it in
+`lens_assignment_launch` and resolves to exactly the same slice. That is what lets the
+per-launch retrieval scope engage for the second phase and `lens_citations_within_slice` audit
+its post — before this, booking the second launch with assign ids moved the first phase's join,
+and booking it without them left the phase unbound and audited by hand. `--phase` is free text
+(≤ 40 characters), it labels the link rows only, and it is refused without `--assign-id`, which
+is what it labels. Re-booking the same launch against the same rows binds nothing twice.
 
 ### The archive round
 
@@ -1782,6 +1964,57 @@ view per file for exactly that purpose. `--record-verdicts` accepts labels keyed
 masked id, the real id or a mix, for both the first and the second judge's sheet — the mask
 is a barrier, not a trap — and a key that names neither is still refused by name.
 
+### The re-judge is kept in the store, with its judges
+
+**Label of record → `verdict`. Second opinion → `verdict_rejudge`** (knowledge schema v13).
+A `--second-judge-file` used to be read for exactly one thing — Cohen's κ per reference set,
+printed into the recording result — and then dropped, so which launches judged, what the
+second judge said about each subject, and where the two disagreed lived only in files
+outside the store. A round's own analysis tool, reading `idea` and `verdict`, then printed
+that round's κ with `n = 0` although the re-judge had run. Every label on that sheet now
+lands as its own row, with the primary label beside it and an `agrees` flag computed on the
+same comparison the κ is (the round's own label words, not the canonical ones). It is
+deliberately **not** a `verdict` row: consolidation, the doctor's checks and the exports all
+count `verdict` rows per idea, and a second opinion filed among them would be counted as a
+label of record. No reader of `verdict` changes.
+
+**Who judged.** `--judge-launch L` (repeatable) names the launches the PRIMARY judge ran
+under and `--second-judge-launch L` (repeatable) the re-judge's. Every id must name a real
+launch, checked before the first row is written. The second judge's list is stored on each
+re-judge row; the primary judges' list rides in the recording result and in the batch's
+`<batch>-verdicts.json` under `judges: {"first": [...], "second": [...]}` — a `verdict` row
+records the RECORDING launch, which is a different fact from who judged. The result also
+gains `rejudge: {n_subjects, n_rows, disagreements}`, the raw list of which subject, which
+set and which two labels, in a stable order.
+
+```bash
+# read the re-judge back out of the store -- per batch and pooled over the round
+trialerror lens screen --round-id R --rejudge-report [--batch-id B] [--labels-file F]
+
+# backfill a batch recorded before knowledge v13, and verify the backfill
+trialerror lens screen --round-id R --record-rejudge --batch-id B \
+    --second-judge-file F [--second-judge-launch L ...] --launch-id <recording launch>
+```
+
+`--rejudge-report` is read-only and computes from `verdict` + `verdict_rejudge` and nothing
+else — that is the point of the table. It returns, per batch and pooled, per reference set:
+`n`, observed and expected agreement, κ, the judging launches and the raw disagreement rows.
+The one thing no table holds is the **category vocabulary**: a κ's chance term is over the
+words a judge could have used, and those are the round's own when it declared a labels file,
+which is a file — so pass the same `--labels-file` the recording took, or accept the design's
+own vocabulary and the expected agreement that follows from it.
+
+`--record-rejudge` is for a batch recorded before the table existed. It takes the same
+second-judge file `--record-verdicts` took (masked, unmasked or mixed — the batch's own mask
+translates it), writes `verdict_rejudge` rows and **nothing else**: no `verdict` row is
+written or superseded, nothing is consolidated, no plant is re-scored. Then it checks
+itself — κ, `n` and observed agreement recomputed from the store must equal the ones that
+batch's recording result file already published, at the precision the file holds them to. On
+any mismatch it deletes the rows again, writes nothing and refuses with both numbers. It
+refuses a batch with no recording on file, and a batch that already carries re-judge rows
+unless `--supersede` is passed. The doctor check `rejudge_rows_match_recorded_kappa` **warns**
+for every batch that published a κ and has not been backfilled, naming the batch and the verb.
+
 The inventory rows in an envelope are **handed over, not retrievable**: the register is the
 reference set the record is judged against, so the knowledge server excludes that source
 kind from every surface a lens or a verifier holds, and a judge that tries `get_chunk` on a
@@ -1868,6 +2101,41 @@ The one rule behind all four: **lenient about what a person ADDS, strict about w
 schema NEEDS.** An extra key is a note; a missing answer, an unknown label or an unresolvable
 reference is a refusal, and every refusal names the position and the field.
 
+### What the slice draw depends on — `--slice-salt`
+
+`lens assign` draws each lens's slice from a seeded stream, and until this flag existed the
+stream was salted with the lens's `roster_id` and the lenses were processed — the shared arm
+pools depleting as they went — in the order the roster rows were inserted. A `roster_id` is a
+MINTED id: deleting and re-adding a roster row, or adding the rows in another order, mints new
+ids and moves the draw, although nothing a reader would call the design (round, seed, lens
+names, seats, weights, candidates) changed. A round that pre-registers its assignment hash is
+then relying on a standing "never re-add a roster row" prohibition to keep that hash true.
+
+Two named schemes, and the scheme is recorded with the draw:
+
+| `--slice-salt` | Per-lens stream | Processing order |
+|---|---|---|
+| `roster-id` (**default**) | `seed` + the lens's minted `roster_id` | roster insertion order |
+| `lens-name` | `seed` + `<round-id>::<lens-name>` | ascending `lens-name` |
+
+Under `lens-name` the draw is a function of the DESIGN: two rosters with the same lens names,
+seats and cards draw the same slices, the same arms and the same card blocks whatever order
+their rows went in and whatever ids they were minted. Lens names must then be unique within
+the round, and a roster with a repeated one is refused before a single row is written. The
+default stays `roster-id`, so nothing that already ran changes; a draw made under it carries a
+one-line `warnings` entry naming this flag, which is a warning and never a refusal.
+
+Every assignment row records its scheme in `slice_spec.salt_scheme`, and `lens log`, `lens
+export` (in `attrs`) and `lens slice-distances` report it per lens. **A row with no recorded
+scheme was drawn under `roster-id`** — every round that ran before the key existed is in that
+state. The scheme is reported BESIDE `slice-distances`' `canonical_sha256`, never folded into
+it, so no already-pre-registered hash moves.
+
+Two consequences worth stating plainly: **reproducing a historical round means drawing it under
+the scheme ITS rows recorded**, not under today's default; and the scheme belongs in a round's
+pre-registered parameters, beside the seed and the weights, because an assignment hash taken
+under one scheme is not reproducible under the other.
+
 ### Linking a lens's launch to its slice
 
 `lens_assignment.launch_id` is the launch that WROTE the row — the orchestrator running
@@ -1879,8 +2147,11 @@ barrier exists for. Two ways to link one, and one of them is required:
 1. Book straight off `lens export` — its `attrs` carry `slice_doc_ids`, `assign_ids` and
    `roster_id`, and the scope reads them in that order.
 2. `trialerror budget book --assign-id <id>` (repeatable), which records
-   `lens_assignment.lens_launch_id`. An `assign_id` that names no row refuses the whole
-   booking rather than linking part of a slice.
+   `lens_assignment.lens_launch_id` (the FIRST launch bound to each row, never overwritten
+   afterwards) and one `lens_assignment_launch` row per binding. An `assign_id` that names no
+   row refuses the whole booking rather than linking part of a slice. A lens booked again —
+   a later phase, a re-spawn — passes the same assign ids plus `--phase <label>`; both
+   launches then resolve to the same slice, and the readers take the union.
 
 `lens log` then reports, per lens, whether that launch actually posted — and the gate
 suite's `lens_log_reconciled` check FAILs on any lens that did not, FAILs a subject
@@ -1889,9 +2160,538 @@ counting rows and passing, and FAILs a log that reconciles no lens at all (`rows
 `n_lenses: 0`), which is what `lens log` returns for a mistyped `--round-id` or a gate
 run before `lens assign`.
 
+### Writing slices a planner chose — `lens assign --plan-file`
+
+In plain words: sometimes the round's design decides exactly which lens reads which
+documents, and the harness should not draw anything. The round's planner writes that
+decision down as a plan file; `lens assign --plan-file` checks it against the store, writes
+it as the round's assignment rows, reads the rows back, and keeps them only if they match
+the file. The rows look exactly like the ones `lens assign`'s own draw writes, so `lens log`,
+`lens export`, the retrieval scope and every doctor check read them the same way.
+
+```
+unset TRIALERROR_PLATFORM_ROOT   # or point it at the program's own platform root
+trialerror lens assign --plan-file plan.json --round-id R-1 --launch-id <launch> \
+    [--expect-plan-sha256 <hex>]
+```
+
+- **What it needs.** The round's roster already added (`lens roster --add`, one row per
+  lens, with its seat and card block), the documents already in the store, and the launch
+  doing the writing (`--launch-id`, recorded on every row). None of the draw flags is
+  accepted with `--plan-file` (`--model-key`, `--home`, `--candidate`, `--slices-per-lens`,
+  `--seed`, `--roster-id`, `--weights`, `--far-floor`, `--arm-per-lens`, `--slice-salt`,
+  `--inter-cluster-mandate`, `--home-cluster`, `--cluster-of`): the plan carries all of that.
+- **The file** (`trialerror-plan-file/1`, every key present):
+  `{format, round_id, seed, weights, far_lens_floor, arm_mode: "per_lens",
+  inter_cluster_mandate, salt_scheme, lenses: [{lens_name, arm, far_floor, rows:
+  [{candidate_id, cluster_id, rank, distance_score, extra}]}], annex, plan_sha256}`.
+  `annex` is the planner's own record: hashed, never read. `extra` rides into each row's
+  `slice_spec` beside the keys the verb writes itself, which it may not reuse (`round_id`,
+  `candidate_id`, `distance_score`, `cluster_id`, `rank`, `salt_scheme`, `plan_sha256`).
+- **What it checks, before writing anything.** V1 the format and the round; V2 the plan's
+  lenses are exactly the roster's; V3 every candidate is a document whose source is not
+  of kind `inventory`, none appears twice, and the round has no assignment rows yet (a plan is
+  written once); V4 the arms — the assumption-buster far, a control seat in the modal arm,
+  the other lenses split by the quota over the non-control seats, at least
+  `max(far_lens_floor, 2)` of them far; V5 a far lens's `far_floor` is its row count, every
+  other lens's 0; V6 ranks `0..n-1` per lens; V7 no reserved key in `extra`; V8
+  `plan_sha256` is the hash of the plan without that key, and equals
+  `--expect-plan-sha256` when given. A refusal's `error.details` names the check and every
+  offending item; nothing is written.
+- **How it writes.** One transaction: lenses in name order, rows in rank order. Then the
+  rows are read back and compared with the file, column by column and as the projection
+  `[{lens_name, arm, candidate_id, cluster_id, rank, distance_score, extra}]` sorted by
+  `(lens_name, rank)`. Any difference rolls the whole transaction back and refuses with
+  `plan_readback_mismatch`.
+- **What it returns.** `{n_rows, n_lenses, projection_sha256, plan_file_sha256,
+  assign_ids: {lens_name: [ids by rank]}}`. `projection_sha256` is the canonical-JSON hash
+  of the projection as read back; a planner that recorded the same hash can compare the
+  two. `plan_file_sha256` is over the file's raw bytes.
+
+A lens launched more than once over parts of its slice — say one launch per half — is
+linked the usual way: `budget book --assign-id <id>` once per row of that part, plus
+`--phase <label>`, using the ids from `assign_ids`. `lens_citations_within_slice` then
+judges each launch against its own part, not the lens's whole slice. Do not book those
+launches off `lens export`'s attrs, which carry the lens's whole slice.
+
+### The round gate reads the round's design
+
+The `aiif_round` suite (`trialerror eval gate --suite aiif_round`) was written for one design:
+one matched-budget control seat, rooms that run, no p-value in the report. A round of another
+design **declares it in its prereg params**, and the four checks that read those keys judge
+the round it declared. Every key is optional, and **a round that declares none of them is
+judged exactly as before**, check for check and message for message. A declaration can give a
+check a fourth status, **`not_applicable`**: the entry carries `"status": "not_applicable"`
+(and `passed: false`), the runner reports it as a pytest skip, and it is never shown as a
+pass. `reproduction_status` is `match` iff every check is a pass or `not_applicable`. Nothing
+reaches that status by default, and a declared value outside its vocabulary FAILS the check
+that reads it rather than falling back to today's rule.
+
+**`design`** — `"control_seats"` with `control_count: N` (N ≥ 1): `control_arm_present`
+passes iff exactly N roster rows are seated `control` and none holds a card, and
+`per_arm_n_disclosed` reads the `seat=control` cells as the control arm. `"paired"`: every
+lens writes half its slice under its card block and half under the plain brief, as two
+launches of the same lens name, each booked with the assign ids of its half plus
+`--phase card` or `--phase plain`. `control_arm_present` then passes iff every standard lens
+holds at least one launch labelled `card` and one labelled `plain`, and no lens of any seat
+holds one without the other. `per_arm_n_disclosed` reads the `arm=plain` cells as the control
+arm. The labels come from a subject block, `lens_launches`, which the caller reads out of
+`lens_assignment_launch` joined to the roster. Only the exact labels `card` and `plain` pair;
+any other label, and `null`, pairs nothing. `"none"`: both checks are `not_applicable`.
+Absent: exactly one control seat, as always. An excerpt of a paired round's subject, and the
+query that fills its block:
+
+```json
+{
+  "prereg": {"prereg_id": "PREREG-…", "status": "committed",
+             "params": {"design": "paired", "rooms": false, "report_p_values": true}},
+  "lens_launches": [
+    {"lens_name": "lens_1", "launch_id": "LNCH-…", "phase": "card"},
+    {"lens_name": "lens_1", "launch_id": "LNCH-…", "phase": "plain"}
+  ]
+}
+```
+
+```sql
+SELECT DISTINCT r.lens_name, l.launch_id, l.phase
+FROM lens_assignment_launch AS l
+JOIN lens_assignment AS a ON a.assign_id = l.assign_id
+JOIN lens_roster AS r ON r.roster_id = a.roster_id
+WHERE r.round_id = :round_id
+```
+
+**`rooms`** — `false` makes `admission_order_hash_matches` `not_applicable`: a round that runs
+no rooms draws no admission order, so there is none to match. `true`, or no declaration, is
+today's rule, and no other check moves.
+
+**`report_p_values`** — `true` lets the report state a p-value as a number (`p = 0.031`,
+`p ≤ 0.05`, `p = 2/64`), name it (`p-value`), and use interval wording (`confidence interval`,
+`Clopper–Pearson interval`, `95 % interval`). The words that claim significance stay barred in
+every mode (`significant`, `significantly`, `significance`, `statistically significant`,
+`statistical significance`, `null hypothesis`). The list itself is unchanged. `false`, or no
+declaration, is today's rule: every term on the list fails, and so does `p <`, `p >` or `p =`
+followed by a number.
+
+**The plain brief — `BRIEF: PLAIN`.** A paired round's plain half is a launch of a STANDARD
+seat, so the lens agent cannot tell it is plain from its seat. It keys on a line in its prompt
+that reads exactly `BRIEF: PLAIN`. Under it, the lens writes from its slice with no card block
+and no card tag, and it leaves `requirements`, `operation_declared` and `provenance.card` out
+of every record. The banned default does not apply to it. Slice discipline, every other record
+field, the stop rule for judgment in the prompt and the derivation phase all hold. **A round's
+renderer must emit that line exactly, on the plain launches only.** A card launch that carries
+it writes plain, and nothing downstream can tell: its records are simply missing the card
+work the comparison was meant to measure.
+
+## Checking a round's plan before it is pre-registered
+
+**In plain words.** A round's gate requirements used to be checked only at the gate, after the
+round had produced its data. A requirement nobody had planned for — the classic case is a round
+that runs rooms but never escrowed the order it would admit ideas in — was found then, and the
+round could not be registered. Now `prereg commit` runs the part of the gate that the
+parameters can already decide, **before anything is written**, and refuses the commit when a
+required check fails. Nothing is escrowed and no row exists for a refused commit, so a refusal
+costs nothing and can be fixed and retried. Two ways forward, and the refusal names both:
+
+1. **Fix the params.** For the room-order case: declare `"rooms": false` if the round runs no
+   rooms, or declare that the order will be escrowed by a second commit
+   (`"admission_escrow": {"by": "second_prereg_commit"}`) and name the room seed
+   (`seeds.rooms` or `admission_seed`).
+2. **Go ahead anyway, on the record.** If the operator decides the round should run as it is,
+   the commit can name each failing check and the decision behind it. That override is stored
+   with the prereg. It cannot be given ahead of time: it must name a check that actually
+   failed, with a reason, and cite an operator decision.
+
+`prereg check` is the same check with nothing written — run it first. It exits 0 whenever the
+check ran; **read `result.overall`** (`pass`, `pass_with_warnings` or `fail`), not the exit code.
+
+The check never changes the params, so the params hash of a checked commit is the same as an
+unchecked one. A commit without `--plan-suite` behaves exactly as before.
+
+### Flags
+
+```bash
+# dry run: writes nothing
+trialerror prereg check --plan-suite aiif_round --round-id ROUND-ID --params-file params.json
+
+# the real commit, checked
+trialerror prereg commit --title "..." --procedure-file procedure.md \
+    --plan-suite aiif_round --round-id ROUND-ID --params-file params.json
+
+# the same, with an operator-approved deviation
+trialerror prereg commit ... --plan-suite aiif_round --round-id ROUND-ID --params-file params.json \
+    --accept-deviation admission_escrow_planned="rooms run only after the operator's go" \
+    --decided-by DECISION-ID
+```
+
+| Flag | Meaning |
+|---|---|
+| `--plan-suite SUITE` | `aiif_round` (the round's frame-time params) or `aiif_round_admission` (the second commit that escrows the room order). |
+| `--round-id ID` | Required with `--plan-suite`. |
+| `--parent-prereg ID` | Required for `aiif_round_admission`, refused otherwise: the round's first prereg. |
+| `--params-file PATH` | UTF-8 JSON object; exclusive with `--params`. |
+| `--accept-deviation CHECK_ID=REASON` | Repeatable. Needs `--decided-by`. Each must name a required check that failed. |
+| `--decided-by REF` | The operator decision (or request) id behind the deviations. |
+
+The `aiif_round` suite checks, from the params (and the program's `[models]` table):
+`declarations_readable`, `control_plan_consistent`, `admission_escrow_planned` (the trap
+above), `models_floors_met`, `arm_mode_declared` and `card_cells_feasible` — a failure of
+these refuses — plus `reference_sets_named` and `plants_declared`, which only warn. Each item
+says what the gate will look for later and what the params hold now. The gate-time checks of
+the `aiif_round` suite themselves are unchanged.
+
+**The second escrow.** A round that runs rooms escrows the order it will admit ideas in with a
+second commit, after the judged screen and before the first room opens
+(`room admission-order` prints the hash). Commit it with `--plan-suite aiif_round_admission
+--parent-prereg <the round's first prereg>` and `--params '{"admission_order_hash": "<64 hex>"}'`.
+The check confirms the parent is the same round's `aiif_round` prereg and that the round runs
+rooms, and that the hash is well formed; when the round's consolidated pool is in the store it
+also recomputes the order from the escrowed seed and warns loudly if the hash differs.
+
+## Registering a result whose gate did not pass cleanly
+
+**In plain words.** Two kinds of result used to stay unregistered, and so off the record. Both
+now have an honest way in, and both need an operator decision, cited by id.
+
+- **A deviation the artifact itself discloses.** The gate suite failed on a check, and the
+  artifact's own text (its deviations table, say) already says why. The critic's verdict was a
+  pass, every blocking edit is verified, only the suite failed.
+  `trialerror artifact register --id ART --by-launch L --with-deviation --deviation
+  CHECK=REASON@REPORT_REF --decided-by DECISION-ID`, once per failing check: the deviations must
+  cover **exactly** the checks that failed, and each `REPORT_REF` must appear verbatim in the
+  artifact file (which must still match the checksum recorded when it was submitted). Exactly one
+  `@` separates the reason from the reference; a `--deviation` with two or more is refused as
+  ambiguous, and a reason or reference that needs an `@` goes in `--deviations-file PATH` (a
+  UTF-8 JSON list of `{check, reason, report_ref}`, instead of `--deviation`). The artifact is registered with
+  `disposition = registered_with_deviation`. A byte-exact reproduction mismatch is not a
+  deviation an artifact can disclose and is refused.
+- **A failed result that belongs on the record.** The critic's verdict was `FAIL`.
+  `trialerror artifact register --id ART --by-launch L --as-failed --failure-ref REPORT_REF
+  --decided-by DECISION-ID`. The artifact's own text must contain `REPORT_REF`, its statement of
+  what failed. A review abandoned without a verdict cannot be registered this way. The artifact
+  is registered with `disposition = registered_failed`.
+
+The two modes are exclusive; without either, `register` is unchanged and the normal path leaves
+`disposition` empty. **State machine.** The graph gained two edges, `gated → registered` and
+`failed → registered`, and `registered` is now the only terminal state. Both edges are legal only
+through these two registrations: `trialerror gate advance --to registered` still refuses them and
+says which function to use. They are in the graph so that the doctor check over every recorded
+transition accepts what the two registrations write; a further doctor check,
+`registration_disposition_consistent`, confirms the artifact, its gate and the last transition
+agree on which path was taken.
+
+### A gate the critic passed but whose reproduction failed
+
+**In plain words.** Sometimes the critic passes a result, but the round's gate suite could not
+reproduce it: the gate's `reproduction_status` reads `mismatch`. The mismatch keeps the gate out
+of `union_applied`, so the result cannot be registered as passed, and `--as-failed` used to want a
+critic `FAIL` it will never have. When the operator decides that such a result is a failure that
+belongs on the record, two commands carry that decision out:
+
+```
+trialerror gate fail-reproduction --id GATE --reason "why it is a failure, in words" \
+    --decided-by DECISION-ID --by-launch L
+trialerror artifact register --id ART --by-launch L --as-failed \
+    --failure-ref "a string from the artifact that states what failed" --decided-by DECISION-ID
+```
+
+The first moves the gate `gated → failed` and nothing else. Every flag shown is required. A missing
+flag is a usage error (exit 2, no envelope); a blank value is `fail_refused`, and so is a gate whose
+recorded reproduction is anything but `mismatch` (`match`, `unrun`, or none) or whose state is
+anything but `gated`; nothing is written on any refusal. The critic's verdict, its
+edits and the reproduction columns are never rewritten: the one change is the gate's state, and one
+`gate_transition` row is added whose evidence records the path (`operator_failed_reproduction`),
+the decision, the reason, the reproduction status and the reproduction reference, in one
+transaction. It moves a gate only toward `failed`: a failed gate never reaches `union_applied`,
+and the normal registration and `--with-deviation` both refuse it.
+
+The second is the `--as-failed` registration above, with every check it already had (the
+artifact's own text must contain `--failure-ref`, the file must match its recorded checksum, a
+decision is required). It accepts a gate whose verdict is not `FAIL` only when that gate reached
+`failed` through `fail-reproduction` and its reproduction still reads `mismatch`; a gate abandoned
+with a plain `gate advance --to failed` is still refused. The registration's transition records
+`basis: operator_failed_reproduction` and the decision that failed the gate (`failed_by`) beside
+its own. `gate advance` refuses evidence that claims `operator_failed_reproduction` (or either
+registration path), so a generic transition cannot pass for this decision. No schema change: the
+gate's CHECKs already allow `failed` and `mismatch`, and the dispositions are the existing
+`failure_registered` / `registered_failed`.
+
+## The transcript archive — nothing is lost when the host clears its own transcripts
+
+**In plain words.** Claude Code keeps a transcript of every session, and deletes each one some
+days after the session's last activity (30 by default). The transcripts are the only complete
+record of what an agent did and why, so this keeps a copy of every transcript file, outside every
+repository, and never deletes a copy because the original went away. Copying costs no model
+tokens and, because a file that has not changed is not even read again, a run every two hours
+costs almost nothing. A regular **audit** then checks that the archive is complete, intact and
+private, and says so in one screen of plain words.
+
+Two things are separate from the archive and are the operator's own call: the archive keeps what
+it has seen, but only **`"cleanupPeriodDays": 3650` in the host's Claude Code `settings.json`**
+stops the host deleting a transcript *before* the archive's next run. Set it on both hosts. The
+audit's retention check fails until it is set.
+
+### What it keeps, and where
+
+One archive folder per host, outside every git working tree (the command refuses one inside a
+repository or inside the folder it copies from):
+
+```
+<dest>/objects/<sha[0:2]>/<sha256>.gz   the file's exact bytes, gzipped, named by their hash
+<dest>/index.db                         a small SQLite index (its own file, no store migration)
+<dest>/audits/AUDIT_<host>_<date>.md    the audit reports (and a .json beside each)
+<dest>/gaps.json                        known gaps, for the audit (optional)
+```
+
+- A file is copied when its size or modification time changed. If the new content is the old
+  content plus more (a transcript that grew), the older copy is marked *superseded*; a superseded
+  copy that is no longer anyone's latest is deleted 30 days after the supersession
+  (`--no-prune` keeps everything). A file that was rewritten rather than extended keeps both
+  versions.
+- A file that disappears from the source is marked *gone* once, and its copy stays. That is the
+  point of the archive.
+- Nothing whose path looks secret is ever copied: `keys/`, `*.key`, `.ssh`, `.credentials*`,
+  `rclone.conf`, `cookies.txt`. Files over 2 GB are skipped with a warning.
+- A second run while one is in progress does nothing and says `locked`; the lock dies with its
+  process, so a crash never leaves a stale one.
+
+### The commands
+
+```
+trialerror archive run     --src DIR --dest DIR --host LABEL [--dry-run] [--no-prune]
+trialerror archive restore --dest DIR (--sha SHA | --host H --path REL [--as-of ISO]) --out FILE
+trialerror archive status  --dest DIR
+trialerror archive audit   --dest DIR --host H [--src DIR] [--sample 50] [--gap-file FILE] [--settings FILE]
+```
+
+- **`run`** prints the counters: `scanned`, `skipped_unchanged`, `skipped_secret`, `skipped_large`,
+  `new_objects`, `bytes_stored`, `superseded`, `gone`, `pruned`, `errors[]`. `--dry-run` reads the
+  source and writes nothing (not even the archive folder). Refusals: `archive_in_repo`,
+  `dest_in_src`, `src_not_found`, `bad_input`. It takes its folders as flags, not from
+  `trialerror.toml`: the scheduler that runs it carries them, and an archive belongs to a host.
+- **`restore`** writes the exact original bytes to `--out` and checks the hash first. `--sha` picks
+  one object; `--host` with `--path` (the file's path relative to `--src`, with forward slashes)
+  picks that file's latest version, or, with `--as-of`, the version the archive had at that time.
+  It never overwrites (`out_exists`). Errors: `not_found`, `object_missing`, `hash_mismatch`.
+- **`status`** prints, per host: files, files gone, objects, bytes stored, how many objects are
+  superseded, and the last run.
+- **`audit`**: below.
+
+### Running it on a schedule (the custodian installs these; nothing installs itself)
+
+**The DEV laptop** — Windows Task Scheduler, every two hours, as the logged-on user:
+
+```
+schtasks /Create /TN "trialerror-archive" /SC HOURLY /MO 2 /RL LIMITED /TR "\"<harness venv>\Scripts\python.exe\" -m trialerror.cli archive run --src \"%USERPROFILE%\.claude\projects\" --dest \"%USERPROFILE%\te-archive\transcripts\" --host dev"
+```
+
+`schtasks` limits the `/TR` text to 261 characters; when the venv path makes it longer, put the
+same command in a `.cmd` file and point `/TR` at that (a `.cmd` file is fine for a scheduled
+task, but it must never be a packet `notify_cmd`; see below).
+
+**The sandbox host** — `deploy/sandbox/containment/te-archive.sh` plus its entry in
+`containment/crontab.txt` (every two hours, at minute 17). The script mounts the
+sandbox's config volume read-only in a throwaway container of the sandbox image, with no
+network, and runs `archive run --src /src/projects --host sandbox` into
+`archive/transcripts/` under the sandbox's deploy root (`chmod 700`). It exits 0 when the run finished (or
+found another run in progress), 1 when the run failed, 2 when it could not start (no docker, no
+image, no volume). `te-archive.sh --dry-run` prints its plan and touches nothing. The image must
+carry the `archive` group, so it takes one `te-rebuild.sh` after this lands.
+
+### The audit — every two weeks, then monthly
+
+**Owner:** the custodian. **Cadence:** the 1st and the 15th of the month; monthly after two clean
+audits in a row; back to every two weeks after any failure (the report says which applies).
+**Cost:** no model tokens. The custodian reads one screen per host.
+
+`trialerror archive audit --dest DIR --host H --src DIR` runs eight checks and files
+`audits/AUDIT_<host>_<date>.md` (and `.json`). The report starts with one line, `clean` or
+`N problems, the first is ...`, then one row per check with `PASS`, `WARN` or `FAIL` and a
+sentence in plain words. A second audit on the same day is kept beside the first (`..._<date>_2.md`),
+is never compared with it, and does not count towards the cadence. A **fail** is something to act on and becomes an item in the weekly
+packet (below); a **warn** is a fact to watch.
+
+| # | Check | Passes when |
+|---|---|---|
+| 1 | Runs | the archive ran at least every 6 hours on this host over the period since the last audit |
+| 2 | Coverage | a rescan of `--src` finds no file that was already at rest when the last run started yet is missing or different in the archive (a file still being written is expected to differ). A file the archive can never copy — over the 2 GB limit, or one that cannot be read — is also a **fail**, named in the report, because the host's clean-up would lose it |
+| 3 | Missing transcripts | *always a warn, never a fail:* counts subagent records (`*.meta.json`) with no transcript file beside them, by project and Claude Code version, with the trend since the last audit; the archive cannot copy what was never written |
+| 4 | Known gaps | every entry in the gap file has an explanation; open ones are listed with their age |
+| 5 | Integrity | a random sample of stored objects (default 50) re-hashes to its own name, and every recorded version has its object file unless it was pruned on purpose |
+| 6 | Retention | `cleanupPeriodDays` in the host's settings file is at least 365 (only that key is read; `--settings FILE`, default next to `--src`; **no settings file at all is a fail**, because the 30-day default then applies, and a file that exists but cannot be read is a warn), and nothing disappeared from the host without an archived copy |
+| 7 | Privacy | the archive is outside every git working tree and (on Linux) mode 700; on Windows it should sit under the user profile, whose default rules make it owner-only (elsewhere it is a warn: the rules were not verified) |
+| 8 | Space | reports the archive's size and its growth since the last audit; warns below 10 GB free disk |
+
+**The gap file** (`<dest>/gaps.json`, or `--gap-file`) is a JSON list of
+`{id, host, what, window, opened_ts, explanation, closed_ts}`. An entry with an empty
+`explanation` stays open and is listed with its age. To explain a gap that says a project had no
+transcript for a stretch of days, add `"project": "<part of the project folder name>"` and a
+`window` written `YYYY-MM-DD..YYYY-MM-DD`: the audit then lists which archived transcripts of that
+project hold entries dated in the window, reading each line's `timestamp` and nothing else. Record
+what it found in `explanation` ("found in <where>", or "not recorded anywhere") and the entry
+closes at the next audit. Run the same probe against the other host's archive to look there too.
+
+**Auditing the sandbox archive.** Run the audit the way the archive is run, in a throwaway
+container with the volume mounted read-only and the archive folder mounted, passing
+`--src /src/projects --settings /src/settings.json`, so the coverage and retention checks see the
+volume.
+
+## Closing a frozen room — the operator's answer to a freeze
+
+**In plain words.** A moderator freezes a room when it cannot resolve on its own, and the frozen
+room waits in the dashboard's DECIDE queue for the operator. When the operator's answer is "close
+it" (it was a trial, or the question no longer matters), this records that answer, and the room
+leaves the queue:
+
+```
+trialerror room close --id ROOM --reason "why it is closed, in words" \
+    --decided-by DECISION-ID --by-launch L
+```
+
+Only a `frozen` room can be closed, and `closed` is terminal: an `open` room is still being
+discussed, a `converged` room decided something, and a closed room cannot be closed, frozen or
+reopened. All three flags are required. A missing flag is a usage error (exit 2, no envelope); a
+blank value is `close_refused`. The close is append-only: the turns, the scores and the
+freeze (with its reason) stay as they were; `room.state` moves `frozen → closed` and one
+`room_closed` event records the reason, the decision and the state it came from, both in one
+transaction (of two closes at once, exactly one lands). Any other refusal (a room that is not
+`frozen`, an unknown room or launch) is `close_refused` too, with nothing written. A closed room
+reads as closed everywhere: `room status` adds a `closed` block (reason, decision, time); the room doc from `room export` keeps its *Freeze* section and adds a
+*Closed* one; the dashboard lists it as CLOSED, heads its own view `CLOSED: <reason> (decided by <ref>)`
+in the settled colour with the freeze as a plain *frozen earlier* line beneath it, drops it from
+DECIDE, and shows the close in the room's history and in *Since you left*; the rooms doctor checks
+treat it as neither stuck nor
+owing a deliverable. `room.state` has no CHECK constraint, so there is no migration.
+
+## The weekly packet — one list of decisions, read once, before the next session
+
+**In plain words.** Decisions pile up while agents work: a gate edit that needs verifying, a
+retention setting, a question only the operator can answer. Instead of asking one at a time, the
+harness gathers every open decision into **one packet** when a research session ends (or when the
+weekly limit is nearly spent). Each decision says what is being decided, why it matters, the
+options and what each leads to, the recommendation, and what happens if nobody decides. The packet
+is capped at 30 minutes of reading and announced by **one** phone notification, with one reminder
+mid-week if items are still open. The operator answers before the next session; the answers are
+recorded, and the next session's start asks for them with `packet list --answered-since`.
+
+### How an item gets in
+
+```
+trialerror packet add --what "..." --why "..." \
+    --option "a=Keep everything::The archive grows; nothing is lost." \
+    --option "b=Keep one year::Older transcripts are gone for good." \
+    --recommend a --if-undecided "Everything is kept." --needed-by next-session \
+    [--asked-by WORDS] [--est-minutes 3] [--priority blocking|normal|low] \
+    [--ref "label in words::path, id or link"]... [--strict]
+trialerror packet add --file item.json
+```
+
+Required: `what` (at most 300 characters), `why` (at most 500), at least two options, each with a
+key, a label and a consequence, `recommended` (one of the option keys), `if_undecided` and
+`needed_by` (`next-session` or `YYYY-MM-DD`). A missing or invalid field is `bad_input`. The
+default priority is `normal` and the default reading time 3 minutes.
+
+**The plain-words lint** warns, and never refuses (unless `--strict`): an ID-like token
+(`AB-123`), a run of 7 or more hex characters or a file path in `what` or `why` that no `--ref`
+label explains; any sentence over 40 words; an empty consequence. The warnings come back in the
+envelope's `warnings`; `--strict` turns them into a refusal (`lint_refused`) and stores nothing.
+
+### The commands
+
+| Command | What it does |
+|---|---|
+| `packet add` | validates and stores one item (above) |
+| `packet list [--open] [--answered-since ISO]` | the open items (the default), and/or the answers recorded since a time, each joined to its question and the label of the option chosen. The next session's boot calls `--answered-since <last boot>` — that is how answers get back |
+| `packet build --trigger session_close\|weekly_limit\|manual [--dry-run] [--when-weekly-pct N] [--push]` | builds `packet/built/PACKET_<ts>.md` and `.json`, leaving out a determination an open item already covers; see below |
+| `packet push [--packet ID] [--force]` | announces a packet with one notification through the configured notifier |
+| `packet answer ITEM --choice KEY [--note TEXT] [--by NAME]` | records the decision and marks the item answered |
+| `packet withdraw ITEM --reason TEXT` | takes an item out |
+| `packet remind` | one reminder for the last pushed packet, once it is `remind_after_days` old and some of its items are still open; at most one per packet |
+
+**`build`** takes the open items — blocking first, then by `needed_by`, then priority, then age —
+and adds (1) the store's **blocking determinations** (the determinations queue), each counted as
+3 minutes and labelled *from DECIDE: not yet in plain words* until those items carry the plain-words
+fields themselves; (2) the **failed checks of the transcript archive's latest audit**, when
+`[archive] dirs` names the archive folders; a clean audit adds one line to the opening lines
+instead. It opens with the first 3 lines of `course_file`, fills the packet up to `max_minutes`
+in that order (an item that does not fit, and everything after it, is listed by its `what` under
+"waiting for the next packet"; a first item longer than the cap still opens the packet), and writes
+one markdown section per item with the recommended option marked and the answer line: the
+configured `link`, or the `packet answer` command. `--dry-run` shows the packet and writes nothing.
+
+**`push`** sends the title `Decisions for you: N (about M min)` and a body of at most 600
+characters: how many decisions, the first one's `what` cut to 200 characters, and where to read.
+At most one push per packet and at most one push per 24 hours across packets; `--force` overrides
+and is recorded in `sent.jsonl`. A notifier that fails records nothing, so the push can be repeated: the hourly weekly-limit job
+announces its own unannounced packet again on its next run.
+
+### A determination an item already explains
+
+**In plain words.** A raw determination from the queue carries only an id and a one-line text,
+which says little to someone who was not there. When an open item of your own explains it in
+plain words, `build` shows the item and leaves the raw entry out, so the operator reads it once.
+
+The item covers an entry when one of its `--ref`s names the entry's id exactly: `DECIDE:<id>` as
+the packet prints it, or the bare `<id>` as the dashboard's queue shows it (a room id, a gate's
+`GATE::EDIT` pair; the text after the first `::` of `--ref` is kept whole, so a pair with its own
+`::` works). A look-alike (a longer id, a path containing the id) covers nothing. Only open items
+cover: an answered or withdrawn item does not, and the raw entry comes back until the thing
+itself is resolved (for a frozen room, `room close`). When two items cover one entry, the first in
+packet order is named. The built packet lists what it left out in `decide_covered`, one
+`{id, covered_by}` per entry, and the covering item's section ends with an *Also answers* line
+naming the entry. The left-out entry's minutes are not counted. An entry is left out only while
+its covering item is in the packet itself: when the `max_minutes` cap moves the item to *waiting*, the
+raw entry is printed in its own place instead, so a blocking decision never drops out of the packet
+because someone explained it. An entry no item covers is printed as before.
+
+### The triggers
+
+1. **Session close.** The research session's close procedure runs `trialerror packet build
+   --trigger session_close --push`. The program adds that one line to its own close checklist.
+2. **Weekly limit.** When the weekly limit is nearly spent, a scheduled task on
+   the machine that holds the program root checks the local quota capture once an hour, at no
+   model cost: `trialerror packet build --trigger weekly_limit --when-weekly-pct 85 --push
+   --program-root <program root>`. It does nothing unless the capture is under a day old, from
+   the current weekly window, and at or above 85%, and once such a packet has been announced it does nothing for 5
+   days, so an hourly run is safe. If the announcement fails (the channel is down), the packet stays
+   built and the next hourly run announces that same packet again instead of building a new one. On Windows:
+   `schtasks /Create /TN "trialerror-packet-weekly" /SC HOURLY /TR "<that command>"`.
+3. **Manual.** The custodian runs `packet build --trigger manual` any time.
+4. **Reminder.** A scheduled `trialerror packet remind` in the middle of the week — for example
+   Wednesdays at 18:00 local time:
+   `schtasks /Create /TN "trialerror-packet-remind" /SC WEEKLY /D WED /ST 18:00 /TR "<that command>"`.
+
+### Configuration and files
+
+All of `[packet]` is optional, in the program's `trialerror.toml`:
+
+```toml
+[packet]
+dir = "packet"              # where the files live (default: packet/ under the program root)
+max_minutes = 30            # the reading cap
+notify_cmd = ["ssh", "<sandbox-host>", "<path of the sandbox notifier script>"]
+link = "https://..."        # where the operator reads the packet (a page or a file path)
+remind_after_days = 3
+course_file = "course.txt"  # its first 3 lines open the packet
+
+[archive]
+dirs = ["D:/te-archive/transcripts"]   # archive folders whose audits feed the packet
+```
+
+`notify_cmd` is a command list; **the title and body are appended as its last two arguments**
+(when the command is `ssh`, they are quoted for the remote shell). **A `.cmd` or `.bat` file is
+refused as the first element** (`bad_config`): Windows would re-parse the item text through
+`cmd.exe`, where `&`, `|`, `>` and `"` in it would run as commands. Name the interpreter
+explicitly instead, for example `["python", "notify.py"]`. The channel's secret stays with
+the sender on its own host: nothing here reads or prints it, and the packet's messages never
+contain any part of `notify_cmd`. Files under `dir`: `pending.jsonl` (the items, rewritten
+atomically), `answers.jsonl` and `sent.jsonl` (append-only), `built/` (the packets). There is no
+store table, so there is no migration. Errors worth knowing: `no_notify_cmd`, `empty_packet`,
+`already_pushed`, `push_limit_24h`, `push_failed`, `bad_config`, `not_found`, `not_open`,
+`bad_choice`.
+
 ## Doctor checks catalog
 
-`trialerror doctor` runs every check registered by every subsystem (**93 checks across 25
+`trialerror doctor` runs every check registered by every subsystem (**95 checks across 24
 categories**); each subsystem owns its own `checks.py`, auto-discovered — adding a new one
 never touches a shared file. That figure had drifted twice before anyone noticed, precisely
 because nothing enforced it, so it is now pinned by a test against the live registry
@@ -1908,19 +2708,18 @@ not the full registry — `trialerror doctor --json` is authoritative.
 | `law` | `law_digest_lockstep`, `law_chain_integrity`, `law_pin_format` |
 | `budget` | `budget_dangling_launches` (live bookings past their TTL, split on session liveness: a launch whose own session is still OPEN **and** still recording hook-liveness events is reported in a separate past-TTL-session-alive list — a TTL that was set too short, which **`budget heartbeat`** clears — and everything else stays in the offender list. With no `--program-root`, no ops.db yet, or an ops.db this run cannot read, the split cannot be evaluated at all and the check degrades to one undifferentiated list, with a liveness-evidence line naming which of those three absences fired rather than assuming the first. Bookings are shared across programs and sessions are not, so a past-TTL launch booked by a session this program's ops.db does not know is reported in its own foreign-session list and the evidence line reads **partial**: this run has no liveness evidence either way about that launch, which is not the same finding as a dead session. The message never claims a crashed session: an elapsed TTL cannot tell the two apart, and the dashboard's budget card prints the same sentence from the same module, and the same SEVERITY word: the check warns whenever ANY booking is past its TTL, including one whose session is demonstrably alive, and the card carries that word on the panel as *past_ttl_status* rather than leaving a reader to infer one. **Why the card's `DANGLING` chip can read 0 and settled while this check warns** (a question FB-1's verify pass asked, finding V-11): `DANGLING` counts the doctor's own *offender* list, and zero there is a true reading of that list rather than a verdict about the past-TTL question — the severity for the other half rides the **PAST TTL, SESSION ALIVE** row, which renders at that warn, and the zero chip's own tooltip says the doctor is still warning and names that row. Two lists, two readings, one severity word computed in one place (`trialerror.budget.dangling.past_ttl_status`), so neither surface can drift from the other), `budget_pool_overspend`, `agent_model_matches_booking` (**fail**, not warn — over reconciled launches that recorded the model they ran on, any that ran on a class below the one their booking claimed; a launch reconciled without --spawned-model is counted as unattested and named as such in the message, never quietly passed. Model names resolve through the program's own `[model_classes]` table — the same one the spawn gate reads, so gate and check never disagree about a name — and a name neither that table nor the built-in families can place is reported apart, at **warn**: unverifiable is a different finding from below-the-floor), `reconcile_provenance` (**where did this program's settled token numbers come from?** — *launch.actual_tokens* is what every cap check, calibration and weekly reading is built on, and until platform-v2 the only way to put a number there was a person typing `--actual-tokens`. *transcript*, *estimate* and *manual* are all caller-ASSERTED labels; *event* is the one that is not — set only by `budget reconcile --from-event`, which reads the host's own *usage* object off the launch's *subagent_return* event, and which the reconcile write path refuses from every other caller including the MCP tool. **warn** on any reconciled launch reading *manual*, a number nobody can trace; never **fail**, because on a host that sends no usage, or for a launch spawned by a tool that fires no hooks, `--actual-tokens` IS the documented path and failing a program for using it would teach an operator to ignore the check. The *transcript*/*event*/*estimate* counts ride the message either way, so a program moving from asserted to measured provenance can watch that ratio move — the only way anyone finds out whether the hook is really firing. A pre-platform-v2 row carries no source at all and is counted as *unrecorded* in its own clause: “settled before this program recorded provenance” and “settled by hand” are different facts, and only the second has a fix. The details carry the **20 most recently settled** manual rows beside the full totals rather than every one of them: unlike the other budget offender lists this one is most of a program's past, and a doctor result is serialised into the dashboard's state file and doctor panel on every run), `quota_capture_stale` (**is the plan-quota capture fresh enough to size a booking against?** — the statusLine script writes it on a Claude Code UI tick, so the reading goes stale precisely while the orchestrator is idle, which is also when it is most likely to be consulted before booking. **warn**, never fail: the feed is optional and screenshot snapshots remain the ground truth, so a stale reading is a state to notice, not a rule broken — the BOOKING GATE is what refuses (`budget book` and the *book_launch* MCP tool, overridable with `--allow-stale-quota` / *allow_stale_quota*, which is recorded on the launch beside the reading it overrode). **skip** when nothing was ever captured: a program that has not wired the statusLine has no reading to be out of date, and calling that staleness would make an optional feed look broken. The bar is `[budget] quota_max_age_s` (default 900 s) and the details say which trialerror.toml — or that the default applied because the run had no program root) |
 | `events` | `event_secret_leak`, `feed_author_integrity` |
-| `feed_translate` | `feed_translation_failures`, `feed_translations_stale` |
 | `sessions` | `session_multiple_open`, `session_hook_alive` |
 | `lexicon` | `term_conflicts_pending`, `term_duplicates_pending`, `term_senses_need_review`, `term_sense_without_evidence` (fail), `term_split_missing_disambiguator` (fail), `term_evidence_source_unlinked`, `term_fts_in_sync` (fail), `definition_claims_unprojected`, `term_system_relation_decided` (fail) |
-| `artifacts` | `gated_type_without_gate`, `orphan_gate_transition`, `gate_illegal_transition_history` |
+| `artifacts` | `gated_type_without_gate`, `orphan_gate_transition`, `gate_illegal_transition_history`, `registration_disposition_consistent` |
 | `memory` | `memory_unresolved_conflict_groups`, `memory_l0_index_budget`, `memory_stale_items`, `memory_pending_conflict_candidates` |
-| `lens` | `far_arm_floor_honored`, `no_duplicate_slice`, `cluster_coverage`, `far_lens_floor_honored` (**fail**; `--arm-per-lens` rounds only — the far arm must seat at least the HARDER of the round's own `--far-floor` and the hard floor of 2 LENSES, which the slice-level check structurally cannot see; a round may raise its own floor but not lower it below 2, and per-slice rounds are skipped, not judged), `recipe_rotation_honored` (**fail** — four bars: every **standard** lens writes under exactly 2 cards, every card in play is held by ≥ 2 of them, ≤ 4 distinct cards per round, and `NEGATE` sits on the assumption-buster seat alone. Holders and block size count standard seats only (the buster's card is its seat's, the control has none by design); the 4-card ceiling counts every non-`NEGATE` card wherever it sits, so a fifth cannot hide on an excluded seat. Rounds with no cards at all are skipped), `lens_citations_within_slice` (**fail** — every document/chunk/anchor id a lens post cites must resolve to a document in that lens's own slice, read from `launch.attrs.slice_doc_ids`, failing that the launch's roster/assignment attrs and their lens_assignment rows, and failing those the `lens_assignment.lens_launch_id` link `budget book --assign-id` writes from the assignment side — a lens booked through the CLI carries none of the exported attrs, and without that fourth source this check SKIPped for exactly the launches it exists for, naming the two ways to link one in the skip message. The audit half of the per-launch retrieval scope, which enforces the same rule only for launches whose booking declares a slice. An id resolving to a document outside the slice is a crossing (**fail**); an id resolving to no row in this corpus crossed nothing and is reported apart at **warn**, still counted in a failing run's message. Posts by launches that are not lens launches are skipped), `idea_missing_dossier` (**fail** — an idea reaches the consolidated status by passing through the novelty screen, and the screen writes one dossier per idea, so a screened row with no dossier file under its round's own directory is a row whose status asserts a measurement nothing can read back. Rounds with no directory on disk are skipped, not judged: "this round predates the screen" is a different statement from "this round lost a dossier"), `round_collapse_flag_unacknowledged` (**fail** — a raised collapse flag nobody ruled on is what makes the collapse monitor decorative. Close it by recording a "round_collapse_acknowledged" event naming the round AND the batch, or by firing the pre-registered "round_collapse_rerun" contingency; acknowledging one batch deliberately does not cover another. Batches whose alarm values are still descriptive-only have no flag to raise and are skipped), `lens_brief_contains_verdict_text` (**fail** — a generator that can see a dossier label, a room verdict or a scoring rubric writes toward it. Briefs are read from a lens launch's own `attrs.brief`/`attrs.prompt` and from "lens_brief" events; only LENS launches are read, since a critic's brief is supposed to carry the rubric and flagging it would teach an operator to ignore this check. A program recording no lens brief anywhere is **skip** with both places named — nothing to audit is a recording-discipline statement, not a clean result) |
+| `lens` | `far_arm_floor_honored`, `no_duplicate_slice`, `cluster_coverage`, `far_lens_floor_honored` (**fail**; `--arm-per-lens` rounds only — the far arm must seat at least the HARDER of the round's own `--far-floor` and the hard floor of 2 LENSES, which the slice-level check structurally cannot see; a round may raise its own floor but not lower it below 2, and per-slice rounds are skipped, not judged), `recipe_rotation_honored` (**fail** — four bars: every **standard** lens writes under exactly 2 cards, every card in play is held by ≥ 2 of them, ≤ 4 distinct cards per round, and `NEGATE` sits on the assumption-buster seat alone. Holders and block size count standard seats only (the buster's card is its seat's, the control has none by design); the 4-card ceiling counts every non-`NEGATE` card wherever it sits, so a fifth cannot hide on an excluded seat. Rounds with no cards at all are skipped), `lens_citations_within_slice` (**fail** — every document/chunk/anchor id a lens post cites must resolve to a document in that lens's own slice, read from `launch.attrs.slice_doc_ids`, failing that the launch's roster/assignment attrs and their lens_assignment rows, and failing those the `lens_assignment.lens_launch_id` link `budget book --assign-id` writes from the assignment side — a lens booked through the CLI carries none of the exported attrs, and without that fourth source this check SKIPped for exactly the launches it exists for, naming the two ways to link one in the skip message. The audit half of the per-launch retrieval scope, which enforces the same rule only for launches whose booking declares a slice. An id resolving to a document outside the slice is a crossing (**fail**); an id resolving to no row in this corpus crossed nothing and is reported apart at **warn**, still counted in a failing run's message. Posts by launches that are not lens launches are skipped), `idea_missing_dossier` (**fail** — an idea reaches the consolidated status by passing through the novelty screen, and the screen writes one dossier per idea, so a screened row with no dossier file under its round's own directory is a row whose status asserts a measurement nothing can read back. Rounds with no directory on disk are skipped, not judged: "this round predates the screen" is a different statement from "this round lost a dossier"), `round_collapse_flag_unacknowledged` (**fail** — a raised collapse flag nobody ruled on is what makes the collapse monitor decorative. Close it by recording a "round_collapse_acknowledged" event naming the round AND the batch, or by firing the pre-registered "round_collapse_rerun" contingency; acknowledging one batch deliberately does not cover another. Batches whose alarm values are still descriptive-only have no flag to raise and are skipped), `lens_brief_contains_verdict_text` (**fail** — a generator that can see a dossier label, a room verdict or a scoring rubric writes toward it. Briefs are read from a lens launch's own `attrs.brief`/`attrs.prompt` and from "lens_brief" events; only LENS launches are read, since a critic's brief is supposed to carry the rubric and flagging it would teach an operator to ignore this check. A program recording no lens brief anywhere is **skip** with both places named — nothing to audit is a recording-discipline statement, not a clean result), `rejudge_rows_match_recorded_kappa` (**warn** — a batch whose recording published Cohen's κ over two or more co-labelled subjects must be able to produce that κ again from the verdict and verdict-rejudge tables. Until knowledge schema v13 the second judge's labels were read for the number and dropped, so the κ was reproducible only from files outside the store; warn rather than fail because every batch recorded before that migration is in exactly that state and the answer is the backfill verb, not an alarm. Batches that published no κ, and stores with no re-judge table, are skipped) |
 | `retrieve` | `fence_integrity` (license-fence spot-check), `retrieval_latency`, `fulltext_index_stale` (tantivy index vs corpus; repair with `trialerror ingest reindex-fulltext`), `query_embed_backend_runnable` (**can THIS process embed a query?** — a program whose document embeddings are produced on another machine has a document backend that refuses to compute here by design, so query-time embedding needs its own backend: `[ingest.embed.query]`. **warn**, never fail, carrying the backend's own reason and a *runtime* detail naming WHICH runtime and its numbers — the in-process encoder's effective *n_threads* / *n_threads_batch* / cgroup CPU quota, or the sidecar client's URL and last health reading — the corpus is intact and `query search` still answers out of the full-text tier and says so in a warnings entry of its envelope, while `verify hypothesis` and `lens screen` refuse; skipped on a corpus with no embeddings at all), `vecmatrix_stale` (the cached resident similarity matrix's fingerprint vs its vector table — **warn**, because a stale cache is never served: the fingerprint is checked per query and a mismatch rebuilds before ranking, so what this reports is the rebuild the next unbounded ranking call will pay for) |
 | `verify` | `verdict_evidence_anchors`, `prereg_escrow_integrity`, `gate_without_prereg` (**fail** — a gate whose artifact's attrs declare a round id must name a live pre-registration, found on the artifact's own `attrs.prereg_id`, on a verdict row about the artifact, or on a verdict about one of that ROUND's own records — `subject_kind='claim'`, resolved through `idea.round_id`, which is the shape the novelty screen actually writes (it links `verdict.prereg_id` per idea per reference set, never onto the artifact). A named prereg that does not resolve, or that was voided, is reported as its own offender kind rather than folded into "named none". Scope is deliberately narrow: every other gated artifact in the program is not under this rule, and widening it to every gate would make it noise an operator learns to skip) |
 | `obs` | `obs_exporter_reachable`, `obs_span_drop_counter` |
 | `util` | `license_audit` (vendored/ header + manifest scan) |
 | `sidecar` | `sidecar_alive` (**is every process this program needs RUNNING actually running?** — one row per `[sidecars.<name>]` table: the process this program recorded, whether the pid is alive, and whether it answers its *health_url*. **warn**, never fail, on the same reading as `query_embed_backend_runnable`: a dead embedding sidecar costs the vector tier, which every retrieval surface already degrades from and reports, and on a just-booted machine it is the expected state until somebody runs one verb. Read-only in both senses — it asks `sidecar status` with restarts switched OFF *and* with the heartbeat refresh switched off, because a doctor run that silently restarted processes could not be used to find out what was wrong, and one that refreshed the heartbeat it reports would be the only thing keeping that timestamp fresh (the age is reported as *heartbeat_age_s* and is deliberately not a verdict: a sidecar's heartbeat is written by whoever last polled, so in a program where nothing polls on a schedule a threshold would fail a healthy process; the live health probe is what answers "is it serving"). A sidecar with no *health_url* is reported as `health.configured: false`, not as healthy, and one that has a *health_url* but is not running reports `configured: true` with *skipped* naming why nothing was probed; a `[sidecars.<name>]` table this supervisor cannot read (a *command* that is a string, an unknown *restart*) is reported as *misconfigured*. Skipped when the program configures none) |
+| `vastai` | `vastai_live_instances` (fails if any TrialError-tagged instance is past its deadline or not confirmed destroyed, warns while one is live and billing, passes when none is; **for THIS root and both lanes**: the run records of the embedding lane (under the program root) and of the OCR lane (in the worker state directory) and, when `[vastai] api_key_path` is set and `[vastai] doctor_api_check` is on, the live vast.ai listing. **fail** when an instance of this root is past its label deadline or failed to destroy — run `trialerror vastai reap` (an OCR lease: `trialerror vastai reap --ocr`) — and, as the public check does, when the account carries another root's TrialError-tagged instance past its deadline or an instance with a malformed TrialError label — run `trialerror vastai reap` and check the vast.ai console; **warn** when one is live (billing), when the account could not be listed (live GPUs cannot be ruled out), or when the account carries another TrialError root's instance within its deadline or ones that are not TrialError's, which are reported and never reaped from here. **pass** at once, with no API call, where vast.ai is not configured — including the queue side's own doctor), `vastai_high_tier` (warns whenever the high tier is configured, approved or recently used; passes otherwise: **warn** when `[vastai] tier = "high"` is configured, a high-tier approval (beside the key file, or an older one under `<root>/keys/`) is unexpired, or, in the last 7 days, the ops DB records a high-tier embedding run (a vastai_high_tier_use event) or the ledger shows a high-tier OCR lease), `vastai_ocr_egress` (**what may leave this machine now**: the executor, the licence tiers and the number of documents `[vastai.egress]` names, whether the approval is valid (and if not, its reason code), its expiry and the envelope left, and the host requirements. **pass** with `[ingest.ocr] executor = "local"`, where nothing leaves; **warn** when the policy or its approval names `"commercial_restricted"`, when `[vastai.egress]` no longer matches the approval's seal (every job is refused until the operator re-approves), or when the approval file is not a valid approval of this root, i.e. hand-written, edited or another root's), `vastai_ocr_ledger` (**the run ledger**: **fail** on a shipped lease with no outcome row whose instance is not confirmed destroyed, by a reaped row or by a run record that says destroyed, once it is past its deadline, has no run record or failed to destroy — run `trialerror vastai reap --ocr` and check the vast.ai console; **warn** on a torn ledger line, on a shipped lease still inside its deadline (in flight), or when the spend of the last 7 days passes half the approval's envelope. Neither of the two makes a network call, and both **pass** at once where vast.ai is not configured) |
 | `webfetch` | `webfetch_sidecar_alive` (the fetch process's heartbeat), `webfetch_backlog`, `webfetch_refused_24h` (warns on the SSRF/exfil refusal class), `webfetch_unattributed` (a fetch no booked launch asked for — the audit trail it reads is append-only, so an intentional one, such as the deliberate forged-attribution test, is retired with `trialerror webfetch ack --fetch-id … --launch-id … --note …` and its host twin `te-webfetch.sh ack`; the line is never deleted, the acknowledged offender is still reported with its note, and the acknowledgement is bounded to what was on record when it was made, so a later fetch fails the check again whether it carries a new id or reuses the acknowledged one), `webfetch_orphans`, `webfetch_queue_disk`, `webfetch_thin_backlog` (info), `webfetch_refetch_due` (info) |
-| `vastai` | `vastai_high_tier` (warns whenever the high tier is configured, approved or recently used; passes otherwise), `vastai_live_instances` (fails if any TrialError-tagged instance is past its deadline or not confirmed destroyed, warns while one is live and billing, passes when none is) |
 
 `--only <name>` runs one (repeatable for several); `--license-audit` is shorthand for
 `--only license_audit`; program-scoped checks (everything except `license_audit`) need

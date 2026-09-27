@@ -39,10 +39,22 @@ def test_terminal_pass_state_is_union_applied_only():
     assert sum(1 for s in STATES if s == TERMINAL_PASS_STATE) == 1
 
 
-def test_registered_and_failed_are_the_only_terminal_states():
-    assert TERMINAL_STATES == {"registered", "failed"}
+def test_registered_is_the_only_terminal_state():
+    """``failed`` used to be terminal too; it now has one guarded edge to
+    ``registered`` (``register_failed`` only)."""
+    assert TERMINAL_STATES == {"registered"}
     for s in TERMINAL_STATES:
         assert LEGAL_TRANSITIONS[s] == frozenset()
+    assert LEGAL_TRANSITIONS["failed"] == frozenset({"registered"})
+
+
+def test_the_two_guarded_edges_to_registered_are_in_the_graph():
+    """``gated -> registered`` (register_with_deviation)
+    and ``failed -> registered`` (register_failed) are legal edges, so the
+    doctor check over recorded transitions accepts what those two write."""
+    assert is_legal_transition("gated", "registered")
+    assert is_legal_transition("failed", "registered")
+    assert LEGAL_TRANSITIONS["gated"] == frozenset({"union_applied", "failed", "registered"})
 
 
 @pytest.mark.parametrize(
@@ -54,6 +66,8 @@ def test_registered_and_failed_are_the_only_terminal_states():
         ("submitted", "failed"),
         ("gated", "union_applied"),
         ("gated", "failed"),
+        ("gated", "registered"),
+        ("failed", "registered"),
         ("union_applied", "registered"),
     ],
 )

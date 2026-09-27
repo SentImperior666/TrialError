@@ -63,3 +63,11 @@ def test_every_dashboard_live_item_has_exactly_one_skip_marked_test():
         skip_marks = [m for m in marks if m.name == "skip"]
         assert skip_marks, f"test_{key} is not @pytest.mark.skip-marked"
         assert skip_marks[0].kwargs.get("reason") == DASHBOARD_LIVE_ITEMS[key]
+
+
+def test_threaded_feed_item_names_no_retired_plain_english_column():
+    text = DASHBOARD_LIVE_ITEMS["live_dom_threaded_feed"]
+    assert "PLAIN ENGLISH" not in text and "faithfulness gate" not in text
+    for n in range(1, 8):
+        assert f"({n})" in text
+    assert "(8)" not in text

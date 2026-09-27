@@ -54,6 +54,7 @@ can tell an idle worker from no worker at all.
 
 from __future__ import annotations
 
+import inspect
 import json
 import shutil
 import threading
@@ -68,6 +69,7 @@ from trialerror.offload import control as control_api
 from trialerror.offload import protocol
 from trialerror.offload.lock import worker_state_dir
 from trialerror.offload.marker import OffloadMarker
+from trialerror.offload.settle import ClaimReturned
 from trialerror.offload.stage import (
     EMBED_INPUT_NAME,
     EMBED_OUTPUT_NAME,
@@ -93,6 +95,9 @@ __all__ = [
     "STOPPED_MARKER",
     "IDLE_MESSAGE",
     "STOPPED_MESSAGE",
+    "STAGE_NOT_SERVED",
+    "left_pending_message",
+    "parse_stages",
     "DEFAULT_EMBED_BATCH_SIZE",
     "WorkerControl",
     "ProgressState",
@@ -162,6 +167,43 @@ IDLE_MESSAGE = "Queue empty - safe to switch DEV off"
 #: C-0097 D2: what a stopped worker exits with.
 STOPPED_MESSAGE = "Stopped on request - the claim went back to the queue"
 
+#: The reason code of a claimed job whose stage this worker run does not serve
+#: (``trialerror offload worker --stages``, the vast.ai OCR design's O5). The
+#: claim goes back unrun, like every other settlement-class-R refusal.
+STAGE_NOT_SERVED = "stage-not-served"
+
+
+def left_pending_message(pending: list[dict[str, Any]]) -> str:
+    """The run's final message when the queue still holds jobs this worker
+    refused (settlement class R) -- instead of :data:`IDLE_MESSAGE`, which
+    would tell the operator the laptop is free while work is still waiting.
+
+    ``pending`` is the run summary's ``refused`` entries whose jobs are still
+    listed in the queue."""
+    counts: dict[str, int] = {}
+    for entry in pending:
+        code = str(entry.get("reason_code") or "unknown")
+        counts[code] = counts.get(code, 0) + 1
+    reasons = ", ".join(f"{n} {code}" for code, n in sorted(counts.items()))
+    return (
+        f"Queue not empty - {len(pending)} job(s) refused by this worker are left pending ({reasons}); "
+        "the refused bucket says what would change each answer"
+    )
+
+
+def parse_stages(value: str | Any) -> tuple[str, ...]:
+    """``"ocr,embed"`` -> ``("ocr", "embed")`` for ``--stages``. Refuses an
+    empty list or a stage this worker has no path for, by name."""
+    raw = value.split(",") if isinstance(value, str) else list(value or ())
+    stages = tuple(dict.fromkeys(str(s).strip() for s in raw if str(s).strip()))
+    unknown = [s for s in stages if s not in STAGES]
+    if not stages or unknown:
+        raise WorkerConfigError(
+            f"--stages {value!r}: name one or more of {', '.join(STAGES)} "
+            f"(unknown: {', '.join(unknown) or 'none given'})"
+        )
+    return stages
+
 _HEARTBEAT_INTERVAL_S = control_api.DEFAULT_HEARTBEAT_INTERVAL_S
 
 #: D3: ``pace_s_per_unit`` is the rolling mean of the last 20 units. Twenty is
@@ -187,7 +229,11 @@ class DevBackends(Protocol):
     a concrete class) purely so the tests can drive the whole loop with
     deterministic stand-ins that are nonetheless NOT the ``Fake*`` classes
     :meth:`validate` refuses -- a test must be able to prove the refusal
-    works without being unable to test anything else."""
+    works without being unable to test anything else.
+
+    ``validate`` MAY also accept a ``stages`` keyword (O5, ``--stages``): the
+    worker passes it only for a run that serves fewer than every stage, and
+    only to a ``validate`` that accepts it (:func:`_validate_served`)."""
 
     def validate(self) -> None: ...
     def ocr(self) -> Any: ...
@@ -240,10 +286,22 @@ class ConfigDevBackends:
     --backend-config-root`` names (D-FB-6): on the worker it is read for
     these two tables and nothing else -- the queue comes from ``--remote``
     or ``--queue-root``.
+
+    **The OCR executor** (the vast.ai OCR design). ``[ingest.ocr] executor``
+    absent or ``"local"`` is DEV's own marker, exactly as before;
+    ``"vastai"`` builds :class:`trialerror.vastai.ocr.VastaiMarkerOcrBackend`,
+    which needs the whole toml (its ``[vastai]`` tables) and ``root`` (paths
+    in them are relative to it). One ``ConfigDevBackends`` is one worker run,
+    so it also owns the vast.ai run state every backend instance of the run
+    shares (the run id the per-run spend cap keys on, and a "vast.ai stopped
+    for this run" latch) -- the resident-backend policy may close and rebuild
+    the OCR backend on a job-kind switch, and neither may reset with it.
     """
 
-    def __init__(self, config: dict[str, Any] | None):
+    def __init__(self, config: dict[str, Any] | None, root: Path | str | None = None):
         self.config = dict(config or {})
+        self.root = Path(root) if root is not None else None
+        self._vast_run_state: Any = None
 
     def _table(self, stage: str) -> dict[str, Any]:
         return (self.config.get("ingest") or {}).get(stage) or {}
@@ -253,19 +311,39 @@ class ConfigDevBackends:
         loaders default it (``fake``)."""
         return str(self._table(stage).get("backend", "fake"))
 
-    def validate(self) -> None:
+    def executor(self) -> str:
+        """What ``[ingest.ocr] executor`` says, defaulted to ``"local"``."""
+        return str(self._table("ocr").get("executor", "local"))
+
+    def validate(self, stages: tuple[str, ...] | list[str] | str | None = None) -> None:
         """Refuse a DEV configuration that would produce fake or offloaded
-        results. Both stages are checked up front, before a single job is
-        claimed, so the operator learns about a misconfiguration in the
-        first second of the launcher rather than after a 40-minute claim."""
-        for stage in STAGES:
+        results. The served stages are checked up front, before a single job
+        is claimed, so the operator learns about a misconfiguration in the
+        first second of the launcher rather than after a 40-minute claim.
+
+        ``stages`` (O5, ``--stages``) names the stages this run serves; only
+        those are checked and constructed. An OCR-only worker therefore needs
+        no runnable ``[ingest.embed]``, and an embed-only one builds no OCR
+        backend at all (with ``executor = "vastai"``: no vast.ai backend, no
+        vast.ai call). ``None`` -- the default -- is every stage, exactly as
+        before.
+
+        A backend with a ``startup()`` (the vast.ai OCR executor: its runtime
+        files, then one reap pass for this root) runs it here, before the
+        first claim -- only when ``ocr`` is served."""
+        served = STAGES if stages is None else tuple(s for s in STAGES if s in parse_stages(stages))
+        for stage in served:
             backend_name = self.backend_name(stage)
             if backend_name in UNRUNNABLE_BACKEND_NAMES:
                 raise WorkerConfigError(unrunnable_backend_message(stage, backend_name))
         # Constructing them also surfaces a missing marker_single_exe /
         # python_exe / module_dir now rather than mid-job.
-        self.ocr()
-        self.embed()
+        ocr_backend = self.ocr() if "ocr" in served else None
+        if "embed" in served:
+            self.embed()
+        startup = getattr(ocr_backend, "startup", None)
+        if callable(startup):
+            startup()
 
     def describe(self) -> dict[str, Any]:
         """:meth:`validate`'s own reading of this root, as DATA instead of a
@@ -302,6 +380,8 @@ class ConfigDevBackends:
                 entry["refusal"] = unrunnable_backend_message(stage, name)
                 stages[stage] = entry
                 continue
+            if stage == "ocr":
+                entry["executor"] = self.executor()
             try:
                 backend = self.ocr() if stage == "ocr" else self.embed()
             except Exception as exc:  # noqa: BLE001 - the failure IS the reading
@@ -309,6 +389,20 @@ class ConfigDevBackends:
                 entry["error"] = f"{type(exc).__name__}: {exc}"
             else:
                 entry["constructed"] = True
+                # The vast.ai executor's own reading: which runtime files
+                # exist (never their contents) and the refusal its worker
+                # would start with -- a worker that refuses to start is a
+                # stage that does not resolve, for this reader too.
+                runtime_report = getattr(backend, "runtime_report", None)
+                if callable(runtime_report):
+                    try:
+                        report = dict(runtime_report())
+                    except Exception as exc:  # noqa: BLE001 - never raises
+                        report = {"refusal": f"{type(exc).__name__}: {exc}"}
+                    entry["vastai"] = report
+                    if report.get("refusal"):
+                        entry["constructed"] = False
+                        entry["error"] = str(report["refusal"])
                 for attr in BACKEND_PATH_ATTRS:
                     value = getattr(backend, attr, None)
                     if value:
@@ -317,6 +411,23 @@ class ConfigDevBackends:
         return {"stages": stages}
 
     def ocr(self) -> Any:
+        if self.executor() == "vastai":
+            # Lazy, like the ingest import below: a DEV root without the
+            # executor never imports the vast.ai package.
+            from trialerror.vastai.ocr import VastaiMarkerOcrBackend, VastRunState
+
+            if self.root is None:
+                raise WorkerConfigError(
+                    "[ingest.ocr] executor = 'vastai' needs the backend-config-root the toml was read from "
+                    "(its [vastai] paths are relative to it); run `trialerror offload worker "
+                    "--backend-config-root <dev root>`"
+                )
+            if self._vast_run_state is None:
+                self._vast_run_state = VastRunState()
+            return _refuse_unreal(
+                VastaiMarkerOcrBackend.from_toml(self.config, config_root=self.root, run_state=self._vast_run_state),
+                "ocr",
+            )
         from trialerror.ingest.backends import load_ocr_backend
 
         return _refuse_unreal(load_ocr_backend(self._table("ocr")), "ocr")
@@ -375,13 +486,41 @@ class ResidentBackends:
         self._keep_resident = keep_resident
         self._ocr: Any = None
         self._embed: Any = None
+        #: An OCR backend resolved for ADMISSION (before the pull) but not yet
+        #: made resident: it joins ``_ocr`` at the next :meth:`ocr`, so the
+        #: residency the heartbeat reports and the kind-switch unload are
+        #: exactly what they were before admission existed.
+        self._ocr_pending: Any = None
 
-    def validate(self) -> None:
-        self._backends.validate()
+    def validate(self, stages: tuple[str, ...] | list[str] | str | None = None) -> None:
+        _validate_served(self._backends, stages)
+
+    def admission_backend(self, stage: str) -> Any:
+        """The backend that will run ``stage``, resolved WITHOUT the D9
+        unload of the other stage: admission happens before the pull, and
+        nothing about residency may move because a job was only looked at."""
+        if stage != "ocr":
+            return self.for_stage(stage)
+        if self._ocr is not None:
+            return self._ocr
+        if self._ocr_pending is None:
+            self._ocr_pending = self._adopt_log(self._backends.ocr())
+        return self._ocr_pending
+
+    def _adopt_log(self, backend: Any) -> Any:
+        """An OCR backend that narrates (the vast.ai executor: leases, host
+        failures, refusals) narrates into this worker's log. DEV's own marker
+        backend has no ``log`` and is left exactly as it was."""
+        if self._log is not None and hasattr(backend, "log") and hasattr(backend, "admit"):
+            backend.log = self._log
+        return backend
 
     def ocr(self) -> Any:
         if self._ocr is None:
-            self._ocr = self._backends.ocr()
+            if self._ocr_pending is not None:
+                self._ocr, self._ocr_pending = self._ocr_pending, None
+            else:
+                self._ocr = self._adopt_log(self._backends.ocr())
         return self._ocr
 
     def embed(self) -> Any:
@@ -445,10 +584,12 @@ class ResidentBackends:
         simply skipped, and a failure to close is swallowed -- the worker
         has already published its results by then, and a noisy teardown
         must not turn a good run into a bad exit."""
-        for backend in (self._embed, self._ocr):
-            self._close_one(backend)
+        for backend in (self._embed, self._ocr, self._ocr_pending):
+            if backend is not None:
+                self._close_one(backend)
         self._embed = None
         self._ocr = None
+        self._ocr_pending = None
 
 
 def _refuse_unreal(backend: Any, stage: str) -> Any:
@@ -460,6 +601,32 @@ def _refuse_unreal(backend: Any, stage: str) -> Any:
             "only a real local backend may publish results into the record (design D13)"
         )
     return backend
+
+
+def _validate_served(backends: Any, stages: tuple[str, ...] | list[str] | str | None) -> None:
+    """The start-up check for the stages this run serves (O5).
+
+    Serving every stage (the default), the call is exactly the one it always
+    was -- ``validate()``, no argument -- so a :class:`DevBackends` whose
+    ``validate`` takes none is untouched. Serving fewer, a ``validate`` that
+    accepts ``stages`` (:class:`ConfigDevBackends`) is told which; one that
+    does not is called as before, and so checks more, never less."""
+    served = STAGES if stages is None else parse_stages(stages)
+    if set(STAGES) <= set(served) or not _accepts_keyword(backends.validate, "stages"):
+        backends.validate()
+        return
+    backends.validate(stages=served)
+
+
+def _accepts_keyword(fn: Callable[..., Any], name: str) -> bool:
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.kind == p.VAR_KEYWORD or (p.name == name and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY))
+        for p in params
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -912,8 +1079,14 @@ def _checkpoint(
     max_pause_s: float | None = None,
     beat: Callable[[], Any] | None = None,
     beat_interval_s: float | None = None,
+    on_pause: Callable[[], Any] | None = None,
 ) -> str:
     """One cooperative checkpoint (C-0097 D2). Returns ``"stop"`` or ``"go"``.
+
+    ``on_pause`` is called once, BEFORE a pause blocks: the vast.ai OCR
+    backend destroys its live lease there, because a pause holds the claim
+    for as long as it lasts and a rented host would bill for all of it (the
+    finished ranges are already cached; resume leases again).
 
     The three places this is called from -- between embed batches, after
     marker returns, between jobs -- are the complete list, and each one sits
@@ -945,6 +1118,8 @@ def _checkpoint(
         previous = progress.state if progress is not None else None
         if progress is not None:
             progress.set_state("paused")
+        if on_pause is not None:
+            on_pause()
         control.wait_while_paused(
             max_pause_s=max_pause_s, beat=beat, beat_interval_s=beat_interval_s
         )
@@ -1012,6 +1187,17 @@ def _range_cache_dir(work_root: Path, job_id: str) -> Path:
     return work_root / OCR_RANGE_CACHE_DIRNAME / job_id
 
 
+def _backend_result_fields(backend: Any) -> dict[str, Any]:
+    """Extra ``result.json`` fields a backend offers for the job it just ran
+    (the vast.ai executor's ``vastai`` provenance block). A backend without
+    ``result_fields`` offers nothing, and ``result.json`` is what it was."""
+    offer = getattr(backend, "result_fields", None)
+    if not callable(offer):
+        return {}
+    extra = offer()
+    return dict(extra) if isinstance(extra, dict) else {}
+
+
 def _expected_page_count(manifest: dict[str, Any]) -> int | None:
     expect = manifest.get("expect") or {}
     value = expect.get("page_count")
@@ -1031,6 +1217,7 @@ def _run_ocr(
     progress: "ProgressState | None" = None,
     max_pause_s: float | None = None,
     range_cache: Path | None = None,
+    keep_range_cache: bool = False,
     log: Callable[[str], None] | None = None,
 ) -> StageOutcome:
     """One OCR job.
@@ -1063,6 +1250,7 @@ def _run_ocr(
             progress.units_done(1)
         _write_ocr_pages(out_dir, manifest, result)
         fields = {"backend": result.ocr_backend, "version": result.ocr_version}
+        fields.update(_backend_result_fields(backend))
         # The checkpoint is AFTER the output is written: the unit is finished, so
         # a stop here keeps the page text this GPU minute already bought.
         stopped = _checkpoint(control, progress=progress, max_pause_s=max_pause_s) == "stop"
@@ -1099,10 +1287,17 @@ def _run_ocr(
     if log is not None:
         log(log_plan)
 
+    on_pause = getattr(backend, "on_pause", None)
+
     def _after_range(done: int, total: int) -> str:
         if progress is not None:
             progress.units_done(done)
-        return _checkpoint(control, progress=progress, max_pause_s=max_pause_s)
+        return _checkpoint(
+            control,
+            progress=progress,
+            max_pause_s=max_pause_s,
+            on_pause=on_pause if callable(on_pause) else None,
+        )
 
     def _range_cost(record: dict[str, Any]) -> None:
         """What one range cost, in this worker's own log.
@@ -1191,11 +1386,23 @@ def _run_ocr(
         # total, and the record of which invocation produced which pages.
         "ranges": [dict(r) for r in result.ranges],
     }
+    fields.update(_backend_result_fields(backend))
     stopped = _checkpoint(control, progress=progress, max_pause_s=max_pause_s) == "stop"
     if range_cache is not None:
-        # The document is finished; the ranges that built it are no longer
-        # anybody's resume.
-        shutil.rmtree(range_cache, ignore_errors=True)
+        if keep_range_cache:
+            # ``--keep-range-cache`` (live records, canary attempt 3, 2026-09-20): marker's OWN text for every
+            # range, which nothing else on this machine keeps -- the published
+            # pages are the parsed, numbered result, so a question about the
+            # raw output (a canary's page separators) is otherwise answerable
+            # only by arithmetic. It stays this job's resume cache: claim this
+            # job id again and the ranges come from here instead of a GPU.
+            if log is not None:
+                log(f"  . kept the range cache at {range_cache} (--keep-range-cache): "
+                    "marker's raw text per range, and this job's resume if it is claimed again")
+        else:
+            # The document is finished; the ranges that built it are no longer
+            # anybody's resume.
+            shutil.rmtree(range_cache, ignore_errors=True)
     return StageOutcome(
         fields=fields,
         stopped=stopped,
@@ -1425,10 +1632,22 @@ def run_worker(
     heartbeat_interval_s: float = _HEARTBEAT_INTERVAL_S,
     keep_resident: bool = False,
     max_pause_s: float | None = None,
+    keep_range_cache: bool = False,
     log: Callable[[str], None] | None = None,
     sleep: Callable[[float], None] | None = None,
+    stages: tuple[str, ...] | list[str] | str = STAGES,
 ) -> dict[str, Any]:
     """Drain the sandbox's offload queue onto this machine's GPU.
+
+    **Refusals (settlement class R, the vast.ai OCR design 11.1).** A job may
+    be handed back UNRUN: its stage is not in ``stages`` (``--stages``,
+    reason ``stage-not-served``), or its backend's admission or run raised
+    :class:`~trialerror.offload.settle.ClaimReturned`. The claim goes back
+    through ``return`` (no attempt burned), the job is listed in a
+    ``refused`` bucket with its reason code -- a key the summary carries
+    only once something was refused -- and it is skipped for the rest of the
+    run. When only skipped jobs remain the run behaves as for an empty queue,
+    except that its message says how many were left pending and why.
 
     Returns a summary envelope body: ``{"claimed", "published", "failed",
     "lost", "stopped", "polls", "message", "control"}``. ``max_polls``/
@@ -1453,13 +1672,22 @@ def run_worker(
     single pause may hold: ``None``, the default, is the design's own
     behaviour -- a pause lasts until an operator resumes or stops it -- and a
     number is for a launcher (or a test) that must not sit paused forever.
+
+    ``keep_range_cache`` (live records, canary attempt 3, 2026-09-20) keeps a chunked OCR job's range cache
+    after the document is published instead of removing it: marker's own text
+    per range, which nothing else keeps, for a canary that must answer a
+    question about the raw output. The kept directory is still that job id's
+    resume cache.
     """
     log = log or (lambda _msg: None)
     sleep = sleep or time.sleep
+    stages = parse_stages(stages)
     work_root = Path(work_root) if work_root is not None else default_work_root()
     work_root.mkdir(parents=True, exist_ok=True)
 
-    backends.validate()
+    # O5: only the served stages are checked and built (an OCR-only worker
+    # needs no [ingest.embed]); every stage served is the plain call as before.
+    _validate_served(backends, stages)
     # FX-S1: ONE backend instance per run, for every job in it -- so the
     # embedding model is loaded once by this worker, not once per job and
     # certainly not once per batch. The finally below is the shutdown that
@@ -1480,6 +1708,12 @@ def run_worker(
         "control": control.transitions,
     }
     jobs_done = 0
+    #: Jobs refused (class R) in this run: skipped until the run ends.
+    skipped: set[str] = set()
+
+    def _idle_message(listed: list[str]) -> str:
+        pending = [e for e in summary.get("refused", []) if e.get("job_id") in listed]
+        return left_pending_message(pending) if pending else IDLE_MESSAGE
 
     def _stop_now(reason: str) -> dict[str, Any]:
         summary["message"] = STOPPED_MESSAGE
@@ -1524,16 +1758,23 @@ def run_worker(
                 return _stop_now("stop honoured while paused, no claim held")
 
             try:
-                available = transport.list_jobs()
+                listed = transport.list_jobs()
             except TransportError as exc:
                 log(f"! could not reach the offload queue: {exc}")
                 summary["message"] = f"transport error: {exc}"
                 return summary
+            available = [job_id for job_id in listed if job_id not in skipped] if skipped else listed
 
             if not available:
-                log(f"- queue empty (poll {summary['polls']})")
+                if len(available) != len(listed):
+                    log(
+                        f"- nothing claimable: {len(listed)} job(s) refused earlier in this run "
+                        f"are still pending (poll {summary['polls']})"
+                    )
+                else:
+                    log(f"- queue empty (poll {summary['polls']})")
                 if not stay:
-                    summary["message"] = IDLE_MESSAGE
+                    summary["message"] = _idle_message(listed)
                     return summary
                 if max_polls is not None and summary["polls"] >= max_polls:
                     summary["message"] = f"stopped after {summary['polls']} poll(s)"
@@ -1555,10 +1796,18 @@ def run_worker(
                     control=control,
                     progress=progress,
                     max_pause_s=max_pause_s,
+                    keep_range_cache=keep_range_cache,
                     log=log,
+                    stages=stages,
                 )
-                summary[outcome[0]].append(job_id)
-                if outcome[0] not in ("lost", "stopped"):
+                if outcome[0] == "refused":
+                    # Class R: listed with its reason, skipped for the run, and
+                    # not a job done -- nothing ran.
+                    summary.setdefault("refused", []).append({"job_id": job_id, **dict(outcome[1])})
+                    skipped.add(job_id)
+                else:
+                    summary[outcome[0]].append(job_id)
+                if outcome[0] not in ("lost", "stopped", "refused"):
                     jobs_done += 1
                 # D2c: between jobs. A stop seen during the job that just
                 # finished ends the run here rather than claiming another.
@@ -1620,6 +1869,32 @@ def _idle_beat(
     return _beat_once(transport, protocol.idle_job_id(worker_id), progress, control, log=log)
 
 
+def _admit(backends: "ResidentBackends", manifest: dict[str, Any], stage: Any, stages: tuple[str, ...]) -> None:
+    """The admission step: after ``claim``, before ``pull``. Raises
+    :class:`ClaimReturned` to hand the job back unrun.
+
+    1. The stage filter (``--stages``, O5). Only KNOWN stages are filtered: an
+       unknown one still fails the way it always has, as an error.
+    2. For OCR, the backend's ``admit(manifest)`` when it has one (the
+       vast.ai executor's egress and spend check). A backend without one --
+       DEV's own marker, every stand-in -- admits everything, and the worker
+       is what it was."""
+    if stage in STAGES and stage not in stages:
+        raise ClaimReturned(
+            STAGE_NOT_SERVED,
+            f"this worker run serves {', '.join(stages)} jobs only (--stages); the {stage} job is left "
+            "pending for a worker that serves it",
+            next_actions=[
+                f"run a worker whose --stages includes {stage}",
+                "or restart this one without --stages (it serves ocr,embed by default)",
+            ],
+        )
+    if stage == "ocr":
+        admit = getattr(backends.admission_backend("ocr"), "admit", None)
+        if callable(admit):
+            admit(manifest)
+
+
 def _process_one(
     transport: Transport,
     backends: "ResidentBackends",
@@ -1632,10 +1907,13 @@ def _process_one(
     control: "WorkerControl | None" = None,
     progress: "ProgressState | None" = None,
     max_pause_s: float | None = None,
+    keep_range_cache: bool = False,
     log: Callable[[str], None],
-) -> tuple[str, str]:
+    stages: tuple[str, ...] = STAGES,
+) -> tuple[str, Any]:
     """Claim and run exactly one job. Returns ``(bucket, detail)`` where
-    bucket is ``claimed``/``published``/``failed``/``lost``/``stopped``."""
+    bucket is ``claimed``/``published``/``failed``/``lost``/``stopped``, or
+    ``refused`` with the refusal's :meth:`ClaimReturned.as_dict` as detail."""
     if progress is not None:
         progress.claiming(job_id)
     try:
@@ -1659,6 +1937,10 @@ def _process_one(
         with _Heartbeat(
             transport, job_id, heartbeat_interval_s, progress=progress, control=control
         ):
+            # Admission: after the claim, BEFORE the pull -- a policy "no"
+            # needs only the manifest, and a document that may not go
+            # anywhere is not copied onto this machine to find that out.
+            _admit(backends, manifest, stage, stages)
             data = transport.pull(job_id)
             protocol.unpack_into(data, in_dir)
             _verify_inputs(manifest, in_dir)
@@ -1679,6 +1961,7 @@ def _process_one(
                     progress=progress,
                     max_pause_s=max_pause_s,
                     range_cache=_range_cache_dir(work_root, job_id),
+                    keep_range_cache=keep_range_cache,
                     log=log,
                 )
             elif stage == "embed":
@@ -1725,8 +2008,11 @@ def _process_one(
                     }
                 )
             _write_result(out_dir, manifest, worker_id=worker_id, fields=fields)
-    except KeyboardInterrupt:
-        log(f"  ^ {job_id}: interrupted -- returning the claim")
+    except KeyboardInterrupt as exc:
+        # Ctrl+C, or the vast.ai lease watchdog's LeaseExpired (a subclass,
+        # settlement class X): the claim goes back unrun and the run ends.
+        why = f" ({exc})" if str(exc) else ""
+        log(f"  ^ {job_id}: interrupted{why} -- returning the claim")
         try:
             transport.return_job(job_id)
         except TransportError:  # pragma: no cover - best effort on the way out
@@ -1741,6 +2027,23 @@ def _process_one(
         except TransportError:
             pass
         return "lost", str(exc)
+    except ClaimReturned as exc:
+        # Settlement class R: this job may not run here, now (its stage is not
+        # served, or its backend refused it -- egress, spend, no host). Handed
+        # back through the existing `return` verb: unrun, NO attempt burned --
+        # the queue side's counter measures GPU failures, and a policy "no"
+        # counted there would abandon the document for the wrong reason.
+        log(f"  < {job_id}: refused [{exc.reason_code}] {exc.message} -- returning the claim unrun")
+        try:
+            transport.return_job(job_id)
+        except TransportError as texc:
+            # The queue's reclaim returns it on its own if this cannot.
+            log(f"  ! {job_id}: refused, but the claim could not be returned yet ({texc})")
+        # Nothing here is publishable, and the pulled input (if any) is a copy
+        # of a document this worker will not run; the range cache, which
+        # lives beside the job directories, is kept for a later resume.
+        shutil.rmtree(base, ignore_errors=True)
+        return "refused", exc.as_dict()
     except Exception as exc:  # noqa: BLE001 - deliberate: a stage failure travels back as data
         log(f"  x {job_id}: {type(exc).__name__}: {exc}")
         shutil.rmtree(out_dir, ignore_errors=True)

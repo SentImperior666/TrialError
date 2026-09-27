@@ -60,6 +60,39 @@ def test_run_one_unknown_handler_name_settles_as_failed_not_a_crash(store):
     assert ledger.get_job(store, job["job_id"])["attempts"] == 1
 
 
+def test_run_one_retired_custom_handler_fails_cleanly_with_a_plain_reason(store):
+    """A queued ``custom`` job naming a handler that was retired (the Feed
+    translator's) is failed with a plain reason, not crashed on."""
+    job = ledger.enqueue(store, kind="custom", payload={"handler": "feed_translate", "post_ids": ["POST-1"]})
+    result = run_one(store, worker_id=make_worker_id())
+    assert result["status"] == "abandoned"
+    final = ledger.get_job(store, job["job_id"])
+    assert final["state"] == "abandoned"
+    assert final["last_error"] == "handler 'feed_translate' is not registered (retired or unknown)"
+
+
+def test_run_one_queued_summarize_row_fails_cleanly_now_that_its_handler_is_retired(store):
+    """A ``summarize`` job queued before the handler was retired (Phase 0)
+    is failed with the same plain reason, not crashed on and not left to
+    loop."""
+    job = ledger.enqueue(
+        store, kind="custom",
+        payload={"handler": "summarize", "subject_kind": "document", "created_by_launch": "LNCH-x", "judgments": {}},
+    )
+    result = run_one(store, worker_id=make_worker_id())
+    assert result["status"] == "abandoned"
+    final = ledger.get_job(store, job["job_id"])
+    assert final["state"] == "abandoned"
+    assert final["last_error"] == "handler 'summarize' is not registered (retired or unknown)"
+
+
+def test_run_one_queued_extract_row_is_abandoned_at_once(store):
+    job = ledger.enqueue(store, kind="extract", payload={"doc_id": "DOC-1"})
+    result = run_one(store, worker_id=make_worker_id())
+    assert result["status"] == "abandoned"
+    assert ledger.get_job(store, job["job_id"])["state"] == "abandoned"
+
+
 def test_run_one_environmental_failure_defers_without_consuming_attempt(store):
     ledger.enqueue(store, kind="custom", payload={"handler": "test_environmental_failure", "reason": "gpu busy"})
     result = run_one(store, worker_id=make_worker_id())

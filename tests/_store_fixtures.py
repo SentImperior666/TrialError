@@ -277,6 +277,19 @@ def populate_one_of_everything(store: Store) -> dict[str, str]:
         },
     )
 
+    # ops_v11: composite PK (assign_id, launch_id); keep assign_id for reference.
+    ids["lens_assignment_launch"] = ids["lens_assignment"]
+    insert(
+        store,
+        "lens_assignment_launch",
+        {
+            "assign_id": ids["lens_assignment"],
+            "launch_id": ids["launch"],
+            "phase": None,
+            "bound_ts": now(),
+        },
+    )
+
     ids["memory_item"] = new_id("MEM")
     insert(
         store,
@@ -585,6 +598,33 @@ def populate_one_of_everything(store: Store) -> dict[str, str]:
         },
     )
 
+    # knowledge-v13 (lane R0-C): the second judge's own row. Keyed on
+    # `subject_id` like every other id this fixture returns, even though the
+    # table's own PK is `rejudge_id` -- the round-trip test reads it back by
+    # the key it was given.
+    ids["verdict_rejudge"] = new_id("RJDG")
+    insert(
+        store,
+        "verdict_rejudge",
+        {
+            "rejudge_id": ids["verdict_rejudge"],
+            "round_id": "round-fixture",
+            "batch_id": "judged-0",
+            "subject_kind": "record",
+            "subject_id": ids["hypothesis"],
+            "reference_set": "R3",
+            "label": "variant",
+            "label_canonical": "variant",
+            "first_label": "same",
+            "agrees": 0,
+            "judge_role": "second",
+            "judge_launches": f'["{ids["launch"]}"]',
+            "recorded_by_launch": ids["launch"],
+            "prereg_id": ids["prereg"],
+            "ts": now(),
+        },
+    )
+
     ids["experiment"] = new_id("EXP")
     insert(
         store,
@@ -700,6 +740,50 @@ def populate_one_of_everything(store: Store) -> dict[str, str]:
             "kind": "page",
             "origin": "operator_list",
             "state": "queued",
+            "created_ts": now(),
+        },
+    )
+
+    # lane SI part B (knowledge_v15_source_investigation): one cached provider
+    # answer and one dossier row. The dossier is the HELD shape on purpose --
+    # ``held_source_id`` is the one same-file FK these two tables carry, so the
+    # round trip exercises it -- and carries no verdict (a dossier is written
+    # before anybody judges it; the verdict columns are nullable).
+    ids["source_evidence"] = new_id("SEVD")
+    insert(
+        store,
+        "source_evidence",
+        {
+            "evidence_id": ids["source_evidence"],
+            "subject_key": "10.1234/fixture",
+            "provider": "openalex",
+            "provider_id": "W1",
+            "kind": "record",
+            "params_json": '{"doi": "10.1234/fixture"}',
+            "outcome": "record",
+            "payload_json": '{"value": null}',
+            "fetched_ts": now(),
+            "created_by_launch": ids["launch"],
+        },
+    )
+
+    ids["source_dossier"] = new_id("DOSS")
+    insert(
+        store,
+        "source_dossier",
+        {
+            "dossier_id": ids["source_dossier"],
+            "list_id": "list-fixture",
+            "row_id": "row-1",
+            "seed_raw": "A. Author, A Study of Widgets, 1986",
+            "subject_key": "10.1234/fixture",
+            "resolution": "exact",
+            "held_source_id": ids["source"],
+            "mechanical_state": "held",
+            "dossier_path": "dossiers/list-fixture/row-1/seed.json",
+            "dossier_sha256": "6" * 64,
+            "stage_version": "fixture",
+            "created_by_launch": ids["launch"],
             "created_ts": now(),
         },
     )

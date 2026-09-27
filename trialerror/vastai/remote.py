@@ -8,6 +8,14 @@ SSH session. The SSH identity is a PATH the operator configures
 
 UNTESTED LIVE (design section 8): the tests replace :class:`SshChannel`
 with an in-memory fake.
+
+Ported from the public TrialError copy's embedding backend, verbatim but for
+one thing: ``LeaseExpired`` is NOT defined here. It is the package's one
+:class:`trialerror.vastai.lease.LeaseExpired`, re-exported, so the embedding
+runner's ``except LeaseExpired`` catches what either lease raises. This module
+sits beside the ``remote/`` data directory (the OCR lane's instance-side
+files, found by path, never imported); ``import trialerror.vastai.remote``
+resolves to this module.
 """
 
 from __future__ import annotations
@@ -18,6 +26,8 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence
+
+from trialerror.vastai.lease import LeaseExpired
 
 __all__ = [
     "LeaseExpired",
@@ -45,16 +55,6 @@ SERVE_SOURCE = "\n".join(
         "",
     ]
 )
-
-
-class LeaseExpired(KeyboardInterrupt):
-    """The TTL watchdog destroyed the instance mid-job.
-
-    A ``KeyboardInterrupt`` subclass ON PURPOSE: ``offload.worker._process_one``
-    answers an interrupt by RETURNING the claim unrun (no offload attempt
-    burned -- a sizing miss is not a GPU fault) and re-raising, which is
-    exactly the right handling, and it keeps ``except Exception`` blocks from
-    swallowing the expiry."""
 
 
 class Channel(Protocol):

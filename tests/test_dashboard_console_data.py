@@ -88,7 +88,7 @@ def test_jobs_panel_leaves_unparseable_text_alone(seeded):
 
 
 def test_job_subject_prefers_the_most_specific_thing_the_payload_names():
-    assert data._job_subject({"handler": "feed_translate", "doc_id": "DOC-1"}) == "feed_translate"
+    assert data._job_subject({"handler": "noop", "doc_id": "DOC-1"}) == "noop"
     assert data._job_subject({"doc_id": "DOC-1"}) == "DOC-1"
     assert data._job_subject({"source_id": "SRC-9"}) == "SRC-9"
     assert data._job_subject({"zip_path": "C:\\tmp\\batch-07.zip"}) == "batch-07.zip"

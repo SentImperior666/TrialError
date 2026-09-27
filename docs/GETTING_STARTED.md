@@ -32,12 +32,11 @@ before you touch real data).
    document (§0–§6 below) walks it in full.
 2. **You already have a research project organized your own way** — a corpus of
    papers, notes, ledgers, a differently-shaped repo — and want to start using TrialError
-   against it *without moving or restructuring anything*. Load the
-   `import-existing-project` skill (`plugin/skills/import-existing-project/SKILL.md`):
-   it walks inventory → interview → bridge (`trialerror.toml` `[paths]` +
-   `[paths].ingest_roots` pointed INTO your existing tree, or a true link — a directory
-   junction on Windows, a symlink on Linux/macOS — when one is unavoidable; no data
-   physically moves) → register → validate.
+   against it *without moving or restructuring anything*. Point `trialerror.toml`
+   `[paths]` + `[paths].ingest_roots` INTO your existing tree (or use a true link — a
+   directory junction on Windows, a symlink on Linux/macOS — when one is unavoidable; no
+   data physically moves), then register and validate. (The guided `import-existing-project`
+   skill was retired in Phase 0, never used; it is restorable from git.)
 3. **You want your existing project's own ledgers/logs to become real TrialError rows** —
    not just files TrialError can read alongside them, but data migrated into
    `ruling`/`artifact`/`event`/... tables. This is a deeper, per-project migration, not

@@ -493,6 +493,20 @@ def test_keep_resident_reaches_the_worker(
     )["keep_resident"] is True
 
 
+def test_keep_range_cache_reaches_the_worker(
+    store, program_root, platform_root, tmp_path, monkeypatch
+):
+    """Live records (canary attempt 3, 2026-09-20): marker's own text per range, kept for a canary that must
+    answer a question about the raw output. Default off -- a published
+    document's ranges are nobody's resume."""
+    assert _run_worker_capturing_kwargs(
+        program_root, platform_root, tmp_path, monkeypatch, []
+    )["keep_range_cache"] is False
+    assert _run_worker_capturing_kwargs(
+        program_root, platform_root, tmp_path, monkeypatch, ["--keep-range-cache"]
+    )["keep_range_cache"] is True
+
+
 # ---------------------------------------------------------------------------
 # C-0097 D1/D4/D5 -- `offload worker-control` and `offload worker-status`
 #

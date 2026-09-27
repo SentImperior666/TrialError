@@ -1,5 +1,7 @@
 """``trialerror gate`` — the gate state machine. Design Section 5.2 (gate row):
-"open, submit, verdict, apply-union, verify-edit, advance." Thin CLI
+"open, submit, verdict, apply-union, verify-edit, advance" (plus
+``fail-reproduction``, added later: the operator's decision that a gate whose
+gate-suite reproduction was ``mismatch`` is a failed result). Thin CLI
 wrapper over ``trialerror.artifacts.gates`` — all logic lives there; this
 module only parses argv and shapes the AgentEnvelope.
 
@@ -15,15 +17,23 @@ import argparse
 import json
 from pathlib import Path
 
-from trialerror.artifacts.errors import GateEntryConditionError, IllegalTransitionError
-from trialerror.artifacts.gates import advance_gate, apply_union, open_gate, record_verdict, submit_gate, verify_edit
+from trialerror.artifacts.errors import GateEntryConditionError, IllegalTransitionError, OperatorFailRefusedError
+from trialerror.artifacts.gates import (
+    advance_gate,
+    apply_union,
+    fail_on_reproduction,
+    open_gate,
+    record_verdict,
+    submit_gate,
+    verify_edit,
+)
 from trialerror.stores.errors import StoreError
 from trialerror.stores.store import Store, open_store
 from trialerror.util.config import find_program_root
 from trialerror.util.envelope import error_envelope, next_action, ok_envelope
 
 GROUP_NAME = "gate"
-HELP = "Gate state machine: open, submit, verdict, apply-union, verify-edit, advance."
+HELP = "Gate state machine: open, submit, verdict, apply-union, verify-edit, advance, fail-reproduction."
 
 _PROGRAM_ROOT_HELP = "override the program root (default: discover trialerror.toml upward from CWD)"
 
@@ -97,6 +107,21 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     p_advance.add_argument("--evidence", default=None, help="JSON value string")
     p_advance.set_defaults(handler=_run_advance)
 
+    p_fail_repro = actions.add_parser(
+        "fail-reproduction",
+        help="gated -> failed by an operator decision, only when the gate's reproduction is 'mismatch' "
+             "(the critic's verdict is kept); then `artifact register --as-failed` accepts the gate",
+    )
+    _add_program_root_arg(p_fail_repro)
+    p_fail_repro.add_argument("--id", required=True, dest="gate_id")
+    p_fail_repro.add_argument("--reason", required=True, help="why the result is a failure, in words")
+    p_fail_repro.add_argument(
+        "--decided-by", required=True, dest="decided_by", metavar="REF",
+        help="the reference of the operator decision that fails the gate",
+    )
+    p_fail_repro.add_argument("--by-launch", required=True, dest="by_launch")
+    p_fail_repro.set_defaults(handler=_run_fail_reproduction)
+
     parser.set_defaults(handler=_run_no_action)
     return parser
 
@@ -119,7 +144,7 @@ def _run_no_action(args: argparse.Namespace) -> dict:
     return error_envelope(
         "gate",
         "no_action",
-        "specify an action: open|submit|verdict|apply-union|verify-edit|advance",
+        "specify an action: open|submit|verdict|apply-union|verify-edit|advance|fail-reproduction",
         next_actions=[next_action(["trialerror", "gate", "--help"], "list gate actions")],
     )
 
@@ -228,3 +253,23 @@ def _run_advance(args: argparse.Namespace) -> dict:
     finally:
         store.close()
     return ok_envelope("gate advance", result=row)
+
+
+def _run_fail_reproduction(args: argparse.Namespace) -> dict:
+    store, err = _open_store(args)
+    if err is not None:
+        return err
+    try:
+        row = fail_on_reproduction(
+            store, gate_id=args.gate_id, decided_by=args.decided_by, reason=args.reason, by_launch=args.by_launch
+        )
+    except OperatorFailRefusedError as exc:
+        return error_envelope("gate fail-reproduction", "fail_refused", str(exc))
+    except (IllegalTransitionError, StoreError, ValueError) as exc:
+        return error_envelope("gate fail-reproduction", "transition_refused", str(exc))
+    finally:
+        store.close()
+    # No next action: the registration that follows (`artifact register --as-failed`) needs a
+    # --failure-ref only the operator can take from the artifact, and a next action carries no
+    # placeholder (docs/OPERATOR_GUIDE.md, Command reference).
+    return ok_envelope("gate fail-reproduction", result=row)

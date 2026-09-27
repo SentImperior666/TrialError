@@ -49,16 +49,22 @@ record for this identifier".
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from urllib.parse import urlencode
 from xml.etree import ElementTree as ET
 
 from trialerror.litapi.config import ProviderApiConfig
-from trialerror.litapi.errors import ProviderNotFoundError, ProviderUnsupportedOperationError
+from trialerror.litapi.errors import (
+    LitApiError,
+    ProviderNotFoundError,
+    ProviderTransportError,
+    ProviderUnsupportedOperationError,
+)
 from trialerror.litapi.models import CitationsPage, WorkRecord, normalize_arxiv_id, normalize_doi
 from trialerror.litapi.providers.base import RateLimiter, get_with_retry, raise_for_transport_error
 from trialerror.litapi.transport import ProviderTransport, TransportResponse
 
-__all__ = ["ArxivProvider"]
+__all__ = ["ArxivProvider", "normalize_license_url"]
 
 #: arXiv's Atom feed namespaces (standard Atom + arXiv's own extension
 #: namespace for doi/journal_ref/comment/primary_category/affiliation).
@@ -66,6 +72,49 @@ _ATOM_NS = "{http://www.w3.org/2005/Atom}"
 _ARXIV_NS = "{http://arxiv.org/schemas/atom}"
 
 _ARXIV_DOI_RE = re.compile(r"^10\.48550/arxiv\.(.+)$", re.IGNORECASE)
+
+#: Version suffix on an arXiv id (``2101.00001v2``). OAI-PMH identifiers are
+#: version-less, so :meth:`ArxivProvider.get_license` strips it.
+_VERSION_SUFFIX_RE = re.compile(r"v\d+$", re.IGNORECASE)
+
+#: Licence URL -> short token, matched on the url with its scheme and any
+#: trailing slash stripped (lane FB-acq item 4). A short vocabulary of tokens
+#: is what makes the recorded grant groupable and greppable; anything not in
+#: this table is recorded AS ITSELF (stripped and lowercased) rather than
+#: dropped, because an unknown licence is still a licence and inventing a
+#: token for it would be worse than keeping the url.
+#:
+#: The three arXiv entries matter most and are the reason this exists at all:
+#: ``arxiv-nonexclusive-distrib-1.0`` grants arXiv distribution rights and
+#: grants the reader none, while the tier such a paper is registered under is
+#: ``open``.
+_LICENSE_URL_TOKENS: dict[str, str] = {
+    "creativecommons.org/licenses/by/4.0": "cc-by-4.0",
+    "creativecommons.org/licenses/by-sa/4.0": "cc-by-sa-4.0",
+    "creativecommons.org/licenses/by-nc-sa/4.0": "cc-by-nc-sa-4.0",
+    "creativecommons.org/licenses/by-nc-nd/4.0": "cc-by-nc-nd-4.0",
+    "creativecommons.org/licenses/by/3.0": "cc-by-3.0",
+    "creativecommons.org/licenses/by-nc-sa/3.0": "cc-by-nc-sa-3.0",
+    "creativecommons.org/publicdomain/zero/1.0": "cc0-1.0",
+    "arxiv.org/licenses/nonexclusive-distrib/1.0": "arxiv-nonexclusive-distrib-1.0",
+    "arxiv.org/licenses/assumed-1991-2003": "arxiv-assumed-1991-2003",
+}
+
+
+def normalize_license_url(raw: str | None) -> str | None:
+    """A licence url as a short token, or the stripped url itself when this
+    build knows no token for it. ``None`` in, ``None`` out."""
+    if not raw:
+        return None
+    text = str(raw).strip().lower()
+    if not text:
+        return None
+    for prefix in ("https://", "http://", "//"):
+        if text.startswith(prefix):
+            text = text[len(prefix) :]
+            break
+    text = text.rstrip("/")
+    return _LICENSE_URL_TOKENS.get(text, text) or None
 
 
 def _doi_to_arxiv_id(doi: str | None) -> str | None:
@@ -127,6 +176,24 @@ def _entry_to_record(entry: ET.Element) -> WorkRecord:
         # fallback when the feed's own pdf <link> is (unexpectedly) absent.
         pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
 
+    # lane FB-acq item 4: two places a licence COULD appear in an entry -- an
+    # arXiv-namespaced <arxiv:license> element, and a <link rel="license">.
+    # Whether arXiv's Atom feed ever carries either could not be established
+    # offline by this build; the parse is defensive, costs one find() per
+    # entry, and is what makes the free case free (no OAI request needed).
+    license_url = _text(entry, "license", ns=_ARXIV_NS)
+    if not license_url:
+        for link in entry.findall(f"{_ATOM_NS}link"):
+            if link.get("rel") == "license" and link.get("href"):
+                license_url = link.get("href")
+                break
+
+    other: dict = {}
+    if journal_ref:
+        other["journal_ref"] = journal_ref
+    if license_url:
+        other["license_url"] = license_url
+
     return WorkRecord(
         title=_text(entry, "title"),
         doi=normalize_doi(doi),
@@ -139,7 +206,7 @@ def _entry_to_record(entry: ET.Element) -> WorkRecord:
         oa_pdf_url=pdf_url,
         url=id_url,
         external_ids={},
-        other={"journal_ref": journal_ref} if journal_ref else {},
+        other=other,
     )
 
 
@@ -148,7 +215,10 @@ class ArxivProvider:
     #: FB-1 item F3: what this provider's `search` matches on.
     search_scope = "all fields (search_query=all:)"
 
-    def __init__(self, transport: ProviderTransport, config: ProviderApiConfig, *, program_root=None):
+    def __init__(
+        self, transport: ProviderTransport, config: ProviderApiConfig, *,
+        program_root=None, pacing_dir=None,
+    ):
         # program_root accepted (unused) only to keep this provider's
         # constructor call-shape identical to OpenAlexProvider/
         # SemanticScholarProvider -- trialerror.litapi.client.build_default_providers
@@ -156,19 +226,42 @@ class ArxivProvider:
         # key concept at all, so there is nothing to resolve here.
         self.transport = transport
         self.config = config
-        self._rate_limiter = RateLimiter(config.min_interval_s)
+        # lane FB-acq item 2: ``pacing_dir`` turns the in-memory rate limiter
+        # into a cross-INVOCATION one (every CLI call is a new process, so the
+        # in-memory gate alone spaced nothing across a shell loop). ``None``
+        # -- the default every test and library caller gets -- keeps exactly
+        # today's in-process behaviour and writes no files anywhere.
+        self._rate_limiter = RateLimiter(
+            config.min_interval_s,
+            stamp_path=(Path(pacing_dir) / f"{self.name}.json") if pacing_dir else None,
+        )
+        #: The last request's :func:`get_with_retry` stats (attempts, total
+        #: backoff waited, last status, Retry-After, whether a request went out
+        #: at all), reset per request and read by
+        #: ``trialerror.litapi.client._provider_outcome``.
+        self.last_request_stats: dict = {}
+
+    #: arXiv answers Atom XML, never JSON, and
+    #: ``UrllibTransport.get``'s own default is ``Accept: application/json``
+    #: for every provider that sends no header of its own -- which is what an
+    #: Atom endpoint is entitled to answer 406 to. The ``*/*`` tail keeps the
+    #: header harmless whatever the host actually negotiates.
+    _ACCEPT = "application/atom+xml, application/xml;q=0.9, */*;q=0.8"
 
     def _get(self, query: dict[str, str]) -> TransportResponse:
         url = f"{self.config.base_url}/query?{urlencode(query)}"
+        self.last_request_stats = {}
         return get_with_retry(
             self.transport,
             url,
             provider=self.name,
-            headers={},
+            headers={"Accept": self._ACCEPT},
             timeout_s=self.config.timeout_s,
             rate_limiter=self._rate_limiter,
             retry_attempts=self.config.retry_attempts,
             retry_on_status=self.config.retry_on_status,
+            max_total_wait_s=self.config.max_total_wait_s,
+            stats=self.last_request_stats,
         )
 
     # -- Provider interface --------------------------------------------------
@@ -204,6 +297,102 @@ class ArxivProvider:
         entries = _parse_feed(response.text)
         records = [_entry_to_record(e) for e in entries if not _entry_is_error(e)]
         return records[:limit]
+
+    # -- licence (beyond the Provider interface) ------------------------------
+
+    def get_license(self, record_or_id) -> tuple[str | None, str]:
+        """This paper's own licence GRANT, as ``(token_or_None, source)``.
+        Never raises -- lane FB-acq item 4's whole point is that recording a
+        grant must not be able to fail an acquisition.
+
+        Two places are tried, cheapest first:
+
+        1. The Atom entry already in hand. ``_entry_to_record`` stores any
+           ``<arxiv:license>`` text or ``<link rel="license">`` href in
+           ``record.other["license_url"]`` -> ``(token, "arxiv_atom")``.
+        2. When ``[litapi.arxiv].license_lookup`` is true (the default), ONE
+           OAI-PMH ``GetRecord`` request through the same limiter and retry
+           policy as every other call this provider makes. Found ->
+           ``(token, "arxiv_oai")``; a well-formed answer with no licence, or
+           an OAI ``<error>`` -> ``(None, "none_reported")``; ANY failure --
+           bad status, transport, malformed XML -> ``(None,
+           "lookup_failed:<outcome>")`` in the same outcome words
+           ``trialerror.ingest.acquire``'s legs use.
+
+        ``(None, "not_attempted")`` when the lookup is switched off and the
+        entry carried nothing.
+
+        TRIALERROR-DEV-NOTE (ASSUMED, not verifiable without egress): the OAI-PMH
+        endpoint (``[litapi.arxiv].oai_base_url``, default
+        ``https://export.arxiv.org/oai2``), the ``oai:arXiv.org:<id>``
+        identifier form, the ``metadataPrefix=arXiv`` name AND the response's
+        own element names were NOT confirmed against a live call by this build,
+        which has no network egress. They are arXiv's long-documented OAI
+        interface as this repo's own mining notes describe it, not a re-fetched
+        fact. The parse is deliberately namespace-agnostic (the first element
+        whose tag ends in ``license``) so a namespace change alone cannot break
+        it, and the two config keys an operator changes if the host or the path
+        differs are ``[litapi.arxiv].oai_base_url`` and, to switch the request
+        off entirely, ``[litapi.arxiv].license_lookup = false``.
+        """
+        record = record_or_id if not isinstance(record_or_id, str) else None
+        arxiv_id = record.arxiv_id if record is not None else normalize_arxiv_id(record_or_id)
+
+        if record is not None:
+            token = normalize_license_url((record.other or {}).get("license_url"))
+            if token:
+                return token, "arxiv_atom"
+
+        if not getattr(self.config, "license_lookup", True):
+            return None, "not_attempted"
+        if not arxiv_id:
+            return None, "not_attempted"
+
+        base = getattr(self.config, "oai_base_url", None)
+        if not base:
+            return None, "not_attempted"
+        bare_id = _VERSION_SUFFIX_RE.sub("", arxiv_id)
+        url = f"{base}?{urlencode({'verb': 'GetRecord', 'identifier': f'oai:arXiv.org:{bare_id}', 'metadataPrefix': 'arXiv'})}"
+        try:
+            self.last_request_stats = {}
+            response = get_with_retry(
+                self.transport,
+                url,
+                provider=self.name,
+                headers={"Accept": "application/xml, text/xml;q=0.9, */*;q=0.8"},
+                timeout_s=self.config.timeout_s,
+                rate_limiter=self._rate_limiter,
+                retry_attempts=self.config.retry_attempts,
+                retry_on_status=self.config.retry_on_status,
+                max_total_wait_s=self.config.max_total_wait_s,
+                stats=self.last_request_stats,
+            )
+        except ProviderTransportError as exc:
+            if exc.host is not None:
+                return None, "lookup_failed:transport_unreachable"
+            if exc.status_code == 429:
+                return None, "lookup_failed:rate_limited"
+            return None, "lookup_failed:http_error"
+        except LitApiError:
+            return None, "lookup_failed:provider_error"
+        except Exception:  # noqa: BLE001 - deliberate: a grant lookup never fails an acquisition
+            return None, "lookup_failed:provider_error"
+
+        if not response.ok:
+            if response.status_code == 429:
+                return None, "lookup_failed:rate_limited"
+            return None, "lookup_failed:http_error"
+        try:
+            root = ET.fromstring(response.text)
+        except ET.ParseError:
+            return None, "lookup_failed:provider_error"
+        for element in root.iter():
+            tag = str(element.tag)
+            if tag.rsplit("}", 1)[-1] == "license" and element.text:
+                token = normalize_license_url(element.text)
+                if token:
+                    return token, "arxiv_oai"
+        return None, "none_reported"
 
     def get_citations(self, identifier: str, *, limit: int = 100, offset: int = 0) -> CitationsPage:
         """See this module's docstring TRIALERROR-DEV-NOTE: arXiv has no

@@ -14,6 +14,14 @@ Order of operations (design sections 2.2, 4, 5):
    :class:`~trialerror.vastai.remote.RemoteEmbedBackend`, publishing into
    ``done/`` where ``stage.py`` verifies it exactly as it verifies DEV;
 7. destroy in ``finally``; a ``vastai_run`` event records what happened.
+
+Ported from the public TrialError copy's embedding backend, verbatim but for
+the adapter to this tree's ``_process_one`` (C-10): :class:`_VastBackends`
+also answers ``for_stage``, ``resident_kinds`` and ``admission_backend`` (the
+worker's resident-backends shape), and the summary carries the worker's
+``refused`` bucket (a job handed back unrun). The embedding lane rents here,
+under its own guards; no OCR command rents (the OCR lane rents only inside
+``trialerror offload worker`` with ``[ingest.ocr] executor = "vastai"``).
 """
 
 from __future__ import annotations
@@ -59,11 +67,12 @@ class VastRunRefused(RuntimeError):
 class _VastBackends:
     """The ``DevBackends`` shape ``_process_one`` expects; embed only.
 
-    ``for_stage``/``resident_kinds`` are how the worker loop resolves a
-    job's backend since the resident-backend work (``ResidentBackends``,
-    C-0097 D9); the per-stage getters stay for anything still calling them.
-    There is nothing to unload on a kind switch here -- this executor
-    serves one stage and holds one remote backend for the whole lease."""
+    Adapter (C-10): this tree's ``_process_one`` drives the worker's
+    resident-backends shape -- ``for_stage`` (the one entry point of the
+    loop), ``resident_kinds`` (reported in the heartbeat) and
+    ``admission_backend`` (the admission step between claim and pull). Here
+    they resolve to the same two answers: the remote embed backend, or the
+    refusal of any OCR marker."""
 
     def __init__(self, embed_backend: RemoteEmbedBackend):
         self._embed = embed_backend
@@ -78,9 +87,10 @@ class _VastBackends:
         return self._embed
 
     def for_stage(self, stage: str) -> Any:
-        if stage != "embed":
-            raise RuntimeError("the vast.ai executor serves embed markers only")
-        return self._embed
+        return self.embed() if stage == "embed" else self.ocr()
+
+    def admission_backend(self, stage: str) -> Any:
+        return self.for_stage(stage)
 
     def resident_kinds(self) -> list[str]:
         return ["embed"]
@@ -259,6 +269,7 @@ def _run_prepared(
         "failed": [],
         "lost": [],
         "claimed": [],
+        "refused": [],
         "expired": False,
         "destroyed": None,
         "notes": list(cfg.notes),

@@ -27,7 +27,7 @@ from pathlib import Path
 
 from trialerror.stores import paths
 from trialerror.stores.connection import connect
-from trialerror.stores.migrate import current_version, latest_version
+from trialerror.stores.migrate import current_version, latest_version, read_provenance
 from trialerror.stores.store import SCHEMA_MODULES
 from trialerror.stores.xid import XID_REGISTRY
 from trialerror.util.doctor import CheckResult, DoctorContext, register_check
@@ -97,8 +97,33 @@ def _db_path(ctx: DoctorContext, db_kind: str) -> Path | None:
 
 @register_check("store_schema_version", category="stores")
 def check_store_schema_version(ctx: DoctorContext) -> CheckResult:
+    """Every present DB's ``PRAGMA user_version`` against the version this
+    client declares -- and, on a mismatch, WHICH WAY it points.
+
+    F17 (lane FB-acq item 5): this check used to compute ``current ==
+    expected`` and fail on anything else, so "this store has not been migrated
+    yet" and "this store was migrated by a NEWER client than the one reading it
+    now" arrived as the same flat failure with the same two numbers, although
+    the two call for opposite actions (migrate the store vs. upgrade the
+    client) and only one of them is dangerous. A store that is AHEAD of the
+    client is now reported by direction, and -- when the runner's own
+    :data:`~trialerror.stores.migrate.PROVENANCE_TABLE` can account for every
+    version in between and all of them only ADDED to the schema -- as a
+    ``warn`` rather than a ``fail``: an older client can read and write every
+    table and column it knows about, so the honest reading is "upgrade the
+    client", not "this store is broken". A gap in that history, or one
+    non-additive migration in it, stays a failure: writing to a store whose
+    shape has moved under you in a way this client cannot see is exactly what
+    the check exists to stop.
+
+    The MATCHING case keeps exactly its three keys (``current_version``,
+    ``expected_version``, ``match``) -- a healthy program's details dict is
+    byte-identical to what it was.
+    """
     per_db: dict[str, dict] = {}
-    mismatches: list[str] = []
+    parts: list[str] = []
+    n_fail = 0
+    n_warn = 0
     for db_kind in _DB_KINDS:
         path = _db_path(ctx, db_kind)
         if path is None or not path.exists():
@@ -107,18 +132,66 @@ def check_store_schema_version(ctx: DoctorContext) -> CheckResult:
         conn = connect(path, read_only=True)
         try:
             current = current_version(conn)
+            expected = latest_version(SCHEMA_MODULES[db_kind].MIGRATIONS)
+            newer: list[dict] = []
+            if current > expected:
+                newer = [
+                    {"version": row["version"], "name": row["name"], "additive": row["additive"]}
+                    for row in read_provenance(conn)
+                    if expected < int(row["version"]) <= current
+                ]
         finally:
             conn.close()
-        expected = latest_version(SCHEMA_MODULES[db_kind].MIGRATIONS)
-        match = current == expected
-        per_db[db_kind] = {"current_version": current, "expected_version": expected, "match": match}
-        if not match:
-            mismatches.append(f"{db_kind} (user_version={current}, expected={expected})")
+        details: dict = {"current_version": current, "expected_version": expected, "match": current == expected}
+        if current == expected:
+            per_db[db_kind] = details
+            continue
+        head = f"{db_kind} (user_version={current}, expected={expected})"
+        if current < expected:
+            details["direction"] = "store_older"
+            per_db[db_kind] = details
+            n_fail += 1
+            parts.append(
+                f"{head}: this store is older than the client -- open it once with this client "
+                "(any store-opening command) to migrate it"
+            )
+            continue
+        details["direction"] = "store_newer"
+        details["newer_migrations"] = newer
+        accounted = {int(entry["version"]) for entry in newer} == set(range(expected + 1, current + 1))
+        if not accounted:
+            # No row for at least one of the versions in between: the runner
+            # that applied it predates the provenance table, or a newer client
+            # holds migrations this one has no name for. Either way this client
+            # cannot say what changed.
+            details["additive_only"] = None
+            per_db[db_kind] = details
+            n_fail += 1
+            parts.append(
+                f"{head}: this client is older than the store and the newer migration(s) are not known "
+                "to be additive: upgrade the client before writing"
+            )
+            continue
+        additive_only = all(int(entry["additive"]) == 1 for entry in newer)
+        details["additive_only"] = additive_only
+        per_db[db_kind] = details
+        if additive_only:
+            n_warn += 1
+            parts.append(
+                f"{head}: this client is older than the store: upgrade the client "
+                f"(the {len(newer)} newer migration(s) are additive)"
+            )
+        else:
+            n_fail += 1
+            parts.append(
+                f"{head}: this client is older than the store and the newer migration(s) are not known "
+                "to be additive: upgrade the client before writing"
+            )
 
-    status = "fail" if mismatches else "pass"
+    status = "fail" if n_fail else ("warn" if n_warn else "pass")
     message = (
-        f"{len(mismatches)} DB(s) not on the expected schema version: {', '.join(mismatches)}"
-        if mismatches
+        f"{len(parts)} DB(s) not on the expected schema version: {'; '.join(parts)}"
+        if parts
         else "all present DB(s) on their expected schema version"
     )
     return CheckResult(

@@ -58,9 +58,9 @@ they survive a future re-read of just this module):
 - **M14 (ops MCP server) / M8 (knowledge MCP server, ``memory_search``
   tool, design Section 5.1 #9):** the read-only progressive-disclosure
   surface (:func:`search_items` then :func:`get_item` for chosen ids) is
-  what design Section 5.1's ``trialerror-knowledge`` tool #9 (``memory_search``)
-  should wrap. Side-effecting memory operations (put a lesson, resolve a
-  conflict) are NOT in ``trialerror-ops``'s 12-tool list as specified (design
+  what design Section 5.1's ``trialerror-knowledge`` tool #9 (``memory_search``,
+  retired in Phase 0) wrapped. Side-effecting memory operations (put a lesson, resolve a
+  conflict) are NOT in ``trialerror-ops``'s tool list as specified (design
   Section 5.1) — if a later module wants agent-callable writes to memory,
   :func:`put_item` and :func:`resolve_conflict` are the functions to wrap;
   this module takes no position on which MCP server that lands in.

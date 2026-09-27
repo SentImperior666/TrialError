@@ -82,11 +82,15 @@ def test_initialized_notification_gets_no_response(seeded_server):
     assert _run(server, {"jsonrpc": "2.0", "method": "notifications/initialized"}) == []
 
 
-def test_tools_list_reports_exactly_12_tools_with_schemas(seeded_server):
+def test_tools_list_reports_exactly_the_8_kept_tools_with_schemas(seeded_server):
     server, _ = seeded_server
     [resp] = _run(server, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
     tools = resp["result"]["tools"]
-    assert len(tools) == TOOL_COUNT == 12
+    assert len(tools) == TOOL_COUNT == 8
+    assert {t["name"] for t in tools} == {
+        "search", "get_chunk", "get_source", "get_document_outline", "resolve_quote",
+        "similar", "corpus_stats", "term_lookup",
+    }
     for t in tools:
         assert t["name"]
         assert t["description"]

@@ -15,11 +15,14 @@ def test_load_litapi_config_defaults_when_section_absent():
     assert cfg.openalex.mailto is None
     assert cfg.openalex.min_interval_s == 1.0
     assert cfg.openalex.retry_attempts == 3
-    assert cfg.openalex.retry_on_status == (500,)
+    # lane FB-acq item 2: 429 joined every provider's retry list -- bounded by
+    # max_total_wait_s and honouring the provider's own Retry-After.
+    assert cfg.openalex.retry_on_status == (429, 500)
+    assert cfg.openalex.max_total_wait_s == 30.0
 
     assert cfg.semanticscholar.base_url == "https://api.semanticscholar.org"
     assert cfg.semanticscholar.retry_attempts == 5
-    assert cfg.semanticscholar.retry_on_status == (403,)
+    assert cfg.semanticscholar.retry_on_status == (403, 429)
     assert cfg.semanticscholar.api_key_header == "x-api-key"
 
 
@@ -75,7 +78,12 @@ def test_load_litapi_config_arxiv_defaults_grounded_in_external_api_facts():
     # the documented, enforced ToU limit -- not a conservative guess.
     assert cfg.arxiv.min_interval_s == 3.0
     assert cfg.arxiv.retry_attempts == 3
-    assert cfg.arxiv.retry_on_status == (500, 503)
+    assert cfg.arxiv.retry_on_status == (429, 500, 503)  # lane FB-acq item 2 added 429
+    # lane FB-acq item 4: the two arxiv-ONLY keys. ASSUMED endpoint -- see
+    # ArxivProvider.get_license's own TRIALERROR-DEV-NOTE; these are the two an
+    # operator changes if arXiv's OAI host or path differs.
+    assert cfg.arxiv.license_lookup is True
+    assert cfg.arxiv.oai_base_url == "https://export.arxiv.org/oai2"
 
 
 def test_all_provider_default_base_urls_use_https():
@@ -103,7 +111,9 @@ def test_load_litapi_config_unpaywall_defaults():
     assert cfg.unpaywall.mailto is None
     assert cfg.unpaywall.min_interval_s == 1.0
     assert cfg.unpaywall.retry_attempts == 3
-    assert cfg.unpaywall.retry_on_status == (500,)
+    assert cfg.unpaywall.retry_on_status == (429, 500)  # lane FB-acq item 2 added 429
+    # the arxiv-only keys are not filled for any other provider
+    assert cfg.unpaywall.oai_base_url is None
 
 
 def test_load_litapi_config_reads_configured_arxiv_and_unpaywall_values():
@@ -265,3 +275,56 @@ def test_resolve_api_key_also_accepts_an_arxiv_index_config(tmp_path):
 def test_resolve_api_key_arxiv_index_none_when_unconfigured():
     cfg = load_litapi_config({}).arxiv_index
     assert resolve_api_key(cfg) is None
+
+
+def test_arxiv_license_lookup_and_oai_base_url_are_configurable():
+    cfg = load_litapi_config(
+        {"litapi": {"arxiv": {"license_lookup": False, "oai_base_url": "https://example.org/oai"}}}
+    )
+
+    assert cfg.arxiv.license_lookup is False
+    assert cfg.arxiv.oai_base_url == "https://example.org/oai"
+
+
+def test_max_total_wait_s_is_configurable_per_provider():
+    cfg = load_litapi_config({"litapi": {"openalex": {"max_total_wait_s": 5.0}}})
+
+    assert cfg.openalex.max_total_wait_s == 5.0
+    assert cfg.semanticscholar.max_total_wait_s == 30.0
+
+
+# ---------------------------------------------------------------------------
+# [litapi.investigate] (lane SI part B, item B3)
+# ---------------------------------------------------------------------------
+
+
+def test_investigate_config_defaults_and_override():
+    """FAILS BEFORE lane SI part B: there was no ``[litapi.investigate]``
+    table. The defaults are the brief's; any key can be overridden; the whole
+    table is what a dossier echoes as its ``thresholds``; a value outside its
+    range is a problem the investigate verbs refuse on -- it does not break
+    loading for the verbs that never read it."""
+    from trialerror.litapi.config import InvestigateConfig
+
+    defaults = load_litapi_config({}).investigate
+    assert defaults == InvestigateConfig()
+    assert defaults.to_dict() == {
+        "title_floor": 0.90, "year_tolerance": 1, "foundational_before": 2000, "max_calls_per_seed": 8,
+        "citing_limit": 20, "review_limit": 10, "references_limit": 10, "author_works_years": 10,
+        "author_works_limit": 8, "abstract_max_words": 350,
+    }
+    assert defaults.problems() == []
+
+    tuned = load_litapi_config(
+        {"litapi": {"investigate": {"title_floor": 0.85, "foundational_before": 1990, "max_calls_per_seed": "5"}}}
+    ).investigate
+    assert (tuned.title_floor, tuned.foundational_before, tuned.max_calls_per_seed) == (0.85, 1990, 5)
+    assert tuned.citing_limit == 20 and tuned.abstract_max_words == 350
+
+    broken = load_litapi_config(
+        {"litapi": {"investigate": {"title_floor": 1.5, "citing_limit": 0, "year_tolerance": -1}}}
+    )
+    assert broken.openalex.base_url == "https://api.openalex.org"  # everything else still loads
+    problems = broken.investigate.problems()
+    assert len(problems) == 3
+    assert any("title_floor" in p for p in problems)

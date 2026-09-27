@@ -43,6 +43,7 @@ the place a real mismatch would surface.
 
 from __future__ import annotations
 
+from pathlib import Path
 from urllib.parse import quote, urlencode
 
 from trialerror.litapi.config import ProviderApiConfig
@@ -92,13 +93,29 @@ class UnpaywallProvider:
     #: FB-1 item F3: what this provider's `search` matches on.
     search_scope = "no search endpoint (DOI lookup and OA locations only)"
 
-    def __init__(self, transport: ProviderTransport, config: ProviderApiConfig, *, program_root=None):
+    def __init__(
+        self, transport: ProviderTransport, config: ProviderApiConfig, *,
+        program_root=None, pacing_dir=None,
+    ):
         # program_root accepted (unused) for constructor-shape parity with
         # every other provider (see trialerror.litapi.providers.arxiv's own
         # identical note) -- Unpaywall has no API-key file to resolve.
         self.transport = transport
         self.config = config
-        self._rate_limiter = RateLimiter(config.min_interval_s)
+        # lane FB-acq item 2: ``pacing_dir`` turns the in-memory rate limiter
+        # into a cross-INVOCATION one (every CLI call is a new process, so the
+        # in-memory gate alone spaced nothing across a shell loop). ``None``
+        # -- the default every test and library caller gets -- keeps exactly
+        # today's in-process behaviour and writes no files anywhere.
+        self._rate_limiter = RateLimiter(
+            config.min_interval_s,
+            stamp_path=(Path(pacing_dir) / f"{self.name}.json") if pacing_dir else None,
+        )
+        #: The last request's :func:`get_with_retry` stats (attempts, total
+        #: backoff waited, last status, Retry-After, whether a request went out
+        #: at all), reset per request and read by
+        #: ``trialerror.litapi.client._provider_outcome``.
+        self.last_request_stats: dict = {}
 
     def _require_email(self) -> str:
         if not self.config.mailto:
@@ -113,6 +130,7 @@ class UnpaywallProvider:
     def _fetch(self, doi: str) -> dict | None:
         email = self._require_email()
         url = f"{self.config.base_url}/{quote(doi, safe='')}?{urlencode({'email': email})}"
+        self.last_request_stats = {}
         response = get_with_retry(
             self.transport,
             url,
@@ -122,6 +140,8 @@ class UnpaywallProvider:
             rate_limiter=self._rate_limiter,
             retry_attempts=self.config.retry_attempts,
             retry_on_status=self.config.retry_on_status,
+            max_total_wait_s=self.config.max_total_wait_s,
+            stats=self.last_request_stats,
         )
         if response.status_code == 404:
             return None

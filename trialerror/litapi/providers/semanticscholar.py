@@ -57,10 +57,11 @@ an oversight.
 
 from __future__ import annotations
 
+from pathlib import Path
 from urllib.parse import quote, urlencode
 
 from trialerror.litapi.config import ProviderApiConfig, resolve_api_key
-from trialerror.litapi.errors import ProviderNotFoundError, ProviderTransportError
+from trialerror.litapi.errors import ProviderNotFoundError, ProviderTransportError, ProviderUnsupportedOperationError
 from trialerror.litapi.models import CitationEdge, CitationsPage, WorkRecord, normalize_arxiv_id, normalize_doi
 from trialerror.litapi.providers.base import RateLimiter, build_headers, get_with_retry, raise_for_transport_error
 from trialerror.litapi.transport import ProviderTransport, TransportResponse
@@ -88,7 +89,7 @@ FIELDS: tuple[str, ...] = (
     "abstract",
 )
 
-_CITATION_FIELDS: tuple[str, ...] = ("title", "externalIds", "authors", "year")
+_CITATION_FIELDS: tuple[str, ...] = ("title", "externalIds", "authors", "year", "citationCount", "publicationTypes")
 _KNOWN_ID_PREFIXES = {"DOI", "ARXIV", "CORPUSID", "MAG", "ACL", "PMID", "PMCID"}
 
 
@@ -117,10 +118,39 @@ def _extract_doi_and_arxiv(external_ids: dict) -> tuple[str | None, str | None]:
     return doi, arxiv_id
 
 
+def _named_authors(data: dict) -> list[dict]:
+    """The author entries that carry a name, in order -- the one filter both
+    ``authors`` and ``author_ids`` are built from, so position ``i`` in one is
+    position ``i`` in the other."""
+    return [a for a in (data.get("authors") or []) if isinstance(a, dict) and a.get("name")]
+
+
+def _first_publication_type(data: dict) -> str | None:
+    types = data.get("publicationTypes")
+    first = types[0] if isinstance(types, (list, tuple)) and types else None
+    return first.lower() if isinstance(first, str) and first else None
+
+
+def _paper_to_edge(paper: dict) -> CitationEdge:
+    external_ids = paper.get("externalIds") or {}
+    doi, arxiv_id = _extract_doi_and_arxiv(external_ids)
+    return CitationEdge(
+        title=paper.get("title"),
+        doi=doi,
+        arxiv_id=arxiv_id,
+        year=paper.get("year"),
+        authors=[a.get("name") for a in _named_authors(paper)],
+        external_ids={"semanticscholar": paper["paperId"]} if paper.get("paperId") else {},
+        work_type=_first_publication_type(paper),
+        citation_count=paper.get("citationCount"),
+    )
+
+
 def _paper_to_record(data: dict) -> WorkRecord:
     external_ids = data.get("externalIds") or {}
     doi, arxiv_id = _extract_doi_and_arxiv(external_ids)
-    authors = [a.get("name") for a in (data.get("authors") or []) if a.get("name")]
+    named = _named_authors(data)
+    authors = [a.get("name") for a in named]
     journal = data.get("journal") or {}
     venue = data.get("venue") or journal.get("name")
     oa_pdf = data.get("openAccessPdf") or {}
@@ -147,6 +177,9 @@ def _paper_to_record(data: dict) -> WorkRecord:
             "isOpenAccess": data.get("isOpenAccess"),
             "publicationTypes": data.get("publicationTypes"),
             "bibtex": (data.get("citationStyles") or {}).get("bibtex"),
+            # lane SI item A1
+            "author_ids": [str(a["authorId"]) if a.get("authorId") is not None else None for a in named],
+            "work_type": _first_publication_type(data),
         },
     )
 
@@ -156,17 +189,34 @@ class SemanticScholarProvider:
     #: FB-1 item F3: what this provider's `search` matches on.
     search_scope = "relevance across the paper-search index"
 
-    def __init__(self, transport: ProviderTransport, config: ProviderApiConfig, *, program_root=None):
+    def __init__(
+        self, transport: ProviderTransport, config: ProviderApiConfig, *,
+        program_root=None, pacing_dir=None,
+    ):
         self.transport = transport
         self.config = config
         self._api_key = resolve_api_key(config, program_root=program_root)
-        self._rate_limiter = RateLimiter(config.min_interval_s)
+        # lane FB-acq item 2: ``pacing_dir`` turns the in-memory rate limiter
+        # into a cross-INVOCATION one (every CLI call is a new process, so the
+        # in-memory gate alone spaced nothing across a shell loop). ``None``
+        # -- the default every test and library caller gets -- keeps exactly
+        # today's in-process behaviour and writes no files anywhere.
+        self._rate_limiter = RateLimiter(
+            config.min_interval_s,
+            stamp_path=(Path(pacing_dir) / f"{self.name}.json") if pacing_dir else None,
+        )
+        #: The last request's :func:`get_with_retry` stats (attempts, total
+        #: backoff waited, last status, Retry-After, whether a request went out
+        #: at all), reset per request and read by
+        #: ``trialerror.litapi.client._provider_outcome``.
+        self.last_request_stats: dict = {}
 
     # -- URL building --------------------------------------------------------
 
     def _get(self, path: str, query: dict[str, str]) -> TransportResponse:
         url = f"{self.config.base_url}{path}?{urlencode(query)}"
         headers = build_headers(self.config, self._api_key)
+        self.last_request_stats = {}
         return get_with_retry(
             self.transport,
             url,
@@ -176,6 +226,8 @@ class SemanticScholarProvider:
             rate_limiter=self._rate_limiter,
             retry_attempts=self.config.retry_attempts,
             retry_on_status=self.config.retry_on_status,
+            max_total_wait_s=self.config.max_total_wait_s,
+            stats=self.last_request_stats,
         )
 
     def _get_by_paper_id(self, paper_id: str) -> dict | None:
@@ -225,43 +277,84 @@ class SemanticScholarProvider:
         results = body.get("data", []) if isinstance(body, dict) else []
         return [_paper_to_record(r) for r in results[:limit]]
 
-    def get_citations(self, identifier: str, *, limit: int = 100, offset: int = 0) -> CitationsPage:
-        """``identifier`` may be a bare Semantic Scholar paper id, or a
-        DOI/arXiv id (passed straight through with the matching prefix --
-        S2's by-id endpoint family accepts these directly, per the mining
-        report's "ID can be S2 ID, DOI, ArXiv, etc." confirmation, so no
-        separate resolve step is needed here, unlike OpenAlex)."""
+    def _list_edges(self, identifier: str, *, relation: str, row_key: str, limit: int, offset: int) -> CitationsPage:
         paper_id = _coerce_paper_id(identifier)
         limit = max(1, min(limit, 1000))
         response = self._get(
-            f"/graph/v1/paper/{quote(paper_id, safe=':')}/citations",
+            f"/graph/v1/paper/{quote(paper_id, safe=':')}/{relation}",
             {"offset": str(offset), "limit": str(limit), "fields": ",".join(_CITATION_FIELDS)},
         )
         if response.status_code == 404:
             raise ProviderNotFoundError(
-                f"Semantic Scholar: no paper found for citations lookup {identifier!r}", provider=self.name
+                f"Semantic Scholar: no paper found for {relation} lookup {identifier!r}", provider=self.name
             )
-        raise_for_transport_error(response, provider=self.name, context=f"get_citations({identifier!r})")
+        raise_for_transport_error(response, provider=self.name, context=f"get_{relation}({identifier!r})")
         body = response.json_body or {}
         rows = body.get("data", []) if isinstance(body, dict) else []
-        items: list[CitationEdge] = []
-        for row in rows:
-            paper = row.get("citingPaper") or {}
-            external_ids = paper.get("externalIds") or {}
-            doi, arxiv_id = _extract_doi_and_arxiv(external_ids)
-            items.append(
-                CitationEdge(
-                    title=paper.get("title"),
-                    doi=doi,
-                    arxiv_id=arxiv_id,
-                    year=paper.get("year"),
-                    authors=[a.get("name") for a in (paper.get("authors") or []) if a.get("name")],
-                    external_ids={"semanticscholar": paper["paperId"]} if paper.get("paperId") else {},
-                )
-            )
+        items = [_paper_to_edge((row or {}).get(row_key) or {}) for row in rows]
         next_offset = body.get("next") if isinstance(body, dict) else None
         return CitationsPage(
             items=items, provider=self.name, offset=offset, limit=limit,
             total=body.get("total") if isinstance(body, dict) else None,
             has_more=next_offset is not None,
         )
+
+    def get_citations(
+        self, identifier: str, *, limit: int = 100, offset: int = 0,
+        work_type: str | None = None, sort: str | None = None,
+    ) -> CitationsPage:
+        """``identifier`` may be a bare Semantic Scholar paper id, or a
+        DOI/arXiv id (passed straight through with the matching prefix --
+        S2's by-id endpoint family accepts these directly, per the mining
+        report's "ID can be S2 ID, DOI, ArXiv, etc." confirmation, so no
+        separate resolve step is needed here, unlike OpenAlex).
+
+        Lane SI item A2: the citations endpoint can neither filter by work type
+        nor sort, so ``work_type`` or ``sort`` given raises
+        :class:`~trialerror.litapi.errors.ProviderUnsupportedOperationError`
+        before any request -- an unfiltered or unsorted page returned in their
+        place would be a different answer presented as the one asked for."""
+        if work_type is not None or sort is not None:
+            # nothing goes out: say so, rather than leave the previous request's
+            # stats for the client's outcome to repeat.
+            self.last_request_stats = {
+                "attempts": 0, "waited_s": 0.0, "last_status": None, "retry_after_s": None, "request_sent": False,
+            }
+        if work_type is not None:
+            raise ProviderUnsupportedOperationError(
+                f"Semantic Scholar citations cannot be filtered by work type ({work_type!r})", provider=self.name
+            )
+        if sort is not None:
+            raise ProviderUnsupportedOperationError(
+                f"Semantic Scholar citations cannot be sorted ({sort!r})", provider=self.name
+            )
+        return self._list_edges(identifier, relation="citations", row_key="citingPaper", limit=limit, offset=offset)
+
+    def get_references(self, identifier: str, *, limit: int = 20) -> CitationsPage:
+        """Lane SI item A2: the works ``identifier`` cites
+        (``/graph/v1/paper/<id>/references``, rows under ``citedPaper``), in
+        the provider's own order. One page only."""
+        return self._list_edges(identifier, relation="references", row_key="citedPaper", limit=limit, offset=0)
+
+    def get_author_works(
+        self, author_id: str, *, since_year: int | None = None, limit: int = 10,
+    ) -> list[WorkRecord]:
+        """Lane SI item A2: one Semantic Scholar author's papers
+        (``/graph/v1/author/<id>/papers``). The endpoint has no year filter, so
+        ``since_year`` is applied here, after the fetch: a paper with no year
+        is dropped when ``since_year`` is set (it cannot be shown to fall in the
+        window), and the filter can leave fewer than ``limit`` papers."""
+        limit = max(1, min(limit, 1000))
+        response = self._get(
+            f"/graph/v1/author/{quote(str(author_id), safe='')}/papers",
+            {"fields": ",".join(FIELDS), "limit": str(limit)},
+        )
+        if response.status_code == 404:
+            raise ProviderNotFoundError(f"Semantic Scholar: no author found for id {author_id!r}", provider=self.name)
+        raise_for_transport_error(response, provider=self.name, context=f"get_author_works({author_id!r})")
+        body = response.json_body or {}
+        rows = body.get("data", []) if isinstance(body, dict) else []
+        records = [_paper_to_record(r) for r in rows[:limit] if isinstance(r, dict)]
+        if since_year is not None:
+            records = [r for r in records if isinstance(r.year, int) and r.year >= int(since_year)]
+        return records

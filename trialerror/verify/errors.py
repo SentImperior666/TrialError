@@ -20,6 +20,8 @@ __all__ = [
     "ReproductionRefError",
     "CitecheckError",
     "QueryEmbedBackendUnrunnableError",
+    "UnknownPlanSuiteError",
+    "PlanCheckFailedError",
 ]
 
 
@@ -101,3 +103,24 @@ class QueryEmbedBackendUnrunnableError(VerifyError):
     So nothing is written and the caller is told what to fix."""
 
     code = QUERY_EMBED_UNRUNNABLE_CODE
+
+
+class UnknownPlanSuiteError(VerifyError):
+    """``prereg commit --plan-suite`` (or ``prereg check``) named a plan suite
+    that :data:`trialerror.verify.plan_check.PLAN_SUITES` does not register."""
+
+
+class PlanCheckFailedError(VerifyError):
+    """The plan-time check found one or more ``must`` failures that no accepted
+    deviation covers, so ``prereg commit`` refused BEFORE writing the escrow or
+    the row. ``result`` carries the full
+    :class:`~trialerror.verify.plan_check.PlanCheckResult`."""
+
+    def __init__(self, result):
+        self.result = result
+        failed = ", ".join(result.must_failures) or "(none)"
+        detail = "; ".join(i.message for i in result.items if i.severity == "must" and i.status == "fail")
+        super().__init__(
+            f"the plan-time check ({result.suite_id}) refused this commit; failing required check(s): {failed}. "
+            f"{detail}"
+        )

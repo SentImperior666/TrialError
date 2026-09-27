@@ -317,7 +317,7 @@ def retract_document(
         raise RetractBlockedError(
             f"document {doc_id!r} has {blocking_claims} claim(s) anchored in it -- retracting would "
             "destroy extracted knowledge that outlived the document's own derived rows. Retract or "
-            "reject those claims first (trialerror extract reject), then retry."
+            "reject those claims first (the DECIDE queue's merge-reject), then retry."
         )
 
     chunk_rows = [

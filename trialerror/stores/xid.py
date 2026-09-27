@@ -48,6 +48,14 @@ XID_REGISTRY: dict[tuple[str, str], XidTarget] = {
     ("feed_post", "launch_id"): XidTarget("platform", "launch", "launch_id"),
     ("lens_assignment", "launch_id"): XidTarget("platform", "launch", "launch_id"),
     ("lens_assignment", "lens_launch_id"): XidTarget("platform", "launch", "launch_id"),
+    # lane R0-B (ops_v11_lens_assignment_launch): the accumulating link.
+    # ``lens_assignment.lens_launch_id`` holds the FIRST launch bound to an
+    # assignment row and is never rewritten; this table holds every one of
+    # them, so a lens booked again for a later phase is bound without
+    # detaching the first. Both columns point at the same target and both are
+    # registered, because the second-phase link is exactly as much a claim
+    # about a real launch as the first.
+    ("lens_assignment_launch", "launch_id"): XidTarget("platform", "launch", "launch_id"),
     ("room_turn", "author_launch"): XidTarget("platform", "launch", "launch_id"),
     # knowledge.db referencers
     ("source", "registered_by_launch"): XidTarget("platform", "launch", "launch_id"),
@@ -57,6 +65,14 @@ XID_REGISTRY: dict[tuple[str, str], XidTarget] = {
     ("merge_proposal", "proposed_by_launch"): XidTarget("platform", "launch", "launch_id"),
     ("hypothesis", "created_by_launch"): XidTarget("platform", "launch", "launch_id"),
     ("verdict", "issued_by_launch"): XidTarget("platform", "launch", "launch_id"),
+    # lane R0-C (knowledge_v13_verdict_rejudge): who RECORDED the second
+    # opinion. ``verdict_rejudge.judge_launches`` -- the launches that
+    # judged it -- is deliberately absent: it is a JSON list, and this
+    # registry's unit is one column naming one row, so there is no honest
+    # entry for it. The recorder validates every id in that list against
+    # ``platform.launch`` before it writes anything, which is the same
+    # refusal by a different route, stated where the list is built.
+    ("verdict_rejudge", "recorded_by_launch"): XidTarget("platform", "launch", "launch_id"),
     ("experiment", "created_by_launch"): XidTarget("platform", "launch", "launch_id"),
     ("idea", "author_launch"): XidTarget("platform", "launch", "launch_id"),
     ("prov_edge", "launch_id"): XidTarget("platform", "launch", "launch_id"),
@@ -95,10 +111,18 @@ XID_REGISTRY: dict[tuple[str, str], XidTarget] = {
     ("term_sense_evidence", "created_by_launch"): XidTarget("platform", "launch", "launch_id"),
     ("term_relation", "marked_by_launch"): XidTarget("platform", "launch", "launch_id"),
     ("term_relation", "decided_by_launch"): XidTarget("platform", "launch", "launch_id"),
+    # lane SI part B (knowledge_v15_source_investigation): who fetched a cached
+    # provider answer, who wrote a dossier, and who judged it. The verdict
+    # column is nullable (a dossier exists before anybody judges it), which is
+    # the "skipped when empty, validated when present" behaviour this needs.
+    ("source_evidence", "created_by_launch"): XidTarget("platform", "launch", "launch_id"),
+    ("source_dossier", "created_by_launch"): XidTarget("platform", "launch", "launch_id"),
+    ("source_dossier", "verdict_by_launch"): XidTarget("platform", "launch", "launch_id"),
     # ---- bullet 2: prereg_id referenced from knowledge.db (prereg lives in
     # ops.db). --------------------------------------------------------------
     ("hypothesis", "prereg_id"): XidTarget("ops", "prereg", "prereg_id"),
     ("verdict", "prereg_id"): XidTarget("ops", "prereg", "prereg_id"),
+    ("verdict_rejudge", "prereg_id"): XidTarget("ops", "prereg", "prereg_id"),
     ("experiment", "prereg_id"): XidTarget("ops", "prereg", "prereg_id"),
     # ---- bullet 3: launch.session_id (session rows live in ops.db). ------
     ("launch", "session_id"): XidTarget("ops", "session", "session_id"),

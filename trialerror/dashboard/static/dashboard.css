@@ -213,15 +213,22 @@ html { scroll-padding-top: calc(var(--topbar-h) + 8px); }
 }
 .rail-item.is-active svg { stroke: var(--ink-hi); }
 .rail-item.is-active .rail-label { color: var(--ink-hi); }
-.rail-item.rail-item--decide { color: var(--crit-text); }
-.rail-item.rail-item--decide svg { stroke: var(--crit-text); }
-.rail-item.rail-item--decide .rail-label { color: var(--crit-text); }
+/* A2: red is reserved for a BLOCKING queue. With nothing blocking, DECIDE
+   looks like every other rail item -- `is-blocking` is toggled by
+   `setHealth` off `blocking_count`, not off whether the queue is merely
+   non-empty. */
+.rail-item.rail-item--decide.is-blocking { color: var(--crit-text); }
+.rail-item.rail-item--decide.is-blocking svg { stroke: var(--crit-text); }
+.rail-item.rail-item--decide.is-blocking .rail-label { color: var(--crit-text); }
 .rail-item .rail-badge {
   position: absolute; top: 6px; right: 8px;
   font-family: var(--font-mono); font-size: 10px; font-weight: 600;
   color: var(--bg); background: var(--crit-fill);
   padding: 0 4px; line-height: 14px;
 }
+/* A2: a calm badge (nothing blocking, but items still wait) reads amber,
+   not red -- the count is "you have this many to look at", not a gate. */
+.rail-item .rail-badge.rail-badge--calm { background: var(--warn); }
 .rail-item .rail-live-dot {
   position: absolute; top: 6px; right: 10px;
   color: var(--live); font-size: 11px; line-height: 1;
@@ -313,6 +320,7 @@ html { scroll-padding-top: calc(var(--topbar-h) + 8px); }
 }
 .card--accent-live { border-left: 2px solid var(--live); }
 .card--accent-crit { border-left: 2px solid var(--crit-fill); }
+.card--accent-warn { border-left: 2px solid var(--warn); }
 .card--top-live { border-top: 2px solid var(--live); }
 .card--top-settled { border-top: 2px solid var(--settled); }
 .card--top-warn { border-top: 2px solid var(--warn); }
@@ -371,7 +379,12 @@ html { scroll-padding-top: calc(var(--topbar-h) + 8px); }
 .btn--destructive { color: var(--bg); background: var(--crit-fill); }
 .btn--secondary { color: var(--ink-2); border-color: var(--hairline); }
 .btn:disabled, .btn[aria-disabled="true"] {
-  color: var(--disabled-ink); border-color: var(--hairline-soft);
+  /* A5: --disabled-ink (#3A4A40) sits almost on top of --bg (#070B09) --
+     "disabled" read as "gone", not "gone but the label is still legible".
+     The dim border + no fill already say "not clickable"; --ink-3 lets the
+     label itself still be read, including the buttons whose whole point is
+     the reason printed on their face (12.11). */
+  color: var(--ink-3); border-color: var(--hairline-soft);
   background: none; cursor: not-allowed;
 }
 .btn-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
@@ -580,7 +593,7 @@ html { scroll-padding-top: calc(var(--topbar-h) + 8px); }
   flex-grow: 1; display: grid; grid-template-columns: minmax(0,1.5fr) minmax(0,1fr);
   gap: var(--card-gap); padding: 0 var(--page-margin); min-height: 0; overflow: hidden;
 }
-.lane { display: flex; flex-direction: column; gap: var(--card-gap); min-height: 0; min-width: 0; overflow-y: auto; overflow-x: hidden; padding-bottom: 4px; }
+.lanes > .lane { display: flex; flex-direction: column; gap: var(--card-gap); min-height: 0; min-width: 0; overflow-y: auto; overflow-x: hidden; padding-bottom: 4px; }
 
 /* long ids in free-flowing prose (entity/artifact/gate ids inside a
    sentence, not already wrapped in .id/.mono) still need a break
@@ -693,13 +706,15 @@ html { scroll-padding-top: calc(var(--topbar-h) + 8px); }
    ============================================================================ */
 .rooms-layout { display: flex; flex-grow: 1; min-height: 0; }
 .rooms-rail { width: 250px; flex-shrink: 0; background: #0A100C; border-right: 1px solid var(--hairline); display: flex; flex-direction: column; overflow-y: auto; }
-.room-row { padding: 11px 12px; border-left: 4px solid transparent; border-bottom: 1px solid var(--hairline-soft); display: flex; flex-direction: column; gap: 4px; cursor: pointer; font-family: var(--font-mono); font-size: 11px; }
+.room-row { padding: 11px 12px; border-left: 4px solid transparent; border-bottom: 1px solid var(--hairline-soft); display: flex; flex-direction: column; gap: 4px; cursor: pointer; font-size: 11px; }
 .room-row:hover { background: var(--surface-2); }
 .room-row.is-active { border-left-color: var(--live); background: var(--surface-2); }
-.room-row .topline { display: flex; align-items: center; gap: 8px; }
-.room-row .topline .id { color: var(--ink-2); flex-grow: 1; }
-.room-row.is-active .topline .id { color: var(--ink-hi); }
-.room-row .sub { color: var(--ink-3); font-size: 10px; }
+/* A7: topic first (prominent, may wrap) with the state chip pinned on the
+   same top line; the room's own id drops to a quiet, middle-truncated
+   second line -- see `.room-row .id` below, shared with `.registry-row`. */
+.room-row .topline { display: flex; align-items: baseline; gap: 8px; }
+.room-row .topline .title { color: var(--ink-2); flex-grow: 1; font-size: 12px; overflow-wrap: anywhere; }
+.room-row.is-active .topline .title { color: var(--ink-hi); font-weight: 600; }
 
 .rooms-transcript { flex-grow: 1; display: flex; flex-direction: column; min-width: 0; }
 .turn-list { flex-grow: 1; padding: 16px 18px; display: flex; flex-direction: column; gap: 12px; min-height: 0; overflow-y: auto; }
@@ -728,7 +743,7 @@ html { scroll-padding-top: calc(var(--topbar-h) + 8px); }
   display: flex; flex-direction: column; gap: 5px; cursor: pointer;
 }
 .determ-item:hover { background: var(--surface-2); }
-.determ-item.is-active { border-left-color: var(--crit-fill); background: var(--surface-2); }
+.determ-item.is-active { border-left-color: var(--live); background: var(--surface-2); }
 .determ-item .topline { display: flex; gap: 9px; align-items: baseline; }
 .determ-item .topline .id { font-family: var(--font-mono); font-size: 11px; color: var(--ink-2); }
 .determ-item.is-active .topline .id { color: var(--ink-hi); }
@@ -743,16 +758,26 @@ html { scroll-padding-top: calc(var(--topbar-h) + 8px); }
 .type-chip-row { padding: 9px 12px; border-bottom: 1px solid var(--hairline-soft); display: flex; gap: 5px; flex-wrap: wrap; font-family: var(--font-mono); font-size: 10px; }
 .type-chip { color: var(--ink-2); border: 1px solid var(--hairline-soft); padding: 3px 7px; cursor: pointer; }
 .type-chip.is-active { color: var(--ink-hi); background: var(--surface-2); border-color: var(--hairline); }
-.registry-row { padding: 10px 12px; border-left: 4px solid transparent; border-bottom: 1px solid var(--hairline-soft); display: flex; flex-direction: column; gap: 3px; cursor: pointer; font-family: var(--font-mono); font-size: 11px; }
+.registry-row { padding: 10px 12px; border-left: 4px solid transparent; border-bottom: 1px solid var(--hairline-soft); display: flex; flex-direction: column; gap: 3px; cursor: pointer; font-size: 11px; }
 .registry-row:hover { background: var(--surface-2); }
 .registry-row.is-active { border-left-color: var(--live); background: var(--surface-2); }
-.registry-row .topline { display: flex; gap: 8px; }
-.registry-row .id { flex-grow: 1; color: var(--ink-2); }
-.registry-row.is-active .id { color: var(--ink-hi); }
-.registry-row .sub { color: var(--ink-3); font-size: 10px; }
+/* A7: the human title is now the prominent, wrappable first line, with the
+   status chip pinned on that same top line; the artifact id is a quiet,
+   middle-truncated second line (below, shared with `.room-row`). */
+.registry-row .topline { display: flex; gap: 8px; align-items: baseline; }
+.registry-row .topline .title { flex-grow: 1; color: var(--ink-2); font-size: 12px; overflow-wrap: anywhere; }
+.registry-row.is-active .topline .title { color: var(--ink-hi); font-weight: 600; }
+/* A7: shared quiet id line for both the DOSSIER registry rows and the
+   ROOMS list rows -- never wraps, never overflows (the un-truncated id
+   lives in `title=`), which is what removed the DOSSIER pane's horizontal
+   scrollbar. */
+.registry-row .id, .room-row .id {
+  font-family: var(--font-mono); font-size: 10px; color: var(--ink-3);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 .dossier-detail { flex-grow: 1; display: flex; flex-direction: column; min-width: 0; overflow-y: auto; }
-.purpose-strip { border: 1px solid var(--hairline); border-left: 2px solid var(--crit-fill); background: var(--surface); padding: 12px 15px; display: flex; gap: 14px; align-items: baseline; }
-.purpose-strip .k { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.14em; color: var(--crit-text); flex-shrink: 0; }
+.purpose-strip { border: 1px solid var(--hairline); border-left: 2px solid var(--warn); background: var(--surface); padding: 12px 15px; display: flex; gap: 14px; align-items: baseline; }
+.purpose-strip .k { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.14em; color: var(--warn); flex-shrink: 0; }
 .purpose-strip .v { font-size: 14px; color: var(--ink-hi); line-height: 1.5; }
 .context-frame-grid { display: grid; grid-template-columns: 112px minmax(0,1fr); gap: 7px 14px; font-size: 12.5px; line-height: 1.5; }
 .context-frame-grid .k { font-family: var(--font-mono); font-size: 10px; color: var(--ink-3); padding-top: 2px; }
@@ -799,7 +824,6 @@ html { scroll-padding-top: calc(var(--topbar-h) + 8px); }
 .goal-card .goal-col .k { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.12em; color: var(--ink-3); }
 .goal-card .goal-col .v { font-size: 15px; color: var(--ink-hi); line-height: 1.4; }
 .goal-card .phases-col { flex-grow: 1; padding: 13px 16px; display: flex; flex-wrap: wrap; gap: 20px; }
-.goal-card .note-col { width: 218px; flex-shrink: 0; border-left: 1px solid var(--hairline-soft); padding: 13px 16px; display: flex; align-items: center; }
 
 .phase-spine { display: flex; align-items: flex-start; padding: 4px 4px 0 4px; }
 .phase-node { width: 150px; display: flex; flex-direction: column; align-items: center; gap: 6px; flex-shrink: 0; }
@@ -820,7 +844,7 @@ html { scroll-padding-top: calc(var(--topbar-h) + 8px); }
 
 .drift-entry { display: grid; grid-template-columns: 16px minmax(0,1fr); gap: 10px; align-items: start; }
 .drift-entry .tag { font-family: var(--font-mono); font-size: 10px; }
-.drift-entry .quote { line-height: 1.45; border-left: 2px solid var(--hairline); padding-left: 10px; color: var(--ink); font-size: 12.5px; }
+.drift-entry .quote { line-height: 1.45; border-left: 2px solid var(--hairline); padding-left: 10px; color: var(--ink); font-size: 12.5px; white-space: pre-wrap; }
 
 /* ============================================================================
    CONSOLE (sweep section 3.9 -- the geometry, which is half of console-3)
@@ -978,15 +1002,15 @@ html { scroll-padding-top: calc(var(--topbar-h) + 8px); }
 }
 .timeline-axis .axis-tick { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; }
 .timeline-axis .gap-marker { position: absolute; top: 0; color: var(--ink-2); white-space: nowrap; }
-.lane { display: flex; align-items: center; gap: 0; height: 14px; }
-.lane .lane-name {
+.timeline > .lane { display: flex; align-items: center; gap: 0; height: 14px; }
+.timeline > .lane .lane-name {
   width: 168px; flex-shrink: 0; font-family: var(--font-mono); font-size: 10px;
   color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.lane button.lane-name { border-bottom: 0; padding: 0; }
-.lane .lane-bars { flex-grow: 1; height: 12px; min-width: 0; }
+.timeline > .lane button.lane-name { border-bottom: 0; padding: 0; }
+.timeline > .lane .lane-bars { flex-grow: 1; height: 12px; min-width: 0; }
 .bar--running { fill: var(--live); }
-.bar--complete { fill: var(--settled); }
+.bar--complete, .bar--closed { fill: var(--settled); }
 .bar--retried { fill: var(--warn); }
 .bar--failed, .bar--abandoned, .bar--frozen { fill: var(--crit-fill); }
 .bar--booked { fill: none; stroke: var(--ink-3); stroke-width: 1; }
@@ -1099,6 +1123,13 @@ h2.title { margin: 0; font-size: 11px; font-weight: 700; letter-spacing: 0.12em;
 .subbar .t { font-family: var(--font-mono); font-size: 12px; color: var(--ink-hi); white-space: nowrap; }
 .subbar .m { font-family: var(--font-mono); font-size: 10px; color: var(--ink-3); white-space: nowrap; }
 .subbar .fill { flex-grow: 1; }
+/* A2: the DECIDE summary's "N LEXICON CANDIDATES -> LEXICON" link -- a
+   <button> so it is keyboard/AT reachable, styled to read as inline text. */
+.link-button {
+  font: inherit; color: var(--ink-hi); background: none; border: none; padding: 0;
+  cursor: pointer; text-decoration: underline;
+}
+.link-button:hover { color: var(--ink-hi); }
 
 .panel-body-pad { padding: 14px 18px; display: flex; flex-direction: column; gap: 12px; min-height: 0; flex-grow: 1; }
 .two-col { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 12px; min-height: 0; }

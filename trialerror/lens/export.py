@@ -32,7 +32,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from trialerror.lens.assign import list_assignments
+from trialerror.lens.assign import list_assignments, row_salt_scheme
+from trialerror.lens.link import assignment_launch_pairs
 from trialerror.lens.roster import roster_cards
 from trialerror.lens.stratify import ARMS
 from trialerror.stores.store import Store
@@ -66,8 +67,9 @@ def export_launch_bookable(store: Store, *, round_id: str) -> list[dict[str, Any
     first assignment's ``created_ts`` (i.e. the same order they were
     assigned in) — deterministic for a given store, not re-sorted by name.
 
-    ``attrs`` additionally carries ``arm_mode``, the lens's ``arm`` and its
-    ``recipe_cards`` block. ``arm`` is the lens's single arm under
+    ``attrs`` additionally carries ``arm_mode``, the ``salt_scheme`` the
+    lens's slice was drawn under, the lens's ``arm`` and its ``recipe_cards``
+    block. ``arm`` is the lens's single arm under
     ``arm_mode="per_lens"`` and ``None`` under ``per_slice``, where a lens
     has no single arm to name — the per-arm counts in ``arms`` are the
     honest answer there, and inventing a "dominant" arm for a mixed slice
@@ -95,6 +97,12 @@ def export_launch_bookable(store: Store, *, round_id: str) -> list[dict[str, Any
                 "seat": row["seat"],
                 "model_class": row["model_class"],
                 "arm_mode": row.get("arm_mode"),
+                # The salt scheme the lens's slice was DRAWN under, read off
+                # its first assignment row (one `run_assignment` call writes
+                # one scheme across every row it writes). A row carrying no
+                # scheme was drawn under the legacy one -- see
+                # `trialerror.lens.assign.row_salt_scheme`.
+                "salt_scheme": row_salt_scheme(row),
                 "recipe_cards": roster_cards(row),
                 "assign_ids": [],
                 "slice_doc_ids": [],
@@ -124,6 +132,7 @@ def export_launch_bookable(store: Store, *, round_id: str) -> list[dict[str, Any
                     "vantage": entry["vantage"],
                     "seat": entry["seat"],
                     "arm_mode": entry["arm_mode"],
+                    "salt_scheme": entry["salt_scheme"],
                     "arm": armed[0] if entry["arm_mode"] == "per_lens" and len(armed) == 1 else None,
                     "recipe_cards": entry["recipe_cards"],
                     "assign_ids": entry["assign_ids"],
@@ -154,9 +163,13 @@ UNCONSUMED_LAUNCH_STATES: frozenset[str] = frozenset({"REFUSED", "DEFERRED"})
 def _launches_by_lens(store: Store, *, assign_ids_by_lens: dict[str, list[str]]) -> dict[str, list[dict[str, Any]]]:
     """Each lens's own launches, resolved every way the booking path writes
     them: a ``launch.attrs`` naming this ``roster_id``, a ``launch.attrs``
-    naming any of the lens's ``assign_ids``, or (fix pass N-2)
-    ``lens_assignment.lens_launch_id`` -- the link ``budget book
-    --assign-id`` records, which carries no attrs at all.
+    naming any of the lens's ``assign_ids``, or (fix pass N-2) the
+    assignment-side link ``budget book --assign-id`` records, which carries
+    no attrs at all -- read since ops schema-v11 from the accumulating
+    ``lens_assignment_launch`` table as well as the legacy
+    ``lens_assignment.lens_launch_id`` column, so a lens booked AGAIN for a
+    later phase contributes all of its launches here instead of only
+    whichever one happened to hold the column.
 
     The first two keys come off :func:`export_launch_bookable`, which is one
     of the two ways an orchestrator books a lens; the third is the other one
@@ -190,22 +203,14 @@ def _launches_by_lens(store: Store, *, assign_ids_by_lens: dict[str, list[str]])
         if owner is not None:
             out[owner].append({"launch_id": row["launch_id"], "state": row["state"]})
 
-    # The third source: the assignment row's own lens_launch_id. A booking
-    # made through `budget book --assign-id` carries no attrs, so nothing
-    # above sees it.
+    # The third source: the assignment-side link. A booking made through
+    # `budget book --assign-id` carries no attrs, so nothing above sees it.
     seen = {launch["launch_id"] for launches in out.values() for launch in launches}
     owners_by_launch: dict[str, str] = {}
-    if owner_of_assign:
-        placeholders = ",".join("?" for _ in owner_of_assign)
-        for link in store.ops.execute(
-            f"SELECT assign_id, lens_launch_id FROM lens_assignment "
-            f"WHERE lens_launch_id IS NOT NULL AND assign_id IN ({placeholders})",
-            list(owner_of_assign),
-        ).fetchall():
-            launch_id = link["lens_launch_id"]
-            if launch_id in seen:
-                continue
-            owners_by_launch.setdefault(launch_id, owner_of_assign[link["assign_id"]])
+    for assign_id, launch_id in assignment_launch_pairs(store.ops, list(owner_of_assign)):
+        if launch_id in seen:
+            continue
+        owners_by_launch.setdefault(launch_id, owner_of_assign[assign_id])
     if owners_by_launch:
         placeholders = ",".join("?" for _ in owners_by_launch)
         for row in store.platform.execute(
@@ -288,6 +293,7 @@ def lens_log(store: Store, *, round_id: str) -> dict[str, Any]:
                 "lens_name": row["lens_name"],
                 "seat": row["seat"],
                 "vantage": row["vantage"],
+                "salt_scheme": row_salt_scheme(row),
                 "assign_ids": [],
             }
         lenses[roster_id]["assign_ids"].append(row["assign_id"])
@@ -321,6 +327,7 @@ def lens_log(store: Store, *, round_id: str) -> dict[str, Any]:
             "lens_name": lens["lens_name"],
             "seat": lens["seat"],
             "vantage": lens["vantage"],
+            "salt_scheme": lens["salt_scheme"],
             "launch_id": consumed[0]["launch_id"] if consumed else (launches[0]["launch_id"] if launches else None),
             "launch_ids": [l["launch_id"] for l in launches],
             "launch_states": [l["state"] for l in launches],

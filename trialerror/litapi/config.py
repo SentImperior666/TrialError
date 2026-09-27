@@ -17,6 +17,8 @@ FakeTransport-free-usable config object)::
     min_interval_s = 1.0                # conservative default -- see TODO below
     retry_attempts = 3                  # mining report: OpenAlex client retries 3x on ReadTimeout/500
     timeout_s = 15.0
+    retry_on_status = [429, 500]        # per-provider default; set explicitly and it wins verbatim
+    max_total_wait_s = 30.0             # hard cap on backoff sleep per request, retries included
 
     [litapi.semanticscholar]
     base_url = "https://api.semanticscholar.org"
@@ -31,6 +33,11 @@ FakeTransport-free-usable config object)::
     min_interval_s = 3.0                # info.arxiv.org ToU: 1 request per 3 seconds (enforced, not a guess)
     retry_attempts = 3
     timeout_s = 15.0
+    license_lookup = true               # may ONE extra OAI-PMH request read a paper's own licence
+                                         # when the Atom feed carries none? (lane FB-acq item 4)
+    oai_base_url = "https://export.arxiv.org/oai2"  # ASSUMED endpoint -- see ArxivProvider.get_license's
+                                         # own TRIALERROR-DEV-NOTE; these two keys are what an operator
+                                         # changes if the host differs
 
     [litapi.unpaywall]
     base_url = "https://api.unpaywall.org/v2"
@@ -101,6 +108,21 @@ FakeTransport-free-usable config object)::
                                          # calls ONLY -- the corpus vectors are precomputed, never re-embedded
                                          # by this package); NEVER inline. resolve_api_key's usual discipline.
 
+    [litapi.investigate]
+    # lane SI part B: the source investigator (`trialerror lit investigate`).
+    # Every key below is echoed whole into each dossier's `thresholds`, so a
+    # dossier always says what it was judged under.
+    title_floor = 0.90                  # citation-vs-record title similarity that counts as a match
+    year_tolerance = 1                  # years either way that still count as the cited year
+    foundational_before = 2000          # a work first published before this year is flagged foundational
+    max_calls_per_seed = 8              # client-level lookups one seed may make (cache hits count too)
+    citing_limit = 20                   # most-cited citing works kept
+    review_limit = 10                   # review-type citing works kept
+    references_limit = 10               # the work's own references kept
+    author_works_years = 10             # authors' works from (this year - N) on
+    author_works_limit = 8              # works kept per author position
+    abstract_max_words = 350            # the abstract is cut at this many words
+
 TRIALERROR-DEV-NOTE / TODO (per the C-0064 litapi-preview mission brief,
 verbatim constraint -- "DO NOT hardcode rate-limit numbers; read them from
 trialerror.toml config with conservative defaults + a clear TODO pointing at
@@ -143,7 +165,7 @@ always wins over every built-in default here either way.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -152,6 +174,7 @@ __all__ = [
     "AlphaxivConfig",
     "ArxivxplorerConfig",
     "ArxivIndexConfig",
+    "InvestigateConfig",
     "LitApiConfig",
     "load_litapi_config",
     "resolve_api_key",
@@ -199,6 +222,13 @@ _DEFAULT_BASE_URLS: dict[str, str] = {
     "arxiv": "https://export.arxiv.org/api",
     "unpaywall": "https://api.unpaywall.org/v2",
 }
+#: arXiv's OAI-PMH endpoint (lane FB-acq item 4) -- ASSUMED, not verified by
+#: this build: see
+#: :meth:`trialerror.litapi.providers.arxiv.ArxivProvider.get_license`'s own
+#: TRIALERROR-DEV-NOTE. ``[litapi.arxiv].oai_base_url`` overrides it, and
+#: ``[litapi.arxiv].license_lookup = false`` turns the request off entirely.
+_DEFAULT_OAI_BASE_URL = "https://export.arxiv.org/oai2"
+
 _DEFAULT_TIMEOUT_S = 15.0
 #: known provider names -- the one place :func:`_provider_config`'s
 #: per-name default lookups and :meth:`LitApiConfig.provider`'s routing
@@ -220,6 +250,24 @@ class ProviderApiConfig:
     retry_attempts: int = 3
     retry_on_status: tuple[int, ...] = ()
     timeout_s: float = _DEFAULT_TIMEOUT_S
+    #: The hard cap on how long ONE request (including its retries) may spend
+    #: asleep on backoff -- see
+    #: :data:`trialerror.litapi.providers.base.DEFAULT_MAX_TOTAL_WAIT_S`. A
+    #: provider that answers ``Retry-After: 3600`` is not waited on for an
+    #: hour: the call returns and says so.
+    max_total_wait_s: float = 30.0
+    #: Read for **arxiv only** (lane FB-acq item 4): may
+    #: :meth:`trialerror.litapi.providers.arxiv.ArxivProvider.get_license` make ONE
+    #: extra OAI-PMH request to read a paper's own licence when the Atom feed
+    #: carries none? Default on; the lookup never blocks or downgrades an
+    #: acquisition, and its failure is recorded rather than raised.
+    license_lookup: bool = True
+    #: Read for **arxiv only** (lane FB-acq item 4): the OAI-PMH endpoint
+    #: ``get_license`` asks. See that method's own TRIALERROR-DEV-NOTE -- the
+    #: endpoint and its response shape are ASSUMED, not verifiable without
+    #: egress, and this key plus ``license_lookup`` are the two an operator
+    #: changes if the host differs.
+    oai_base_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -271,6 +319,48 @@ class ArxivIndexConfig:
 
 
 @dataclass(frozen=True)
+class InvestigateConfig:
+    """``[litapi.investigate]`` -- the source investigator's thresholds and
+    limits (lane SI part B, item B3; ``trialerror.litapi.investigate``). The
+    defaults are the brief's. :meth:`to_dict` is what every dossier's
+    ``thresholds`` block carries, whole."""
+
+    title_floor: float = 0.90
+    year_tolerance: int = 1
+    foundational_before: int = 2000
+    max_calls_per_seed: int = 8
+    citing_limit: int = 20
+    review_limit: int = 10
+    references_limit: int = 10
+    author_works_years: int = 10
+    author_works_limit: int = 8
+    abstract_max_words: int = 350
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def problems(self) -> list[str]:
+        """Every value outside its sane range, one sentence each (empty when
+        the config is usable). Checked by the investigate verbs rather than at
+        load time, so a typo in this table cannot break ``lit lookup`` and the
+        other verbs that never read it; and refused rather than clamped, since
+        a clamped threshold would be echoed into every dossier as if chosen."""
+        out: list[str] = []
+        if not 0.0 < self.title_floor <= 1.0:
+            out.append(f"[litapi.investigate].title_floor must be in (0, 1], got {self.title_floor!r}")
+        for key in ("year_tolerance", "author_works_years"):
+            if getattr(self, key) < 0:
+                out.append(f"[litapi.investigate].{key} must be >= 0, got {getattr(self, key)!r}")
+        for key in (
+            "max_calls_per_seed", "citing_limit", "review_limit", "references_limit", "author_works_limit",
+            "abstract_max_words",
+        ):
+            if getattr(self, key) < 1:
+                out.append(f"[litapi.investigate].{key} must be >= 1, got {getattr(self, key)!r}")
+        return out
+
+
+@dataclass(frozen=True)
 class LitApiConfig:
     """The full ``[litapi]`` section, resolved."""
 
@@ -281,6 +371,9 @@ class LitApiConfig:
     alphaxiv: AlphaxivConfig
     arxivxplorer: ArxivxplorerConfig
     arxiv_index: ArxivIndexConfig
+    #: lane SI part B. Defaulted so a caller building this dataclass by hand
+    #: (none in this tree today) is not broken by the new section.
+    investigate: InvestigateConfig = field(default_factory=InvestigateConfig)
 
     def provider(self, name: str) -> ProviderApiConfig:
         if name == "openalex":
@@ -310,14 +403,22 @@ def _provider_config(name: str, raw: dict[str, Any]) -> ProviderApiConfig:
         # documented-elsewhere-in-the-ecosystem "temporarily overloaded"
         # code for the export.arxiv.org host, not independently confirmed
         # this session -- TRIALERROR-DEV-NOTE, flagged).
+        # lane FB-acq item 2: 429 joins every provider's list. A rate limit is
+        # the most transient status there is -- it is the one code whose whole
+        # meaning is "ask again later" -- and it was the only common status
+        # this retried on none of the four. The retry is bounded by
+        # max_total_wait_s and honours the provider's own Retry-After, so
+        # adding it here cannot turn into a storm (see
+        # trialerror.litapi.providers.base.get_with_retry). An explicit
+        # retry_on_status in trialerror.toml still wins verbatim.
         if name == "openalex":
-            retry_on_status = (500,)
+            retry_on_status = (429, 500)
         elif name == "semanticscholar":
-            retry_on_status = (403,)
+            retry_on_status = (403, 429)
         elif name == "arxiv":
-            retry_on_status = (500, 503)
+            retry_on_status = (429, 500, 503)
         else:  # unpaywall
-            retry_on_status = (500,)
+            retry_on_status = (429, 500)
     return ProviderApiConfig(
         name=name,
         base_url=str(raw.get("base_url", _DEFAULT_BASE_URLS[name])),
@@ -328,6 +429,14 @@ def _provider_config(name: str, raw: dict[str, Any]) -> ProviderApiConfig:
         retry_attempts=int(raw.get("retry_attempts", _DEFAULT_RETRY_ATTEMPTS[name])),
         retry_on_status=tuple(retry_on_status),
         timeout_s=float(raw.get("timeout_s", _DEFAULT_TIMEOUT_S)),
+        max_total_wait_s=float(raw.get("max_total_wait_s", 30.0)),
+        # arxiv-only keys (lane FB-acq item 4). Filled for arxiv alone rather
+        # than added to every provider's section, because there is exactly one
+        # provider whose licence can be looked up this way.
+        license_lookup=bool(raw.get("license_lookup", True)) if name == "arxiv" else True,
+        oai_base_url=(
+            str(raw.get("oai_base_url", _DEFAULT_OAI_BASE_URL)) if name == "arxiv" else None
+        ),
     )
 
 
@@ -362,6 +471,25 @@ def _arxiv_index_config(raw: dict[str, Any]) -> ArxivIndexConfig:
     )
 
 
+def _investigate_config(raw: dict[str, Any]) -> InvestigateConfig:
+    """``[litapi.investigate]``, every key optional, coerced like every other
+    section's (``int``/``float``). Ranges are :meth:`InvestigateConfig.problems`'
+    business, not this loader's."""
+    defaults = InvestigateConfig()
+    return InvestigateConfig(
+        title_floor=float(raw.get("title_floor", defaults.title_floor)),
+        year_tolerance=int(raw.get("year_tolerance", defaults.year_tolerance)),
+        foundational_before=int(raw.get("foundational_before", defaults.foundational_before)),
+        max_calls_per_seed=int(raw.get("max_calls_per_seed", defaults.max_calls_per_seed)),
+        citing_limit=int(raw.get("citing_limit", defaults.citing_limit)),
+        review_limit=int(raw.get("review_limit", defaults.review_limit)),
+        references_limit=int(raw.get("references_limit", defaults.references_limit)),
+        author_works_years=int(raw.get("author_works_years", defaults.author_works_years)),
+        author_works_limit=int(raw.get("author_works_limit", defaults.author_works_limit)),
+        abstract_max_words=int(raw.get("abstract_max_words", defaults.abstract_max_words)),
+    )
+
+
 def load_litapi_config(program_config_raw: dict[str, Any] | None) -> LitApiConfig:
     """Build a :class:`LitApiConfig` from a program's already-loaded
     ``trialerror.toml`` ``raw`` dict (``trialerror.util.config.ProgramConfig.raw``,
@@ -376,6 +504,7 @@ def load_litapi_config(program_config_raw: dict[str, Any] | None) -> LitApiConfi
         alphaxiv=_alphaxiv_config(root.get("alphaxiv", {}) or {}),
         arxivxplorer=_arxivxplorer_config(root.get("arxivxplorer", {}) or {}),
         arxiv_index=_arxiv_index_config(root.get("arxiv_index", {}) or {}),
+        investigate=_investigate_config(root.get("investigate", {}) or {}),
     )
 
 

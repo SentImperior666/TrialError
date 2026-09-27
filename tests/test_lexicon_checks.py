@@ -1,6 +1,6 @@
 """``trialerror.lexicon.checks`` -- the nine lexicon doctor checks.
 
-Shape follows ``tests/test_feed_translate_checks.py`` exactly: a
+Shape: a
 ``registry`` fixture that clears + re-discovers the global check registry,
 a ``_run``/``_ctx`` pair, and the ``store``/``program_root``/``platform_root``
 fixtures from ``tests/conftest.py``.

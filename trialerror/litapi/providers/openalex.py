@@ -42,6 +42,7 @@ OpenAlex record in this session; flagged for the live-smoke follow-up.
 
 from __future__ import annotations
 
+from pathlib import Path
 from urllib.parse import quote, urlencode
 
 from trialerror.litapi.config import ProviderApiConfig, resolve_api_key
@@ -67,6 +68,10 @@ SELECT_FIELDS: tuple[str, ...] = (
     "cited_by_count",
     "abstract_inverted_index",
     "referenced_works",
+    # lane SI item A1: the work's type (``article``, ``review``, ``book``, ...)
+    # and its per-year citation counts.
+    "type",
+    "counts_by_year",
 )
 
 
@@ -97,13 +102,45 @@ def _reconstruct_abstract(inverted_index: dict | None) -> str | None:
     return " ".join(slots.get(i, "") for i in range(max_pos + 1)).strip() or None
 
 
-def _work_to_record(data: dict) -> WorkRecord:
-    authorships = data.get("authorships") or []
-    authors = [
-        a.get("author", {}).get("display_name")
-        for a in authorships
-        if a.get("author", {}).get("display_name")
+def _named_authorships(data: dict) -> list[dict]:
+    """The authorships that carry a display name, in authorship order -- the
+    one filter both ``authors`` and ``author_ids`` are built from, so position
+    ``i`` in one is position ``i`` in the other."""
+    return [
+        (a.get("author") or {})
+        for a in (data.get("authorships") or [])
+        if (a.get("author") or {}).get("display_name")
     ]
+
+
+def _counts_by_year(data: dict) -> list[dict]:
+    """``counts_by_year`` as ``[{year, cited_by_count}]`` verbatim (only the two
+    keys kept; OpenAlex also ships ``works_count`` for author entities)."""
+    rows = data.get("counts_by_year") or []
+    return [
+        {"year": row.get("year"), "cited_by_count": row.get("cited_by_count")}
+        for row in rows
+        if isinstance(row, dict)
+    ]
+
+
+def _work_to_edge(r: dict) -> CitationEdge:
+    """One listing row (citing work, referenced work) as a :class:`CitationEdge`."""
+    return CitationEdge(
+        title=r.get("title"),
+        doi=normalize_doi(r.get("doi")),
+        arxiv_id=None,
+        year=r.get("publication_year"),
+        authors=[a.get("display_name") for a in _named_authorships(r)],
+        external_ids={"openalex": _short_openalex_id(r.get("id"))} if r.get("id") else {},
+        work_type=r.get("type"),
+        citation_count=r.get("cited_by_count"),
+    )
+
+
+def _work_to_record(data: dict) -> WorkRecord:
+    named = _named_authorships(data)
+    authors = [a.get("display_name") for a in named]
     primary_location = data.get("primary_location") or {}
     open_access = data.get("open_access") or {}
     oa_pdf_url = primary_location.get("pdf_url") or open_access.get("oa_url")
@@ -128,7 +165,13 @@ def _work_to_record(data: dict) -> WorkRecord:
         oa_pdf_url=oa_pdf_url,
         url=data.get("id"),
         external_ids=external_ids,
-        other={"referenced_works": data.get("referenced_works", [])},
+        other={
+            "referenced_works": data.get("referenced_works", []),
+            # lane SI item A1
+            "work_type": data.get("type"),
+            "counts_by_year": _counts_by_year(data),
+            "author_ids": [_short_openalex_id(a.get("id")) for a in named],
+        },
     )
 
 
@@ -137,11 +180,27 @@ class OpenAlexProvider:
     #: FB-1 item F3: what this provider's `search` matches on.
     search_scope = "title only (filter=title.search)"
 
-    def __init__(self, transport: ProviderTransport, config: ProviderApiConfig, *, program_root=None):
+    def __init__(
+        self, transport: ProviderTransport, config: ProviderApiConfig, *,
+        program_root=None, pacing_dir=None,
+    ):
         self.transport = transport
         self.config = config
         self._api_key = resolve_api_key(config, program_root=program_root)
-        self._rate_limiter = RateLimiter(config.min_interval_s)
+        # lane FB-acq item 2: ``pacing_dir`` turns the in-memory rate limiter
+        # into a cross-INVOCATION one (every CLI call is a new process, so the
+        # in-memory gate alone spaced nothing across a shell loop). ``None``
+        # -- the default every test and library caller gets -- keeps exactly
+        # today's in-process behaviour and writes no files anywhere.
+        self._rate_limiter = RateLimiter(
+            config.min_interval_s,
+            stamp_path=(Path(pacing_dir) / f"{self.name}.json") if pacing_dir else None,
+        )
+        #: The last request's :func:`get_with_retry` stats (attempts, total
+        #: backoff waited, last status, Retry-After, whether a request went out
+        #: at all), reset per request and read by
+        #: ``trialerror.litapi.client._provider_outcome``.
+        self.last_request_stats: dict = {}
 
     # -- URL building ------------------------------------------------------
 
@@ -154,6 +213,7 @@ class OpenAlexProvider:
     def _get(self, path: str, extra_query: dict[str, str]) -> TransportResponse:
         url = f"{self.config.base_url}{path}?{urlencode(self._query(extra_query))}"
         headers = build_headers(self.config, self._api_key)
+        self.last_request_stats = {}
         return get_with_retry(
             self.transport,
             url,
@@ -163,6 +223,8 @@ class OpenAlexProvider:
             rate_limiter=self._rate_limiter,
             retry_attempts=self.config.retry_attempts,
             retry_on_status=self.config.retry_on_status,
+            max_total_wait_s=self.config.max_total_wait_s,
+            stats=self.last_request_stats,
         )
 
     # -- Provider interface --------------------------------------------------
@@ -209,9 +271,47 @@ class OpenAlexProvider:
         results = body.get("results", []) if isinstance(body, dict) else []
         return [_work_to_record(r) for r in results[:limit]]
 
-    def get_citations(self, identifier: str, *, limit: int = 100, offset: int = 0) -> CitationsPage:
+    def _resolve_work_id(self, identifier: str, *, purpose: str) -> str:
+        """A DOI is resolved to its OpenAlex work id first (one extra request);
+        a bare ``W123`` is used as is. The test is the one ``get_citations``
+        has always used -- anything holding a ``/`` or a ``.`` is resolved as a
+        DOI -- so the full ``https://openalex.org/W123`` form goes through the
+        DOI lookup too (kept unchanged here; lane SI names it in its report)."""
+        if "/" in identifier or identifier.count(".") >= 1:
+            # looks like a DOI, not a bare/URL-form OpenAlex id -- resolve first.
+            resolved = self.get_by_doi(identifier)
+            if resolved is None or "openalex" not in resolved.external_ids:
+                raise ProviderNotFoundError(
+                    f"OpenAlex: could not resolve {identifier!r} to a work id for {purpose} lookup",
+                    provider=self.name,
+                )
+            return resolved.external_ids["openalex"]
+        return _short_openalex_id(identifier) or identifier
+
+    def _list_edges(self, query: dict[str, str], *, context: str, offset: int, limit: int) -> CitationsPage:
+        response = self._get("/works", query)
+        raise_for_transport_error(response, provider=self.name, context=context)
+        body = response.json_body or {}
+        results = body.get("results", []) if isinstance(body, dict) else []
+        meta = body.get("meta", {}) if isinstance(body, dict) else {}
+        total = meta.get("count")
+        items = [_work_to_edge(r) for r in results]
+        has_more = isinstance(total, int) and (offset + len(items)) < total
+        return CitationsPage(items=items, provider=self.name, offset=offset, limit=limit, total=total, has_more=has_more)
+
+    def get_citations(
+        self, identifier: str, *, limit: int = 100, offset: int = 0,
+        work_type: str | None = None, sort: str | None = None,
+    ) -> CitationsPage:
         """``identifier`` may be a DOI or an OpenAlex work id (short
         ``W123`` or the full ``https://openalex.org/W123`` form).
+
+        Lane SI item A2: ``work_type`` narrows the citing works to one OpenAlex
+        type (``filter=cites:<W>,type:<work_type>``) and ``sort`` is passed
+        through as ``sort=<sort>`` (e.g. ``cited_by_count:desc``). With both
+        left at ``None`` the request URL is byte-identical to the one built
+        before these keywords existed.
+
         TRIALERROR-DEV-NOTE (scope limitation, disclosed): OpenAlex paginates
         listing endpoints via ``page``/``per-page``, not a raw byte
         offset; this maps ``offset`` to a page number assuming ``offset``
@@ -221,39 +321,40 @@ class OpenAlexProvider:
         might otherwise expect an offset-based API to support."""
         limit = max(1, min(limit, 100))
         page = (offset // limit) + 1
-        openalex_id = identifier
-        if "/" in identifier or identifier.count(".") >= 1:
-            # looks like a DOI, not a bare/URL-form OpenAlex id -- resolve first.
-            resolved = self.get_by_doi(identifier)
-            if resolved is None or "openalex" not in resolved.external_ids:
-                raise ProviderNotFoundError(
-                    f"OpenAlex: could not resolve {identifier!r} to a work id for citations lookup",
-                    provider=self.name,
-                )
-            openalex_id = resolved.external_ids["openalex"]
-        else:
-            openalex_id = _short_openalex_id(identifier) or identifier
+        openalex_id = self._resolve_work_id(identifier, purpose="citations")
+        work_filter = f"cites:{openalex_id}"
+        if work_type is not None:
+            work_filter += f",type:{work_type}"
+        query = {"filter": work_filter, "per-page": str(limit), "page": str(page)}
+        if sort is not None:
+            query["sort"] = sort
+        return self._list_edges(query, context=f"get_citations({identifier!r})", offset=offset, limit=limit)
 
-        response = self._get("/works", {"filter": f"cites:{openalex_id}", "per-page": str(limit), "page": str(page)})
-        raise_for_transport_error(response, provider=self.name, context=f"get_citations({identifier!r})")
+    def get_references(self, identifier: str, *, limit: int = 20) -> CitationsPage:
+        """Lane SI item A2: the works ``identifier`` cites, most-cited first
+        (``filter=cited_by:<W>&sort=cited_by_count:desc``). Resolves a DOI to a
+        work id exactly as :meth:`get_citations` does. One page only."""
+        limit = max(1, min(limit, 100))
+        openalex_id = self._resolve_work_id(identifier, purpose="references")
+        query = {"filter": f"cited_by:{openalex_id}", "per-page": str(limit), "sort": "cited_by_count:desc"}
+        return self._list_edges(query, context=f"get_references({identifier!r})", offset=0, limit=limit)
+
+    def get_author_works(
+        self, author_id: str, *, since_year: int | None = None, limit: int = 10,
+    ) -> list[WorkRecord]:
+        """Lane SI item A2: one OpenAlex author's works, most-cited first,
+        optionally only those published from ``since_year`` on
+        (``filter=author.id:<A>[,from_publication_date:<since_year>-01-01]``).
+        ``author_id`` is an OpenAlex author id (``A123`` or its URL form)."""
+        limit = max(1, min(limit, 100))
+        short_id = _short_openalex_id(author_id) or author_id
+        author_filter = f"author.id:{short_id}"
+        if since_year is not None:
+            author_filter += f",from_publication_date:{int(since_year)}-01-01"
+        response = self._get(
+            "/works", {"filter": author_filter, "sort": "cited_by_count:desc", "per-page": str(limit)},
+        )
+        raise_for_transport_error(response, provider=self.name, context=f"get_author_works({author_id!r})")
         body = response.json_body or {}
         results = body.get("results", []) if isinstance(body, dict) else []
-        meta = body.get("meta", {}) if isinstance(body, dict) else {}
-        total = meta.get("count")
-        items = [
-            CitationEdge(
-                title=r.get("title"),
-                doi=normalize_doi(r.get("doi")),
-                arxiv_id=None,
-                year=r.get("publication_year"),
-                authors=[
-                    a.get("author", {}).get("display_name")
-                    for a in (r.get("authorships") or [])
-                    if a.get("author", {}).get("display_name")
-                ],
-                external_ids={"openalex": _short_openalex_id(r.get("id"))} if r.get("id") else {},
-            )
-            for r in results
-        ]
-        has_more = isinstance(total, int) and (offset + len(items)) < total
-        return CitationsPage(items=items, provider=self.name, offset=offset, limit=limit, total=total, has_more=has_more)
+        return [_work_to_record(r) for r in results[:limit]]

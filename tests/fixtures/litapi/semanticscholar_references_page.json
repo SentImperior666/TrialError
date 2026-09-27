@@ -1,0 +1,28 @@
+{
+  "offset": 0,
+  "next": null,
+  "data": [
+    {
+      "citedPaper": {
+        "paperId": "bbbb0000000000000000000000000000000001",
+        "title": "A Study of Widgets",
+        "externalIds": {"DOI": "10.1234/widgets.1986"},
+        "year": 1986,
+        "citationCount": 250,
+        "publicationTypes": ["Book"],
+        "authors": [{"authorId": "3000", "name": "Dan Author"}]
+      }
+    },
+    {
+      "citedPaper": {
+        "paperId": "bbbb0000000000000000000000000000000002",
+        "title": "Further Notes on Widgets",
+        "externalIds": {},
+        "year": 1990,
+        "citationCount": 40,
+        "publicationTypes": null,
+        "authors": [{"authorId": null, "name": "Eve Other"}]
+      }
+    }
+  ]
+}

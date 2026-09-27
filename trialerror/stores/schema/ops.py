@@ -31,6 +31,7 @@ TABLES = (
     "prereg",
     "lens_roster",
     "lens_assignment",
+    "lens_assignment_launch",
     "memory_item",
     "memory_relation",
     "room",
@@ -839,6 +840,75 @@ _V10 = (
     "CREATE INDEX IF NOT EXISTS idx_lens_assignment_lens_launch ON lens_assignment(lens_launch_id)",
 )
 
+# ---- schema-v11 (a lens is a NAME with SEVERAL launches: bindings
+# accumulate instead of overwriting; lane R0-B item 3) ----------------------
+#
+# ``lens_assignment.lens_launch_id`` holds ONE launch per assignment row, and
+# ``book_launch(assign_ids=...)`` overwrote it on every booking. A lens booked
+# a second time -- a later phase of the same round, a re-spawn after a
+# cut-off -- therefore moved the join its first launch's records and feed post
+# hang off, and the only way to keep that join intact was to book the second
+# launch with no assign ids at all, which left it with no slice binding and
+# invisible to the citation audit. Both readings were wrong about the same
+# thing: a lens is a name, and a name can hold several launches.
+#
+# ``lens_assignment_launch`` is the accumulating link: one row per
+# (assignment, launch) pair, with the ``phase`` label the booking declared
+# (NULL for a booking that declared none) and the time the binding was made.
+# The PK makes a re-booking of the same pair a no-op rather than a duplicate.
+#
+# ``lens_assignment.lens_launch_id`` stays, and stays FIRST-WINS: it is what
+# every pre-v11 reader resolves, and rewriting it is what this migration
+# exists to stop. The backfill gives every already-bound assignment row its
+# link row, so a store migrated here reads exactly as it did before --
+# ``bound_ts`` from the assignment's own ``created_ts`` (the only timestamp
+# the row carries; the binding cannot predate the row), falling back to the
+# migration's own run time if one is somehow NULL.
+_V11 = (
+    """
+    CREATE TABLE lens_assignment_launch (
+        assign_id TEXT NOT NULL,
+        launch_id TEXT NOT NULL,
+        phase     TEXT,
+        bound_ts  TEXT NOT NULL,
+        PRIMARY KEY (assign_id, launch_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_lens_assignment_launch_launch "
+    "ON lens_assignment_launch(launch_id)",
+    """
+    INSERT OR IGNORE INTO lens_assignment_launch (assign_id, launch_id, phase, bound_ts)
+    SELECT assign_id, lens_launch_id, NULL,
+           COALESCE(created_ts, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    FROM lens_assignment
+    WHERE lens_launch_id IS NOT NULL
+    """,
+)
+
+# ---- v12: plan-time check columns on `prereg`; registration dispositions -----
+# Additive (ALTER TABLE ... ADD COLUMN and CREATE INDEX only). `prereg` gains
+# the round/suite/parent link and the recorded plan check (the plan-time
+# check at commit); `gate` and `artifact` gain the disposition of a registration
+# that went through `register_with_deviation` or `register_failed`. NULL
+# on every existing row, and on every row written by the normal paths. A
+# fresh store gets these by applying this migration after v1, so `_V1` is
+# not edited.
+_V12 = (
+    "ALTER TABLE prereg ADD COLUMN round_id TEXT",
+    "ALTER TABLE prereg ADD COLUMN plan_suite TEXT",
+    "ALTER TABLE prereg ADD COLUMN parent_prereg_id TEXT",
+    "ALTER TABLE prereg ADD COLUMN plan_check TEXT",
+    "ALTER TABLE prereg ADD COLUMN plan_check_status TEXT "
+    "CHECK (plan_check_status IN ('pass','pass_with_warnings','deviations_accepted'))",
+    "ALTER TABLE prereg ADD COLUMN plan_checked_ts TEXT",
+    "CREATE INDEX IF NOT EXISTS ix_prereg_round_suite ON prereg(round_id, plan_suite)",
+    "ALTER TABLE gate ADD COLUMN disposition TEXT "
+    "CHECK (disposition IN ('deviation_disclosed','failure_registered'))",
+    "ALTER TABLE gate ADD COLUMN deviation_ref TEXT",
+    "ALTER TABLE artifact ADD COLUMN disposition TEXT "
+    "CHECK (disposition IN ('registered_with_deviation','registered_failed'))",
+)
+
 MIGRATIONS = (
     Migration(version=1, name="ops_v1_initial_schema", statements=_V1),
     Migration(version=2, name="ops_v2_memory_item_account_id_nullable_and_thread_status_refs", statements=_V2),
@@ -850,4 +920,6 @@ MIGRATIONS = (
     Migration(version=8, name="ops_v8_thread_created_by_nullable_and_author", statements=_V8),
     Migration(version=9, name="ops_v9_lens_control_seat_recipe_cards_and_arm_mode", statements=_V9),
     Migration(version=10, name="ops_v10_lens_assignment_lens_launch_id", statements=_V10),
+    Migration(version=11, name="ops_v11_lens_assignment_launch", statements=_V11),
+    Migration(version=12, name="ops_v12_prereg_plan_check_and_registration_dispositions", statements=_V12),
 )

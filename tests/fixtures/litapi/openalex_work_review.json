@@ -1,0 +1,23 @@
+{
+  "id": "https://openalex.org/W5000000001",
+  "doi": "https://doi.org/10.1234/widgets.review",
+  "title": "A Review of Widget Studies",
+  "publication_year": 2015,
+  "type": "review",
+  "ids": {"openalex": "https://openalex.org/W5000000001", "doi": "https://doi.org/10.1234/widgets.review"},
+  "authorships": [
+    {"author_position": "first", "author": {"id": "https://openalex.org/A5000000001", "display_name": "Ann Author"}},
+    {"author_position": "middle", "author": {"id": null, "display_name": "Ben Nobody"}},
+    {"author_position": "last", "author": {"id": "https://openalex.org/A5000000003", "display_name": "Cat Writer"}}
+  ],
+  "primary_location": {"source": {"display_name": "Journal of Widget Studies"}},
+  "open_access": {"is_oa": false, "oa_url": null},
+  "cited_by_count": 17,
+  "counts_by_year": [
+    {"year": 2017, "cited_by_count": 5},
+    {"year": 2016, "cited_by_count": 9},
+    {"year": 2015, "cited_by_count": 3}
+  ],
+  "abstract_inverted_index": {"A": [0], "review.": [1]},
+  "referenced_works": ["https://openalex.org/W1"]
+}

@@ -281,8 +281,12 @@ def test_an_empty_provenance_graph_reads_as_the_reading_not_a_blank(traced):  # 
     p = data.build_evidence_panel(rostore, claim_id=ids["claim_same_doc"])
     tree = run_harness("renderDetail", [p, {}])["tree"]
     assert "0 EDGES · THE GENERAL PROVENANCE GRAPH IS EMPTY" in texts(by_class(tree, "empty"))
-    assert any("prov_edge has zero writers outside lexicon lineage edges" in t
-               for t in texts(by_class(tree, "note-strip")))
+    # A8: the on-screen note is the plain operator sentence; the old
+    # developer-facing wording is now the note's `title` (a tooltip).
+    note_strips = by_class(tree, "note-strip")
+    assert any(n.get("text") == "Contradictions shown here come from contradiction verdicts only." for n in note_strips)
+    assert any("prov_edge has zero writers outside lexicon lineage edges" in n.get("attrs", {}).get("title", "")
+               for n in note_strips)
 
 
 @requires_node
@@ -315,14 +319,19 @@ def test_a_program_that_cannot_answer_gets_a_stated_omission_not_an_empty_box(pa
     omitted.pop("term_conflicts", None)
     omitted["term_conflicts_omitted"] = {
         "reason": "awaiting_migration",
-        "message": (
+        "message": "Term-sense conflicts per claim are not available yet.",
+        "message_detail": (
             "the per-claim term-sense conflict read (lexicon.api.conflicts_for_claim) is not in "
             "this program yet -- this region is omitted rather than drawn empty"
         ),
     }
     tree = run_harness("renderDetail", [omitted, {}])["tree"]
-    notes = texts(by_class(tree, "note-strip"))
-    assert any(t.startswith("TERM-SENSE CONFLICTS:") and "conflicts_for_claim" in t for t in notes)
+    note_strips = by_class(tree, "note-strip")
+    notes = texts(note_strips)
+    # A8: the on-screen note is "TERM-SENSE CONFLICTS: " + the plain sentence;
+    # the developer-facing detail (naming the actual read) moves to `title`.
+    assert any(t == "TERM-SENSE CONFLICTS: Term-sense conflicts per claim are not available yet." for t in notes)
+    assert any("conflicts_for_claim" in n.get("attrs", {}).get("title", "") for n in note_strips)
     assert not by_class(tree, "ev-term-conflict")
 
 

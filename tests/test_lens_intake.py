@@ -208,6 +208,50 @@ def test_records_may_arrive_wrapped_in_an_object(store):
 
 
 # ---------------------------------------------------------------------------
+# a derivative record: its parents, and the phase it was written in
+# ---------------------------------------------------------------------------
+#
+# A round may run a derivation phase after its first screen, in which a lens
+# writes records FROM records. Two things on such a record are what make it
+# readable afterwards as a derivative rather than as one more first-phase
+# idea: the ids it was built on, and the phase it was written in. The first
+# is a promoted column; the second is a key the author adds to the
+# provenance object, and provenance keeps every key it is given. Both are
+# pinned here because a round that cannot tell its two phases apart cannot
+# compare them, and neither one announces its loss.
+
+
+def test_a_derivative_record_keeps_its_parents_and_its_phase(store):
+    launch_id = bootstrap_launch(store)
+    rows = intake_records(
+        store,
+        round_id=ROUND_ID,
+        records=[_record(
+            parent_ids=["IDEA-P1", "IDEA-P2"],
+            provenance={"docs": ["DOC-A"], "card": "TRANSFER", "phase": "derivation"},
+        )],
+        author_launch=launch_id,
+    )
+    stored = read_idea(store, idea_id=rows[0]["idea_id"])
+    assert stored["parent_ids"] == ["IDEA-P1", "IDEA-P2"]
+    provenance = json.loads(stored["provenance"])
+    assert provenance["phase"] == "derivation"
+    # The keys the rest of the round reads are untouched by the new one.
+    assert provenance["docs"] == ["DOC-A"]
+    assert provenance["card"] == "TRANSFER"
+
+
+def test_a_first_phase_record_carries_neither(store):
+    """The other half of the same contract: the fields are omitted in the
+    first phase, and omitting them is not a half-written record."""
+    launch_id = bootstrap_launch(store)
+    rows = intake_records(store, round_id=ROUND_ID, records=[_record()], author_launch=launch_id)
+    stored = read_idea(store, idea_id=rows[0]["idea_id"])
+    assert stored["parent_ids"] is None
+    assert "phase" not in json.loads(stored["provenance"])
+
+
+# ---------------------------------------------------------------------------
 # the CLI verb
 # ---------------------------------------------------------------------------
 
@@ -318,3 +362,33 @@ def test_intake_with_no_status_flag_still_writes_raw_records(cli_program_root, t
     store = open_store(cli_program_root, platform_root=tmp_path / "platform_root")
     assert read_idea(store, idea_id=env["result"]["idea_ids"][0])["status"] == "raw"
     store.close()
+
+
+def test_the_intake_verb_carries_a_derivative_records_parents_and_phase(
+    cli_program_root, tmp_path, capsys
+):
+    """The same contract down the path a round actually uses: the operator
+    hands the verb a file, and what the file said is what the row says."""
+    store = open_store(cli_program_root, platform_root=tmp_path / "platform_root")
+    launch_id = bootstrap_launch(store)
+    store.close()
+    path = tmp_path / "records.json"
+    path.write_text(
+        json.dumps([_record(
+            parent_ids=["IDEA-P1"],
+            provenance={"docs": ["DOC-A"], "card": "TRANSFER", "phase": "derivation"},
+        )]),
+        encoding="utf-8",
+    )
+
+    env = _run(capsys, [
+        "lens", "--program-root", str(cli_program_root), "intake", "--round-id", ROUND_ID,
+        "--records", str(path), "--author-launch", launch_id, "--no-embed",
+    ])
+    assert env["ok"] is True, env
+
+    store = open_store(cli_program_root, platform_root=tmp_path / "platform_root")
+    stored = read_idea(store, idea_id=env["result"]["idea_ids"][0])
+    store.close()
+    assert stored["parent_ids"] == ["IDEA-P1"]
+    assert json.loads(stored["provenance"])["phase"] == "derivation"

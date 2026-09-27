@@ -32,11 +32,18 @@ from __future__ import annotations
 
 import json
 import re
+import hashlib
 import sqlite3
-from typing import Any, Callable, Sequence
+from pathlib import Path
+from typing import Any, Callable, Mapping, Sequence
 
 from trialerror.artifacts._txn import raw_insert, raw_update
-from trialerror.artifacts.errors import GateEntryConditionError, IllegalTransitionError
+from trialerror.artifacts.errors import (
+    GateEntryConditionError,
+    IllegalTransitionError,
+    OperatorFailRefusedError,
+    RegistrationRefusedError,
+)
 from trialerror.artifacts.state_machine import assert_legal_transition
 from trialerror.events.api import append_event_in_txn
 from trialerror.stores import get as store_get
@@ -54,6 +61,10 @@ __all__ = [
     "submit_gate",
     "record_verdict",
     "apply_union",
+    "register_with_deviation",
+    "register_failed",
+    "fail_on_reproduction",
+    "OPERATOR_FAIL_PATH",
     "verify_edit",
     "send_back_edit",
 ]
@@ -65,6 +76,16 @@ VERDICT_VALUES = frozenset({"PASS", "PASS_WITH_EDITS", "FAIL"})
 REPRODUCTION_STATUS_VALUES = frozenset({"match", "mismatch", "unrun"})
 
 _GATE_ID_RE_PREFIX = "CR"
+
+#: ``gate_transition.evidence.path`` of the one transition
+#: :func:`fail_on_reproduction` writes. :func:`register_failed` accepts a gate
+#: without a critic ``FAIL`` only when its move into ``failed`` carries it.
+OPERATOR_FAIL_PATH = "operator_failed_reproduction"
+
+#: Evidence paths only this module's named functions write. :func:`advance_gate`
+#: refuses evidence that claims one, so a generic transition cannot pass for
+#: an operator decision (or a registration) it is not.
+_RESERVED_EVIDENCE_PATHS = frozenset({OPERATOR_FAIL_PATH, "register_with_deviation", "register_failed"})
 
 
 def _next_gate_id(conn: sqlite3.Connection) -> str:
@@ -147,12 +168,12 @@ def _normalize_edits(edits: Sequence[dict[str, Any]] | None) -> list[dict[str, A
     return normalized
 
 
-def _check_union_entry(gate: dict[str, Any]) -> None:
-    """The F10-resolution enforcement: everything the transition INTO
-    ``union_applied`` must verify before it is allowed to land. Collects
-    every violation (rather than failing on the first) so a caller sees the
-    whole picture in one refusal — the same "combine every reason" style
-    ``trialerror.law.service.verify_pin`` uses for its own multi-check refusal."""
+def _union_entry_problems(gate: dict[str, Any], *, ignore_reproduction: bool = False) -> list[str]:
+    """Every reason the gate may not enter ``union_applied``, collected rather
+    than stopping at the first, so a caller sees the whole picture.
+    ``ignore_reproduction=True`` leaves out the reproduction condition only:
+    :func:`register_with_deviation` shares the verdict and blocking-edit
+    conditions and replaces the reproduction one with its own."""
     problems: list[str] = []
 
     verdict = gate.get("verdict")
@@ -164,10 +185,20 @@ def _check_union_entry(gate: dict[str, Any]) -> None:
     if unverified_blocking:
         problems.append(f"blocking edit(s) not yet verified: {unverified_blocking}")
 
-    reproduction_status = gate.get("reproduction_status")
-    if reproduction_status == "mismatch":
-        problems.append("reproduction_status is 'mismatch'")
+    if not ignore_reproduction:
+        reproduction_status = gate.get("reproduction_status")
+        if reproduction_status == "mismatch":
+            problems.append("reproduction_status is 'mismatch'")
+    return problems
 
+
+def _check_union_entry(gate: dict[str, Any]) -> None:
+    """The F10-resolution enforcement: everything the transition INTO
+    ``union_applied`` must verify before it is allowed to land. Collects
+    every violation (rather than failing on the first) so a caller sees the
+    whole picture in one refusal — the same "combine every reason" style
+    ``trialerror.law.service.verify_pin`` uses for its own multi-check refusal."""
+    problems = _union_entry_problems(gate)
     if problems:
         raise GateEntryConditionError(
             f"gate {gate['gate_id']!r}: cannot enter union_applied — " + "; ".join(problems)
@@ -290,8 +321,28 @@ def advance_gate(
     shares its transition-execution core (see module docstring)."""
     if not by_launch:
         raise ValueError("advance_gate: by_launch is required (gate_transition.by_launch is NOT NULL)")
+    # A reserved path is a string; checking the type first keeps an unhashable
+    # path (a list, an object) from raising TypeError here instead of passing.
+    if (
+        isinstance(evidence, Mapping)
+        and isinstance(evidence.get("path"), str)
+        and evidence["path"] in _RESERVED_EVIDENCE_PATHS
+    ):
+        raise IllegalTransitionError(
+            f"gate {gate_id!r}: evidence path {evidence.get('path')!r} is written only by its own verb, "
+            "never by a generic transition"
+        )
     _require_launch_exists(store, by_launch, field_name="by_launch")
     gate = _require_gate(store, gate_id)
+    if to_state == "registered" and gate["state"] in ("gated", "failed"):
+        # These two edges are in the graph so recorded transitions validate,
+        # but they are legal only inside the two functions that write the
+        # transition themselves, after their own preconditions.
+        raise IllegalTransitionError(
+            f"gate {gate_id!r}: {gate['state']!r} -> 'registered' is not a generic transition; use "
+            "register_with_deviation (a disclosed deviation; CLI: `trialerror artifact register --with-deviation`) or "
+            "register_failed (a recorded FAIL; CLI: `trialerror artifact register --as-failed`)"
+        )
     ts = ts or now()
 
     conn = store.ops
@@ -316,6 +367,433 @@ def advance_gate(
         conn.execute("ROLLBACK")
         raise
     return _require_gate(store, gate_id)
+
+
+def _read_frozen_artifact(store: Store, artifact: Mapping[str, Any]) -> str:
+    """The artifact file's text, refused unless it is the file that was
+    registered for review: it exists and its sha256 equals ``artifact.sha256``.
+    The disclosure a registration rests on must be in the very bytes the gate
+    looked at, not in an edited copy."""
+    path = Path(artifact["path"])
+    if not path.is_file() and not path.is_absolute():
+        path = store.program_root / path
+    if not path.is_file():
+        raise RegistrationRefusedError(
+            f"artifact {artifact['artifact_id']!r}: its file {str(artifact['path'])!r} is missing, so what it "
+            "discloses cannot be checked"
+        )
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != artifact["sha256"]:
+        raise RegistrationRefusedError(
+            f"artifact {artifact['artifact_id']!r}: its file no longer matches the sha256 recorded when it "
+            "was submitted for review; a disclosure in a changed file is not the disclosure the gate saw"
+        )
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RegistrationRefusedError(
+            f"artifact {artifact['artifact_id']!r}: its file is not UTF-8 text ({exc})"
+        ) from exc
+
+
+def _require_registrable_artifact(store: Store, gate: dict[str, Any]) -> dict[str, Any]:
+    artifact = store_get(store, "artifact", pk_column="artifact_id", pk_value=gate["artifact_id"])
+    if artifact is None:
+        raise RegistrationRefusedError(f"gate {gate['gate_id']!r}: its artifact {gate['artifact_id']!r} does not exist")
+    if artifact["status"] != "in_gate" or artifact.get("gate_id") != gate["gate_id"]:
+        raise RegistrationRefusedError(
+            f"artifact {artifact['artifact_id']!r} is {artifact['status']!r} with gate {artifact.get('gate_id')!r}; "
+            f"only the artifact's current gate ({gate['gate_id']!r}) can register it"
+        )
+    return artifact
+
+
+def _failing_gate_suite_checks(gate: dict[str, Any]) -> list[str]:
+    """The names of the checks that failed in the gate-suite record
+    ``reproduction_ref`` holds. Any other kind of reproduction record (a
+    byte-exact ``verify reproduce`` mismatch, say) is not a disclosed
+    deviation and is refused."""
+    from trialerror.eval.gate_suites import check_status
+
+    raw = gate.get("reproduction_ref")
+    try:
+        record = json.loads(raw) if raw else None
+    except (TypeError, json.JSONDecodeError):
+        record = None
+    if not isinstance(record, dict) or record.get("kind") != "gate_suite" or not isinstance(record.get("checks"), list):
+        raise RegistrationRefusedError(
+            f"gate {gate['gate_id']!r}: reproduction_ref is not a gate-suite record, so there is no failing check "
+            "to disclose. A reproduction mismatch is not a deviation an artifact can disclose"
+        )
+    return [str(c.get("name")) for c in record["checks"] if isinstance(c, dict) and check_status(c) == "fail"]
+
+
+def _commit_registration(
+    store: Store,
+    *,
+    gate_id: str,
+    artifact_id: str,
+    expected_state: str,
+    gate_changes: dict[str, Any],
+    artifact_changes: dict[str, Any],
+    evidence: Any,
+    by_launch: str,
+    ts: str,
+    supersedes: str | None,
+    what: str,
+) -> None:
+    """The one transaction both registration functions share: re-fetch the
+    gate under the write lock and re-check its state (the OB-2 race fix
+    ``register_artifact`` uses), move it to ``registered``, write its
+    ``gate_transition`` row, and flip the artifact."""
+    conn = store.ops
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        fresh = conn.execute("SELECT * FROM gate WHERE gate_id = ?", (gate_id,)).fetchone()
+        if fresh is None or fresh["state"] != expected_state:
+            raise RegistrationRefusedError(
+                f"gate {gate_id!r}: {what} needs the gate at {expected_state!r} — "
+                + (f"it is at {fresh['state']!r}" if fresh is not None else "it no longer exists")
+            )
+        fresh_artifact = conn.execute("SELECT status FROM artifact WHERE artifact_id = ?", (artifact_id,)).fetchone()
+        if fresh_artifact is None or fresh_artifact["status"] != "in_gate":
+            raise RegistrationRefusedError(f"artifact {artifact_id!r} is no longer in its gate")
+        if supersedes:
+            prior = conn.execute("SELECT status FROM artifact WHERE artifact_id = ?", (supersedes,)).fetchone()
+            if prior is None or prior["status"] != "registered":
+                raise ValidationError(
+                    f"{what}: supersedes={supersedes!r} does not name an existing 'registered' artifact"
+                )
+            raw_update(conn, "artifact", pk_column="artifact_id", pk_value=supersedes, changes={"status": "superseded"})
+        raw_update(conn, "gate", pk_column="gate_id", pk_value=gate_id, changes={**gate_changes, "state": "registered"})
+        raw_insert(
+            conn,
+            "gate_transition",
+            {
+                "gate_id": gate_id,
+                "from_state": expected_state,
+                "to_state": "registered",
+                "ts": ts,
+                "by_launch": by_launch,
+                "evidence": json.dumps(evidence, ensure_ascii=False),
+            },
+        )
+        raw_update(
+            conn, "artifact", pk_column="artifact_id", pk_value=artifact_id,
+            changes={
+                **artifact_changes,
+                "status": "registered",
+                "registered_ts": ts,
+                "registered_by_launch": by_launch,
+                "supersedes": supersedes,
+            },
+        )
+        conn.execute("COMMIT")
+    except (ValidationError, RegistrationRefusedError, ValueError):
+        conn.execute("ROLLBACK")
+        raise
+    except sqlite3.IntegrityError as exc:
+        conn.execute("ROLLBACK")
+        raise ValidationError(f"{what}: integrity violation: {exc}") from exc
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def register_with_deviation(
+    store: Store,
+    *,
+    gate_id: str,
+    deviations: Sequence[Mapping[str, str]],
+    decided_by: str,
+    by_launch: str,
+    supersedes: str | None = None,
+    ts: str | None = None,
+) -> dict[str, Any]:
+    """Register an artifact whose gate suite failed on something the artifact
+    itself discloses, by an operator decision (without this, a report that
+    already states a deviation in its own deviations table stays unregistered
+    because one gate check found the very thing the report says).
+
+    ``deviations`` is ``[{"check": <suite check name>, "reason": <plain
+    words>, "report_ref": <a string that appears in the artifact>}]``. Every
+    refusal is a :class:`~trialerror.artifacts.errors.RegistrationRefusedError`
+    with a plain-words message:
+
+    1. the gate exists and is ``gated``;
+    2. its ``reproduction_status`` is ``mismatch`` (``match`` takes the normal
+       path; ``unrun`` has nothing to disclose);
+    3. every other condition for ``union_applied`` holds (a passing verdict,
+       every blocking edit verified) -- shared with the normal path through
+       :func:`_union_entry_problems`;
+    4. ``reproduction_ref`` is a gate-suite record, and the deviations cover
+       its failing checks EXACTLY: each failing check at least once, no
+       deviation naming a check that did not fail;
+    5. the artifact file (unchanged since submission: its sha256 matches)
+       contains every ``report_ref`` verbatim -- the disclosure has to be in
+       the artifact's own text;
+    6. ``decided_by`` is non-empty.
+
+    Then, in one transaction, the gate moves ``gated -> registered`` with
+    ``disposition='deviation_disclosed'``, a ``gate_transition`` row records
+    the path, the decision and the deviations, and the artifact becomes
+    ``registered`` with ``disposition='registered_with_deviation'``. Returns
+    the artifact row. This is one of only two writers of a ``gated`` or
+    ``failed`` gate to ``registered``; :func:`advance_gate` refuses both."""
+    if not by_launch:
+        raise ValueError("register_with_deviation: by_launch is required")
+    _require_launch_exists(store, by_launch, field_name="by_launch")
+    if not isinstance(decided_by, str) or not decided_by.strip():
+        raise RegistrationRefusedError(
+            "register_with_deviation: decided_by is required -- the operator decision that accepts the deviation"
+        )
+    gate = _require_gate(store, gate_id)
+    if gate["state"] != "gated":
+        raise RegistrationRefusedError(
+            f"gate {gate_id!r} is {gate['state']!r}; registering with a deviation needs a gate at 'gated'"
+        )
+    status = gate.get("reproduction_status")
+    if status == "match":
+        raise RegistrationRefusedError(
+            f"gate {gate_id!r}: the gate suite passed (reproduction_status 'match'), so there is nothing to "
+            "disclose -- use the normal path (apply-union, then register)"
+        )
+    if status != "mismatch":
+        raise RegistrationRefusedError(
+            f"gate {gate_id!r}: reproduction_status is {status!r}; only a gate suite that ran and failed "
+            "('mismatch') can be registered with a disclosed deviation"
+        )
+    problems = _union_entry_problems(gate, ignore_reproduction=True)
+    if problems:
+        raise RegistrationRefusedError(
+            f"gate {gate_id!r}: cannot register with a deviation — " + "; ".join(problems)
+        )
+    failing = _failing_gate_suite_checks(gate)
+    if not deviations:
+        raise RegistrationRefusedError(
+            f"gate {gate_id!r}: no deviation given; the failing check(s) {failing} each need one"
+        )
+    named: list[str] = []
+    for d in deviations:
+        check, reason, report_ref = d.get("check"), d.get("reason"), d.get("report_ref")
+        if not (isinstance(check, str) and check and isinstance(reason, str) and reason.strip()
+                and isinstance(report_ref, str) and report_ref):
+            raise RegistrationRefusedError(
+                f"gate {gate_id!r}: each deviation needs a check, a reason and a report_ref; got {dict(d)!r}"
+            )
+        named.append(check)
+    uncovered = [c for c in failing if c not in named]
+    stray = sorted({c for c in named if c not in failing})
+    if uncovered or stray:
+        raise RegistrationRefusedError(
+            f"gate {gate_id!r}: the deviations must cover exactly the checks that failed -- failing: {failing}; "
+            f"not covered: {uncovered or 'none'}; named but not failing: {stray or 'none'}"
+        )
+    artifact = _require_registrable_artifact(store, gate)
+    text = _read_frozen_artifact(store, artifact)
+    absent = [d["report_ref"] for d in deviations if d["report_ref"] not in text]
+    if absent:
+        raise RegistrationRefusedError(
+            f"artifact {artifact['artifact_id']!r}: the artifact's own text does not contain {absent!r}; a "
+            "deviation is registered only when the artifact itself discloses it"
+        )
+
+    ts = ts or now()
+    recorded = [{"check": d["check"], "reason": d["reason"], "report_ref": d["report_ref"]} for d in deviations]
+    _commit_registration(
+        store, gate_id=gate_id, artifact_id=artifact["artifact_id"], expected_state="gated",
+        gate_changes={"disposition": "deviation_disclosed", "deviation_ref": json.dumps(recorded, ensure_ascii=False)},
+        artifact_changes={"disposition": "registered_with_deviation"},
+        evidence={"path": "register_with_deviation", "decided_by": decided_by, "deviations": recorded},
+        by_launch=by_launch, ts=ts, supersedes=supersedes, what="register_with_deviation",
+    )
+    return store_get(store, "artifact", pk_column="artifact_id", pk_value=artifact["artifact_id"])
+
+
+def fail_on_reproduction(
+    store: Store,
+    *,
+    gate_id: str,
+    decided_by: str,
+    reason: str,
+    by_launch: str,
+    ts: str | None = None,
+) -> dict[str, Any]:
+    """The operator's decision that a gate whose gate-suite reproduction failed
+    is a failed result, although the critic passed it: ``gated -> failed``.
+
+    Without it such a gate can go nowhere the operator wants: its
+    ``mismatch`` keeps it out of ``union_applied``, and :func:`register_failed`
+    wanted a critic ``FAIL`` it will never have. After it,
+    :func:`register_failed` accepts the gate (see there).
+
+    Refusals (:class:`~trialerror.artifacts.errors.OperatorFailRefusedError`),
+    each before anything is written:
+
+    1. ``decided_by`` or ``reason`` is empty;
+    2. the gate is not ``gated`` -- the one state this path names (a ``FAIL``
+       verdict already lands at ``failed``; ``union_applied`` cannot hold a
+       mismatch; ``draft``/``submitted`` have no reproduction yet; ``failed``
+       and ``registered`` are past it);
+    3. its ``reproduction_status`` is not ``mismatch``.
+
+    It only ever moves a gate toward ``failed``. The critic's ``verdict``,
+    ``edits`` and the reproduction columns are not written: the one
+    ``UPDATE`` sets ``gate.state``, and one ``gate_transition`` row is added
+    whose evidence carries the decision, the reason and the reproduction
+    reference -- both in one transaction, re-checked under its write lock."""
+    if not by_launch:
+        raise ValueError("fail_on_reproduction: by_launch is required")
+    if not isinstance(decided_by, str) or not decided_by.strip():
+        raise OperatorFailRefusedError(
+            "fail_on_reproduction: decided_by is required -- the operator decision that fails the gate"
+        )
+    if not isinstance(reason, str) or not reason.strip():
+        raise OperatorFailRefusedError("fail_on_reproduction: reason is required -- say in words why it failed")
+    _require_launch_exists(store, by_launch, field_name="by_launch")
+    _require_gate(store, gate_id)
+    ts = ts or now()
+
+    conn = store.ops
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        fresh = conn.execute("SELECT * FROM gate WHERE gate_id = ?", (gate_id,)).fetchone()
+        if fresh is None:
+            raise ValueError(f"no such gate: {gate_id!r}")
+        gate = dict(fresh)
+        if gate["state"] != "gated":
+            raise OperatorFailRefusedError(
+                f"gate {gate_id!r} is {gate['state']!r}; an operator-decided failure on a mismatched "
+                "reproduction needs the gate at 'gated'"
+            )
+        if gate.get("reproduction_status") != "mismatch":
+            raise OperatorFailRefusedError(
+                f"gate {gate_id!r}: reproduction_status is {gate.get('reproduction_status')!r}; this path fails "
+                "only a gate whose recorded reproduction is 'mismatch'"
+            )
+        evidence = {
+            "path": OPERATOR_FAIL_PATH,
+            "decided_by": decided_by,
+            "reason": reason,
+            "reproduction_status": gate["reproduction_status"],
+            "reproduction_ref": gate.get("reproduction_ref"),
+        }
+        _execute_transition(conn, gate=gate, to_state="failed", by_launch=by_launch, evidence=evidence, ts=ts)
+        conn.execute("COMMIT")
+    except sqlite3.IntegrityError as exc:
+        conn.execute("ROLLBACK")
+        raise ValidationError(f"fail_on_reproduction: integrity violation: {exc}") from exc
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return _require_gate(store, gate_id)
+
+
+def _operator_fail_record(store: Store, gate_id: str) -> dict[str, Any] | None:
+    """The evidence of the gate's move into ``failed`` when
+    :func:`fail_on_reproduction` wrote it (``gated -> failed`` with
+    :data:`OPERATOR_FAIL_PATH`), else ``None``."""
+    row = store.ops.execute(
+        "SELECT from_state, evidence FROM gate_transition WHERE gate_id = ? AND to_state = 'failed' "
+        "ORDER BY ts DESC, rowid DESC LIMIT 1",
+        (gate_id,),
+    ).fetchone()
+    if row is None or row["from_state"] != "gated":
+        return None
+    try:
+        evidence = json.loads(row["evidence"]) if row["evidence"] else None
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(evidence, dict) or evidence.get("path") != OPERATOR_FAIL_PATH:
+        return None
+    return evidence
+
+
+def register_failed(
+    store: Store,
+    *,
+    gate_id: str,
+    failure_ref: str,
+    decided_by: str,
+    by_launch: str,
+    supersedes: str | None = None,
+    ts: str | None = None,
+) -> dict[str, Any]:
+    """Register an artifact as a FAILED result: the gate failed and the
+    operator decided the failure belongs on the record (without this, a
+    result that failed stays off the record). Refusals
+    (:class:`~trialerror.artifacts.errors.RegistrationRefusedError`):
+
+    1. the gate is ``failed``;
+    2. it failed in one of two ways: its ``verdict`` is ``FAIL`` (the
+       critic's), or it reached ``failed`` through :func:`fail_on_reproduction`
+       (the operator's decision on a ``mismatch`` reproduction, which must
+       still read ``mismatch``). A review abandoned without either -- a bare
+       ``gate advance --to failed`` -- is not a failed result;
+    3. the artifact file (sha256 unchanged) contains ``failure_ref``
+       verbatim, the artifact's own statement of what failed;
+    4. ``decided_by`` is non-empty.
+
+    Then, in one transaction, the gate moves ``failed -> registered`` with
+    ``disposition='failure_registered'``, a ``gate_transition`` row records
+    the path, the decision and the reference (and, on the second way, the
+    ``basis`` and the decision that failed the gate), and the artifact
+    becomes ``registered`` with ``disposition='registered_failed'``. The
+    critic's verdict is left as it was on either way. Returns the artifact
+    row."""
+    if not by_launch:
+        raise ValueError("register_failed: by_launch is required")
+    _require_launch_exists(store, by_launch, field_name="by_launch")
+    if not isinstance(decided_by, str) or not decided_by.strip():
+        raise RegistrationRefusedError(
+            "register_failed: decided_by is required -- the operator decision that puts the failure on the record"
+        )
+    gate = _require_gate(store, gate_id)
+    if gate["state"] != "failed":
+        raise RegistrationRefusedError(
+            f"gate {gate_id!r} is {gate['state']!r}; registering a failed result needs a gate at 'failed'"
+        )
+    operator_fail = None
+    if gate.get("verdict") != "FAIL":
+        operator_fail = _operator_fail_record(store, gate_id)
+        if operator_fail is None:
+            raise RegistrationRefusedError(
+                f"gate {gate_id!r}: its verdict is {gate.get('verdict')!r}, not 'FAIL', and it did not reach "
+                "'failed' by an operator decision on a mismatched reproduction (`trialerror gate "
+                "fail-reproduction`) -- a review that was abandoned is not a failed result"
+            )
+        if gate.get("reproduction_status") != "mismatch":
+            raise RegistrationRefusedError(
+                f"gate {gate_id!r}: it was failed on a mismatched reproduction, but its reproduction_status now "
+                f"reads {gate.get('reproduction_status')!r}; the basis of that decision no longer holds"
+            )
+    if not isinstance(failure_ref, str) or not failure_ref:
+        raise RegistrationRefusedError(
+            f"gate {gate_id!r}: failure_ref is required -- a string from the artifact that states what failed"
+        )
+    artifact = _require_registrable_artifact(store, gate)
+    text = _read_frozen_artifact(store, artifact)
+    if failure_ref not in text:
+        raise RegistrationRefusedError(
+            f"artifact {artifact['artifact_id']!r}: the artifact's own text does not contain {failure_ref!r}; a "
+            "failed result is registered only when the artifact itself states the failure"
+        )
+
+    ts = ts or now()
+    _commit_registration(
+        store, gate_id=gate_id, artifact_id=artifact["artifact_id"], expected_state="failed",
+        gate_changes={"disposition": "failure_registered"},
+        artifact_changes={"disposition": "registered_failed"},
+        evidence={
+            "path": "register_failed", "decided_by": decided_by, "failure_ref": failure_ref,
+            **(
+                {"basis": OPERATOR_FAIL_PATH, "failed_by": operator_fail.get("decided_by")}
+                if operator_fail is not None else {}
+            ),
+        },
+        by_launch=by_launch, ts=ts, supersedes=supersedes, what="register_failed",
+    )
+    return store_get(store, "artifact", pk_column="artifact_id", pk_value=artifact["artifact_id"])
 
 
 def submit_gate(store: Store, *, gate_id: str, by_launch: str, evidence: Any = None, ts: str | None = None) -> dict[str, Any]:

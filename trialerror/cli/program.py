@@ -104,7 +104,7 @@ id = "{program_id}"
 # configured_path_value) -- relocate any of TrialError's rendered/output
 # locations without moving data, e.g. to bridge INTO an existing non-TrialError
 # project's own layout instead of restructuring it (see
-# plugin/skills/import-existing-project, and docs/the import-design notes (internal, not in this export) for
+# docs/GETTING_STARTED.md path 2, and docs/the import-design notes (internal, not in this export) for
 # the worked example). Every value below is program-root-relative unless
 # given as an absolute path; a field left commented out falls back to the
 # literal shown. `ingest_roots` (a list) is the one knob that predates this
@@ -212,9 +212,12 @@ id = "{program_id}"
 # There is no keep-alive option. Tiers are for Qwen3-Embedding-4B @ 2048 dims;
 # mid ~= an RTX 5080 Laptop GPU and is the default. max_dph values are
 # ceilings you choose, not prices -- check live offers with `trialerror vastai plan`.
+# The same table serves the OCR lane on a GPU worker's backend-config-root
+# ([ingest.ocr] executor = "vastai"; docs/USER_SETUP.md section 1b), which reads
+# its own image, startup_s, safety and disk_gb from [vastai.ocr].
 # [vastai]
 # api_key_path = "keys/vastai.key"            # operator-placed; never inline the key
-# ssh_identity_path = "C:/Users/you/.ssh/id_ed25519"   # key registered with vast.ai
+# ssh_identity_path = "C:/path/to/.ssh/te_vastai"   # a key pair for vast.ai alone, registered there
 # tier = "mid"                  # low | mid | high. "high" ALSO needs an operator
 #                               # approval (`trialerror vastai approve-high`, TTY only)
 # max_job_usd = 3.00            # refuse to start if the worst case ($/h x TTL) exceeds this
@@ -245,24 +248,6 @@ id = "{program_id}"
 # program whose record you intend to keep.
 # [ingest]
 # require_real_backends = true
-
-# Plain-English Feed translator (trialerror.feed_translate, `trialerror feed
-# translate`). Absent table -> backend = "pending": a translation job builds
-# the envelope and parks it, costing nothing and calling nothing, for an
-# agent to fill with `trialerror feed translate --post-id ... --body "..."`.
-#   backend = "pending"  park envelopes (default; zero cost, zero network)
-#   backend = "fake"     deterministic offline rewrite, for demos and tests
-#   backend = "model"    model-backed; refuses to run without a booked launch,
-#                        and has no generation driver in this build (see
-#                        docs/reviews/AISPEAK_TRANSLATOR_DESIGN.md Section 3)
-# The faithfulness gate always runs its deterministic fidelity tier; the two
-# knobs below only widen what else withholds a translation.
-# [feed.translator]
-# backend = "pending"
-# model = "claude-sonnet-5"
-# faithfulness_min_score = 0.8
-# strict_style = false                # also withhold on register-level style breaks
-# require_faithfulness_score = false  # also withhold anything never judged
 
 # Literature-metadata API clients (trialerror.litapi.config, `trialerror lit ...`).
 # Every field defaults conservatively when this section is absent -- see

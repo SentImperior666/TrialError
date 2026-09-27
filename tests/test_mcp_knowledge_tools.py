@@ -14,9 +14,6 @@ from __future__ import annotations
 
 from trialerror.mcp.knowledge import TOOL_COUNT, build_tools
 from trialerror.stores.store import open_store
-from trialerror.stores.writer import insert
-from trialerror.util.ids import new_id
-from trialerror.util.timeutil import now
 
 from tests._retrieve_fixtures import build_small_corpus
 
@@ -29,13 +26,12 @@ def _seeded_store_and_tools(program_root, platform_root):
     return tools, corpus
 
 
-def test_tool_registry_has_exactly_the_12_named_tools(program_root, platform_root):
+def test_tool_registry_has_exactly_the_8_named_tools(program_root, platform_root):
     tools = build_tools(program_root=program_root, platform_root=platform_root)
-    assert len(tools) == TOOL_COUNT == 12
+    assert len(tools) == TOOL_COUNT == 8
     assert set(tools) == {
         "search", "get_chunk", "get_source", "get_document_outline", "resolve_quote",
-        "similar", "graph_neighbors", "corpus_stats", "memory_search", "list_requests", "poll_job",
-        "term_lookup",
+        "similar", "corpus_stats", "term_lookup",
     }
     for name, spec in tools.items():
         assert spec.name == name
@@ -134,89 +130,11 @@ def test_similar_claim_kind_is_graceful(program_root, platform_root):
     assert env["result"]["results"] == []
 
 
-def test_graph_neighbors_happy_path(program_root, platform_root):
-    tools, corpus = _seeded_store_and_tools(program_root, platform_root)
-    store = open_store(program_root, platform_root=platform_root)
-    try:
-        e1 = new_id("ENT")
-        insert(store, "entity", {"entity_id": e1, "name": "T", "entity_type": "x", "resolution": "confirmed", "created_by_launch": corpus["launch_id"], "created_at": now()})
-    finally:
-        store.close()
-    env = tools["graph_neighbors"].handler({"entity_id": e1})
-    assert env["ok"] is True
-    assert env["result"]["count"] == 0
-
-
-def test_graph_neighbors_not_found_is_a_structured_error(program_root, platform_root):
-    tools, _ = _seeded_store_and_tools(program_root, platform_root)
-    env = tools["graph_neighbors"].handler({"entity_id": "ENT-does-not-exist"})
-    assert env["ok"] is False
-    assert env["error"]["code"] == "EntityNotFoundError"
-
-
 def test_corpus_stats_happy_path(program_root, platform_root):
     tools, _ = _seeded_store_and_tools(program_root, platform_root)
     env = tools["corpus_stats"].handler({})
     assert env["ok"] is True
     assert env["result"]["sources"] == 2
-
-
-def test_memory_search_empty_index(program_root, platform_root):
-    tools, _ = _seeded_store_and_tools(program_root, platform_root)
-    env = tools["memory_search"].handler({"query": "anything"})
-    assert env["ok"] is True
-    assert env["result"] == {"items": [], "count": 0}
-
-
-def test_memory_search_put_then_get_by_id(program_root, platform_root):
-    tools, _ = _seeded_store_and_tools(program_root, platform_root)
-    store = open_store(program_root, platform_root=platform_root)
-    try:
-        from trialerror.memory.api import put_item
-
-        account_id = new_id("ACC")
-        insert(store, "account", {"account_id": account_id, "label": "t", "created_ts": now()})
-        row = put_item(store, key="k1", tier="L0", kind="fact", body="body text", account_id=account_id)
-    finally:
-        store.close()
-    env = tools["memory_search"].handler({"id": row["memory_item_id"]})
-    assert env["ok"] is True
-    assert env["result"]["item"]["body"] == "body text"
-
-
-def test_memory_search_not_found_by_id(program_root, platform_root):
-    tools, _ = _seeded_store_and_tools(program_root, platform_root)
-    env = tools["memory_search"].handler({"id": "MEM-does-not-exist"})
-    assert env["ok"] is False
-    assert env["error"]["code"] == "not_found"
-
-
-def test_list_requests_happy_path(program_root, platform_root):
-    tools, _ = _seeded_store_and_tools(program_root, platform_root)
-    env = tools["list_requests"].handler({})
-    assert env["ok"] is True
-    assert env["result"]["count"] == 2
-
-
-def test_poll_job_not_found_is_a_structured_error(program_root, platform_root):
-    tools, _ = _seeded_store_and_tools(program_root, platform_root)
-    env = tools["poll_job"].handler({"job_id": "JOB-does-not-exist"})
-    assert env["ok"] is False
-    assert env["error"]["code"] == "not_found"
-
-
-def test_poll_job_happy_path(program_root, platform_root):
-    tools, corpus = _seeded_store_and_tools(program_root, platform_root)
-    store = open_store(program_root, platform_root=platform_root)
-    try:
-        job_id = new_id("JOB")
-        insert(store, "job", {"job_id": job_id, "kind": "embed", "payload": "{}", "state": "pending", "created_ts": now()})
-    finally:
-        store.close()
-    env = tools["poll_job"].handler({"job_id": job_id})
-    assert env["ok"] is True
-    assert env["result"]["job"]["job_id"] == job_id
-    assert env["result"]["heartbeat_age_s"] is None
 
 
 def _seed_term(program_root, platform_root, corpus):

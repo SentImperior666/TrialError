@@ -596,7 +596,7 @@ GPU_LIVE_CC_ITEMS: dict[str, str] = {
     "live_cc_mcp_smoke_knowledge_server": (
         "MCP smoke via Claude Code for trialerror-knowledge (design Section 12 M8 row: \"MCP smoke "
         "via Claude Code (integration session)\"): register `trialerror mcp knowledge` in a real "
-        "Claude Code session's MCP config and confirm the 11 tools are actually offered to and "
+        "Claude Code session's MCP config and confirm the 8 tools are actually offered to and "
         "callable by a live agent. Offline proxy already covered: "
         "tests/test_mcp_knowledge_protocol.py (real stdio JSON-RPC wire round trip + a real "
         "subprocess initialize/tools-list handshake)."
@@ -607,7 +607,7 @@ GPU_LIVE_CC_ITEMS: dict[str, str] = {
         "session, call `book_launch` via the MCP tool, spawn a REAL subagent with the returned "
         "launch_id -- Claude Code 2.1.x does this as the `Agent` tool, not the legacy `Task` "
         "alias (FU-11, 2026-09-05); exercises the live PreToolUse hook above -- then "
-        "`reconcile_launch`. While here, capture the full `tool_input` object of that real "
+        "`trialerror budget reconcile` (reconcile_launch is no longer an MCP tool). While here, capture the full `tool_input` object of that real "
         "`Agent` spawn from the session transcript and confirm it still carries a `prompt` (or "
         "`description`) field: spawn_gate.py/post_task.py's launch_id extraction assumed that "
         "shape, unverified, the same way the tool NAME was assumed to stay `Task` -- if the "

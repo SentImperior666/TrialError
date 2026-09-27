@@ -39,8 +39,8 @@ from trialerror.util.envelope import error_envelope, next_action, ok_envelope
 
 GROUP_NAME = "mcp"
 HELP = (
-    "MCP servers: `trialerror mcp ops` starts the trialerror-ops stdio server (design Section 5.1, 12 tools); "
-    "`trialerror mcp knowledge` starts the trialerror-knowledge stdio server (design Section 5.1, 11 tools)."
+    "MCP servers: `trialerror mcp ops` starts the trialerror-ops stdio server (design Section 5.1, 3 tools after Phase 0); "
+    "`trialerror mcp knowledge` starts the trialerror-knowledge stdio server (design Section 5.1, 8 tools after Phase 0)."
 )
 
 

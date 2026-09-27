@@ -19,10 +19,11 @@ Split in two, deliberately:
   LOGICAL plan, never byte-identical database rows — ids/timestamps are
   never claimed to be reproducible, only the assignment decisions are).
 
-No duplicate slices across a round: each lens is processed in the given
-order and drawn candidates are removed from the shared arm pools before the
-next lens draws — a candidate can be assigned to at most one lens per round
-by construction, never by a post-hoc check.
+No duplicate slices across a round: each lens is processed in the order the
+salt scheme fixes (see :data:`SALT_SCHEMES`) and drawn candidates are removed
+from the shared arm pools before the next lens draws — a candidate can be
+assigned to at most one lens per round by construction, never by a post-hoc
+check.
 
 Two assignment MODES, and the difference between them is the whole point of
 ``arm_mode``:
@@ -47,7 +48,11 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping, Sequence
 
-from trialerror.lens.errors import ArmAllocationError, InsufficientCandidatesError
+from trialerror.lens.errors import (
+    ArmAllocationError,
+    DuplicateLensNameError,
+    InsufficientCandidatesError,
+)
 from trialerror.lens.quota import compute_quota_counts, derive_rng, draw_quota
 from trialerror.lens.stratify import ARMS, Arm, score_candidates, stratify
 from trialerror.lens.vectors import fetch_doc_vectors, program_config
@@ -58,6 +63,13 @@ from trialerror.util.timeutil import now
 
 __all__ = [
     "ARM_MODES",
+    "SALT_SCHEMES",
+    "LEGACY_SALT_SCHEME",
+    "LENS_NAME_SALT_SCHEME",
+    "SALT_SCHEME_KEY",
+    "LEGACY_SALT_WARNING_CODE",
+    "legacy_salt_warning",
+    "row_salt_scheme",
     "modal_arm",
     "allocate_lens_arms",
     "build_assignment_plan",
@@ -71,6 +83,34 @@ __all__ = [
 #: transcribed for caller-side validation. See the module docstring for what
 #: the two modes actually measure.
 ARM_MODES: tuple[str, ...] = ("per_slice", "per_lens")
+
+#: The legacy salt scheme, and the default: the per-lens draw stream is
+#: salted by the lens's minted ``roster_id`` and lenses are processed in the
+#: order the caller hands them over (for the CLI, roster insertion order).
+#: Exactly the behaviour every round before the scheme existed ran under.
+LEGACY_SALT_SCHEME = "roster-id"
+
+#: The scheme that makes the draw a function of the DESIGN: the stream is
+#: salted ``"<round_id>::<lens_name>"`` and lenses are processed in ascending
+#: ``lens_name`` order, so nothing about the draw moves when a roster row is
+#: deleted and re-added, or when the rows are inserted in another order.
+#: ``lens_name`` must then be unique within the round's roster.
+LENS_NAME_SALT_SCHEME = "lens-name"
+
+#: The two named salt schemes. A round's scheme is part of its design and
+#: belongs in its pre-registered parameters: a pre-registered assignment hash
+#: taken under one scheme is not reproducible under the other.
+SALT_SCHEMES: tuple[str, ...] = (LEGACY_SALT_SCHEME, LENS_NAME_SALT_SCHEME)
+
+#: The key every row's ``slice_spec`` records its scheme under. A stored row
+#: WITHOUT it was written under :data:`LEGACY_SALT_SCHEME` — every round that
+#: ran before the scheme existed is in exactly that state, which is what
+#: :func:`row_salt_scheme` reads it as.
+SALT_SCHEME_KEY = "salt_scheme"
+
+#: ``warnings`` code the legacy scheme rides out on. A warning, never a
+#: refusal: the legacy draw is reproducible, it just depends on minted ids.
+LEGACY_SALT_WARNING_CODE = "draw_depends_on_roster_ids"
 
 #: Decimal places every distance :func:`slice_distances` reports is rounded
 #: to -- AND decided on. The two have to be the same number: a pick made on
@@ -104,6 +144,100 @@ def _apply_inter_cluster_mandate(
     return filtered
 
 
+def legacy_salt_warning() -> dict[str, str]:
+    """The one-line warning a draw made under :data:`LEGACY_SALT_SCHEME`
+    carries: it succeeded, and how it succeeded is material. Deleting and
+    re-adding a roster row, or adding the rows in another order, mints new
+    ids and MOVES the draw, although nothing a reader would call the design
+    (round, seed, lens names, seats, weights, candidates) changed."""
+    return {
+        "code": LEGACY_SALT_WARNING_CODE,
+        "message": (
+            f"this draw is salted by roster ids and processed in roster order (salt scheme "
+            f"{LEGACY_SALT_SCHEME!r}), so re-adding a roster row or inserting the rows in another "
+            f"order moves it even though the design did not change; pass "
+            f"--slice-salt {LENS_NAME_SALT_SCHEME} to salt by round and lens name instead, and "
+            "pre-register the scheme with the round"
+        ),
+    }
+
+
+def row_salt_scheme(row: Mapping[str, Any]) -> str:
+    """The salt scheme a ``lens_assignment`` row was drawn under, read out of
+    its ``slice_spec`` blob. A row whose spec carries no
+    :data:`SALT_SCHEME_KEY` — or will not parse at all — reads as
+    :data:`LEGACY_SALT_SCHEME`, because that is what every round that ran
+    before the key existed was drawn under. Never raises: an unreadable spec
+    is not evidence of a different scheme."""
+    raw = row.get("slice_spec")
+    spec: Any = raw
+    if not isinstance(raw, Mapping):
+        try:
+            spec = json.loads(raw) if raw else None
+        except (TypeError, ValueError):
+            spec = None
+    scheme = spec.get(SALT_SCHEME_KEY) if isinstance(spec, Mapping) else None
+    return str(scheme) if scheme else LEGACY_SALT_SCHEME
+
+
+def _lens_name(lens: Mapping[str, Any]) -> str:
+    """One lens's declared name, for the schemes that draw on it."""
+    name = lens.get("lens_name")
+    if name is None or not str(name).strip():
+        raise ValueError(
+            f"build_assignment_plan: salt_scheme={LENS_NAME_SALT_SCHEME!r} draws on each lens's "
+            f"lens_name, and lens {lens.get('roster_id')!r} carries none — pass the roster row's "
+            f"lens_name, or use salt_scheme={LEGACY_SALT_SCHEME!r}"
+        )
+    return str(name)
+
+
+def _lens_name_order(
+    lenses: Sequence[Mapping[str, Any]], *, round_id: str | None
+) -> list[Mapping[str, Any]]:
+    """The roster in ascending ``lens_name`` order, which is the processing
+    order :data:`LENS_NAME_SALT_SCHEME` fixes — the order the shared arm
+    pools deplete in and the order the per-lens arm allocation reads.
+
+    Refuses a roster with a repeated name (:class:`DuplicateLensNameError`)
+    before a single row is written: under this scheme the name IS the lens's
+    identity in the draw, so two lenses sharing one would share a draw
+    stream and a position in the order, and the round's draw would not be
+    defined. ``round_id`` is required because it is half of the salt — one
+    lens name means one stream WITHIN a round, not across every round the
+    program ever runs."""
+    if round_id is None or not str(round_id).strip():
+        raise ValueError(
+            f"build_assignment_plan: salt_scheme={LENS_NAME_SALT_SCHEME!r} salts each lens's draw "
+            f"with '<round_id>::<lens_name>' and needs round_id; got {round_id!r}"
+        )
+    named = [(_lens_name(lens), lens) for lens in lenses]
+    seen: dict[str, int] = {}
+    for name, _lens in named:
+        seen[name] = seen.get(name, 0) + 1
+    duplicates = sorted(name for name, count in seen.items() if count > 1)
+    if duplicates:
+        raise DuplicateLensNameError(
+            f"build_assignment_plan: salt_scheme={LENS_NAME_SALT_SCHEME!r} makes lens_name the "
+            f"lens's identity in the draw, so it must be unique within round {str(round_id)!r}'s "
+            f"roster — repeated: {duplicates!r}. Rename the duplicate lens (or use "
+            f"salt_scheme={LEGACY_SALT_SCHEME!r}, where the minted roster_id is the identity)."
+        )
+    named.sort(key=lambda pair: pair[0])
+    return [lens for _name, lens in named]
+
+
+def _draw_salt(lens: Mapping[str, Any], *, salt_scheme: str, round_id: str | None) -> str:
+    """The salt one lens's draw stream is derived from under ``salt_scheme``.
+
+    ``roster-id`` returns the minted ``roster_id`` — byte for byte what
+    :func:`~trialerror.lens.quota.derive_rng` was handed before the schemes
+    existed. ``lens-name`` returns ``"<round_id>::<lens_name>"``."""
+    if salt_scheme == LEGACY_SALT_SCHEME:
+        return str(lens["roster_id"])
+    return f"{round_id}::{_lens_name(lens)}"
+
+
 def modal_arm(quota: Mapping[str, int]) -> Arm:
     """The arm the quota gave the most lenses; ties broken by arm order
     (near, moderate, far) so the answer never depends on dict iteration.
@@ -121,8 +255,18 @@ def allocate_lens_arms(
 ) -> tuple[list[Arm], dict[Arm, int]]:
     """Split the ROSTER across the three arms (``arm_mode="per_lens"``).
 
-    Returns ``(arms, quota)`` — one arm per lens, in the order ``lenses``
-    was given, plus the roster-level quota those arms were drawn against.
+    Returns ``(arms, quota)`` — one arm per lens, POSITIONALLY in the order
+    ``lenses`` was given, plus the roster-level quota those arms were drawn
+    against.
+
+    The arm draw reads no lens id: the only thing about the roster it draws
+    on is its ORDER (which lens sits at which index when the shuffled bag is
+    dealt out) and its size. So the caller, not this function, decides what
+    the draw depends on by deciding what order it presents the roster in —
+    :func:`build_assignment_plan` hands it the roster already in the order its
+    ``salt_scheme`` fixes (roster order under ``roster-id``, ascending
+    ``lens_name`` under ``lens-name``). This function does not re-sort, and
+    must not: its result is read back by index against the list it was given.
     The quota is :func:`~trialerror.lens.quota.compute_quota_counts` over the LENS
     COUNT, so the familiar numbers fall straight out of the existing
     apportionment: a roster of 6 at 40/40/20 with a floor of 2 far lenses is
@@ -199,11 +343,14 @@ def build_assignment_plan(
     cluster_of: Mapping[str, str] | None = None,
     home_cluster: str | None = None,
     arm_mode: str = "per_slice",
+    salt_scheme: str = LEGACY_SALT_SCHEME,
+    round_id: str | None = None,
     config: Any = None,
 ) -> dict[str, Any]:
-    """Pure planner. ``lenses`` is processed in the given order (each item
-    at least ``{"roster_id": ...}``, plus ``"seat"`` when ``arm_mode`` is
-    ``per_lens``); returns a JSON-serializable dict with the full stratified
+    """Pure planner. ``lenses`` is processed in the order ``salt_scheme``
+    fixes (each item at least ``{"roster_id": ...}``, plus ``"seat"`` when
+    ``arm_mode`` is ``per_lens`` and ``"lens_name"`` when ``salt_scheme`` is
+    ``lens-name``); returns a JSON-serializable dict with the full stratified
     candidate list plus, per lens, its arm, quota, far floor and drawn
     slices. Raises
     :class:`~trialerror.lens.errors.InsufficientCandidatesError` (via
@@ -219,12 +366,44 @@ def build_assignment_plan(
     is exactly what keeps the existing ``far_arm_floor_honored`` doctor
     check true in both modes without it having to know a mode exists.
 
+    ``salt_scheme`` (:data:`SALT_SCHEMES`) says what the seeded draw is a
+    function of, and is recorded in the returned plan:
+
+    - ``roster-id`` (the default, and exactly what every round before the
+      schemes ran under, bit for bit): each lens's stream is
+      ``derive_rng(seed, salt=<roster_id>)`` and the lenses are processed —
+      and the shared pools depleted — in the order the caller gave them.
+      Both halves depend on MINTED ids, so deleting and re-adding a roster
+      row, or adding the rows in another order, moves the draw although
+      nothing a reader would call the design changed.
+    - ``lens-name``: each lens's stream is
+      ``derive_rng(seed, salt="<round_id>::<lens_name>")`` and the lenses are
+      processed in ascending ``lens_name`` order — the pool depletion, the
+      per-lens arm allocation and the plan's own lens order with it. Requires
+      ``round_id`` and a roster whose ``lens_name``s are unique
+      (:class:`~trialerror.lens.errors.DuplicateLensNameError` otherwise, raised
+      before any lens draws).
+
+    A round's scheme is part of its design: an assignment hash pre-registered
+    under one scheme is not reproducible under the other, so reproducing a
+    historical round means using the scheme ITS rows recorded
+    (:func:`row_salt_scheme`).
+
     ``config`` is the program config the candidate scan reads
     ``[retrieve] numpy_fastpath`` from. This function holds no store, so it
     cannot read one for itself; :func:`run_assignment` resolves it and
     passes it down (lane FB-7 fix pass, V-1)."""
     if arm_mode not in ARM_MODES:
         raise ValueError(f"build_assignment_plan: arm_mode must be one of {ARM_MODES!r}, got {arm_mode!r}")
+    if salt_scheme not in SALT_SCHEMES:
+        raise ValueError(
+            f"build_assignment_plan: salt_scheme must be one of {SALT_SCHEMES!r}, got {salt_scheme!r}"
+        )
+    if salt_scheme == LENS_NAME_SALT_SCHEME:
+        # The ONE place the processing order is decided, and therefore the one
+        # place the pool-depletion order and the arm allocation's index order
+        # are decided with it (see allocate_lens_arms' docstring).
+        lenses = _lens_name_order(lenses, round_id=round_id)
 
     scores = score_candidates(candidates, home, config=config)
     stratified = stratify(scores, cluster_of=cluster_of)
@@ -257,7 +436,7 @@ def build_assignment_plan(
             lens_arm = None
             quota = dict(slice_quota)
             lens_far_floor = far_floor
-        rng = derive_rng(seed, salt=roster_id)
+        rng = derive_rng(seed, salt=_draw_salt(lens, salt_scheme=salt_scheme, round_id=round_id))
         try:
             drawn = draw_quota(pools, quota, rng)
         except InsufficientCandidatesError as exc:
@@ -290,6 +469,7 @@ def build_assignment_plan(
         "weights": list(weights),
         "far_floor": far_floor,
         "arm_mode": arm_mode,
+        "salt_scheme": salt_scheme,
         "far_lens_floor": far_floor if arm_mode == "per_lens" else None,
         "roster_quota": dict(roster_quota) if arm_mode == "per_lens" else None,
         "inter_cluster_mandate": inter_cluster_mandate,
@@ -324,13 +504,23 @@ def run_assignment(
     cluster_of: Mapping[str, str] | None = None,
     home_cluster: str | None = None,
     arm_mode: str = "per_slice",
+    salt_scheme: str = LEGACY_SALT_SCHEME,
     launch_id: str | None = None,
     now_ts: str | None = None,
     config: Any = None,
 ) -> dict[str, Any]:
     """Fetch doc-pooled vectors, build the plan, then write one
     ``lens_assignment`` row per (lens, drawn candidate). Returns
-    ``{"plan": <pure plan dict>, "rows": [<written lens_assignment rows>]}``.
+    ``{"plan": <pure plan dict>, "rows": [<written lens_assignment rows>],
+    "salt_scheme": <scheme>, "warnings": [...]}``.
+
+    ``salt_scheme`` is :func:`build_assignment_plan`'s, defaulting to the
+    legacy :data:`LEGACY_SALT_SCHEME`; ``round_id`` is the other half of the
+    ``lens-name`` salt. Every row records its scheme under
+    :data:`SALT_SCHEME_KEY` in ``slice_spec``, so a reader of a stored round
+    can tell which scheme drew it, and a draw made under the legacy scheme
+    returns :func:`legacy_salt_warning` in ``warnings`` — a warning, never a
+    refusal.
 
     Each row carries the mode it was written under (``arm_mode``), the
     roster-level far-LENS floor (``far_lens_floor``, ``NULL`` outside
@@ -368,6 +558,8 @@ def run_assignment(
         cluster_of=cluster_of,
         home_cluster=home_cluster,
         arm_mode=arm_mode,
+        salt_scheme=salt_scheme,
+        round_id=round_id,
     )
 
     ts = now_ts or now()
@@ -391,6 +583,7 @@ def run_assignment(
                         "distance_score": slice_["distance_score"],
                         "cluster_id": slice_["cluster_id"],
                         "rank": rank,
+                        SALT_SCHEME_KEY: salt_scheme,
                     },
                     ensure_ascii=False,
                 ),
@@ -410,7 +603,12 @@ def run_assignment(
             }
             rows.append(insert(store, "lens_assignment", row))
 
-    return {"plan": plan, "rows": rows}
+    return {
+        "plan": plan,
+        "rows": rows,
+        "salt_scheme": salt_scheme,
+        "warnings": [legacy_salt_warning()] if salt_scheme == LEGACY_SALT_SCHEME else [],
+    }
 
 
 def list_assignments(store: Store, *, round_id: str) -> list[dict[str, Any]]:
@@ -489,6 +687,13 @@ def slice_distances(
     or a run and an outside script, are compared by ONE value rather than
     by reading two tables side by side.
 
+    Each lens also reports the ``salt_scheme`` its assignment rows were
+    drawn under (:func:`row_salt_scheme`; absent on the rows means
+    :data:`LEGACY_SALT_SCHEME`), because the hash above is only reproducible
+    under the scheme that drew it. It is reported BESIDE the hash and is
+    deliberately NOT one of its inputs: putting it in would move the recorded
+    hash of every round that pre-registered one.
+
     ``config`` is resolved off the store when none is passed, so the
     pooling scan behind these distances honours ``[retrieve]
     numpy_fastpath`` (lane FB-7 fix pass, V-1).
@@ -511,6 +716,7 @@ def slice_distances(
         rows = [r for r in rows if str(r.get("lens_name")) in wanted]
 
     by_lens: dict[str, list[str]] = {}
+    scheme_of_lens: dict[str, str] = {}
     for row in rows:
         try:
             spec = json.loads(row.get("slice_spec") or "{}")
@@ -519,7 +725,12 @@ def slice_distances(
         candidate = spec.get("candidate_id")
         if candidate is None:
             continue
-        bucket = by_lens.setdefault(str(row.get("lens_name")), [])
+        lens_key = str(row.get("lens_name"))
+        bucket = by_lens.setdefault(lens_key, [])
+        # The scheme of the lens's FIRST assignment row (rows are in
+        # assignment order): one run_assignment call writes one scheme across
+        # every row it writes, so the first row is the lens's scheme.
+        scheme_of_lens.setdefault(lens_key, row_salt_scheme(row))
         if str(candidate) not in bucket:
             bucket.append(str(candidate))
 
@@ -571,6 +782,7 @@ def slice_distances(
         if scored_docs:
             farthest = sorted(scored_docs, key=lambda pair: (-pair[1], pair[0]))[0][0]
         lenses[lens_name] = {
+            "salt_scheme": scheme_of_lens.get(lens_name, LEGACY_SALT_SCHEME),
             "slice_doc_ids": slice_docs,
             "home_mean_distance": dict(home_means),
             "nearest_home": nearest_home,

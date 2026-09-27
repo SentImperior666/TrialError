@@ -77,10 +77,11 @@ def test_initialized_notification_gets_no_response(server):
     assert responses == []
 
 
-def test_tools_list_reports_exactly_12_tools_with_schemas(server):
+def test_tools_list_reports_exactly_the_3_kept_tools_with_schemas(server):
     [resp] = _run(server, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
     tools = resp["result"]["tools"]
-    assert len(tools) == TOOL_COUNT == 12
+    assert len(tools) == TOOL_COUNT == 3
+    assert {t["name"] for t in tools} == {"session_status", "book_launch", "read_inbox"}
     for t in tools:
         assert t["name"]
         assert t["description"]
@@ -138,19 +139,21 @@ def test_tools_call_unknown_tool_is_a_protocol_error(server):
 
 
 def test_tools_call_business_refusal_is_a_structured_tool_error_not_a_crash(server):
-    """A schema-valid call that the underlying subsystem refuses (unknown
-    launch_id) comes back as ``isError: true`` structured content -- never
+    """A schema-valid call that the underlying subsystem refuses (no open
+    session to book under) comes back as ``isError: true`` structured content -- never
     a JSON-RPC protocol error, never a raised exception reaching the
     transport."""
     [resp] = _run(
         server,
         {"jsonrpc": "2.0", "id": 6, "method": "tools/call",
-         "params": {"name": "reconcile_launch", "arguments": {"launch_id": "LNCH-nope", "actual_tokens": 1}}},
+         "params": {"name": "book_launch",
+                    "arguments": {"program_id": "PROG-test", "agent_kind": "tester", "model_class": "top",
+                                  "model": "sonnet", "purpose": "fixture", "est_tokens": 500}}},
     )
     result = resp["result"]
     assert result["isError"] is True
     assert result["structuredContent"]["ok"] is False
-    assert result["structuredContent"]["error"]["code"] == "reconcile_refused"
+    assert result["structuredContent"]["error"]["code"] == "no_open_session"
 
 
 def test_unknown_method_is_method_not_found(server):
@@ -166,8 +169,9 @@ def test_ping(server):
 def test_full_book_spawn_reconcile_round_trip_over_the_wire(store, server):
     """The closest an in-process pytest run can get to design Section 12's
     M14 acceptance line "live Claude Code smoke: book->spawn->reconcile
-    round trip": book_launch and reconcile_launch travel the REAL
-    initialize/tools-call JSON-RPC wire (this file's whole point); the
+    round trip": book_launch travels the REAL initialize/tools-call
+    JSON-RPC wire (this file's whole point; reconcile_launch was retired as
+    a tool in Phase 0, so the reconcile leg calls its API directly); the
     "spawn" leg is what a live PreToolUse hook does between those two MCP
     calls -- ``trialerror.budget.gate.evaluate_spawn_for_open_session`` IS that
     hook's own decision function (``plugin/hooks/spawn_gate.py`` is a thin
@@ -198,13 +202,9 @@ def test_full_book_spawn_reconcile_round_trip_over_the_wire(store, server):
     assert gate_result.allowed is True
     assert get(store, "launch", pk_column="launch_id", pk_value=launch_id)["state"] == "RUNNING"
 
-    [reconcile_resp] = _run(
-        server,
-        {"jsonrpc": "2.0", "id": 11, "method": "tools/call",
-         "params": {"name": "reconcile_launch", "arguments": {"launch_id": launch_id, "actual_tokens": 777}}},
-    )
-    reconcile_env = reconcile_resp["result"]["structuredContent"]
-    assert reconcile_env["ok"] is True
+    from trialerror.budget.pools import reconcile_launch
+
+    reconcile_launch(store, launch_id=launch_id, actual_tokens=777, reconcile_source="manual")
     final = get(store, "launch", pk_column="launch_id", pk_value=launch_id)
     assert final["state"] == "RECONCILED"
     assert final["actual_tokens"] == 777

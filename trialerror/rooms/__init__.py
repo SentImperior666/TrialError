@@ -21,7 +21,7 @@ Public surface
 State machine (:mod:`trialerror.rooms.state_machine`):
 
 - :data:`~trialerror.rooms.state_machine.STATES` (``open``/``converged``/
-  ``frozen``), :data:`~trialerror.rooms.state_machine.LEGAL_TRANSITIONS`,
+  ``frozen``/``closed``), :data:`~trialerror.rooms.state_machine.LEGAL_TRANSITIONS`,
   :data:`~trialerror.rooms.state_machine.TERMINAL_STATES` — the graph itself,
   importable standalone (e.g. for an exhaustive test over every
   ``(from_state, to_state)`` pair, mirroring ``trialerror.artifacts.
@@ -72,11 +72,13 @@ from trialerror.rooms.api import (
     build_moderator_scoring_envelope,
     build_participant_turn_envelope,
     check_room_converged,
+    close_room,
     converge_room,
     create_room,
     export_room,
     freeze_room,
     get_discussion_points,
+    get_close_record,
     get_dp_score,
     get_freeze_reason,
     get_room,
@@ -91,6 +93,7 @@ from trialerror.rooms.errors import (
     IllegalRoomTransitionError,
     OwnershipConflictError,
     RoomsError,
+    UnseatedParticipantError,
 )
 from trialerror.rooms.state_machine import (
     LEGAL_TRANSITIONS,
@@ -105,6 +108,7 @@ __all__ = [
     "IllegalRoomTransitionError",
     "ConvergenceBarNotMetError",
     "OwnershipConflictError",
+    "UnseatedParticipantError",
     "STATES",
     "TERMINAL_STATES",
     "LEGAL_TRANSITIONS",
@@ -126,6 +130,8 @@ __all__ = [
     "converge_room",
     "freeze_room",
     "get_freeze_reason",
+    "close_room",
+    "get_close_record",
     "register_room_deliverable",
     "render_room_markdown",
     "export_room",
