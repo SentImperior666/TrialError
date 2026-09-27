@@ -7,7 +7,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "upkeep_ledger.py"
+
+# `scripts/` is not part of every distribution of this tree (the export ships a fixed set of directories), so the
+# script under test can be absent: the module then reports a skip instead of two failures about a missing file.
+pytestmark = pytest.mark.skipif(not SCRIPT.is_file(), reason="scripts/upkeep_ledger.py is not part of this distribution")
 
 REQUIRED_ROWS = (
     "py files: total",
