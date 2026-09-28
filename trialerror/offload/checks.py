@@ -445,7 +445,7 @@ def check_offload_backend_root_resolved(ctx: DoctorContext) -> CheckResult:
                 "config_error": f"{type(exc).__name__}: {exc}",
             },
         )
-    described = ConfigDevBackends(raw_config).describe()
+    described = ConfigDevBackends(raw_config, root=ctx.program_root).describe()
     stages: dict[str, Any] = described["stages"]
 
     failures: list[str] = []
@@ -477,6 +477,9 @@ def check_offload_backend_root_resolved(ctx: DoctorContext) -> CheckResult:
             )
         else:
             parts.append(f"{stage}: {backend!r} resolved")
+        if "executor" in entry:
+            # The vast.ai OCR design: WHERE this stage's marker runs.
+            parts[-1] += f", executor {entry['executor']!r}"
 
     details = {
         "backend_config_root": str(ctx.program_root),

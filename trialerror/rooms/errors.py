@@ -20,6 +20,7 @@ __all__ = [
     "IllegalRoomTransitionError",
     "ConvergenceBarNotMetError",
     "OwnershipConflictError",
+    "UnseatedParticipantError",
     "TurnKindRefusedError",
     "StanceIncompleteError",
     "AdmissionOrderError",
@@ -60,6 +61,21 @@ class OwnershipConflictError(RoomsError):
     launch id every turn, so the launch comparison alone never fires for
     the same lens twice, and the owning lens is resolved through the
     launch's ``attrs.lens_name``."""
+
+
+class UnseatedParticipantError(RoomsError):
+    """A launch posted into a room that DECLARES its participants under a
+    ``lens_name`` that is not one of them.
+
+    A declared name is an identity claim the room then counts turns by: it
+    is what makes a seat spawned fresh for each turn one author across its
+    turns, and what the closure rule, the blind-first-turn envelope and the
+    final-stance path all read. A name nobody seated is therefore a seat the
+    room's own configuration says does not exist -- silently accepting it
+    would add an unseated author to the transcript and quietly change what
+    "every participant has spoken" means. A launch that declares NO name is
+    not judged here (it keeps answering by launch id, exactly as before),
+    and a room that declares no participants has no seating to check."""
 
 
 class TurnKindRefusedError(RoomsError):

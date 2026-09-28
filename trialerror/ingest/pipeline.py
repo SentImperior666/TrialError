@@ -218,6 +218,8 @@ def register_source(
     content_sha256: str | None = None,
     rights_notes: str | None = None,
     request_state: str = "delivered",
+    license_grant: str | None = None,
+    license_grant_source: str | None = None,
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Register (or dedup onto) one ``source`` row. Design Section 6 stage
@@ -231,6 +233,15 @@ def register_source(
     mutated to self-reference; ``dedup_of`` is the caller-facing dedup
     signal, matching design's "returns the existing row with dedup_of
     set").
+
+    A CONTENTLESS registration (``content_sha256 is None`` -- a request-queue
+    row, which has no file yet) dedups on ``doi``/``arxiv_id`` instead, the
+    only identity such a row has (lane FB-acq item 1). Without it, acquiring
+    the same paywalled DOI twice filed two ``wanted`` rows, because the
+    ``content_sha256`` branch above can never match a NULL. A row WITH content
+    wins the tie when both exist, since that is the one a reader wants. Rows
+    with content are unaffected: two different files under one DOI are two
+    different sources and still register twice.
     """
     allowed = allowed_acquisition_routes(config)
     if allowed is not None and acquisition_route not in allowed:
@@ -242,6 +253,29 @@ def register_source(
     if content_sha256 is not None:
         existing = store.knowledge.execute(
             "SELECT * FROM source WHERE content_sha256 = ?", (content_sha256,)
+        ).fetchone()
+        if existing is not None:
+            row = dict(existing)
+            row["dedup_of"] = row["source_id"]
+            return row
+    elif doi is not None or arxiv_id is not None:
+        # Identifiers are compared AS STORED: callers pass already-normalised
+        # ids (trialerror.litapi.models.normalize_doi/normalize_arxiv_id), and
+        # normalising again here would be a second, divergent opinion about
+        # what a DOI is. Only the identifiers that were actually given are
+        # bound, so a NULL column can never match a NULL argument.
+        clauses = []
+        params: list[Any] = []
+        if doi is not None:
+            clauses.append("doi = ?")
+            params.append(doi)
+        if arxiv_id is not None:
+            clauses.append("arxiv_id = ?")
+            params.append(arxiv_id)
+        existing = store.knowledge.execute(
+            f"SELECT * FROM source WHERE ({' OR '.join(clauses)}) "
+            "ORDER BY (content_sha256 IS NULL), registered_ts LIMIT 1",
+            tuple(params),
         ).fetchone()
         if existing is not None:
             row = dict(existing)
@@ -263,6 +297,11 @@ def register_source(
         "content_sha256": content_sha256,
         "license_tier": license_tier,
         "acquisition_route": acquisition_route,
+        # lane FB-acq item 4 (F16): the document's OWN licence grant, beside the
+        # route-derived tier -- NULL when nobody read one, which is not the same
+        # as "no licence". No reader consults it yet; see knowledge schema v14.
+        "license_grant": license_grant,
+        "license_grant_source": license_grant_source,
         "rights_notes": rights_notes,
         "request_state": request_state,
         "registered_ts": now(),

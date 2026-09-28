@@ -433,8 +433,7 @@ def find_stale_or_missing_document_summaries(store: Store) -> dict[str, list[str
     """Every ``document`` partitioned into ``missing`` (no current summary
     at all) and ``stale`` (a current summary exists, but its
     ``subject_sha256`` no longer matches the document's CURRENT
-    ``sha256``). Used by :mod:`trialerror.summarize.handlers`'s batch
-    job-discovery, which always has a full :class:`Store` (``ctx.store``).
+    ``sha256``). (Its batch job-discovery caller was retired in Phase 0.)
 
     TRIALERROR-DEV-NOTE: :mod:`trialerror.summarize.checks`'s ``summaries_stale``
     doctor check reimplements this exact predicate as a single raw SQL

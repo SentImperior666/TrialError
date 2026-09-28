@@ -4,14 +4,14 @@
 Nine checks, category ``lexicon``, auto-discovered by
 ``trialerror.util.doctor.discover_and_register_checks`` purely because this
 file lives at ``trialerror/lexicon/checks.py`` -- the same directory
-convention ``trialerror/feed_translate/checks.py`` and ``trialerror/events/
-checks.py`` already document. Adding this file is the whole registration
+convention ``trialerror/events/checks.py`` and the other subsystems'
+``checks.py`` files already document. Adding this file is the whole registration
 step; no shared file is touched.
 
 Every check reads ``knowledge.db`` directly with a fresh, read-only
 ``sqlite3.Connection`` (:func:`trialerror.stores.connection.connect`,
-``read_only=True``) -- the same shape ``trialerror.feed_translate.checks``
-uses, and for the same reason: a doctor check runs against whatever program
+``read_only=True``) -- the same shape the other subsystems' checks use,
+and for the same reason: a doctor check runs against whatever program
 is on disk, including one whose store a write path has never opened, so it
 must never itself trigger a migration or hold the store open.
 
@@ -32,8 +32,8 @@ Both non-``ok`` states report ``status="skip"`` (:class:`~trialerror.util.
 doctor.CheckResult`'s status vocabulary is exactly ``pass|fail|warn|skip`` --
 there is no ``not_initialized``/``awaiting_migration`` status value; those
 are read from the message instead), distinguished only by message text --
-matching the ``trialerror.feed_translate.checks._open_ops`` precedent this
-module's ``_open_knowledge`` mirrors line for line.
+matching the precedent this module's ``_open_knowledge`` mirrors line for
+line.
 
 **Fail vs. warn, restated from the design table.** Three of the nine are
 ``fail``: ``term_sense_without_evidence`` and ``term_split_missing_
@@ -90,7 +90,7 @@ def _open_knowledge(ctx: DoctorContext, name: str) -> tuple[sqlite3.Connection |
     """Resolve ``knowledge.db`` read-only, or hand back the ``skip`` result
     for whichever of the two absent-table states applies. See the module
     docstring's "three states" section -- this is the one place that tells
-    them apart, mirroring ``trialerror.feed_translate.checks._open_ops``."""
+    them apart."""
     if ctx.program_root is None:
         return None, CheckResult(
             name=name, category=_CATEGORY, status="skip",

@@ -1,0 +1,17 @@
+{
+  "id": "https://openalex.org/W9400000001",
+  "doi": "https://doi.org/10.9999/gadgets",
+  "title": "A Theory of Gadgets",
+  "publication_year": 1969,
+  "type": "book",
+  "ids": {"openalex": "https://openalex.org/W9400000001", "doi": "https://doi.org/10.9999/gadgets"},
+  "authorships": [
+    {"author_position": "first", "author": {"id": "https://openalex.org/A9400000001", "display_name": "Gus Early"}}
+  ],
+  "primary_location": {"source": {"display_name": "Gadget Press"}, "pdf_url": "https://example.org/gadgets.pdf"},
+  "open_access": {"is_oa": true, "oa_url": "https://example.org/gadgets.pdf"},
+  "cited_by_count": 900,
+  "counts_by_year": [{"year": 2025, "cited_by_count": 11}],
+  "abstract_inverted_index": {"Gadgets": [0], "are": [1], "theorised.": [2]},
+  "referenced_works": []
+}

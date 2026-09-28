@@ -156,6 +156,11 @@
 
   function parseTs(iso) {
     if (iso === null || iso === undefined || iso === "") return NaN;
+    if (typeof iso === "number") return isFinite(iso) ? (iso < 1e12 ? iso * 1000 : iso) : NaN;
+    if (typeof iso === "string" && /^\d{9,13}$/.test(iso)) {
+      var n = Number(iso);
+      return n < 1e12 ? n * 1000 : n;
+    }
     var ms = Date.parse(iso);
     return isNaN(ms) ? NaN : ms;
   }
@@ -234,7 +239,21 @@
     return withSeconds ? text + ":" + pad2(d.getUTCSeconds()) : text;
   }
 
-  function fmtClock(iso, withSeconds) { return fmtClockMs(parseTs(iso), withSeconds); }
+  /** Like fmtClockMs, but for labelling a specific EVENT's time (not a
+   * duration and not a timeline axis tick, which stays bare HH:MM even
+   * across midnight -- console-3's within-window ticks read the segment
+   * boundaries, not the wall calendar). A past UTC day gets an "MM-DD "
+   * prefix so a stale event doesn't read as if it happened minutes ago. */
+  function fmtClock(iso, withSeconds, nowMs) {
+    var ms = parseTs(iso);
+    var text = fmtClockMs(ms, withSeconds);
+    if (isNaN(ms)) return text;
+    var reference = typeof nowMs === "number" ? nowMs : Date.now();
+    var d = new Date(ms), n = new Date(reference);
+    var sameUtcDay = d.getUTCFullYear() === n.getUTCFullYear() && d.getUTCMonth() === n.getUTCMonth() && d.getUTCDate() === n.getUTCDate();
+    if (sameUtcDay) return text;
+    return pad2(d.getUTCMonth() + 1) + "-" + pad2(d.getUTCDate()) + " " + text;
+  }
 
   /** HH:MM:SS since a stamp -- the SESSION card's OPEN reading, which ticks. */
   function fmtElapsedClock(iso, nowMs) {
@@ -878,11 +897,18 @@
       grid.appendChild(readingRow("ACTIVE JOBS", String(open.active_jobs_count || 0)));
       body.appendChild(grid);
 
-      // 3. Actions -- drawn, disabled, and saying why (12.11).
+      // 3. Actions -- drawn, disabled, and saying why (12.11). The `title`
+      // reason is invisible until hover; A5 puts the same words on screen,
+      // one line per button, since both of this row's buttons are ALWAYS
+      // disabled (there is no writesEnabled() here to collapse them under).
+      var closeReason = "session close is a CLI ritual with a course-check -- not a dashboard write in this build";
+      var handoffReason = "the handoff renderer is a CLI verb; the dashboard has no callable for it";
       body.appendChild(div("btn-row", [
-        disabledBtn("CLOSE SESSION", "session close is a CLI ritual with a course-check -- not a dashboard write in this build"),
-        disabledBtn("RENDER HANDOFF", "the handoff renderer is a CLI verb; the dashboard has no callable for it")
+        disabledBtn("CLOSE SESSION", closeReason),
+        disabledBtn("RENDER HANDOFF", handoffReason)
       ]));
+      body.appendChild(line("note-strip", "CLOSE SESSION — done from the command line (it runs the course check)"));
+      body.appendChild(line("note-strip", "RENDER HANDOFF — done from the command line"));
 
       body.appendChild(sessionHistory(panel.recent_sessions));
       return body;
@@ -1126,7 +1152,7 @@
     var BAR_CLASS = {
       running: "bar--running", complete: "bar--complete", retried: "bar--retried",
       booked: "bar--booked", failed: "bar--failed", abandoned: "bar--abandoned",
-      frozen: "bar--frozen"
+      frozen: "bar--frozen", closed: "bar--closed"
     };
 
     function pctOf(x, width) {
@@ -1914,6 +1940,7 @@
       timelineX: timelineX,
       jobsSnapshotOf: jobsSnapshotOf,
       jobDelta: jobDelta,
+      parseTs: parseTs,
       fmtAgoText: fmtAgoText,
       fmtDuration: fmtDuration,
       fmtCompact: fmtCompact,
@@ -1966,6 +1993,7 @@
     timelineX: timelineX,
     jobsSnapshotOf: jobsSnapshotOf,
     jobDelta: jobDelta,
+    parseTs: parseTs,
     fmtAgoText: fmtAgoText,
     fmtDuration: fmtDuration,
     fmtCompact: fmtCompact,

@@ -1,0 +1,19 @@
+{
+  "paperId": "s2widgets000000000000000000000000000001",
+  "title": "A Study of Widgets",
+  "externalIds": {"DOI": "10.9999/widgets", "CorpusId": 9000001},
+  "authors": [
+    {"authorId": "9001", "name": "Cat Writer"},
+    {"authorId": "9002", "name": "Dan Other"}
+  ],
+  "year": 1986,
+  "venue": "Journal of Widget Studies",
+  "journal": {"name": "Journal of Widget Studies"},
+  "url": "https://www.semanticscholar.org/paper/s2widgets000000000000000000000000000001",
+  "openAccessPdf": null,
+  "isOpenAccess": false,
+  "influentialCitationCount": 12,
+  "publicationTypes": ["JournalArticle"],
+  "citationCount": 240,
+  "abstract": "Widgets are studied here at length, from their first appearance to their later uses in practice."
+}

@@ -7,8 +7,8 @@ plan's Section 1 table lists as "does not exist yet": a corpus journey that
 drives ``program init`` and ``session boot --create-account`` through the real
 CLI and asserts both lexical backends on one corpus; a dashboard journey with
 HTTP assertions on a scratch program INCLUDING the token-guarded write path; an
-ops journey that exercises the PostToolUse hook, the feed translator's
-fail-closed seam behind a real booking, law append/verify with a stale-pin
+ops journey that exercises the PostToolUse hook, the feed thread/post reads,
+law append/verify with a stale-pin
 negative control, and the jobs worker through the real console entry point; an
 offload enqueue/verify pair; the operator-item enumeration; and the
 ``e2e_check`` evidence row every check in the plan is recorded as.
@@ -21,7 +21,7 @@ that module rather than re-implemented; business logic through the landed
 Python API; REAL subprocesses only where the subprocess boundary is itself what
 is being proven (the hook scripts, ``program init``, ``session boot
 --create-account``, ``ingest reindex-fulltext``, ``law append``/``verify``,
-``feed translate``, ``jobs start-worker --job-id``, ``jobs pause``,
+``feed threads``/``feed read``, ``jobs start-worker --job-id``, ``jobs pause``,
 ``jobs logs``, ``dashboard serve`` + HTTP against it, ``events tail``/
 ``export --out``). Nothing here imports from ``tests/``.
 
@@ -196,8 +196,6 @@ E2E_CHECK_CATALOGUE: tuple[E2ECheckSpec, ...] = (
             "  docker exec -u node <container> sh -c 'trialerror ingest reindex-fulltext --help >/dev/null 2>&1 "
             "&& echo tantivy_cli=1 || echo tantivy_cli=0; python -c \"import tantivy\" 2>/dev/null "
             "&& echo tantivy_pkg=1 || echo tantivy_pkg=0'\n"
-            "  docker exec -u node <container> sh -c 'trialerror feed translate --help >/dev/null 2>&1 "
-            "&& echo translator=1 || echo translator=0'\n"
             "  docker exec -u node <container> sh -c 'trialerror offload --help >/dev/null 2>&1 "
             "&& echo offload=1 || echo offload=0'\n"
             "  SQLRO /workspace/platform/platform.db 'select count(*) from launch;'\n"
@@ -248,7 +246,7 @@ E2E_CHECK_CATALOGUE: tuple[E2ECheckSpec, ...] = (
             "If the port line matches, kill only that pid -- never restart the dashboard window."
         ),
     ),
-    _spec("E-19", "P4", "journey", "feed thread + post + translation fails CLOSED", journey="e2e_ops"),
+    _spec("E-19", "P4", "journey", "feed thread + post, read back through the CLI", journey="e2e_ops"),
     _spec("E-20", "P4", "journey", "budget: book -> spawn -> return -> reconcile -> zero dangling", journey="e2e_ops"),
     _spec("E-21", "P4", "journey", "law append/verify, chain_ok, stale-pin control", journey="e2e_ops"),
     _spec("E-22", "P4", "journey", "jobs worker claim/finish through the console entry point", journey="e2e_ops"),
@@ -531,7 +529,6 @@ class Capabilities:
 
     tantivy_pkg: bool = False
     tantivy_cli: bool = False
-    translator: bool = False
     offload: bool = False
     plan_blob: str | None = None
 
@@ -544,7 +541,6 @@ class Capabilities:
         return {
             "tantivy_pkg": self.tantivy_pkg,
             "tantivy_cli": self.tantivy_cli,
-            "translator": self.translator,
             "offload": self.offload,
             "plan_blob": self.plan_blob,
         }
@@ -675,7 +671,6 @@ def probe_capabilities(*, repo_root: Path | None = None, timeout: float = 60.0) 
     return Capabilities(
         tantivy_pkg=importlib.util.find_spec("tantivy") is not None,
         tantivy_cli=_help_ok(["ingest", "reindex-fulltext"]),
-        translator=_help_ok(["feed", "translate"]),
         offload=_help_ok(["offload"]),
         plan_blob=plan_blob,
     )
@@ -763,15 +758,6 @@ def read_recorded_checks(store: Any, *, run_id: str | None = None) -> dict[str, 
 # ===========================================================================
 def _sql_count(conn: Any, sql: str, params: Sequence[Any] = ()) -> int:
     return int(conn.execute(sql, params).fetchone()[0])
-
-
-def _launch_states(store: Any) -> dict[str, str]:
-    """``{launch_id: state}`` for the whole platform ledger.
-
-    A COUNT would not notice a state transition on an existing row, and
-    "no launch row CHANGED STATE" is what E-19(a)'s criterion actually says.
-    """
-    return {r["launch_id"]: r["state"] for r in store.platform.execute("SELECT launch_id, state FROM launch")}
 
 
 def _program_is_scaffolded(program_root: Path) -> bool:
@@ -963,7 +949,6 @@ def _write_scratch_toml(
     ocr: str,
     embed: str,
     fulltext_backend: str | None = None,
-    translator: str | None = None,
     require_real_backends: bool = False,
     extra_paths: Mapping[str, Any] | None = None,
     embed_extra: Mapping[str, Any] | None = None,
@@ -999,9 +984,6 @@ def _write_scratch_toml(
     if fulltext_backend is not None:
         blocks.append(_toml_table("retrieve", {"fulltext_backend": fulltext_backend}))
         written.append("retrieve")
-    if translator is not None:
-        blocks.append(_toml_table("feed.translator", {"backend": translator}))
-        written.append("feed.translator")
 
     path.write_text(text + "\n".join(blocks), encoding="utf-8")
 
@@ -1379,7 +1361,6 @@ def run_e2e_corpus(
                 ocr="fake",
                 embed="fake",
                 fulltext_backend="tantivy" if caps.tantivy else None,
-                translator="model" if caps.translator else None,
             )
         steps.append({"name": "write_scratch_toml", "ok": True, "detail": {"toml_tables_written": tables}})
 
@@ -1516,7 +1497,7 @@ _STEP_TO_CHECK: dict[str, str] = {
     "create_e2e_thread": "E-70", "write_refused_without_token": "E-70",
     "write_refused_with_wrong_token": "E-70", "write_accepted_with_token": "E-70",
     "feed_post_row_visible": "E-70", "shutdown_clean": "E-70",
-    "feed_thread_post": "E-19", "feed_translate_fail_closed": "E-19",
+    "feed_thread_post": "E-19",
     "budget_book_spawn_return_reconcile": "E-20",
     "law_append_verify_with_stale_control": "E-21", "jobs_worker_cli_once": "E-22",
     "events_tail_types": "E-23", "session_close_and_handoff": "E-24",
@@ -2128,10 +2109,8 @@ def run_e2e_ops(
 
     Step order is NOT id order. E-20 reads ``spawns_vs_bookings`` while every
     consumed launch under the session still has a matching ``subagent_return``;
-    E-19's translator half then consumes a booking through a JOB HANDLER, which
-    has no subagent to return it, and that is exactly the one-off mismatch E-24
-    predicts and asserts. Running the translator half first would make E-20's
-    criterion false for a documented reason, which is worse than useless.
+    ``spawns_vs_bookings`` must end ``pass`` (E-24), so nothing in this journey
+    may consume a booking without a matching ``subagent_return``.
     """
     repo_root = (Path(repo_root) if repo_root is not None else _REPO_ROOT).resolve()
     program_root = Path(program_root).resolve()
@@ -2141,7 +2120,6 @@ def run_e2e_ops(
     steps: list[dict[str, Any]] = []
     recorder = E2ERecorder(run_id=run_id, plan_blob=caps.plan_blob)
     store = None
-    translator_ran = False
 
     try:
         with _step(steps, "open_scratch_session"):
@@ -2163,7 +2141,6 @@ def run_e2e_ops(
         # -- E-19, thread/post half ----------------------------------------
         with _step(steps, "feed_thread_post"):
             e19a = _feed_thread_post(store, program_root, platform_root, run_id=run_id, launch_id=launch_id)
-            thread_id, post_id = e19a["thread_id"], e19a["post_id"]
         steps.append({"name": "feed_thread_post", "ok": True, "detail": e19a})
 
         # -- E-20 -----------------------------------------------------------
@@ -2175,21 +2152,8 @@ def run_e2e_ops(
         steps.append({"name": "budget_book_spawn_return_reconcile", "ok": True, "detail": e20})
         recorder.record(store, "E-20", "pass", evidence=e20)
 
-        # -- E-19, translator half ------------------------------------------
-        if not caps.translator:
-            reason = "the feed translator is not present on this deployment (`feed translate` is not a CLI verb)"
-            _blocked(steps, "feed_translate_fail_closed", "lane-b", reason)
-            recorder.record(store, "E-19", "blocked", owner="lane-b",
-                            evidence={**e19a, "translator_reason": reason})
-        else:
-            with _step(steps, "feed_translate_fail_closed"):
-                e19b = _feed_translate_fail_closed(
-                    store, program_root, platform_root, session_id=session_id,
-                    program_id=run_id, post_id=post_id,
-                )
-                translator_ran = True
-            steps.append({"name": "feed_translate_fail_closed", "ok": True, "detail": e19b})
-            recorder.record(store, "E-19", "pass", evidence={**e19a, **e19b})
+        # -- E-19 -----------------------------------------------------------
+        recorder.record(store, "E-19", "pass", evidence=e19a)
 
         # -- E-21 -----------------------------------------------------------
         with _step(steps, "law_append_verify_with_stale_control"):
@@ -2238,7 +2202,7 @@ def run_e2e_ops(
         with _step(steps, "doctor_green_after_close"):
             e24 = _doctor_after_close(
                 program_root, platform_root, repo_root=repo_root,
-                session_id=session_id, translator_ran=translator_ran,
+                session_id=session_id,
             )
         steps.append({"name": "doctor_green_after_close", "ok": True, "detail": e24})
 
@@ -2305,7 +2269,7 @@ def _feed_thread_post(
     body = (
         f"Opening the e2e ops thread for run {run_id}. This post is full text, not a summary, because the "
         f"feed's whole contract is that a reader never has to go somewhere else for what was actually said. "
-        f"It exists so the translator seam below has a real post to fail closed on."
+        f"It exists so the read verbs below have a real post to read back."
     )
     post = post_feed(store, thread_id=thread_id, body=body, launch_id=launch_id)
     post_id = post["post_id"]
@@ -2465,196 +2429,6 @@ def _payload_field(payload: Any, key: str) -> Any:
         except json.JSONDecodeError:
             return None
     return payload.get(key) if isinstance(payload, dict) else None
-
-
-def _feed_translate_fail_closed(
-    store: Any,
-    program_root: Path,
-    platform_root: Path,
-    *,
-    session_id: str,
-    program_id: str,
-    post_id: str,
-) -> dict[str, Any]:
-    """E-19's second half: the ``model`` translator backend refuses LOUDLY, in
-    two different ways, at two different points.
-
-    (a) The BOOKING GATE, a negative control: the handler checks the job's
-        ``created_by_launch`` BEFORE it ever calls the backend, so a job
-        enqueued without ``--by-launch`` must fail on "created_by_launch is
-        empty" and must NOT mention the missing driver.
-    (b) The DRIVER SEAM, behind a real booking: the handler consumes the
-        booking (PROVISIONAL -> RUNNING) and only then calls the backend, which
-        raises. The failure is a LOGIC failure carrying the exact
-        "has no generation driver" substring, no translation is stored, and the
-        launch is left RUNNING.
-
-    Two different messages with the launch consumed only in (b) is what
-    excludes a "fail-closed" that never reached the backend at all -- and the
-    named substring is what excludes a translator that quietly degraded to the
-    fake or pending backend.
-
-    The step then SETTLES what it opened: a handler-consumed launch has no
-    subagent to return it, so it is reconciled here (otherwise E-24's close
-    would refuse ``dangling_launches``), and both jobs are paused (a logic
-    failure below max attempts becomes claimable again after the backoff, and a
-    retry would only burn an attempt and make the program non-deterministic for
-    E-22).
-    """
-    from trialerror.budget.pools import book_launch, reconcile_launch
-
-    # the criterion is "no launch row CHANGED STATE", so the snapshot is the
-    # whole {launch_id: state} mapping: a COUNT would be blind to a transition
-    # on a row that was already there.
-    launch_ledger_before = _launch_states(store)
-
-    # -- (a) the booking gate -------------------------------------------
-    env_a, _pa = _run_cli(
-        ["feed", "translate", "--post-id", post_id], program_root=program_root, platform_root=platform_root
-    )
-    if not env_a.get("ok"):
-        raise RuntimeError(f"feed translate (no --by-launch) refused at enqueue time: {env_a.get('error')}")
-    job_id_a = env_a["result"]["job"]["job_id"]
-
-    run_a, _pra = _run_cli(
-        ["jobs", "start-worker", "--foreground", "--mode", "once", "--job-id", job_id_a],
-        program_root=program_root, platform_root=platform_root,
-    )
-    status_a = (run_a.get("result") or {}).get("status")
-    if status_a != "failed":
-        raise RuntimeError(f"the unbooked translate job settled as {status_a!r}, expected 'failed'")
-    row_a = _job_row(store, job_id_a)
-    last_error_a = row_a.get("last_error") or ""
-    if "created_by_launch is empty" not in last_error_a:
-        raise RuntimeError(f"the booking-gate refusal does not name created_by_launch: {last_error_a[:200]!r}")
-    if "has no generation driver" in last_error_a:
-        raise RuntimeError(
-            "the unbooked job reached the BACKEND -- the booking gate did not fire before the driver seam"
-        )
-    launch_ledger_after_a = _launch_states(store)
-    if launch_ledger_after_a != launch_ledger_before:
-        added = sorted(set(launch_ledger_after_a) - set(launch_ledger_before))
-        removed = sorted(set(launch_ledger_before) - set(launch_ledger_after_a))
-        moved = {
-            lid: (launch_ledger_before[lid], launch_ledger_after_a[lid])
-            for lid in set(launch_ledger_before) & set(launch_ledger_after_a)
-            if launch_ledger_before[lid] != launch_ledger_after_a[lid]
-        }
-        raise RuntimeError(
-            f"the booking-gate refusal changed the launch ledger; it must not "
-            f"(added={added} removed={removed} state_changes={moved})"
-        )
-
-    _run_cli(["jobs", "pause", job_id_a], program_root=program_root, platform_root=platform_root)
-
-    # -- (b) the driver seam behind a real booking -----------------------
-    booked = book_launch(
-        store, session_id=session_id, program_id=program_id, agent_kind="e2e-translator",
-        model_class="small", model="haiku", purpose="mechanical", est_tokens=200,
-    )
-    if not booked.ok:
-        raise RuntimeError(f"book_launch for the translator refused: {booked.state} {booked.reason}")
-    translator_launch_id = booked.launch_id
-    launch_states = ["PROVISIONAL"]
-
-    env_b, _pb = _run_cli(
-        ["feed", "translate", "--post-id", post_id, "--by-launch", translator_launch_id],
-        program_root=program_root, platform_root=platform_root,
-    )
-    if not env_b.get("ok"):
-        raise RuntimeError(f"feed translate --by-launch refused at enqueue time: {env_b.get('error')}")
-    job_b = env_b["result"]["job"]
-    job_id_b = job_b["job_id"]
-    # NOTE (deviation, recorded in the implementation doc): `feed translate`
-    # enqueues job KIND "custom" and names the handler inside the payload --
-    # there is no `feed_translate` job kind. The handler name is what the
-    # criterion is really about, so that is what is asserted.
-    handler_b = _payload_field(job_b.get("payload"), "handler")
-    if handler_b != "feed_translate":
-        raise RuntimeError(
-            f"the enqueued job's handler is {handler_b!r}, expected 'feed_translate' "
-            f"(job kind {job_b.get('kind')!r})"
-        )
-
-    run_b, _prb = _run_cli(
-        ["jobs", "start-worker", "--foreground", "--mode", "once", "--job-id", job_id_b],
-        program_root=program_root, platform_root=platform_root,
-    )
-    status_b = (run_b.get("result") or {}).get("status")
-    if status_b != "failed":
-        raise RuntimeError(f"the booked translate job settled as {status_b!r}, expected 'failed'")
-
-    state_b = _launch_state(store, translator_launch_id)
-    if state_b != "RUNNING":
-        raise RuntimeError(
-            f"the translator launch is {state_b!r} after the handler ran; the handler must have consumed it "
-            "(PROVISIONAL -> RUNNING) before calling the backend"
-        )
-    launch_states.append("RUNNING")
-
-    row_b = _job_row(store, job_id_b)
-    if row_b.get("failure_class") != "logic":
-        raise RuntimeError(f"failure_class is {row_b.get('failure_class')!r}, expected 'logic'")
-    last_error_b = row_b.get("last_error") or ""
-    if "has no generation driver" not in last_error_b:
-        raise RuntimeError(
-            f"the driver-seam failure does not carry the named substring: {last_error_b[:200]!r} -- the "
-            "translator degraded to another backend instead of refusing"
-        )
-
-    logs_b, _plb = _run_cli(
-        ["jobs", "logs", job_id_b], program_root=program_root, platform_root=platform_root
-    )
-    log_types = [e["type"] for e in (logs_b.get("result") or {}).get("events", [])]
-
-    trans_env, _pt = _run_cli(
-        ["feed", "translations", "--post-id", post_id], program_root=program_root, platform_root=platform_root
-    )
-    if trans_env.get("ok"):
-        raise RuntimeError("a current translation exists for the post; the gate should have withheld everything")
-    if (trans_env.get("error") or {}).get("code") != "not_found":
-        raise RuntimeError(f"feed translations failed for an unexpected reason: {trans_env.get('error')}")
-
-    from trialerror.dashboard.data import build_feed_panel
-    from trialerror.dashboard.store_ro import open_store_ro
-
-    rostore = open_store_ro(program_root, platform_root=platform_root)
-    try:
-        panel = build_feed_panel(rostore, thread_id=None)
-    finally:
-        rostore.close()
-    served = next((p for p in panel.get("posts", []) if p.get("post_id") == post_id), None)
-    if served is not None and served.get("translation"):
-        raise RuntimeError("the feed panel is serving a translation for a post whose translation failed closed")
-
-    reconcile_launch(store, launch_id=translator_launch_id, actual_tokens=0, reconcile_source="manual")
-    if _launch_state(store, translator_launch_id) != "RECONCILED":
-        raise RuntimeError("the translator launch did not reach RECONCILED")
-    launch_states.append("RECONCILED")
-
-    _run_cli(["jobs", "pause", job_id_b], program_root=program_root, platform_root=platform_root)
-    paused = [
-        jid for jid in (job_id_a, job_id_b)
-        if _job_row(store, jid)["state"] == "paused"
-    ]
-    if len(paused) != 2:
-        raise RuntimeError(f"expected both translate jobs paused, got {paused}")
-
-    return {
-        "gate_job_id": job_id_a,
-        "gate_error_head": last_error_a[:160],
-        "gate_launch_ledger_unchanged": True,
-        "gate_launch_rows_seen": len(launch_ledger_before),
-        "translator_launch_id": translator_launch_id,
-        "launch_states_seen": launch_states,
-        "translate_job_id": job_id_b,
-        "job_state": row_b["state"],
-        "failure_class": row_b["failure_class"],
-        "last_error_head": last_error_b[:160],
-        "ledger_event_types": sorted(set(log_types)),
-        "paused": paused,
-        "feed_panel_translation": None,
-    }
 
 
 def _law_append_verify(
@@ -2881,13 +2655,11 @@ def _events_tail_and_export(
 
 
 def _doctor_after_close(
-    program_root: Path, platform_root: Path, *, repo_root: Path, session_id: str, translator_ran: bool
+    program_root: Path, platform_root: Path, *, repo_root: Path, session_id: str
 ) -> dict[str, Any]:
     """E-24's second half: doctor still has zero failures after the close, and
-    ``spawns_vs_bookings`` is in EXACTLY the shape E-19 predicted -- ``warn``
-    with one mismatched session at 4 consumed / 3 returned when the translator
-    half ran (a booking consumed by a JOB HANDLER has no subagent to return
-    it), ``pass`` when it was blocked. Any other shape is a real finding."""
+    ``spawns_vs_bookings`` is ``pass`` -- every consumed booking under the
+    session has its ``subagent_return``. Any other shape is a real finding."""
     discover_and_register_checks()
     results = run_checks(DoctorContext(repo_root=repo_root, program_root=program_root, platform_root=platform_root))
     failed = [r.name for r in results if r.status == "fail"]
@@ -2898,27 +2670,8 @@ def _doctor_after_close(
     mismatched = svb.details.get("mismatched_sessions") or []
     bad_events = svb.details.get("bad_launch_id_events") or []
 
-    if translator_ran:
-        if svb.status != "warn":
-            raise RuntimeError(
-                f"spawns_vs_bookings is {svb.status!r}; with the translator half run it must be 'warn' "
-                "(one handler-consumed booking with no subagent_return)"
-            )
-        if len(mismatched) != 1 or mismatched[0].get("session_id") != session_id:
-            raise RuntimeError(f"unexpected mismatched_sessions: {mismatched}")
-        entry = mismatched[0]
-        if entry.get("consumed_launch_count") != entry.get("subagent_return_count", -1) + 1:
-            raise RuntimeError(
-                f"the mismatch is not the documented one-off: {entry} (expected consumed == returned + 1)"
-            )
-        if bad_events:
-            raise RuntimeError(f"subagent_return rows with a null/unknown launch_id: {bad_events}")
-    else:
-        if svb.status != "pass":
-            raise RuntimeError(
-                f"spawns_vs_bookings is {svb.status!r}; with the translator half blocked it must be 'pass': "
-                f"{svb.message}"
-            )
+    if svb.status != "pass":
+        raise RuntimeError(f"spawns_vs_bookings is {svb.status!r}; it must be 'pass': {svb.message}")
 
     return {
         "doctor_total": len(results),
@@ -2927,7 +2680,6 @@ def _doctor_after_close(
         "spawns_vs_bookings": {
             "status": svb.status, "mismatched_sessions": mismatched, "bad_launch_id_events": bad_events,
         },
-        "translator_ran": translator_ran,
     }
 
 

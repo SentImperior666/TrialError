@@ -1,0 +1,24 @@
+{
+  "meta": {"count": 3, "page": 1, "per_page": 2},
+  "results": [
+    {
+      "id": "https://openalex.org/W6000000001",
+      "doi": "https://doi.org/10.1234/widgets.1986",
+      "title": "A Study of Widgets",
+      "publication_year": 1986,
+      "type": "book",
+      "authorships": [{"author": {"id": "https://openalex.org/A6000000001", "display_name": "Dan Author"}}],
+      "cited_by_count": 250
+    },
+    {
+      "id": "https://openalex.org/W6000000002",
+      "doi": null,
+      "title": "Further Notes on Widgets",
+      "publication_year": 1990,
+      "type": "article",
+      "authorships": [{"author": {"id": "https://openalex.org/A6000000002", "display_name": "Eve Other"}}],
+      "cited_by_count": 40
+    }
+  ],
+  "group_by": []
+}

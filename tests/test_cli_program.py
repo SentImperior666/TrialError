@@ -240,3 +240,12 @@ def test_fx12_post_verb_placement_still_wins_over_a_different_global_value(progr
     assert env["ok"] is True
     # the decoy root never got a trialerror.toml/stores written to it by this call.
     assert not (decoy_root / "stores").exists()
+
+
+def test_program_init_paths_comment_names_no_retired_skill(tmp_path, platform_root, capsys):
+    dest = tmp_path / "no-retired-skill"
+    rc, _env = _call(["program", "init", "demo", "--dir", str(dest), "--platform-root", str(platform_root)], capsys)
+    assert rc == 0
+    text = (dest / "trialerror.toml").read_text(encoding="utf-8")
+    assert "import-existing-project" not in text
+    assert "docs/GETTING_STARTED.md" in text

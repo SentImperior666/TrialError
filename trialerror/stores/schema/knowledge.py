@@ -42,6 +42,14 @@ TABLES = (
     "term_sense",
     "term_sense_evidence",
     "term_relation",
+    # lane R0-C, knowledge_v13_verdict_rejudge. The SECOND opinion on a
+    # judged subject. Deliberately not a ``verdict`` row -- see _V13.
+    "verdict_rejudge",
+    # lane SI part B, knowledge_v15_source_investigation: the provider-response
+    # cache the source investigator reads through, and one dossier row per
+    # investigated seed -- see _V15.
+    "source_evidence",
+    "source_dossier",
 )
 
 _V1 = (
@@ -1188,6 +1196,212 @@ _V12 = (
     "CREATE INDEX idx_verdict_round ON verdict(round_id, batch_id, subject_id)",
 )
 
+# ---- schema-v13 (lane R0-C): ``verdict_rejudge`` ------------------------
+#
+# A judged screen may re-judge a seeded share of its subjects with a SECOND
+# judge. The recorder used that judge's labels for exactly one thing --
+# Cohen's kappa per reference set, printed into the recording result -- and
+# then dropped them. So the store held one row per subject per reference
+# set, all stamped with the RECORDING launch, and which launches judged,
+# what the second judge said about each subject, and where the two
+# disagreed lived only in files outside it. A round's own analysis tool,
+# which reproduces its numbers from ``idea`` and ``verdict``, could not see
+# the re-judge at all and printed the round's kappa with n = 0 while the
+# re-judge had in fact run. The harness's own principle is that an audit
+# number must be reproducible from the store; this table is what makes the
+# re-judge one.
+#
+# It is deliberately NOT the ``verdict`` table. A ``verdict`` row is the
+# LABEL OF RECORD, and consolidation, doctor checks and exports all count
+# rows per idea; a second opinion filed beside it would be miscounted as
+# one by every one of those readers. No existing reader of ``verdict``
+# changes because of this migration.
+#
+# ``first_label`` is the primary label of record for that subject and set,
+# copied here as it was given. It is not redundant with the ``verdict``
+# row: a PLANT is a subject of the re-judge too and carries no ``verdict``
+# row at all, so without this column a kappa over a sheet that included
+# plants could not be reproduced. ``agrees`` is the same comparison the
+# recorded kappa is computed on (the round's own label words, not the
+# canonical ones), stored rather than derived so a reader needs no
+# vocabulary to count disagreements.
+#
+# ``judge_launches`` is a JSON list, which the XID registry has no form
+# for; only ``recorded_by_launch`` is registered there. The UNIQUE key is
+# ``(round_id, batch_id, subject_id, reference_set, judge_role)``: one
+# second opinion per subject per set per batch, so a re-recording REPLACES
+# the batch's rows instead of doubling them.
+_V13 = (
+    """
+    CREATE TABLE verdict_rejudge (
+        rejudge_id          TEXT PRIMARY KEY,
+        round_id            TEXT NOT NULL,
+        batch_id            TEXT NOT NULL,
+        subject_kind        TEXT NOT NULL,
+        subject_id          TEXT NOT NULL,
+        reference_set       TEXT NOT NULL,
+        label               TEXT NOT NULL,
+        label_canonical     TEXT,
+        first_label         TEXT,
+        agrees              INTEGER,
+        judge_role          TEXT NOT NULL DEFAULT 'second',
+        judge_launches      TEXT,
+        recorded_by_launch  TEXT NOT NULL,
+        prereg_id           TEXT,
+        ts                  TEXT NOT NULL,
+        UNIQUE (round_id, batch_id, subject_id, reference_set, judge_role)
+    )
+    """,
+    "CREATE INDEX idx_verdict_rejudge_batch ON verdict_rejudge(round_id, batch_id)",
+    "CREATE INDEX idx_verdict_rejudge_subject ON verdict_rejudge(subject_id)",
+)
+
+# ---- schema-v14 (lane FB-acq item 4, F16: the document's own licence grant,
+# recorded) ---------------------------------------------------------------
+#
+# ``license_tier`` is a five-value ROUTE classification -- how this harness came
+# to hold the file, mapped from the acquisition path -- and nothing in the store
+# holds the document's own licence. The arXiv leg of an acquisition writes
+# ``license_tier='open'`` unconditionally and arXiv's Atom parser reads no
+# licence at all; the Unpaywall leg reads ``best_oa_location.license`` only to
+# CHOOSE a tier and then discards the string. So a source registered as ``open``
+# might be CC-BY, might be arXiv's own non-exclusive distribution licence (which
+# grants redistribution to nobody), and the store cannot say which -- while
+# ``trialerror.retrieve.fence`` reads the tier as if it were the grant.
+#
+# Two nullable TEXT columns, and no CHECK: licence identifiers are an open
+# vocabulary (every Creative Commons version, every publisher's own wording,
+# arXiv's three), and a CHECK on an open vocabulary is a migration waiting to
+# happen. ``license_grant`` holds a normalised token
+# (``trialerror.litapi.providers.arxiv._LICENSE_URL_TOKENS``) or, when nothing
+# matched, the licence url itself; ``license_grant_source`` says where it came
+# from -- ``arxiv_atom``, ``arxiv_oai``, ``unpaywall_best_oa_location``,
+# ``none_reported``, or ``lookup_failed:<outcome>``.
+#
+# NULL means "nobody read a grant for this row" -- which is every row registered
+# before this migration, and every row registered by a path that does not look.
+# It does not mean "no licence".
+#
+# NO READER CONSULTS THESE YET, deliberately. The fence's
+# ``FENCED_LICENSE_TIERS``, ``is_fenced_license`` and ``source_license_tier``
+# are untouched, no filter or doctor check reads the new columns, and the tier
+# still means exactly what it meant. This migration makes the grant RECORDABLE;
+# changing what the tier means, or fencing on a grant, is a later decision that
+# now has data to be made against.
+#
+# Plain ADD COLUMN, no table rebuild: the v7 recipe (new table, copy, drop,
+# rename) exists for CHECK-constraint changes, and there is no constraint here
+# to change. Being ADD-COLUMN-only also makes this migration ADDITIVE by
+# ``trialerror.stores.migrate.is_additive``'s mechanical rule, so an older client
+# opening a v14 store gets a doctor WARNING telling it to upgrade rather than a
+# failure -- which is exactly right: every table and column an older client
+# knows is still there, unchanged.
+_V14 = (
+    "ALTER TABLE source ADD COLUMN license_grant TEXT",
+    "ALTER TABLE source ADD COLUMN license_grant_source TEXT",
+)
+
+# ---- schema-v15 (lane SI part B, item B1: the source investigator's two
+# tables) -------------------------------------------------------------------
+#
+# ``trialerror lit investigate run`` vets a batch of cited works before any of
+# them reaches a human's request queue: does the cited identifier resolve to the
+# work the citation describes, is the work already held, who cites it, did a
+# later review consolidate it. That is many provider calls per work, repeated
+# every time a list is re-run, against providers that rate-limit. Two tables:
+#
+# ``source_evidence`` -- one provider's answer to one call, kept. The precedent
+# is ``web_fetch`` (v4): a response cache keyed by a normalised key with a
+# live/superseded split, and every row attributed to a launch.
+#   * ``subject_key`` is the normalised key of the work the call was about -- a
+#     bare normalised DOI, ``arxiv:<id>``, ``isbn:<isbn13>`` or
+#     ``title:<normalised title>|<year>``; ``params_json`` is the call's own
+#     arguments (canonical JSON, sorted keys), so two calls about one work with
+#     different limits or filters are two rows.
+#   * ``outcome`` is the provider's answer in the client's one vocabulary
+#     (``trialerror.litapi.client.PROVIDER_OUTCOMES``), deliberately without a
+#     CHECK: that tuple is code, and a vocabulary word added there must not need
+#     a table rebuild here. The reader decides what may be served from cache --
+#     ``rate_limited``, ``transport_unreachable`` and ``http_error`` never are
+#     (they are re-asked); ``record`` and ``not_found`` are.
+#   * ``UNIQUE(subject_key, provider, kind, params_json) WHERE superseded_by IS
+#     NULL`` -- at most one LIVE answer per call, any number of retired ones
+#     behind it. A re-ask retires the live row first and then inserts, exactly
+#     web_fetch's refresh order, and for the same reason ``superseded_by`` is
+#     NOT a same-file FK (the pointer names a row that does not exist yet at the
+#     moment the old one stops being live).
+#   * ``provider_id`` is the provider's own id for what was fetched (an
+#     OpenAlex ``W...``, a Semantic Scholar paper id, an author id), when the
+#     answer carried one. Nullable.
+#
+# ``source_dossier`` -- one row per investigated seed, keyed ``UNIQUE(list_id,
+# row_id, seed_raw)``: the same citation asked for in the same request row is
+# one dossier however often the list is re-run. The dossier itself is a JSON
+# file on disk (``dossier_path``); the row carries what a query filters on --
+# the resolution, the mechanical state, the matched held source -- plus the
+# file's ``dossier_sha256`` so a verdict can refuse a file edited since it was
+# recorded. ``held_source_id`` IS a same-file FK: a held match names a source
+# row that already exists. The verdict columns are nullable (a dossier is
+# written before anybody judges it) and the verdict word is a CHECKed closed
+# vocabulary, like ``resolution`` and ``mechanical_state``; the verdict's
+# detail, including every superseded verdict (``history``), is JSON.
+#
+# ``created_by_launch`` (both tables) and ``verdict_by_launch`` are registered
+# in ``trialerror.stores.xid`` against ``platform.launch``.
+#
+# CREATE TABLE / CREATE UNIQUE INDEX only, so the migration classifies as
+# ADDITIVE by ``trialerror.stores.migrate.is_additive``: an older client opening
+# a v15 store finds every table and column it knows unchanged.
+_V15 = (
+    """
+    CREATE TABLE source_evidence (
+        evidence_id         TEXT PRIMARY KEY,
+        subject_key         TEXT NOT NULL,
+        provider            TEXT NOT NULL,
+        provider_id         TEXT,
+        kind                TEXT NOT NULL CHECK (
+            kind IN ('record','citing','citing_reviews','references','author_works','search')
+        ),
+        params_json         TEXT NOT NULL,
+        outcome             TEXT NOT NULL,
+        payload_json        TEXT,
+        fetched_ts          TEXT NOT NULL,
+        created_by_launch   TEXT NOT NULL,
+        superseded_by       TEXT
+    )
+    """,
+    "CREATE UNIQUE INDEX idx_source_evidence_live ON source_evidence(subject_key, provider, kind, params_json) "
+    "WHERE superseded_by IS NULL",
+    """
+    CREATE TABLE source_dossier (
+        dossier_id           TEXT PRIMARY KEY,
+        list_id              TEXT NOT NULL,
+        row_id               TEXT NOT NULL,
+        seed_raw             TEXT NOT NULL,
+        subject_key          TEXT,
+        resolution           TEXT NOT NULL CHECK (
+            resolution IN ('exact','probable','mismatch','none','retry')
+        ),
+        held_source_id       TEXT REFERENCES source(source_id),
+        mechanical_state     TEXT NOT NULL CHECK (
+            mechanical_state IN ('held','need_info','wrong_identifier','open','retry')
+        ),
+        verdict              TEXT CHECK (
+            verdict IN ('REQUEST','REQUEST-AS-FOUNDATIONAL','SUBSTITUTE-WITH','HELD','DROP','NEED-INFO')
+        ),
+        verdict_detail_json  TEXT,
+        verdict_by_launch    TEXT,
+        verdict_ts           TEXT,
+        dossier_path         TEXT NOT NULL,
+        dossier_sha256       TEXT NOT NULL,
+        stage_version        TEXT NOT NULL,
+        created_by_launch    TEXT NOT NULL,
+        created_ts           TEXT NOT NULL,
+        UNIQUE (list_id, row_id, seed_raw)
+    )
+    """,
+)
+
 MIGRATIONS = (
     Migration(version=1, name="knowledge_v1_initial_schema", statements=_V1),
     Migration(version=2, name="knowledge_v2_idea_promoted_columns", statements=_V2),
@@ -1201,4 +1415,7 @@ MIGRATIONS = (
     Migration(version=10, name="knowledge_v10_vec_ideas", statements=_V10),
     Migration(version=11, name="knowledge_v11_idea_extra", statements=_V11),
     Migration(version=12, name="knowledge_v12_verdict_round_scope", statements=_V12),
+    Migration(version=13, name="knowledge_v13_verdict_rejudge", statements=_V13),
+    Migration(version=14, name="knowledge_v14_source_license_grant", statements=_V14),
+    Migration(version=15, name="knowledge_v15_source_investigation", statements=_V15),
 )

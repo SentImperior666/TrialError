@@ -54,13 +54,25 @@ enforcement code, zero edits to ``trialerror/artifacts/gates.py`` (out of this
 build's lane; see this build's own scope note) -- reusing infrastructure
 that already exists is the entire integration.
 
+**Three statuses, and only two of them are verdicts.** A check passes,
+fails, or is ``not_applicable`` (:data:`NOT_APPLICABLE`): its bar was
+removed by a declaration the subject carries, which only a check that
+documents such a declaration may honour, and never by default. The runner
+reports it as a pytest SKIP, so ``reproduction_status`` is ``match`` iff
+every check is a pass or ``not_applicable``; the per-check entry carries
+``"status": "not_applicable"`` and ``passed: false``, so it is never shown
+as a pass.
+
 **Three registered suites.** ``citation-grounded`` and ``review-verdict``
 are this module's originals; ``aiif_round`` is the ideation framework's own
 gate class, fourteen checks over one round's artifacts (see that section's
 own header for the subject shape it reads, and for the one posture every
 check there shares: absent data fails closed). It is a pure-function suite
 like the others -- it reads an assembled ``subject`` dict and never opens a
-store.
+store. Four of its checks also read the round's own DESIGN from the prereg
+params (``design``/``control_count``, ``rooms``, ``report_p_values``); a
+subject that declares none of them is judged exactly as before those keys
+existed.
 
 TRIALERROR-DEV-NOTE (CLI surface deviates from the literal brief): the brief
 names the CLI verb ``trialerror gate eval <gate_id>``. This build's lane owns
@@ -98,6 +110,11 @@ from trialerror.verify.verdicts import record_verdict
 __all__ = [
     "MetricResult",
     "MetricFn",
+    "CHECK_PASS",
+    "CHECK_FAIL",
+    "NOT_APPLICABLE",
+    "CHECK_STATUSES",
+    "check_status",
     "GateSuite",
     "register_suite",
     "get_suite",
@@ -115,6 +132,10 @@ __all__ = [
     "IDEA_DISPOSITIONS",
     "BUNDLE_LABEL_KEYS",
     "SIGNIFICANCE_TERMS",
+    "REPORTED_P_VALUE_TERMS",
+    "ROUND_DESIGNS",
+    "CARD_PHASE",
+    "PLAIN_PHASE",
     "MIN_LENS_CELLS_PER_CARD",
     "prereg_present",
     "models_table_present",
@@ -137,6 +158,16 @@ __all__ = [
 _RUNNER_PATH = Path(__file__).resolve().parent / "_gate_suite_runner.py"
 
 
+#: The three statuses a check can end in. ``not_applicable`` is a check
+#: whose bar the subject's own DECLARATION removed (the ``aiif_round``
+#: section below says which declarations can) -- it did not pass, it was not
+#: judged, and it never counts as a pass in a report.
+CHECK_PASS = "pass"
+CHECK_FAIL = "fail"
+NOT_APPLICABLE = "not_applicable"
+CHECK_STATUSES: tuple[str, ...] = (CHECK_PASS, CHECK_FAIL, NOT_APPLICABLE)
+
+
 @dataclass(frozen=True)
 class MetricResult:
     """One metric function's verdict on one subject -- DeepEval's
@@ -146,15 +177,49 @@ class MetricResult:
     (for threshold-style metrics; ``None`` for a metric with no natural
     scalar, e.g. reproduction status), and a human-readable message (the
     assertion failure text -- design's own "surgical patching" bar: a
-    failure names exactly what's wrong, never just a bare boolean)."""
+    failure names exactly what's wrong, never just a bare boolean).
+
+    ``not_applicable`` marks a check the subject's own declaration exempted.
+    Such a result carries ``passed=False`` (it did not pass -- a reader that
+    looks at ``passed`` alone never sees it as a pass), the runner turns it
+    into a pytest SKIP rather than an assertion, and :meth:`to_dict` adds
+    ``"status": "not_applicable"``. A pass or a fail serialises exactly as it
+    always has, with no ``status`` key: read the status of a serialised check
+    through :func:`check_status`."""
 
     name: str
     passed: bool
     score: float | None
     message: str
+    not_applicable: bool = False
+
+    def __post_init__(self) -> None:
+        if self.not_applicable and self.passed:
+            raise ValueError(f"{self.name}: a not_applicable result is not a pass -- it must carry passed=False")
+
+    @property
+    def status(self) -> str:
+        """``"pass"``, ``"fail"`` or ``"not_applicable"``."""
+        if self.not_applicable:
+            return NOT_APPLICABLE
+        return CHECK_PASS if self.passed else CHECK_FAIL
 
     def to_dict(self) -> dict[str, Any]:
-        return {"name": self.name, "passed": self.passed, "score": self.score, "message": self.message}
+        out = {"name": self.name, "passed": self.passed, "score": self.score, "message": self.message}
+        if self.not_applicable:
+            out["status"] = NOT_APPLICABLE
+        return out
+
+
+def check_status(check: Mapping[str, Any]) -> str:
+    """The status of one serialised check (:meth:`MetricResult.to_dict`, or
+    an entry of :func:`run_gate_suite`'s ``checks``): ``"not_applicable"``
+    when the entry says so, otherwise ``"pass"``/``"fail"`` from ``passed``
+    -- the one reader for both shapes, so no caller has to know that a pass
+    carries no ``status`` key."""
+    if check.get("status") == NOT_APPLICABLE:
+        return NOT_APPLICABLE
+    return CHECK_PASS if check.get("passed") else CHECK_FAIL
 
 
 MetricFn = Callable[[Mapping[str, Any]], MetricResult]
@@ -397,12 +462,19 @@ register_suite(
 # includes this check is asserting faithfulness WAS measured") applies to
 # every bar a pre-registered round commits to.
 #
+# The one exemption is DECLARED, never inferred: a round whose prereg params
+# declare a design that removes a bar gets `not_applicable` on that bar's
+# check -- its own status, never a pass (module docstring). A round that
+# declares nothing is judged exactly as it was before the declarations
+# existed, check for check and message for message.
+#
 # The SUBJECT is assembled by the caller from the round's own artifacts and
 # stores (the suite never reads a store -- module docstring). Its sections,
 # each named by the check that reads it:
 #
 #   prereg            {prereg_id, status, params{...}}      prereg_present,
-#                                                           admission_order_hash_matches
+#                                                           admission_order_hash_matches,
+#                                                           + the design declarations below
 #   models_table      {purpose: class}                      models_table_present
 #   ideas             [{idea_id, status, dossier{...}}]      novelty_bundle_complete,
 #                                                           consolidation_completeness
@@ -412,11 +484,44 @@ register_suite(
 #   distribution      run_mechanical_screen()'s own card     distribution_card_present
 #   roster            [{lens_name, seat, recipe_cards[]}]    control_arm_present,
 #                                                           card_cells_ge_2
+#   lens_launches     [{lens_name, launch_id, phase}]        control_arm_present
+#                                                           (design "paired" only)
 #   assignment        {arm_mode, ...}                        arm_mode_declared
 #   admission_order   {hash, ...}                            admission_order_hash_matches
 #   lens_log          {offenders[]} | [rows]                 lens_log_reconciled
 #   outcomes          [{cell, arm?, n, ...}]                 per_arm_n_disclosed
 #   report_text       the round's own prose                  no_significance_language
+#
+# The round's DESIGN, declared in `prereg.params` -- every key optional, and
+# an absent key (or a JSON null) means today's rule, which is also the
+# strictest reading:
+#
+#   design           "control_seats" | "paired" | "none"     control_arm_present,
+#                    absent: exactly ONE control seat          per_arm_n_disclosed
+#   control_count    whole number N >= 1; read only under     control_arm_present
+#                    design "control_seats"
+#   rooms            true | false; absent: rooms expected      admission_order_hash_matches
+#   report_p_values  true | false; absent: false               no_significance_language
+#
+# A declared value outside its vocabulary FAILS the check that reads it,
+# naming the value -- it never falls back to today's rule and never yields
+# `not_applicable` (the `lens_log_reconciled` posture: a check that cannot
+# read what it exists to check says so).
+#
+# `lens_launches` is read under design "paired" only: one row per launch
+# bound to one of the round's `lens_assignment` rows, as the caller reads the
+# launch-binding table `lens_assignment_launch` joined through
+# `lens_assignment.roster_id` to `lens_roster.lens_name`:
+#
+#   {"lens_name": <lens_roster.lens_name>,
+#    "launch_id": <lens_assignment_launch.launch_id>,
+#    "phase":     <lens_assignment_launch.phase verbatim, null when unlabelled>}
+#
+# A launch bound to several of a lens's assignment rows may appear once per
+# row; rows are de-duplicated on (lens_name, launch_id, phase). Only the
+# exact labels "card" and "plain" are read -- any other label, and null,
+# pairs nothing. Every standard seat must hold both halves; every lens the
+# block names, whatever its seat, must hold both or neither.
 # ---------------------------------------------------------------------------
 
 #: The model floors a framework round requires, purpose by purpose -- the
@@ -504,9 +609,90 @@ _SIGNIFICANCE_RE = re.compile(
 #: language without using the word.
 _P_VALUE_RE = re.compile(r"(?<![\w])p\s*[<>=]\s*\.?\d", re.IGNORECASE)
 
+#: The terms of :data:`SIGNIFICANCE_TERMS` a round that declares
+#: ``report_p_values: true`` may use: a p-value's own name and interval
+#: wording. With them, a p-value stated as a number (`p = 0.031`,
+#: `p = 2/64`) is allowed too. The rest of the list -- the words that CLAIM
+#: significance -- stays barred in every mode; the list itself is unchanged.
+REPORTED_P_VALUE_TERMS: tuple[str, ...] = ("p-value", "p value", "confidence interval")
+
+#: :data:`_SIGNIFICANCE_RE` without :data:`REPORTED_P_VALUE_TERMS`, built the
+#: same way so the words that stay barred match exactly as they always did.
+_SIGNIFICANCE_CLAIM_RE = re.compile(
+    r"(?<![\w-])(?:"
+    + "|".join(
+        t.replace(" ", r"\s+").replace("-", r"[-\s]") for t in SIGNIFICANCE_TERMS if t not in REPORTED_P_VALUE_TERMS
+    )
+    + r")(?![\w-])",
+    re.IGNORECASE,
+)
+
+#: The three round designs a prereg may declare under ``params.design``
+#: (section header). Absent means today's rule: exactly one control seat.
+DESIGN_CONTROL_SEATS = "control_seats"
+DESIGN_PAIRED = "paired"
+DESIGN_NONE = "none"
+ROUND_DESIGNS: tuple[str, ...] = (DESIGN_CONTROL_SEATS, DESIGN_PAIRED, DESIGN_NONE)
+
+#: The two ``lens_assignment_launch.phase`` labels a paired round books its
+#: lenses under (`budget book --phase card|plain`), read exactly.
+CARD_PHASE = "card"
+PLAIN_PHASE = "plain"
+
+#: Under design ``paired`` the control arm is each lens's plain half: the
+#: outcome cells carrying ``arm: "plain"``.
+PLAIN_ARM = "plain"
+
 
 def _result(name: str, passed: bool, message: str, score: float | None = None) -> MetricResult:
     return MetricResult(name=name, passed=passed, score=score, message=message)
+
+
+def _not_applicable(name: str, message: str) -> MetricResult:
+    """A check whose bar the round's own declaration removed. Only the
+    declaration branches below build one; no check reaches it by default."""
+    return MetricResult(name=name, passed=False, score=None, message=f"not applicable: {message}", not_applicable=True)
+
+
+def _round_params(subject: Mapping[str, Any]) -> Mapping[str, Any]:
+    """``subject["prereg"]["params"]`` for the design declarations, or an
+    empty mapping. Never raises: the checks that read a declaration read
+    nothing else from the prereg, so a malformed prereg must leave them
+    exactly where it left them before the declarations existed -- on today's
+    rule -- and the checks that DO read the prereg report it."""
+    prereg = subject.get("prereg")
+    params = prereg.get("params") if isinstance(prereg, Mapping) else None
+    return params if isinstance(params, Mapping) else {}
+
+
+def _declared_design(subject: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """``(design, problem)``. ``(None, None)`` when nothing is declared --
+    today's rule. ``problem`` names a declared value the suite cannot read,
+    which fails every check that reads it."""
+    design = _round_params(subject).get("design")
+    if design is None:
+        return None, None
+    if not isinstance(design, str) or design not in ROUND_DESIGNS:
+        return None, (
+            f"the prereg params declare design={design!r}, which is none of {list(ROUND_DESIGNS)} -- a "
+            "declaration the suite cannot read is not one it may act on, and it does not fall back to the "
+            "single-control rule either"
+        )
+    return design, None
+
+
+def _declared_flag(subject: Mapping[str, Any], key: str) -> tuple[bool | None, str | None]:
+    """``(value, problem)`` for a true/false declaration. ``(None, None)``
+    when it is absent or null -- today's rule."""
+    value = _round_params(subject).get(key)
+    if value is None:
+        return None, None
+    if not isinstance(value, bool):
+        return None, (
+            f"the prereg params declare {key}={value!r}; it is a JSON true or false, or left out -- a "
+            "declaration the suite cannot read is not one it may act on"
+        )
+    return value, None
 
 
 def prereg_present(subject: Mapping[str, Any]) -> MetricResult:
@@ -713,8 +899,20 @@ def distribution_card_present(subject: Mapping[str, Any]) -> MetricResult:
 
 
 def control_arm_present(subject: Mapping[str, Any]) -> MetricResult:
-    """``subject["roster"]`` must seat exactly one ``control`` lens, and that
-    lens must hold no recipe card.
+    """The round's control arm is there, in the form its design declares
+    (``prereg.params.design``, section header):
+
+    - **not declared** -- today's rule: ``subject["roster"]`` seats exactly
+      one ``control`` lens, holding no recipe card.
+    - ``control_seats`` -- exactly ``control_count`` roster rows are seated
+      ``control`` and none holds a card.
+    - ``paired`` -- every standard lens holds at least one launch labelled
+      ``phase = card`` and one labelled ``phase = plain``
+      (``subject["lens_launches"]``), and no lens holds one half without the
+      other: each lens is its own control, one half written under its card
+      block and the other under the plain brief.
+    - ``none`` -- ``not_applicable``: the round declared it makes no control
+      comparison.
 
     **The CONTROL seat never counts toward the arm mix or the far floor**
     (charter AMENDMENT-4 item 1, design AMENDMENT-5 item 1). This check
@@ -723,6 +921,139 @@ def control_arm_present(subject: Mapping[str, Any]) -> MetricResult:
     place the amendment removed it from. A control lens holding a card is
     not a control at all, and the round it sits in reports a comparison it
     did not run."""
+    design, problem = _declared_design(subject)
+    if problem:
+        return _result("control_arm_present", False, problem)
+    if design is None:
+        return _control_arm_single_seat(subject)
+    if design == DESIGN_NONE:
+        rows = subject.get("roster") or []
+        seated = sum(1 for r in rows if isinstance(r, Mapping) and str(r.get("seat")) == CONTROL_SEAT) if isinstance(rows, list) else 0
+        return _not_applicable(
+            "control_arm_present",
+            f"design 'none' is declared in the prereg params -- the round makes no control comparison, so there "
+            f"is no control arm to find (the roster seats {seated} control lens(es); none is judged as a control)",
+        )
+    if design == DESIGN_CONTROL_SEATS:
+        return _control_arm_declared_seats(subject)
+    return _control_arm_paired(subject)
+
+
+def _control_arm_declared_seats(subject: Mapping[str, Any]) -> MetricResult:
+    """Design ``control_seats``: exactly ``control_count`` control rows, none
+    of them carded. The count is read here and only here."""
+    count = _round_params(subject).get("control_count")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        return _result(
+            "control_arm_present", False,
+            f"design 'control_seats' declares control_count={count!r}; it must be a whole number N >= 1 -- the "
+            "number of control seats is what the declaration escrows",
+        )
+    roster = subject.get("roster") or []
+    if not roster:
+        return _result(
+            "control_arm_present", False,
+            f"subject['roster'] is empty -- no seats to check (design 'control_seats' declares {count} control seat(s))",
+        )
+    controls = [r for r in roster if str(r.get("seat")) == CONTROL_SEAT]
+    names = [r.get("lens_name") for r in controls]
+    carded = [r.get("lens_name") for r in controls if r.get("recipe_cards")]
+    problems: list[str] = []
+    if len(controls) != count:
+        problems.append(f"the roster seats {len(controls)} control lens(es) {names}, not the {count} declared")
+    if carded:
+        problems.append(f"the control lens(es) {carded} hold recipe cards -- a control with a card is not a control")
+    if problems:
+        return _result(
+            "control_arm_present", False,
+            f"design 'control_seats' (control_count {count}): " + "; ".join(problems),
+        )
+    return _result(
+        "control_arm_present", True,
+        f"design 'control_seats': {count} control lens(es) {names} seated with no card, as declared, excluded from "
+        "the arm mix and from the far floor",
+    )
+
+
+def _control_arm_paired(subject: Mapping[str, Any]) -> MetricResult:
+    """Design ``paired``: the control is each lens's own plain half, so the
+    arm is present iff every standard lens holds both halves, and no lens --
+    whatever its seat -- holds one half without the other."""
+    roster = subject.get("roster") or []
+    if not roster:
+        return _result("control_arm_present", False, "subject['roster'] is empty -- no seats to check (design 'paired')")
+    standard = sorted({str(r.get("lens_name")) for r in roster if str(r.get("seat")) == STANDARD_SEAT})
+    if not standard:
+        return _result(
+            "control_arm_present", False,
+            "design 'paired': the roster seats no standard lens, so there is no card half and plain half to pair",
+        )
+    block = subject.get("lens_launches")
+    if block is None:
+        return _result(
+            "control_arm_present", False,
+            "design 'paired': subject['lens_launches'] is absent -- the pairing is read from each lens's bound "
+            "launches and their phase labels (lens_assignment_launch.phase), and the subject carries none",
+        )
+    if not isinstance(block, list):
+        return _result(
+            "control_arm_present", False,
+            f"design 'paired': subject['lens_launches'] shape unrecognised ({type(block).__name__}) -- it is a list "
+            "of {lens_name, launch_id, phase} rows, one per bound launch",
+        )
+    malformed = [i for i, row in enumerate(block) if not isinstance(row, Mapping) or not str(row.get("lens_name") or "").strip()]
+    if malformed:
+        return _result(
+            "control_arm_present", False,
+            f"design 'paired': subject['lens_launches'] row(s) {malformed[:10]} name no lens -- a launch that "
+            "belongs to no lens pairs nothing, and the check cannot say whose half it is",
+        )
+    halves: dict[str, dict[str, set[str]]] = {}
+    seen: set[tuple[str, str, Any]] = set()
+    for i, row in enumerate(block):
+        lens = str(row["lens_name"])
+        launch = str(row.get("launch_id") or f"<unnamed launch, row {i}>")
+        phase = row.get("phase") if isinstance(row.get("phase"), str) else None
+        if (lens, launch, phase) in seen:
+            continue
+        seen.add((lens, launch, phase))
+        if phase in (CARD_PHASE, PLAIN_PHASE):
+            halves.setdefault(lens, {CARD_PHASE: set(), PLAIN_PHASE: set()})[phase].add(launch)
+    seat_of = {str(r.get("lens_name")): str(r.get("seat")) for r in roster}
+    offenders: list[str] = []
+    for lens in sorted(set(standard) | set(halves)):
+        card = sorted(halves.get(lens, {}).get(CARD_PHASE, ()))
+        plain = sorted(halves.get(lens, {}).get(PLAIN_PHASE, ()))
+        if lens in standard:
+            if card and plain:
+                continue
+        elif bool(card) == bool(plain):
+            continue
+        seat = seat_of.get(lens, "not on the roster")
+        offenders.append(
+            f"{lens} ({seat}): card launch(es) {card or 'none'}, plain launch(es) {plain or 'none'}"
+        )
+    n_card = sum(len(h[CARD_PHASE]) for h in halves.values())
+    n_plain = sum(len(h[PLAIN_PHASE]) for h in halves.values())
+    if offenders:
+        return _result(
+            "control_arm_present", False,
+            f"design 'paired': {len(offenders)} lens(es) do not hold both halves -- {offenders}. Every standard "
+            f"lens needs at least one launch labelled phase='{CARD_PHASE}' and one labelled phase='{PLAIN_PHASE}', "
+            f"and no lens may hold one half without the other ({n_card} card and {n_plain} plain launch(es) found "
+            f"over {len(standard)} standard lens(es))",
+        )
+    return _result(
+        "control_arm_present", True,
+        f"design 'paired': all {len(standard)} standard lens(es) hold a card half and a plain half ({n_card} card "
+        f"and {n_plain} plain launch(es) found), and no lens holds one half without the other -- each lens's "
+        "plain half is its control",
+    )
+
+
+def _control_arm_single_seat(subject: Mapping[str, Any]) -> MetricResult:
+    """Today's rule, for a round that declares no design: exactly one
+    ``control`` seat, holding no card."""
     roster = subject.get("roster") or []
     if not roster:
         return _result("control_arm_present", False, "subject['roster'] is empty -- no seats to check")
@@ -845,7 +1176,27 @@ def admission_order_hash_matches(subject: Mapping[str, Any]) -> MetricResult:
 
     An ``admission_escrow`` carrying a status outside
     :data:`PREREG_USABLE_STATUSES` is not an escrow a round may gate on,
-    the same way a voided prereg is not."""
+    the same way a voided prereg is not.
+
+    **A round that runs no rooms declares it** (``prereg.params.rooms:
+    false``, section header) and gets ``not_applicable``: no order was drawn,
+    so there is none to match. ``rooms: true`` or no declaration is the rule
+    above, unchanged."""
+    rooms, problem = _declared_flag(subject, "rooms")
+    if problem:
+        return _result("admission_order_hash_matches", False, problem)
+    if rooms is False:
+        return _not_applicable(
+            "admission_order_hash_matches",
+            "rooms=false is declared in the prereg params -- the round runs no rooms, so no admission order was "
+            "drawn or escrowed and there is none to match",
+        )
+    return _admission_order_rule(subject)
+
+
+def _admission_order_rule(subject: Mapping[str, Any]) -> MetricResult:
+    """The admission rule itself, for a round that runs rooms (declared, or
+    by default): the order run hashes to the order escrowed."""
     ran = (subject.get("admission_order") or {}).get("hash")
     params = (subject.get("prereg") or {}).get("params") or {}
     escrow = subject.get("admission_escrow") or {}
@@ -986,20 +1337,99 @@ def per_arm_n_disclosed(subject: Mapping[str, Any]) -> MetricResult:
     with no control cell has not reported the comparison it rests on. A row
     that names the control in its cell TEXT while carrying no ``seat`` key is
     read as an undisclosed control, not as an arm cell — that is the shape
-    that let the cell pass as one."""
-    outcomes = subject.get("outcomes") or []
-    if not outcomes:
-        return _result("per_arm_n_disclosed", False, "subject['outcomes'] is empty -- the pre-registered analysis reported no cells")
-    undisclosed = [
+    that let the cell pass as one.
+
+    **What the control arm is follows the declared design** (section
+    header): the ``seat=control`` cells when nothing is declared or under
+    ``control_seats``; the ``arm=plain`` cells under ``paired``, where each
+    lens's plain half is its control; ``not_applicable`` under ``none``."""
+    design, problem = _declared_design(subject)
+    if problem:
+        return _result("per_arm_n_disclosed", False, problem)
+    if design is None:
+        return _per_arm_n_seat_control(subject)
+    if design == DESIGN_NONE:
+        return _not_applicable(
+            "per_arm_n_disclosed",
+            "design 'none' is declared in the prereg params -- the round reports no control arm, so there is no "
+            "control cell to disclose; under that declaration this check judges none of the cells",
+        )
+    if design == DESIGN_CONTROL_SEATS:
+        seat_rule = _per_arm_n_seat_control(subject)
+        return _result("per_arm_n_disclosed", seat_rule.passed, f"design 'control_seats': {seat_rule.message}", seat_rule.score)
+    return _per_arm_n_paired(subject)
+
+
+def _cells_without_n(outcomes: list) -> list[str]:
+    """The outcome cells that disclose no numeric ``n``, by label."""
+    return [
         str(row.get("cell") or row.get("arm") or row.get("card") or "<unnamed cell>")
         for row in outcomes
         if not isinstance(row.get("n"), (int, float))
     ]
-    mixed = [
+
+
+def _control_cells_in_arm_mix(outcomes: list) -> list[str]:
+    """``seat=control`` cells reported under a near/moderate/far arm -- the
+    control counted inside the arm mix the amendment keeps it out of."""
+    return [
         str(row.get("cell") or "<unnamed cell>")
         for row in outcomes
         if str(row.get("seat") or "").lower() == CONTROL_SEAT and row.get("arm") in ("near", "moderate", "far")
     ]
+
+
+def _per_arm_n_paired(subject: Mapping[str, Any]) -> MetricResult:
+    """Design ``paired``: every cell discloses its n, and the control arm --
+    the ``arm=plain`` cells -- is reported. The seat-keyed guards stay: a
+    ``seat=control`` row inside the arm mix is still refused, and a cell
+    naming the control in its text is undisclosed unless it carries
+    ``arm=plain``, which IS this design's key for the control."""
+    outcomes = subject.get("outcomes") or []
+    if not outcomes:
+        return _result(
+            "per_arm_n_disclosed", False,
+            "subject['outcomes'] is empty -- the pre-registered analysis reported no cells (design 'paired')",
+        )
+    undisclosed = _cells_without_n(outcomes)
+    mixed = _control_cells_in_arm_mix(outcomes)
+    unkeyed = [
+        str(row.get("cell") or "<unnamed cell>")
+        for row in outcomes
+        if not str(row.get("seat") or "").strip()
+        and str(row.get("arm") or "").lower() != PLAIN_ARM
+        and CONTROL_SEAT in str(row.get("cell") or "").lower()
+    ]
+    if undisclosed or mixed or unkeyed:
+        return _result(
+            "per_arm_n_disclosed", False,
+            f"design 'paired': {len(undisclosed)} outcome cell(s) disclose no n ({undisclosed[:10]}); control "
+            f"cells reported inside the arm mix: {mixed or 'none'}; cell(s) naming the control with neither a "
+            f"seat key nor arm='{PLAIN_ARM}': {unkeyed or 'none'}",
+        )
+    plain_cells = [r for r in outcomes if str(r.get("arm") or "").lower() == PLAIN_ARM]
+    if not plain_cells:
+        return _result(
+            "per_arm_n_disclosed", False,
+            f"design 'paired': all {len(outcomes)} outcome cell(s) disclose their n, but no cell carries "
+            f"arm={PLAIN_ARM!r} -- each lens's plain half is the round's control, so a reported analysis with no "
+            "plain cell has not reported the comparison it rests on",
+        )
+    return _result(
+        "per_arm_n_disclosed", True,
+        f"design 'paired': all {len(outcomes)} outcome cell(s) disclose their n; the control arm is reported as "
+        f"the plain half ({len(plain_cells)} arm={PLAIN_ARM!r} cell(s))",
+    )
+
+
+def _per_arm_n_seat_control(subject: Mapping[str, Any]) -> MetricResult:
+    """The seat-keyed rule: every cell discloses its n and the
+    ``seat=control`` cell is reported, as a control and not as an arm."""
+    outcomes = subject.get("outcomes") or []
+    if not outcomes:
+        return _result("per_arm_n_disclosed", False, "subject['outcomes'] is empty -- the pre-registered analysis reported no cells")
+    undisclosed = _cells_without_n(outcomes)
+    mixed = _control_cells_in_arm_mix(outcomes)
     unkeyed = [
         str(row.get("cell") or "<unnamed cell>")
         for row in outcomes
@@ -1035,7 +1465,46 @@ def no_significance_language(subject: Mapping[str, Any]) -> MetricResult:
     The round's own limits paragraph says why: n per arm or card is single
     digits, so every comparison is directional. "Significant" in a report
     over six cells is a claim the design does not make, whether or not a
-    test was run."""
+    test was run.
+
+    **A round that pre-registered a test declares it** (``prereg.params
+    .report_p_values: true``, section header): its report may then state a
+    p-value as a number (``p = 0.031``, ``p = 2/64``) and use
+    :data:`REPORTED_P_VALUE_TERMS` (a p-value's name, interval wording). The
+    words that claim significance stay barred in every mode; the list is
+    the same list."""
+    report_p_values, problem = _declared_flag(subject, "report_p_values")
+    if problem:
+        return _result("no_significance_language", False, problem)
+    if report_p_values:
+        return _significance_claims_absent(subject)
+    return _significance_language_absent(subject)
+
+
+def _significance_claims_absent(subject: Mapping[str, Any]) -> MetricResult:
+    """``report_p_values: true``: numbers and interval wording pass; the
+    claim words of :data:`SIGNIFICANCE_TERMS` do not."""
+    text = subject.get("report_text")
+    if text is None:
+        return _result("no_significance_language", False, "subject['report_text'] is absent -- there is no prose to check")
+    found = sorted({m.group(0).lower() for m in _SIGNIFICANCE_CLAIM_RE.finditer(str(text))})
+    if found:
+        return _result(
+            "no_significance_language", False,
+            f"the report uses significance language {found} -- report_p_values is declared, so a p-value stated as "
+            "a number and interval wording are allowed, but the words that claim significance stay barred in every "
+            "mode",
+        )
+    return _result(
+        "no_significance_language", True,
+        "report_p_values is declared: p-values stated as numbers and interval wording are allowed, and the report "
+        "uses none of the words that claim significance",
+    )
+
+
+def _significance_language_absent(subject: Mapping[str, Any]) -> MetricResult:
+    """Today's rule: no significance vocabulary and no ``p < .05``-shaped
+    claim at all."""
     text = subject.get("report_text")
     if text is None:
         return _result("no_significance_language", False, "subject['report_text'] is absent -- there is no prose to check")
@@ -1106,7 +1575,11 @@ def run_gate_suite(suite_id: str, subject: Mapping[str, Any], *, cwd: str | Path
     documents for its own subject_kind/procedure checks).
 
     Returns ``{"suite_id", "returncode", "overall": "PASS"|"FAIL",
-    "checks": [MetricResult.to_dict(), ...], "stdout_tail"}``. Raises
+    "checks": [MetricResult.to_dict(), ...], "stdout_tail"}``. A
+    ``not_applicable`` check is a pytest SKIP, so ``overall`` is ``PASS`` iff
+    every check passed or was not applicable; its entry in ``checks`` carries
+    ``"status": "not_applicable"`` (read any entry through
+    :func:`check_status`). Raises
     :class:`~trialerror.eval.errors.GateSuiteRunnerError` if the subprocess
     itself couldn't run (failed to launch, timed out, or exited with a
     pytest code outside ``{0, 1}`` -- 0/1 are pytest's own "ran to
@@ -1187,7 +1660,7 @@ def run_gate_suite_for_gate(
     verdict_row = record_verdict(
         store, subject_kind="artifact", subject_id=gate["artifact_id"], procedure="gate",
         procedure_version=procedure_version, label=run_result["overall"],
-        evidence=[{"note": f"{c['name']}: {c['message']}", "stance": "PASS" if c["passed"] else "FAIL"} for c in run_result["checks"]],
+        evidence=[{"note": f"{c['name']}: {c['message']}", "stance": check_status(c).upper()} for c in run_result["checks"]],
         reproduction_ref=reproduction_ref, issued_by_launch=issued_by_launch,
     )
 

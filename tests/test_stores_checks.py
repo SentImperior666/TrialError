@@ -133,9 +133,26 @@ def test_store_schema_version_passes_on_freshly_migrated_store(store, program_ro
     # by subject alone, which is right for a record whose id is unique across
     # the programme and wrong for a plant whose id is whatever the round's
     # plants file called it).
-    assert r.details["ops"] == {"current_version": 10, "expected_version": 10, "match": True}
+    # Lane R0-B added ops v11 (``lens_assignment_launch``, the accumulating
+    # lens-launch link: a lens is a NAME with several launches, so a second
+    # booking for the same assignment rows binds beside the first instead of
+    # overwriting it), again the next free number.
+    # Lane R0-C added knowledge v13 (``verdict_rejudge``: the second judge's
+    # labels, which the recorder read for one kappa and then dropped, so a
+    # number the round published could not be reproduced from the store).
+    # ops v12 added (the plan-time check columns on ``prereg`` and the registration
+    # dispositions on ``gate``/``artifact``), ADD COLUMN only, so ADDITIVE.
+    assert r.details["ops"] == {"current_version": 12, "expected_version": 12, "match": True}
     assert r.details["jobs"] == {"current_version": 3, "expected_version": 3, "match": True}
-    assert r.details["knowledge"] == {"current_version": 12, "expected_version": 12, "match": True}
+    # Lane FB-acq item 4 added knowledge v14 (``source.license_grant`` /
+    # ``license_grant_source``: ``license_tier`` records the ROUTE an acquisition
+    # took, and nothing held the document's own grant -- an ``open`` row might be
+    # CC-BY or might be arXiv's own non-exclusive distribution licence, and the
+    # store could not say which). ADD COLUMN only, so it classifies as ADDITIVE.
+    # Lane SI part B added knowledge v15 (``source_evidence``/``source_dossier``:
+    # the source investigator's provider-response cache and its one dossier row
+    # per investigated cited work). CREATE TABLE only, so ADDITIVE too.
+    assert r.details["knowledge"] == {"current_version": 15, "expected_version": 15, "match": True}
     # platform stayed on v1 from M1 until lane FB-3, whose D-FB-13/D-FB-14
     # work is the first thing to need a shape change in the money store:
     # ``launch`` gains the usage split and ``pool_id``, and

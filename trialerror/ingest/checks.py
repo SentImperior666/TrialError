@@ -568,7 +568,7 @@ def check_extract_pending_backlog(ctx: DoctorContext) -> CheckResult:
     extract_pending_backlog, entity_dupes_suspected"). PENDING extraction
     candidates (``trialerror.ingest.extract.EXTRACT_REGISTER_KEY`` ``record``
     rows whose payload ``status == 'pending'``) waiting on an explicit
-    ``trialerror extract accept``/``reject`` decision -- the merge-review
+    an explicit accept/reject decision (the DECIDE queue's merge-accept/merge-reject) -- the merge-review
     queue's own "never silent auto-merge" contract means this count can
     only shrink via a human/agent decision, never automatically, so a
     growing backlog is a genuine standing-health signal (same warn-on-any-

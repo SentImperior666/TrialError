@@ -31,8 +31,12 @@ class _ScriptedTransport:
         return self._responses[idx]
 
 
-def _limiter(min_interval_s: float = 0.0) -> RateLimiter:
-    return RateLimiter(min_interval_s)
+def _limiter(min_interval_s: float = 0.0, *, sleeps: list | None = None) -> RateLimiter:
+    """A limiter whose ``_sleep_fn`` never really sleeps. ``get_with_retry``
+    defaults its backoff sleeps to the limiter's own ``_sleep_fn`` (lane FB-acq
+    item 2), so a limiter left on the real ``time.sleep`` would make every
+    retry test below wait out its own exponential backoff for real."""
+    return RateLimiter(min_interval_s, _sleep_fn=(sleeps.append if sleeps is not None else lambda _s: None))
 
 
 def test_rate_limiter_first_call_never_sleeps():

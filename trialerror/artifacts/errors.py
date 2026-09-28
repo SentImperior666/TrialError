@@ -49,3 +49,10 @@ class RegistrationRefusedError(ArtifactsError):
     ``union_applied`` — including the case of no gate at all — or the
     artifact has already been registered/superseded (design Section 4.2:
     "Registration closes a gate; never the reverse")."""
+
+
+class OperatorFailRefusedError(ArtifactsError):
+    """``trialerror gate fail-reproduction`` was refused: the operator's decision
+    to fail a gate whose gate-suite reproduction was ``mismatch`` needs the gate
+    at ``gated`` with that ``mismatch`` recorded, a ``decided_by`` and a
+    ``reason`` (``trialerror.artifacts.gates.fail_on_reproduction``)."""

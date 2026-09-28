@@ -35,14 +35,26 @@ from tests._store_fixtures import populate_one_of_everything
 # "chunk_fts" it is an FTS5 virtual table maintained by its own write API,
 # with no row of its own to round-trip, and TABLE_DB is the validated write
 # API's routing map rather than an inventory of everything in the file.
-EXPECTED_TABLE_COUNT_BY_DB = {"platform": 5, "ops": 23, "knowledge": 23, "jobs": 2}
+# Lane R0-B's ops_v11 "lens_assignment_launch" (the accumulating lens-launch
+# link -- a lens is a name with several launches, so the binding is a table
+# rather than a column) makes it 24 for ops: an additive seam like every one
+# above it.
+# Lane R0-C's knowledge_v13 "verdict_rejudge" (the second judge's labels,
+# which the recorder used for one kappa and then dropped) makes it 24 for
+# knowledge -- deliberately its own table rather than more `verdict` rows,
+# since a second opinion is not a label of record.
+# Lane SI part B's knowledge_v15 "source_evidence" (a provider-response cache,
+# live/superseded like web_fetch) and "source_dossier" (one row per
+# investigated cited work) make it 26 for knowledge -- additive seams like
+# every one above them.
+EXPECTED_TABLE_COUNT_BY_DB = {"platform": 5, "ops": 24, "knowledge": 26, "jobs": 2}
 
 
 def test_table_counts_match_design_section_4():
     for db_kind, expected in EXPECTED_TABLE_COUNT_BY_DB.items():
         actual = len(SCHEMA_MODULES[db_kind].TABLES)
         assert actual == expected, f"{db_kind}: expected {expected} tables, schema module declares {actual}"
-    assert len(TABLE_DB) == sum(EXPECTED_TABLE_COUNT_BY_DB.values()) == 53
+    assert len(TABLE_DB) == sum(EXPECTED_TABLE_COUNT_BY_DB.values()) == 57
 
 
 def test_round_trip_one_row_per_table(store):

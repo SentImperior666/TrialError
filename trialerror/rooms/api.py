@@ -145,6 +145,11 @@ rule by rule, and what each one is enforced BY:
   outright; :func:`post_message`'s own check now fires on the lens name as
   well as the launch id, which is what makes it fire for a re-spawned lens
   at all.
+- **a declared name must be a seat** — :func:`_check_seated` (lane R0-B item
+  2). The declared name is the identity everything above counts by, so a
+  room that declares participants refuses a turn posted under a name it does
+  not seat. A launch declaring no name, or a room declaring no
+  participants, is untouched.
 
 One reading recorded rather than assumed: the charter says "a FINAL-STANCE
 decision point per participant" and the design says "a final DP has each
@@ -175,6 +180,7 @@ from trialerror.rooms.errors import (
     OwnershipConflictError,
     StanceIncompleteError,
     TurnKindRefusedError,
+    UnseatedParticipantError,
 )
 from trialerror.rooms.state_machine import assert_legal_transition
 from trialerror.stores import get as store_get
@@ -227,6 +233,8 @@ __all__ = [
     "converge_room",
     "freeze_room",
     "get_freeze_reason",
+    "close_room",
+    "get_close_record",
     "register_room_deliverable",
     "render_room_markdown",
     "export_room",
@@ -602,6 +610,37 @@ def _room_events(store: Store, *, event_type: str, room_id: str) -> list[dict[st
     return out
 
 
+def _check_seated(store: Store, *, room_id: str, config: Mapping[str, Any], launch_id: str) -> None:
+    """A DECLARED lens name must name one of a room's DECLARED participants
+    (lane R0-B item 2).
+
+    The rest of the rooms API already treats the declared name as the
+    author's identity -- :func:`_turns_by_author` groups by it,
+    :func:`_rounds_spoken` counts by it, and the closure rule and the
+    blind-first-turn envelope are decided from those. Until now nothing
+    checked that the name was one the room seats, so a typo (or a seat
+    posting into the wrong room) silently added an author the room's own
+    configuration does not have, and quietly moved every "has every
+    participant spoken" reading with it.
+
+    Deliberately narrow, so nothing that worked before stops working: a
+    launch that declares NO lens name is not judged (it answers by launch
+    id, as it always did), and a room that declares NO participants has no
+    seating to judge against."""
+    seats = _participants(config)
+    if not seats:
+        return
+    name = lens_name_of_launch(store, launch_id)
+    if name is None or name in seats:
+        return
+    raise UnseatedParticipantError(
+        f"post_message: launch {launch_id!r} declares lens name {name!r}, which room {room_id!r} does "
+        f"not seat — its participants are {seats!r}. A room counts turns by the declared name, so a "
+        "name nobody seated would post as an author this room does not have. Book the turn's launch "
+        "with `--lens-name <one of the room's participants>`, or with no lens name at all"
+    )
+
+
 def _check_neither_ownership(store: Store, *, dp: Mapping[str, Any], launch_id: str) -> None:
     """The NEITHER-ownership invariant (module TRIALERROR-DEV-NOTE item 4):
     refuses a turn where the posting launch — or the posting LENS — is the
@@ -833,6 +872,9 @@ def post_message(
 
     Refuses (:class:`ValueError`) if the room is not ``open``, or if
     ``dp_id`` names no discussion point in this room; refuses
+    (:class:`~trialerror.rooms.errors.UnseatedParticipantError`) a launch
+    whose declared ``lens_name`` is not one of a participant-declaring
+    room's seats (see :func:`_check_seated`); refuses
     (:class:`~trialerror.rooms.errors.OwnershipConflictError`) under the
     NEITHER-ownership invariant (see :func:`_check_neither_ownership`);
     refuses (:class:`~trialerror.rooms.errors.TurnKindRefusedError`) a
@@ -869,7 +911,13 @@ def post_message(
         raise TurnKindRefusedError(
             f"post_message: kind must be one of {list(TURN_KINDS)}, got {kind!r}"
         )
+    # Ownership first, seating second. An unseated name that ALSO owns the
+    # idea under review is two faults, and the ownership one is the one the
+    # operator has to hear about: "you are vetting your own idea" survives
+    # any amount of re-seating, while "this room does not seat you" reads as
+    # a configuration slip and invites exactly the wrong fix.
     _check_neither_ownership(store, dp=dp, launch_id=launch_id)
+    _check_seated(store, room_id=room_id, config=config, launch_id=launch_id)
     _require_launch_exists(store, launch_id, field_name="launch_id")
     if kind == "closure" and not dp.get("procedural"):
         spoken = _rounds_spoken(store, room_id=room_id, dp_id=dp_id, launch_id=launch_id)
@@ -2131,6 +2179,63 @@ def get_freeze_reason(store: Store, room_id: str) -> str | None:
     return json.loads(row["payload"]).get("reason")
 
 
+def close_room(
+    store: Store, *, room_id: str, by_launch: str, reason: str, decided_by: str, ts: str | None = None
+) -> dict[str, Any]:
+    """``frozen -> closed`` — the operator's answer to a freeze, when the
+    answer is "close it" (a trial room, a question nobody needs answered any
+    more). Without it a frozen room stays frozen, and so stays in the
+    dashboard's DECIDE queue, however the operator decided.
+
+    ``reason`` and ``decided_by`` (the operator decision's reference) are both
+    required and are recorded on the companion ``room_closed`` event, with
+    ``from_state``, the same way :func:`freeze_room` records its reason.
+    Append-only: the turns, the scores and the ``room_frozen`` event stay as
+    they were; only ``room.state`` moves, through the same compare-and-swap
+    transaction every other room transition uses (:func:`_transition_room_cas`),
+    so the state and its event land together or not at all, and exactly one
+    of N concurrent closes lands.
+
+    Refuses (:class:`~trialerror.rooms.errors.IllegalRoomTransitionError`)
+    unless the room is ``frozen`` right now: an ``open`` room is still being
+    discussed, a ``converged`` room decided something, and a ``closed`` room
+    is terminal."""
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("close_room: reason is required (say in words why the room is closed)")
+    if not isinstance(decided_by, str) or not decided_by.strip():
+        raise ValueError("close_room: decided_by is required -- the reference of the operator decision that closes it")
+    room = _require_room(store, room_id)
+    _require_launch_exists(store, by_launch, field_name="by_launch")
+    assert_legal_transition(room["state"], "closed")
+    ts = ts or now()
+    _transition_room_cas(
+        store, room_id=room_id, expected_state=room["state"], to_state="closed",
+        by_launch=by_launch, ts=ts, event_type="room_closed",
+        payload_extra={"from_state": room["state"], "reason": reason, "decided_by": decided_by},
+    )
+    return _require_room(store, room_id)
+
+
+def get_close_record(store: Store, room_id: str) -> dict[str, Any] | None:
+    """What the room's ``room_closed`` event recorded (``reason``,
+    ``decided_by``, ``ts``, ``launch_id``), or ``None`` if the room was never
+    closed. Same SQL-side lookup as :func:`get_freeze_reason`."""
+    row = store.ops.execute(
+        "SELECT ts, launch_id, payload FROM event WHERE type = 'room_closed' "
+        "AND json_extract(payload, '$.room_id') = ? ORDER BY ts DESC, rowid DESC LIMIT 1",
+        (room_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    payload = json.loads(row["payload"])
+    return {
+        "reason": payload.get("reason"),
+        "decided_by": payload.get("decided_by"),
+        "ts": row["ts"],
+        "launch_id": row["launch_id"],
+    }
+
+
 # ---------------------------------------------------------------------------
 # deliverable registration hook
 # ---------------------------------------------------------------------------
@@ -2197,7 +2302,8 @@ def render_room_markdown(store: Store, room_id: str) -> str:
     doc" the design's own §9.8 traceability row names. A pure view: every
     discussion point, its current score (or "not yet scored"), and every
     turn posted on it in order; the freeze reason (if any) as a trailing
-    section. Deterministic given the same store contents (no wall-clock
+    section, and a closed room's reason and decision as one more.
+    Deterministic given the same store contents (no wall-clock
     read other than what's already stored)."""
     room = _require_room(store, room_id)
     config = _room_config(room)
@@ -2235,11 +2341,19 @@ def render_room_markdown(store: Store, room_id: str) -> str:
             lines.append(t["body"])
             lines.append("")
 
-    if room["state"] == "frozen":
+    if room["state"] in ("frozen", "closed"):
         reason = get_freeze_reason(store, room_id)
         lines.append("## Freeze")
         lines.append("")
         lines.append(reason or "_(no reason recorded)_")
+        lines.append("")
+    if room["state"] == "closed":
+        record = get_close_record(store, room_id) or {}
+        lines.append("## Closed")
+        lines.append("")
+        lines.append(record.get("reason") or "_(no reason recorded)_")
+        lines.append("")
+        lines.append(f"_decided by: {record.get('decided_by') or '(not recorded)'}_")
         lines.append("")
 
     return "\n".join(lines)

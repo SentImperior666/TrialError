@@ -215,20 +215,15 @@ def test_index_handler_populates_active_model_vec_table(store, program_root, raw
     assert rows == chunks
 
 
-def test_extract_handler_is_registered_stub_not_auto_chained(store, program_root, raw_dir):
-    """design Section 11: "v0 ships the schema + a minimal claim
-    extractor" -- the handler exists and settles cleanly, but ``index``
-    does not enqueue it automatically."""
+def test_extract_is_never_auto_enqueued(store, program_root, raw_dir):
+    """``index`` does not enqueue an ``extract`` job (the extract handler was
+    retired in Phase 0; the kind stays in the jobs CHECK)."""
     path = write_html_fixture(raw_dir / "doc.html")
     _launch_id, _source, result = _register_and_add(store, program_root, path)
-    doc_id = result["document"]["doc_id"]
     _drain(store)
 
     extract_job = store.jobs.execute("SELECT * FROM job WHERE kind='extract'").fetchone()
     assert extract_job is None  # never auto-enqueued
-
-    r = run_one(store, worker_id="wx", job_id="JOB-manual-extract", kind="extract", payload={"doc_id": doc_id})
-    assert r["status"] == "complete"
 
 
 # ---------------------------------------------------------------------------

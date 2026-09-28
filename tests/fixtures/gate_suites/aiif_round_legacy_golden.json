@@ -1,0 +1,1448 @@
+{
+ "about": "Legacy golden for the aiif_round suite, generated from the unmodified suite before lane R1-H edited it: every check's to_dict() (or {'raises': <exception type>}) for subjects that declare none of design/control_count/rooms/report_p_values. 'base_subject'/'base_checks' is the complete round. A case carries either a full 'subject' with all fourteen 'checks', or a 'patch' against the base (['set', path, value] | ['del', path] | ['append', path, value]) with 'checks_changed' listing only the checks whose output differs from 'base_checks' -- every other check must equal its base entry.",
+ "generated_from_commit": "a1b6140",
+ "base_subject": {
+  "prereg": {
+   "prereg_id": "PREREG-0001",
+   "status": "committed",
+   "params": {
+    "arm_mode": "per_lens",
+    "room_admission": "seeded-stratified-all",
+    "admission_seed": "seed-1"
+   }
+  },
+  "models_table": {
+   "keystone": "top",
+   "ideation": "top",
+   "moderation": "top",
+   "room_participant": "top",
+   "novelty_judge": "top",
+   "gates": "top",
+   "consolidation": "mid",
+   "screen": "mid"
+  },
+  "ideas": [
+   {
+    "idea_id": "IDEA-0",
+    "status": "consolidated",
+    "dossier": {
+     "label_inventory": "no-close-neighbour",
+     "label_corpus": "absent",
+     "judged": false
+    }
+   },
+   {
+    "idea_id": "IDEA-1",
+    "status": "consolidated",
+    "dossier": {
+     "label_inventory": "no-close-neighbour",
+     "label_corpus": "absent",
+     "judged": false
+    }
+   },
+   {
+    "idea_id": "IDEA-2",
+    "status": "consolidated",
+    "dossier": {
+     "label_inventory": "no-close-neighbour",
+     "label_corpus": "absent",
+     "judged": false
+    }
+   },
+   {
+    "idea_id": "IDEA-merged",
+    "status": "merged",
+    "dossier": {}
+   }
+  ],
+  "reference_snapshot": {
+   "R1": {
+    "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+   },
+   "R2": {
+    "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+   },
+   "R3": {
+    "sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+   },
+   "R4": {
+    "sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+   },
+   "R5": {
+    "snapshot_id": "index-build-9"
+   }
+  },
+  "judge_envelopes": [
+   {
+    "subject_id": "IDEA-0",
+    "record": {
+     "requirements": "two lines",
+     "statement": "a state transition",
+     "probe": "check row X"
+    }
+   }
+  ],
+  "plants": {
+   "n_plants": 10,
+   "n_inventory_plants": 5,
+   "n_paraphrase_plants": 5,
+   "caught": [
+    "PL-1"
+   ],
+   "missed": [],
+   "unlabelled": [],
+   "catch_rate": 1.0,
+   "inventory_failures": [],
+   "unauditable": false,
+   "batch_failed": false
+  },
+  "distribution": {
+   "declared_operations": {
+    "opportunity": {
+     "entropy": 0.82,
+     "counts": {}
+    },
+    "method": {
+     "entropy": 0.71,
+     "counts": {}
+    }
+   },
+   "pairwise_similarity": {
+    "median": 0.41,
+    "p90": 0.66
+   },
+   "template_mass": {
+    "template_share": 0.12
+   }
+  },
+  "roster": [
+   {
+    "lens_name": "lens_1",
+    "seat": "standard",
+    "recipe_cards": [
+     "MISMATCH",
+     "TRANSFER"
+    ]
+   },
+   {
+    "lens_name": "lens_2",
+    "seat": "standard",
+    "recipe_cards": [
+     "TRANSFER",
+     "MISMATCH"
+    ]
+   },
+   {
+    "lens_name": "lens_3",
+    "seat": "assumption_buster",
+    "recipe_cards": [
+     "NEGATE"
+    ]
+   },
+   {
+    "lens_name": "lens_4",
+    "seat": "control",
+    "recipe_cards": []
+   }
+  ],
+  "assignment": {
+   "arm_mode": "per_lens",
+   "far_lens_floor": 2
+  },
+  "admission_order": {
+   "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "n_ideas": 3
+  },
+  "admission_escrow": {
+   "prereg_id": "PREREG-0002",
+   "status": "committed",
+   "admission_order_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "lens_log": {
+   "offenders": [],
+   "n_lenses": 4
+  },
+  "outcomes": [
+   {
+    "cell": "arm=near",
+    "arm": "near",
+    "n": 3
+   },
+   {
+    "cell": "arm=far",
+    "arm": "far",
+    "n": 2
+   },
+   {
+    "cell": "control",
+    "seat": "control",
+    "n": 1
+   }
+  ],
+  "report_text": "The far arm survived more rooms than the near arm, directionally, at n=2 and n=3.",
+  "findings": []
+ },
+ "base_checks": {
+  "admission_order_hash_matches": {
+   "name": "admission_order_hash_matches",
+   "passed": true,
+   "score": null,
+   "message": "the admission order matches the hash escrowed in the post-screen admission escrow (PREREG-0002, committed) (aaaaaaaaaaaa...)"
+  },
+  "arm_mode_declared": {
+   "name": "arm_mode_declared",
+   "passed": true,
+   "score": null,
+   "message": "arm_mode='per_lens', matching the pre-registered params"
+  },
+  "card_cells_ge_2": {
+   "name": "card_cells_ge_2",
+   "passed": true,
+   "score": null,
+   "message": "every card in play is held by >= 2 standard lenses ({'MISMATCH': 2, 'TRANSFER': 2})"
+  },
+  "consolidation_completeness": {
+   "name": "consolidation_completeness",
+   "passed": true,
+   "score": null,
+   "message": "all 4 finding(s) carry a disposition in ['CONSOLIDATED', 'ELIMINATED', 'MERGED', 'PROMOTED']"
+  },
+  "control_arm_present": {
+   "name": "control_arm_present",
+   "passed": true,
+   "score": null,
+   "message": "one control lens (lens_4) is seated with no card, excluded from the arm mix and from the far floor"
+  },
+  "distribution_card_present": {
+   "name": "distribution_card_present",
+   "passed": true,
+   "score": null,
+   "message": "the audit card carries entropy per axis, the pairwise-similarity distribution and the template mass"
+  },
+  "lens_log_reconciled": {
+   "name": "lens_log_reconciled",
+   "passed": true,
+   "score": null,
+   "message": "every booked lens posted (4)"
+  },
+  "models_table_present": {
+   "name": "models_table_present",
+   "passed": true,
+   "score": null,
+   "message": "all 8 purposes carry their floor or better"
+  },
+  "no_significance_language": {
+   "name": "no_significance_language",
+   "passed": true,
+   "score": null,
+   "message": "the report states its comparisons directionally, with no significance language"
+  },
+  "novelty_bundle_complete": {
+   "name": "novelty_bundle_complete",
+   "passed": true,
+   "score": 1.0,
+   "message": "all 3 consolidated idea(s) carry a dossier against snapshot-identified R1-R5"
+  },
+  "per_arm_n_disclosed": {
+   "name": "per_arm_n_disclosed",
+   "passed": true,
+   "score": null,
+   "message": "all 3 outcome cell(s) disclose their n; the control is reported as a control (1 cell(s)) and not as an arm"
+  },
+  "plants_caught": {
+   "name": "plants_caught",
+   "passed": true,
+   "score": 1.0,
+   "message": "every one of 5 inventory plant(s) was caught (catch rate 1.0; 0 plant(s) of other kinds missed, reported not failed)"
+  },
+  "prereg_present": {
+   "name": "prereg_present",
+   "passed": true,
+   "score": null,
+   "message": "prereg PREREG-0001 is committed"
+  },
+  "self_assessment_absent": {
+   "name": "self_assessment_absent",
+   "passed": true,
+   "score": null,
+   "message": "none of 1 judge envelope(s) carries an overt self-assessment sentence"
+  }
+ },
+ "cases": [
+  {
+   "name": "empty_subject",
+   "subject": {},
+   "checks": {
+    "admission_order_hash_matches": {
+     "name": "admission_order_hash_matches",
+     "passed": false,
+     "score": null,
+     "message": "subject['admission_order'] carries no hash -- the order the round ran is unrecorded"
+    },
+    "arm_mode_declared": {
+     "name": "arm_mode_declared",
+     "passed": false,
+     "score": null,
+     "message": "subject['assignment'] declares no arm_mode -- per-arm n has no defined unit"
+    },
+    "card_cells_ge_2": {
+     "name": "card_cells_ge_2",
+     "passed": false,
+     "score": null,
+     "message": "subject['roster'] is empty -- no card cells to count"
+    },
+    "consolidation_completeness": {
+     "name": "consolidation_completeness",
+     "passed": false,
+     "score": null,
+     "message": "subject['findings'] is empty -- nothing to consolidate"
+    },
+    "control_arm_present": {
+     "name": "control_arm_present",
+     "passed": false,
+     "score": null,
+     "message": "subject['roster'] is empty -- no seats to check"
+    },
+    "distribution_card_present": {
+     "name": "distribution_card_present",
+     "passed": false,
+     "score": null,
+     "message": "subject['distribution'] is empty -- the round published no audit card"
+    },
+    "lens_log_reconciled": {
+     "name": "lens_log_reconciled",
+     "passed": false,
+     "score": null,
+     "message": "subject['lens_log'] is absent -- nothing reconciled the round's booked lenses against its posts"
+    },
+    "models_table_present": {
+     "name": "models_table_present",
+     "passed": false,
+     "score": null,
+     "message": "subject['models_table'] is empty -- no [models] purpose table, so no booking in this round had a floor to meet (meets_minimum(class, None) passes everything)"
+    },
+    "no_significance_language": {
+     "name": "no_significance_language",
+     "passed": false,
+     "score": null,
+     "message": "subject['report_text'] is absent -- there is no prose to check"
+    },
+    "novelty_bundle_complete": {
+     "name": "novelty_bundle_complete",
+     "passed": false,
+     "score": null,
+     "message": "subject['ideas'] holds no consolidated idea -- nothing reached a room"
+    },
+    "per_arm_n_disclosed": {
+     "name": "per_arm_n_disclosed",
+     "passed": false,
+     "score": null,
+     "message": "subject['outcomes'] is empty -- the pre-registered analysis reported no cells"
+    },
+    "plants_caught": {
+     "name": "plants_caught",
+     "passed": false,
+     "score": null,
+     "message": "subject['plants'] is empty -- no seeded-plant battery rode in the judged batch"
+    },
+    "prereg_present": {
+     "name": "prereg_present",
+     "passed": false,
+     "score": null,
+     "message": "subject['prereg'] names no prereg_id (nothing was escrowed before the round ran)"
+    },
+    "self_assessment_absent": {
+     "name": "self_assessment_absent",
+     "passed": false,
+     "score": null,
+     "message": "subject['judge_envelopes'] is empty -- the judged half's envelopes are what this check reads, and a round that ran a judged screen has them"
+    }
+   }
+  },
+  {
+   "name": "round_shaped_undeclared",
+   "subject": {
+    "prereg": {
+     "prereg_id": "PREREG-0100",
+     "status": "committed",
+     "params": {
+      "arm_mode": "per_lens",
+      "slice_salt": "lens-name",
+      "seed": "seed-100",
+      "weights": [
+       40,
+       40,
+       20
+      ]
+     }
+    },
+    "models_table": {
+     "keystone": "top",
+     "ideation": "top",
+     "moderation": "top",
+     "room_participant": "top",
+     "novelty_judge": "top",
+     "gates": "top",
+     "consolidation": "mid",
+     "screen": "mid"
+    },
+    "ideas": [
+     {
+      "idea_id": "IDEA-000",
+      "status": "consolidated",
+      "dossier": {
+       "label_inventory": "no-close-neighbour",
+       "label_corpus": "absent",
+       "judged": true
+      }
+     },
+     {
+      "idea_id": "IDEA-001",
+      "status": "consolidated",
+      "dossier": {
+       "label_inventory": "no-close-neighbour",
+       "label_corpus": "absent",
+       "judged": false
+      }
+     },
+     {
+      "idea_id": "IDEA-002",
+      "status": "consolidated",
+      "dossier": {
+       "label_inventory": "no-close-neighbour",
+       "label_corpus": "absent",
+       "judged": true
+      }
+     },
+     {
+      "idea_id": "IDEA-003",
+      "status": "consolidated",
+      "dossier": {
+       "label_inventory": "no-close-neighbour",
+       "label_corpus": "absent",
+       "judged": false
+      }
+     },
+     {
+      "idea_id": "IDEA-004",
+      "status": "consolidated",
+      "dossier": {
+       "label_inventory": "no-close-neighbour",
+       "label_corpus": "absent",
+       "judged": true
+      }
+     },
+     {
+      "idea_id": "IDEA-005",
+      "status": "consolidated",
+      "dossier": {
+       "label_inventory": "no-close-neighbour",
+       "label_corpus": "absent",
+       "judged": false
+      }
+     },
+     {
+      "idea_id": "IDEA-006",
+      "status": "consolidated",
+      "dossier": {
+       "label_inventory": "no-close-neighbour",
+       "label_corpus": "absent",
+       "judged": true
+      }
+     },
+     {
+      "idea_id": "IDEA-007",
+      "status": "consolidated",
+      "dossier": {
+       "label_inventory": "no-close-neighbour",
+       "label_corpus": "absent",
+       "judged": false
+      }
+     },
+     {
+      "idea_id": "IDEA-100",
+      "status": "eliminated",
+      "dossier": {
+       "label_inventory": "same",
+       "label_corpus": "stated"
+      }
+     },
+     {
+      "idea_id": "IDEA-101",
+      "status": "eliminated",
+      "dossier": {}
+     },
+     {
+      "idea_id": "IDEA-102",
+      "status": "merged",
+      "dossier": {}
+     }
+    ],
+    "reference_snapshot": {
+     "R1": {
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+     },
+     "R2": {
+      "snapshot_id": "archive-7"
+     },
+     "R3": {
+      "sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+     },
+     "R4": {
+      "sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+     },
+     "R5": {
+      "snapshot_id": "index-build-12"
+     }
+    },
+    "judge_envelopes": [
+     {
+      "subject_id": "J-0",
+      "record": {
+       "requirements": "",
+       "statement": "a state change 0",
+       "probe": "row 0"
+      }
+     },
+     {
+      "subject_id": "J-1",
+      "record": {
+       "requirements": "",
+       "statement": "a state change 1",
+       "probe": "row 1"
+      }
+     },
+     {
+      "subject_id": "J-2",
+      "record": {
+       "requirements": "",
+       "statement": "a state change 2",
+       "probe": "row 2"
+      }
+     }
+    ],
+    "plants": {
+     "n_plants": 12,
+     "n_inventory_plants": 6,
+     "caught": [
+      "PLANT-inventory-0",
+      "PLANT-inventory-1",
+      "PLANT-inventory-2",
+      "PLANT-inventory-3",
+      "PLANT-inventory-4",
+      "PLANT-inventory-5"
+     ],
+     "missed": [
+      {
+       "plant_id": "PLANT-paraphrase-2",
+       "label": "new-mechanism",
+       "expected": [
+        "variant"
+       ]
+      }
+     ],
+     "unlabelled": [],
+     "catch_rate": 0.916667,
+     "inventory_failures": [],
+     "unauditable": false,
+     "batch_failed": false,
+     "batch_fail_on": [
+      "inventory"
+     ],
+     "failures": [],
+     "by_kind": {
+      "inventory": {
+       "n": 6,
+       "caught": [],
+       "missed": [],
+       "unlabelled": [],
+       "catch_rate": 1.0,
+       "fails_batch": true
+      },
+      "paraphrase": {
+       "n": 6,
+       "caught": [],
+       "missed": [
+        "PLANT-paraphrase-2"
+       ],
+       "unlabelled": [],
+       "catch_rate": 0.833333,
+       "fails_batch": false
+      }
+     },
+     "by_set": {
+      "R3": {
+       "caught": [],
+       "missed": [],
+       "unlabelled": [],
+       "n_expecting": 12,
+       "catch_rate": 0.916667
+      }
+     }
+    },
+    "distribution": {
+     "declared_operations": {
+      "opportunity": {
+       "entropy": 0.77,
+       "counts": {
+        "gap": 5,
+        "bridge": 3
+       }
+      },
+      "method": {
+       "entropy": 0.64,
+       "counts": {
+        "formalize": 4,
+        "invert": 4
+       }
+      }
+     },
+     "pairwise_similarity": {
+      "median": 0.38,
+      "p90": 0.61,
+      "n_pairs": 28
+     },
+     "template_mass": {
+      "template_share": 0.09,
+      "n_template": 1
+     }
+    },
+    "roster": [
+     {
+      "lens_name": "lens_a",
+      "seat": "standard",
+      "recipe_cards": [
+       "INVERT",
+       "TRANSFER"
+      ]
+     },
+     {
+      "lens_name": "lens_b",
+      "seat": "standard",
+      "recipe_cards": [
+       "TRANSFER",
+       "INVERT"
+      ]
+     },
+     {
+      "lens_name": "lens_c",
+      "seat": "standard",
+      "recipe_cards": [
+       "DECOUPLE",
+       "MISMATCH"
+      ]
+     },
+     {
+      "lens_name": "lens_d",
+      "seat": "standard",
+      "recipe_cards": [
+       "MISMATCH",
+       "DECOUPLE"
+      ]
+     },
+     {
+      "lens_name": "lens_e",
+      "seat": "standard",
+      "recipe_cards": [
+       "INVERT",
+       "DECOUPLE"
+      ]
+     },
+     {
+      "lens_name": "lens_f",
+      "seat": "assumption_buster",
+      "recipe_cards": [
+       "NEGATE"
+      ]
+     }
+    ],
+    "assignment": {
+     "arm_mode": "per_lens",
+     "far_lens_floor": 2,
+     "salt_scheme": "lens-name"
+    },
+    "lens_log": {
+     "round_id": "ROUND-100",
+     "rows": [
+      {
+       "roster_id": "ROS-00",
+       "lens_name": "lens_a",
+       "seat": "standard",
+       "vantage": "vantage 0",
+       "salt_scheme": "lens-name",
+       "launch_id": "LNCH-00C",
+       "launch_ids": [
+        "LNCH-00C",
+        "LNCH-00P"
+       ],
+       "launch_states": [
+        "RECONCILED",
+        "RECONCILED"
+       ],
+       "booking_consumed": true,
+       "n_slices": 6,
+       "n_ideas": 6,
+       "n_feed_posts": 2,
+       "posted": true
+      },
+      {
+       "roster_id": "ROS-01",
+       "lens_name": "lens_b",
+       "seat": "standard",
+       "vantage": "vantage 1",
+       "salt_scheme": "lens-name",
+       "launch_id": "LNCH-01C",
+       "launch_ids": [
+        "LNCH-01C",
+        "LNCH-01P"
+       ],
+       "launch_states": [
+        "RECONCILED",
+        "RECONCILED"
+       ],
+       "booking_consumed": true,
+       "n_slices": 6,
+       "n_ideas": 6,
+       "n_feed_posts": 2,
+       "posted": true
+      },
+      {
+       "roster_id": "ROS-02",
+       "lens_name": "lens_c",
+       "seat": "standard",
+       "vantage": "vantage 2",
+       "salt_scheme": "lens-name",
+       "launch_id": "LNCH-02C",
+       "launch_ids": [
+        "LNCH-02C",
+        "LNCH-02P"
+       ],
+       "launch_states": [
+        "RECONCILED",
+        "RECONCILED"
+       ],
+       "booking_consumed": true,
+       "n_slices": 6,
+       "n_ideas": 6,
+       "n_feed_posts": 2,
+       "posted": true
+      },
+      {
+       "roster_id": "ROS-03",
+       "lens_name": "lens_d",
+       "seat": "standard",
+       "vantage": "vantage 3",
+       "salt_scheme": "lens-name",
+       "launch_id": "LNCH-03C",
+       "launch_ids": [
+        "LNCH-03C",
+        "LNCH-03P"
+       ],
+       "launch_states": [
+        "RECONCILED",
+        "RECONCILED"
+       ],
+       "booking_consumed": true,
+       "n_slices": 6,
+       "n_ideas": 6,
+       "n_feed_posts": 2,
+       "posted": true
+      },
+      {
+       "roster_id": "ROS-04",
+       "lens_name": "lens_e",
+       "seat": "standard",
+       "vantage": "vantage 4",
+       "salt_scheme": "lens-name",
+       "launch_id": "LNCH-04C",
+       "launch_ids": [
+        "LNCH-04C",
+        "LNCH-04P"
+       ],
+       "launch_states": [
+        "RECONCILED",
+        "RECONCILED"
+       ],
+       "booking_consumed": true,
+       "n_slices": 6,
+       "n_ideas": 6,
+       "n_feed_posts": 2,
+       "posted": true
+      },
+      {
+       "roster_id": "ROS-05",
+       "lens_name": "lens_f",
+       "seat": "assumption_buster",
+       "vantage": "vantage 5",
+       "salt_scheme": "lens-name",
+       "launch_id": "LNCH-05C",
+       "launch_ids": [
+        "LNCH-05C"
+       ],
+       "launch_states": [
+        "RECONCILED"
+       ],
+       "booking_consumed": true,
+       "n_slices": 6,
+       "n_ideas": 6,
+       "n_feed_posts": 2,
+       "posted": true
+      }
+     ],
+     "n_lenses": 6,
+     "n_posted": 6,
+     "offenders": []
+    },
+    "lens_launches": [
+     {
+      "lens_name": "lens_a",
+      "launch_id": "LNCH-00C",
+      "phase": "card"
+     },
+     {
+      "lens_name": "lens_a",
+      "launch_id": "LNCH-00P",
+      "phase": "plain"
+     },
+     {
+      "lens_name": "lens_b",
+      "launch_id": "LNCH-01C",
+      "phase": "card"
+     },
+     {
+      "lens_name": "lens_b",
+      "launch_id": "LNCH-01P",
+      "phase": "plain"
+     },
+     {
+      "lens_name": "lens_c",
+      "launch_id": "LNCH-02C",
+      "phase": "card"
+     },
+     {
+      "lens_name": "lens_c",
+      "launch_id": "LNCH-02P",
+      "phase": "plain"
+     },
+     {
+      "lens_name": "lens_d",
+      "launch_id": "LNCH-03C",
+      "phase": "card"
+     },
+     {
+      "lens_name": "lens_d",
+      "launch_id": "LNCH-03P",
+      "phase": "plain"
+     },
+     {
+      "lens_name": "lens_e",
+      "launch_id": "LNCH-04C",
+      "phase": "card"
+     },
+     {
+      "lens_name": "lens_e",
+      "launch_id": "LNCH-04P",
+      "phase": "plain"
+     },
+     {
+      "lens_name": "lens_f",
+      "launch_id": "LNCH-05C",
+      "phase": null
+     }
+    ],
+    "outcomes": [
+     {
+      "cell": "arm=card",
+      "arm": "card",
+      "n": 30
+     },
+     {
+      "cell": "arm=plain",
+      "arm": "plain",
+      "n": 30
+     },
+     {
+      "cell": "card=INVERT",
+      "card": "INVERT",
+      "n": 9
+     },
+     {
+      "cell": "card=TRANSFER",
+      "card": "TRANSFER",
+      "n": 6
+     }
+    ],
+    "report_text": "Card-half records survived the screen more often than plain-half records (randomization p = 2/64 over the lens-level pairs), with a Clopper–Pearson 95 % interval of 0.41 to 0.77 on the card-half share and a 95 % confidence interval reported beside it. Per-cell n is disclosed.",
+    "findings": []
+   },
+   "checks": {
+    "admission_order_hash_matches": {
+     "name": "admission_order_hash_matches",
+     "passed": false,
+     "score": null,
+     "message": "subject['admission_order'] carries no hash -- the order the round ran is unrecorded"
+    },
+    "arm_mode_declared": {
+     "name": "arm_mode_declared",
+     "passed": true,
+     "score": null,
+     "message": "arm_mode='per_lens', matching the pre-registered params"
+    },
+    "card_cells_ge_2": {
+     "name": "card_cells_ge_2",
+     "passed": true,
+     "score": null,
+     "message": "every card in play is held by >= 2 standard lenses ({'INVERT': 3, 'TRANSFER': 2, 'DECOUPLE': 3, 'MISMATCH': 2})"
+    },
+    "consolidation_completeness": {
+     "name": "consolidation_completeness",
+     "passed": true,
+     "score": null,
+     "message": "all 11 finding(s) carry a disposition in ['CONSOLIDATED', 'ELIMINATED', 'MERGED', 'PROMOTED']"
+    },
+    "control_arm_present": {
+     "name": "control_arm_present",
+     "passed": false,
+     "score": null,
+     "message": "the roster seats no control lens -- the matched-budget comparison (AIIF vs CONTROL on O1) has no control arm, and the adoption rule rests on it. The control seat sits on the modal arm and is excluded from the arm mix and the far floor, so it is counted here by seat, not among the arms"
+    },
+    "distribution_card_present": {
+     "name": "distribution_card_present",
+     "passed": true,
+     "score": null,
+     "message": "the audit card carries entropy per axis, the pairwise-similarity distribution and the template mass"
+    },
+    "lens_log_reconciled": {
+     "name": "lens_log_reconciled",
+     "passed": true,
+     "score": null,
+     "message": "every booked lens posted (6)"
+    },
+    "models_table_present": {
+     "name": "models_table_present",
+     "passed": true,
+     "score": null,
+     "message": "all 8 purposes carry their floor or better"
+    },
+    "no_significance_language": {
+     "name": "no_significance_language",
+     "passed": false,
+     "score": null,
+     "message": "the report uses significance language ['confidence interval', 'p = 2'] -- every comparison in a round of this size is directional, with its per-cell n disclosed"
+    },
+    "novelty_bundle_complete": {
+     "name": "novelty_bundle_complete",
+     "passed": true,
+     "score": 1.0,
+     "message": "all 8 consolidated idea(s) carry a dossier against snapshot-identified R1-R5"
+    },
+    "per_arm_n_disclosed": {
+     "name": "per_arm_n_disclosed",
+     "passed": false,
+     "score": null,
+     "message": "all 4 outcome cell(s) disclose their n, but no cell carries seat='control' -- the adoption rule compares the arms against the matched-budget control, so a reported analysis with no control cell has not reported the comparison it rests on. The control is named by seat, because the amendment keeps it out of the arm mix"
+    },
+    "plants_caught": {
+     "name": "plants_caught",
+     "passed": true,
+     "score": 0.916667,
+     "message": "every one of 6 inventory plant(s) was caught (catch rate 0.916667; 1 plant(s) of other kinds missed, reported not failed)"
+    },
+    "prereg_present": {
+     "name": "prereg_present",
+     "passed": true,
+     "score": null,
+     "message": "prereg PREREG-0100 is committed"
+    },
+    "self_assessment_absent": {
+     "name": "self_assessment_absent",
+     "passed": true,
+     "score": null,
+     "message": "none of 3 judge envelope(s) carries an overt self-assessment sentence"
+    }
+   }
+  },
+  {
+   "name": "two_controls",
+   "patch": [
+    [
+     "append",
+     [
+      "roster"
+     ],
+     {
+      "lens_name": "lens_5",
+      "seat": "control",
+      "recipe_cards": []
+     }
+    ]
+   ],
+   "checks_changed": {
+    "control_arm_present": {
+     "name": "control_arm_present",
+     "passed": false,
+     "score": null,
+     "message": "2 control seats are rostered; the comparison is against ONE matched-budget control"
+    }
+   }
+  },
+  {
+   "name": "control_carded",
+   "patch": [
+    [
+     "set",
+     [
+      "roster",
+      3,
+      "recipe_cards"
+     ],
+     [
+      "MISMATCH"
+     ]
+    ]
+   ],
+   "checks_changed": {
+    "control_arm_present": {
+     "name": "control_arm_present",
+     "passed": false,
+     "score": null,
+     "message": "the control lens ['lens_4'] holds recipe cards -- a control with a card is not a control"
+    }
+   }
+  },
+  {
+   "name": "roster_empty",
+   "patch": [
+    [
+     "set",
+     [
+      "roster"
+     ],
+     []
+    ]
+   ],
+   "checks_changed": {
+    "card_cells_ge_2": {
+     "name": "card_cells_ge_2",
+     "passed": false,
+     "score": null,
+     "message": "subject['roster'] is empty -- no card cells to count"
+    },
+    "control_arm_present": {
+     "name": "control_arm_present",
+     "passed": false,
+     "score": null,
+     "message": "subject['roster'] is empty -- no seats to check"
+    }
+   }
+  },
+  {
+   "name": "no_control",
+   "patch": [
+    [
+     "del",
+     [
+      "roster",
+      3
+     ]
+    ]
+   ],
+   "checks_changed": {
+    "control_arm_present": {
+     "name": "control_arm_present",
+     "passed": false,
+     "score": null,
+     "message": "the roster seats no control lens -- the matched-budget comparison (AIIF vs CONTROL on O1) has no control arm, and the adoption rule rests on it. The control seat sits on the modal arm and is excluded from the arm mix and the far floor, so it is counted here by seat, not among the arms"
+    }
+   }
+  },
+  {
+   "name": "admission_params_hash",
+   "patch": [
+    [
+     "set",
+     [
+      "prereg",
+      "params",
+      "admission_order_hash"
+     ],
+     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ],
+    [
+     "del",
+     [
+      "admission_escrow"
+     ]
+    ]
+   ],
+   "checks_changed": {
+    "admission_order_hash_matches": {
+     "name": "admission_order_hash_matches",
+     "passed": true,
+     "score": null,
+     "message": "the admission order matches the hash escrowed in the prereg params (admission_order_hash) (aaaaaaaaaaaa...)"
+    }
+   }
+  },
+  {
+   "name": "admission_params_hash_mismatch",
+   "patch": [
+    [
+     "set",
+     [
+      "prereg",
+      "params",
+      "admission_order_hash"
+     ],
+     "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    ]
+   ],
+   "checks_changed": {
+    "admission_order_hash_matches": {
+     "name": "admission_order_hash_matches",
+     "passed": false,
+     "score": null,
+     "message": "the admission order run (aaaaaaaaaaaa...) is not the order escrowed in the prereg params (admission_order_hash) (cccccccccccc...) -- the rooms were ordered by something other than the escrowed seeded draw"
+    }
+   }
+  },
+  {
+   "name": "admission_escrow_voided",
+   "patch": [
+    [
+     "set",
+     [
+      "admission_escrow",
+      "status"
+     ],
+     "voided"
+    ]
+   ],
+   "checks_changed": {
+    "admission_order_hash_matches": {
+     "name": "admission_order_hash_matches",
+     "passed": false,
+     "score": null,
+     "message": "subject['admission_escrow'] is 'voided' -- an escrow outside ['committed', 'revealed'] is not one a round may gate on, the same way a voided prereg is not"
+    }
+   }
+  },
+  {
+   "name": "admission_no_escrow",
+   "patch": [
+    [
+     "del",
+     [
+      "admission_escrow"
+     ]
+    ]
+   ],
+   "checks_changed": {
+    "admission_order_hash_matches": {
+     "name": "admission_order_hash_matches",
+     "passed": false,
+     "score": null,
+     "message": "no escrow carries an admission_order_hash -- neither the prereg params nor an 'admission_escrow' section. The order is drawn over the round's consolidated pool, so it is escrowed after the judged screen and before the first room opens; an order nothing was escrowed against can be re-derived once the screen's results are in"
+    }
+   }
+  },
+  {
+   "name": "admission_unrecorded",
+   "patch": [
+    [
+     "set",
+     [
+      "admission_order"
+     ],
+     {}
+    ]
+   ],
+   "checks_changed": {
+    "admission_order_hash_matches": {
+     "name": "admission_order_hash_matches",
+     "passed": false,
+     "score": null,
+     "message": "subject['admission_order'] carries no hash -- the order the round ran is unrecorded"
+    }
+   }
+  },
+  {
+   "name": "outcomes_empty",
+   "patch": [
+    [
+     "set",
+     [
+      "outcomes"
+     ],
+     []
+    ]
+   ],
+   "checks_changed": {
+    "per_arm_n_disclosed": {
+     "name": "per_arm_n_disclosed",
+     "passed": false,
+     "score": null,
+     "message": "subject['outcomes'] is empty -- the pre-registered analysis reported no cells"
+    }
+   }
+  },
+  {
+   "name": "outcomes_undisclosed_n",
+   "patch": [
+    [
+     "del",
+     [
+      "outcomes",
+      0,
+      "n"
+     ]
+    ]
+   ],
+   "checks_changed": {
+    "per_arm_n_disclosed": {
+     "name": "per_arm_n_disclosed",
+     "passed": false,
+     "score": null,
+     "message": "1 outcome cell(s) disclose no n (['arm=near']); control cells reported inside the arm mix: none; cell(s) naming the control with no seat key, which is an undisclosed control rather than an arm: none"
+    }
+   }
+  },
+  {
+   "name": "outcomes_control_in_arm_mix",
+   "patch": [
+    [
+     "set",
+     [
+      "outcomes",
+      2,
+      "arm"
+     ],
+     "moderate"
+    ]
+   ],
+   "checks_changed": {
+    "per_arm_n_disclosed": {
+     "name": "per_arm_n_disclosed",
+     "passed": false,
+     "score": null,
+     "message": "0 outcome cell(s) disclose no n ([]); control cells reported inside the arm mix: ['control']; cell(s) naming the control with no seat key, which is an undisclosed control rather than an arm: none"
+    }
+   }
+  },
+  {
+   "name": "outcomes_unkeyed_control",
+   "patch": [
+    [
+     "set",
+     [
+      "outcomes"
+     ],
+     [
+      {
+       "cell": "arm=near",
+       "arm": "near",
+       "n": 3
+      },
+      {
+       "cell": "control (matched budget)",
+       "n": 1
+      }
+     ]
+    ]
+   ],
+   "checks_changed": {
+    "per_arm_n_disclosed": {
+     "name": "per_arm_n_disclosed",
+     "passed": false,
+     "score": null,
+     "message": "0 outcome cell(s) disclose no n ([]); control cells reported inside the arm mix: none; cell(s) naming the control with no seat key, which is an undisclosed control rather than an arm: ['control (matched budget)']"
+    }
+   }
+  },
+  {
+   "name": "outcomes_no_control_cell",
+   "patch": [
+    [
+     "del",
+     [
+      "outcomes",
+      2
+     ]
+    ]
+   ],
+   "checks_changed": {
+    "per_arm_n_disclosed": {
+     "name": "per_arm_n_disclosed",
+     "passed": false,
+     "score": null,
+     "message": "all 2 outcome cell(s) disclose their n, but no cell carries seat='control' -- the adoption rule compares the arms against the matched-budget control, so a reported analysis with no control cell has not reported the comparison it rests on. The control is named by seat, because the amendment keeps it out of the arm mix"
+    }
+   }
+  },
+  {
+   "name": "report_absent",
+   "patch": [
+    [
+     "del",
+     [
+      "report_text"
+     ]
+    ]
+   ],
+   "checks_changed": {
+    "no_significance_language": {
+     "name": "no_significance_language",
+     "passed": false,
+     "score": null,
+     "message": "subject['report_text'] is absent -- there is no prose to check"
+    }
+   }
+  },
+  {
+   "name": "report_significance_words",
+   "patch": [
+    [
+     "set",
+     [
+      "report_text"
+     ],
+     "The far arm was significantly better; this reaches statistical significance."
+    ]
+   ],
+   "checks_changed": {
+    "no_significance_language": {
+     "name": "no_significance_language",
+     "passed": false,
+     "score": null,
+     "message": "the report uses significance language ['significantly', 'statistical significance'] -- every comparison in a round of this size is directional, with its per-cell n disclosed"
+    }
+   }
+  },
+  {
+   "name": "report_p_value_forms",
+   "patch": [
+    [
+     "set",
+     [
+      "report_text"
+     ],
+     "It held (p < .05), p=0.03 on the judged subset, and p = 2/64 over pairs."
+    ]
+   ],
+   "checks_changed": {
+    "no_significance_language": {
+     "name": "no_significance_language",
+     "passed": false,
+     "score": null,
+     "message": "the report uses significance language ['p < .0', 'p = 2', 'p=0'] -- every comparison in a round of this size is directional, with its per-cell n disclosed"
+    }
+   }
+  },
+  {
+   "name": "report_confidence_interval",
+   "patch": [
+    [
+     "set",
+     [
+      "report_text"
+     ],
+     "We report a 95% confidence interval and reject the null hypothesis."
+    ]
+   ],
+   "checks_changed": {
+    "no_significance_language": {
+     "name": "no_significance_language",
+     "passed": false,
+     "score": null,
+     "message": "the report uses significance language ['confidence interval', 'null hypothesis'] -- every comparison in a round of this size is directional, with its per-cell n disclosed"
+    }
+   }
+  },
+  {
+   "name": "report_p_leq",
+   "patch": [
+    [
+     "set",
+     [
+      "report_text"
+     ],
+     "The contrast held at p ≤ 0.05 on the judged half."
+    ]
+   ],
+   "checks_changed": {}
+  },
+  {
+   "name": "report_trend_words",
+   "patch": [
+    [
+     "set",
+     [
+      "report_text"
+     ],
+     "A trend toward survival, marginally higher, approaching the bar."
+    ]
+   ],
+   "checks_changed": {}
+  },
+  {
+   "name": "report_interval_words",
+   "patch": [
+    [
+     "set",
+     [
+      "report_text"
+     ],
+     "A Clopper–Pearson interval and a 95 % interval, both directional."
+    ]
+   ],
+   "checks_changed": {}
+  },
+  {
+   "name": "params_not_a_mapping",
+   "patch": [
+    [
+     "set",
+     [
+      "prereg",
+      "params"
+     ],
+     [
+      "arm_mode",
+      "per_lens"
+     ]
+    ]
+   ],
+   "checks_changed": {
+    "admission_order_hash_matches": {
+     "raises": "AttributeError"
+    },
+    "arm_mode_declared": {
+     "raises": "AttributeError"
+    }
+   }
+  },
+  {
+   "name": "prereg_not_a_mapping",
+   "patch": [
+    [
+     "set",
+     [
+      "prereg"
+     ],
+     "PREREG-0001"
+    ]
+   ],
+   "checks_changed": {
+    "admission_order_hash_matches": {
+     "raises": "AttributeError"
+    },
+    "arm_mode_declared": {
+     "raises": "AttributeError"
+    },
+    "prereg_present": {
+     "raises": "AttributeError"
+    }
+   }
+  }
+ ]
+}

@@ -112,6 +112,11 @@ include = ["trialerror*"]
 [tool.setuptools.package-data]
 "trialerror.artifacts" = ["templates/*.md"]
 "trialerror.dashboard" = ["static/*"]
+# The vast.ai OCR executor's remote side: the instance bootstrap, the range
+# wrapper, the canary generator and its text, the marker model manifest and
+# the pins `trialerror vastai lock-deps` reads (shipped to the rented host or
+# read on DEV at run time, never imported).
+"trialerror.vastai" = ["remote/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

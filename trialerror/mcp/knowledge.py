@@ -1,8 +1,9 @@
 """``trialerror-knowledge`` -- the Resource Gateway MCP server. Design Section 12
-(M8 row): "MCP server (11 tools)". Design Section 5.1's ``trialerror-knowledge``
-table (read-only; all content sanitized, untrusted-wrapped, and
-license-fenced per Section 7) pins the exact 11 tools and their landed-API
-mapping:
+(M8 row). Design Section 5.1's ``trialerror-knowledge`` table (read-only; all
+content sanitized, untrusted-wrapped, and license-fenced per Section 7) pinned
+the tools and their landed-API mapping. Four of them (``graph_neighbors``,
+``memory_search``, ``list_requests``, ``poll_job``) were retired in Phase 0
+(0 uses in the audit window); eight remain:
 
 ======================  ==========================================================
 Tool                    Landed API wrapped
@@ -13,13 +14,7 @@ get_source              trialerror.retrieve.engine.get_source                 (M
 get_document_outline    trialerror.retrieve.engine.get_document_outline       (M8)
 resolve_quote           trialerror.retrieve.engine.resolve_quote              (M8)
 similar                 trialerror.retrieve.engine.similar                    (M8)
-graph_neighbors         trialerror.retrieve.engine.graph_neighbors            (M8)
 corpus_stats            trialerror.retrieve.engine.corpus_stats               (M8)
-memory_search           trialerror.memory.api.{search_items,get_item,
-                         boot_bundle}                                    (M11)
-list_requests           trialerror.retrieve.engine.list_requests              (M8, over
-                         source.request_state -- M7's request queue)
-poll_job                trialerror.jobs.ledger.get_job                        (M2)
 term_lookup             trialerror.lexicon.api.{find_term,get_term,
                          senses_for_term,evidence_for_sense}              (lane e, E3)
 ======================  ==========================================================
@@ -37,7 +32,7 @@ query.py``) and (later) M9's verification pipelines.
 knowledge.py gains a read-only term_lookup tool (_wrap pattern; fenced
 excerpts)")** is the one exception to "wraps M8's retrieve.engine": it
 wraps :mod:`trialerror.lexicon.api` instead, read-only exactly like the
-other eleven. Its own excerpt-fencing is self-contained in this file
+other seven. Its own excerpt-fencing is self-contained in this file
 (:func:`_term_evidence_payload`) rather than routed through
 ``trialerror.retrieve.engine`` -- a term's evidence is not a chunk, so
 there is no existing engine function shaped for it -- but it reuses
@@ -82,34 +77,30 @@ from typing import Any, Mapping, Sequence
 
 from trialerror import __version__
 from trialerror.events.api import append_event
-from trialerror.jobs.ledger import get_job
 from trialerror.mcp.protocol import ToolServer, ToolSpec, serve_stdio
-from trialerror.memory.api import boot_bundle, get_item, search_items
 from trialerror.retrieve import engine
 from trialerror.retrieve.errors import RetrievalError
 from trialerror.stores.errors import StoreError
 from trialerror.stores.store import Store, open_store
 from trialerror.util.envelope import error_envelope, ok_envelope
-from trialerror.util.timeutil import now_dt, parse
 
 __all__ = ["SERVER_NAME", "TOOL_COUNT", "build_tools", "build_server", "run_server"]
 
 SERVER_NAME = "trialerror-knowledge"
 SERVER_INSTRUCTIONS = (
     "Read-only research-corpus retrieval: hybrid (FTS+vector) search, citation-grounded "
-    "chunk/source/document lookups, quote resolution, nearest-neighbor, entity-graph "
-    "neighbors, corpus stats, progressive-disclosure memory search, the acquisition "
-    "request queue, job polling, and read-only lexicon term lookups. Every search/get_chunk/"
-    "similar result carries a non-null citation block; commercial_restricted sources are "
+    "chunk/source/document lookups, quote resolution, nearest-neighbor, corpus stats, "
+    "and read-only lexicon term lookups. Every search/get_chunk/"
+    "similar result carries a non-null citation block, whose doi and arxiv_id keys are always "
+    "present (null when the source has none); commercial_restricted sources are "
     "served fenced (<=20-word excerpt, fenced:true) -- never raw verbatim text (design "
     "Section 7), and the same fence applies to a term's anchor-backed evidence excerpts. "
     "See docs/DESIGN_v0.md Section 5.1/7 for the full contract."
 )
-#: Design Section 5.1 table: 11 tools, plus lane e's ``term_lookup`` (E3).
-TOOL_COUNT = 12
+#: Eight tools. Four (``graph_neighbors``, ``memory_search``, ``list_requests``,
+#: ``poll_job``) were retired in Phase 0 (0 uses); restorable from git.
+TOOL_COUNT = 8
 
-#: mirrors ``source.request_state``'s DDL CHECK domain, for the ``list_requests`` schema.
-_REQUEST_STATES = ("wanted", "requested", "delivered", "verifying", "archived", "indexed", "rejected", "failed")
 
 
 # ---------------------------------------------------------------------------
@@ -296,78 +287,12 @@ def _tool_similar(args: Mapping[str, Any], *, store: Store, launch_id: str | Non
 
 
 # ---------------------------------------------------------------------------
-# 7. graph_neighbors
-# ---------------------------------------------------------------------------
-
-
-def _tool_graph_neighbors(args: Mapping[str, Any], *, store: Store, launch_id: str | None = None) -> dict[str, Any]:
-    result = engine.graph_neighbors(
-        store, args["entity_id"], as_of=args.get("as_of"), as_of_tx=args.get("as_of_tx"),
-        k=int(args.get("k", 50)), launch_id=launch_id,
-    )
-    return ok_envelope("graph_neighbors", result=result)
-
-
-# ---------------------------------------------------------------------------
 # 8. corpus_stats
 # ---------------------------------------------------------------------------
 
 
 def _tool_corpus_stats(_args: Mapping[str, Any], *, store: Store) -> dict[str, Any]:
     return ok_envelope("corpus_stats", result=engine.corpus_stats(store))
-
-
-# ---------------------------------------------------------------------------
-# 9. memory_search (M11: search_items + get_item is the read-only pair this wraps)
-# ---------------------------------------------------------------------------
-
-
-def _tool_memory_search(args: Mapping[str, Any], *, store: Store) -> dict[str, Any]:
-    if args.get("id"):
-        item = get_item(store, args["id"])
-        if item is None:
-            return error_envelope("memory_search", "not_found", f"no memory_item {args['id']!r}")
-        return ok_envelope("memory_search", result={"item": item})
-
-    if args.get("boot_bundle"):
-        kwargs: dict[str, Any] = {"account_id": args.get("account_id")}
-        if args.get("token_budget") is not None:
-            kwargs["token_budget"] = int(args["token_budget"])
-        return ok_envelope("memory_search", result=boot_bundle(store, **kwargs))
-
-    items = search_items(
-        store,
-        query=args.get("query"),
-        tier=args.get("tier"),
-        kind=args.get("kind"),
-        account_id=args.get("account_id"),
-        status=args.get("status", "active"),
-        limit=int(args.get("limit", 50)),
-    )
-    return ok_envelope("memory_search", result={"items": items, "count": len(items)})
-
-
-# ---------------------------------------------------------------------------
-# 10. list_requests
-# ---------------------------------------------------------------------------
-
-
-def _tool_list_requests(args: Mapping[str, Any], *, store: Store) -> dict[str, Any]:
-    result = engine.list_requests(store, state=args.get("state"), limit=int(args.get("limit", 100)))
-    return ok_envelope("list_requests", result=result)
-
-
-# ---------------------------------------------------------------------------
-# 11. poll_job
-# ---------------------------------------------------------------------------
-
-
-def _tool_poll_job(args: Mapping[str, Any], *, store: Store) -> dict[str, Any]:
-    job = get_job(store, args["job_id"])
-    if job is None:
-        return error_envelope("poll_job", "not_found", f"no such job: {args['job_id']!r}")
-    heartbeat_age_s = (now_dt() - parse(job["heartbeat_ts"])).total_seconds() if job.get("heartbeat_ts") else None
-    return ok_envelope("poll_job", result={"job": job, "heartbeat_age_s": heartbeat_age_s})
 
 
 # ---------------------------------------------------------------------------
@@ -620,21 +545,20 @@ def _tool_term_lookup(args: Mapping[str, Any], *, store: Store) -> dict[str, Any
 def build_tools(
     *, program_root: Path, platform_root: Path | None = None, launch_id: str | None = None
 ) -> dict[str, ToolSpec]:
-    """Build the exact 11-tool registry (design Section 5.1), each bound to
+    """Build the exact 8-tool registry (design Section 5.1, less the four retired in Phase 0), each bound to
     ``program_root``/``platform_root`` for the lifetime of one server
     process.
 
     ``launch_id`` is the launch this server process serves. When it is given
     and that launch declares a slice, every tool that returns corpus CONTENT
     is restricted to it by the engine itself: the two ranked surfaces
-    (``search``, ``similar``) and the five addressed by id (``get_chunk``,
-    ``get_source``, ``get_document_outline``, ``resolve_quote``,
-    ``graph_neighbors``). The last five matter most, because they are the
-    ones that never rank anything -- an id or a quote fragment learned
-    anywhere reaches them directly, so a barrier they did not carry would be
-    a barrier the ranked surfaces enforced against nobody. ``corpus_stats``,
-    ``memory_search``, ``list_requests``, ``poll_job`` and ``term_lookup``
-    are unscoped and stay so: none of them serves chunk text.
+    (``search``, ``similar``) and the four addressed by id (``get_chunk``,
+    ``get_source``, ``get_document_outline``, ``resolve_quote``). The last
+    four matter most, because they are the ones that never rank anything --
+    an id or a quote fragment learned anywhere reaches them directly, so a
+    barrier they did not carry would be a barrier the ranked surfaces
+    enforced against nobody. ``corpus_stats`` and ``term_lookup`` are
+    unscoped and stay so: neither serves chunk text.
 
     No tool schema below exposes ``launch_id``: the value comes from how the
     server was STARTED, so an agent holding these tools cannot widen its own
@@ -650,7 +574,8 @@ def build_tools(
             "search",
             "Hybrid (FTS prefilter -> vector rerank -> reciprocal-rank fusion) search over the "
             "research corpus (tool #1, wraps trialerror.retrieve.engine.search). Every result row "
-            "carries a non-null citation block (source_id/title/license_tier/anchor/quote); "
+            "carries a non-null citation block (source_id/title/doi/arxiv_id/license_tier/anchor/"
+            "quote -- doi and arxiv_id are always present and null when the source has none); "
             "commercial_restricted sources are served fenced (<=20-word excerpt, fenced:true).",
             {
                 "type": "object",
@@ -720,70 +645,11 @@ def build_tools(
             },
             _tool_similar,
         ),
-        "graph_neighbors": ws(
-            "graph_neighbors",
-            "Entity/claim graph edges (tool #7, wraps trialerror.retrieve.engine.graph_neighbors). "
-            "as_of = valid-time (event) axis; as_of_tx = transaction axis. No v0 writer populates "
-            "entity/relation yet (design Section 11: full KG extraction is v1) -- schema-correct, "
-            "typically empty until a future writer lands.",
-            {
-                "type": "object",
-                "properties": {
-                    "entity_id": {"type": "string"},
-                    "as_of": {"type": "string"},
-                    "as_of_tx": {"type": "string"},
-                    "k": {"type": "integer", "description": "default 50"},
-                },
-                "required": ["entity_id"],
-            },
-            _tool_graph_neighbors,
-        ),
         "corpus_stats": w(
             "corpus_stats",
             "Sources/docs/chunks/index-freshness summary (tool #8, wraps trialerror.retrieve.engine.corpus_stats).",
             {"type": "object", "properties": {}},
             _tool_corpus_stats,
-        ),
-        "memory_search": w(
-            "memory_search",
-            "Progressive-disclosure L0->L1->L2 memory search, or `id` for one item's full body, or "
-            "`boot_bundle` for the M6 boot payload (tool #9, wraps trialerror.memory.api.{search_items,"
-            "get_item,boot_bundle} -- the read-only pair M11's own contract names).",
-            {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string", "description": "fetch ONE full item by id (skips filters)"},
-                    "query": {"type": "string"},
-                    "tier": {"type": "string", "enum": ["L0", "L1", "L2"]},
-                    "kind": {"type": "string", "enum": ["rule", "fact", "lesson", "preference", "index"]},
-                    "account_id": {"type": "string"},
-                    "status": {"type": "string", "description": "default 'active'"},
-                    "limit": {"type": "integer", "description": "default 50"},
-                    "boot_bundle": {"type": "boolean"},
-                    "token_budget": {"type": "integer"},
-                },
-            },
-            _tool_memory_search,
-        ),
-        "list_requests": w(
-            "list_requests",
-            "Acquisition request queue by state (tool #10, wraps trialerror.retrieve.engine.list_requests "
-            "over source.request_state -- M7's request queue).",
-            {
-                "type": "object",
-                "properties": {
-                    "state": {"type": "string", "enum": list(_REQUEST_STATES)},
-                    "limit": {"type": "integer", "description": "default 100"},
-                },
-            },
-            _tool_list_requests,
-        ),
-        "poll_job": w(
-            "poll_job",
-            "Job state/progress/heartbeat age -- the async-long-job contract (tool #11, wraps "
-            "trialerror.jobs.ledger.get_job).",
-            {"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]},
-            _tool_poll_job,
         ),
         "term_lookup": w(
             "term_lookup",

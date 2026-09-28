@@ -45,12 +45,15 @@ from trialerror.verify.errors import (
     PreregNotFoundError,
     PreregTamperedError,
     PreregVoidedError,
+    PlanCheckFailedError,
 )
+from trialerror.verify.plan_check import PlanCheckResult, PlanContext, room_seed_named, run_plan_check
 
 __all__ = [
     "sha256_hex",
     "canonical_json",
     "commit_prereg",
+    "check_prereg_plan",
     "reveal_prereg",
     "prereg_status",
     "check_prereg_compliance",
@@ -92,12 +95,78 @@ def _require_prereg(store: Store, prereg_id: str) -> dict[str, Any]:
     return row
 
 
+def _plan_context(
+    store: Store,
+    *,
+    params: Mapping[str, Any],
+    round_id: str | None,
+    parent_prereg_id: str | None,
+) -> PlanContext:
+    """The context a plan suite reads: the params, the program's ``[models]``
+    table as it stands now (``{}`` when the config is unreadable), the parent
+    prereg row (its ``plan_check`` column included) when one is named, and the
+    store for the admission suite's optional recompute."""
+    try:
+        models_table = dict(load_config(store.program_root / "trialerror.toml").models)
+    except ConfigError:
+        models_table = {}
+    parent = _require_prereg(store, parent_prereg_id) if parent_prereg_id is not None else None
+    return PlanContext(params, models_table, round_id, parent, store)
+
+
+def check_prereg_plan(
+    store: Store,
+    *,
+    plan_suite: str,
+    params: Mapping[str, Any] | None,
+    round_id: str | None = None,
+    parent_prereg_id: str | None = None,
+) -> PlanCheckResult:
+    """The dry run of :func:`commit_prereg`'s plan-time check: the same result,
+    with no escrow file and no ``prereg`` row written."""
+    params = dict(params) if params is not None else {}
+    ctx = _plan_context(store, params=params, round_id=round_id, parent_prereg_id=parent_prereg_id)
+    return run_plan_check(plan_suite, ctx)
+
+
+def _validated_deviations(
+    result: PlanCheckResult, accepted_deviations: Mapping[str, str] | None, decided_by: str | None
+) -> dict[str, str]:
+    """The accepted deviations, refused unless every one names a must-failure
+    of ``result`` with a reason, and an operator decision is cited. A deviation
+    cannot be approved ahead of the failure it covers."""
+    accepted = dict(accepted_deviations or {})
+    if not accepted:
+        return {}
+    if not isinstance(decided_by, str) or not decided_by.strip():
+        raise ValidationError(
+            "commit_prereg: accepted_deviations need decided_by -- a non-empty reference to the operator "
+            "decision that accepts them"
+        )
+    must_failures = set(result.must_failures)
+    for check_id, reason in accepted.items():
+        if check_id not in must_failures:
+            raise ValidationError(
+                f"commit_prereg: cannot accept a deviation for {check_id!r}: it is not a required check that "
+                f"failed (failing required checks: {sorted(must_failures) or 'none'}); a deviation cannot be "
+                "approved before it exists"
+            )
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValidationError(f"commit_prereg: the deviation for {check_id!r} needs a non-empty reason")
+    return accepted
+
+
 def commit_prereg(
     store: Store,
     *,
     title: str,
     procedure: str,
     params: Mapping[str, Any] | None = None,
+    plan_suite: str | None = None,
+    round_id: str | None = None,
+    parent_prereg_id: str | None = None,
+    accepted_deviations: Mapping[str, str] | None = None,
+    decided_by: str | None = None,
 ) -> dict[str, Any]:
     """Hash-commit ``{title, procedure, params}`` blind, escrowing the raw
     content under the platform tree. Returns the ``prereg`` row as written
@@ -106,11 +175,69 @@ def commit_prereg(
     Refuses (:class:`~trialerror.verify.errors.InvalidProcedureError`) an empty
     or whitespace-only ``procedure`` — a blind commitment to nothing is not
     a commitment.
+
+    **The plan-time check.** With ``plan_suite`` set, the round's gate
+    requirements that the params can already decide are checked first
+    (:mod:`trialerror.verify.plan_check`), and a required check that fails
+    refuses the commit
+    (:class:`~trialerror.verify.errors.PlanCheckFailedError`) BEFORE the
+    escrow file or the row is written -- an escrow with no row, or a row for a
+    refused commit, would corrupt the blind. ``accepted_deviations``
+    (``check_id -> reason``, with ``decided_by`` naming the operator decision)
+    lets named required failures through; each must be a failure the check
+    actually found. The check reads ``params`` and never alters them, so the
+    params hash and the escrowed content are the same with or without it. The
+    result is recorded in the row's ``plan_check`` column. Without
+    ``plan_suite`` nothing changes and the new columns stay NULL.
     """
     if not isinstance(procedure, str) or not procedure.strip():
         raise InvalidProcedureError("commit_prereg: 'procedure' must be a non-empty string")
 
     params = dict(params) if params is not None else {}
+
+    plan_columns: dict[str, Any] = {}
+    if plan_suite is None:
+        stray = [
+            name
+            for name, value in (
+                ("round_id", round_id),
+                ("parent_prereg_id", parent_prereg_id),
+                ("accepted_deviations", accepted_deviations),
+                ("decided_by", decided_by),
+            )
+            if value
+        ]
+        if stray:
+            raise ValidationError(f"commit_prereg: {stray} only apply together with plan_suite")
+    else:
+        if not round_id:
+            raise ValidationError("commit_prereg: plan_suite needs round_id")
+        ctx = _plan_context(store, params=params, round_id=round_id, parent_prereg_id=parent_prereg_id)
+        result = run_plan_check(plan_suite, ctx)
+        accepted = _validated_deviations(result, accepted_deviations, decided_by)
+        uncovered = [c for c in result.must_failures if c not in accepted]
+        if uncovered:
+            raise PlanCheckFailedError(result)
+        # Only the plan_check column carries these two; the params (and so
+        # their hash) are never touched.
+        plan_columns = {
+            "round_id": round_id,
+            "plan_suite": plan_suite,
+            "parent_prereg_id": parent_prereg_id,
+            "plan_check": json.dumps(
+                {
+                    **result.to_dict(),
+                    "rooms_declared": params.get("rooms"),
+                    "room_seed": room_seed_named(params),
+                    "accepted_deviations": accepted,
+                    "decided_by": decided_by if accepted else None,
+                },
+                ensure_ascii=False,
+            ),
+            "plan_check_status": "deviations_accepted" if accepted else result.overall,
+            "plan_checked_ts": result.checked_ts,
+        }
+
     ts = now()
     prereg_id = new_id("PREG")
     procedure_sha256 = sha256_hex(procedure)
@@ -137,6 +264,7 @@ def commit_prereg(
         "escrow_path": str(escrow_path),
         "revealed_ts": None,
         "status": "committed",
+        **plan_columns,
     }
     return store_insert(store, "prereg", row)
 

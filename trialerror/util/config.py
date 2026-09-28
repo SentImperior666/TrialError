@@ -80,6 +80,17 @@ class ProgramConfig:
         every other table here; absence means "the documented default"."""
         return self.raw.get("budget", {})
 
+    @property
+    def packet(self) -> dict[str, Any]:
+        """``[packet]`` — the weekly decision packet's knobs, all optional:
+        ``dir`` (default ``packet/`` under the program root), ``max_minutes``
+        (30), ``notify_cmd`` (a command list; the title and body are appended
+        as its last two arguments), ``link`` (where the operator reads the
+        packet), ``remind_after_days`` (3) and ``course_file``. Read
+        generically, like ``budget``; ``trialerror.packet.store.packet_settings``
+        applies the defaults and validates the values."""
+        return self.raw.get("packet", {})
+
 
 def load_config(path: str | Path) -> ProgramConfig:
     """Load and minimally validate a ``trialerror.toml`` file."""

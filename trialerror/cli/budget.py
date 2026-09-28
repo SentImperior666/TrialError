@@ -15,6 +15,7 @@ from pathlib import Path
 from trialerror.budget.errors import (
     BudgetError,
     LaunchNotOwnedError,
+    LensNameRefusedError,
     ModelPolicyViolationError,
     NoOpenSessionError,
     UnknownAssignmentError,
@@ -79,8 +80,21 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
         "--assign-id", action="append", default=None, dest="assign_ids", metavar="ASSIGN_ID",
         help="for a lens booking: the lens_assignment row(s) this launch covers, repeatable (they are on "
              "each `trialerror lens export` row as attrs.assign_ids). Recorded as lens_assignment."
-             "lens_launch_id, which is how the retrieval scope and the citation audit resolve this "
-             "launch's slice",
+             "lens_launch_id (the first binding) and a lens_assignment_launch row (every binding), "
+             "which is how the retrieval scope and the citation audit resolve this launch's slice",
+    )
+    book.add_argument(
+        "--lens-name", default=None, metavar="NAME",
+        help="the lens/seat this launch IS, recorded as launch.attrs.lens_name. A room counts turns by "
+             "this name, so a seat spawned fresh for each turn is still one author across them. With "
+             "--assign-id the assignment rows stay authoritative: the same name is a no-op, a "
+             "different one refuses the booking",
+    )
+    book.add_argument(
+        "--phase", default=None, metavar="LABEL",
+        help="a free-text label (<= 40 chars) for THIS binding of the lens, stored on the link rows -- "
+             "e.g. a later phase of the same round, or a re-spawn. The first binding is never "
+             "overwritten. Refused without --assign-id, which is what it labels",
     )
     book.add_argument(
         "--quota-dir", default=None, help="override the plan-quota capture dir (see `budget quota`)"
@@ -330,6 +344,8 @@ def _run_book(args: argparse.Namespace) -> dict:
             workpackage=args.workpackage,
             attrs=attrs,
             assign_ids=getattr(args, "assign_ids", None),
+            lens_name=getattr(args, "lens_name", None),
+            phase=getattr(args, "phase", None),
             policy=policy,
             override_ruling_id=args.override_ruling_id,
         )
@@ -347,6 +363,12 @@ def _run_book(args: argparse.Namespace) -> dict:
             "budget book", "unknown_assignment", str(exc),
             next_actions=[next_action(["trialerror", "lens", "export", "--round-id", "<round>"],
                                       "read this round's assign_ids off the bookable rows")],
+        )
+    except LensNameRefusedError as exc:
+        return error_envelope(
+            "budget book", "lens_name_refused", str(exc),
+            next_actions=[next_action(["trialerror", "lens", "export", "--round-id", "<round>"],
+                                      "read this round's lens names and assign_ids off the bookable rows")],
         )
     finally:
         store.close()

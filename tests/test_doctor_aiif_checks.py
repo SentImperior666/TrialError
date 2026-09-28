@@ -11,7 +11,6 @@ row of the design's integration table.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 
@@ -195,15 +194,35 @@ def _lens_brief_launch(store, text: str) -> str:
     return bootstrap_launch(store, attrs={"lens_name": "lens_1", "brief": text}, purpose="ideation")
 
 
+_ROUND_PLAN_BLOCK = (
+    '**Objective (bounded but locally complete).** One paragraph: what this\n'
+    'round must move, stated so that anyone can tell when it is done.\n'
+    '**Priorities (at most three)**, each already supported by the slices and\n'
+    'the roster — no priority that needs material the round does not have.\n'
+    "Order them blockers and regressions first (holes in the program's standing\n"
+    'claims), extensions second.\n'
+    '**Explicitly excluded this round:** the adjacent questions that would be\n'
+    '"nice while we\'re here", re-framings of the program, re-litigation of\n'
+    'settled rulings. Name them, so a lens cannot drift into them by accident.\n'
+    '**Preservation gate** — what must NOT regress: the standing claims, the\n'
+    'seed-reproducible arms, the far-lens floor, the full-text rule, the >90%\n'
+    'bar.\n'
+    '**Acceptance gate** — the smallest end-to-end check that says the round\n'
+    'succeeded: every booked lens posted, `trialerror lens log` clean, every\n'
+    'consolidated record carrying its screen record, the synthesis artifact gated\n'
+    'and the prereg revealed.\n'
+    "Do not request or reconstruct the previous round's plan. Re-derive this\n"
+    "one from the program's spec and the latest evidence (the previous round's\n"
+    "outputs), never from the previous round's plan."
+)
+
+
 def _round_plan_block() -> str:
-    """The round-plan template out of the ideation-round skill -- the one block
-    that file says goes into every lens's prompt verbatim. Read from the file
-    rather than copied, so a future edit to the template is audited by this
-    check rather than by nobody."""
-    path = Path(__file__).resolve().parent.parent / "plugin" / "skills" / "ideation-round" / "SKILL.md"
-    lines = [line[1:].strip() for line in path.read_text(encoding="utf-8").splitlines() if line.startswith(">")]
-    assert lines, "the ideation-round skill carries no round-plan blockquote"
-    return chr(10).join(lines)
+    """The round-plan template that went into every lens's prompt verbatim
+    (it lived in the ideation-round skill, retired in Phase 0). Kept here as a
+    fixture so the brief check is still audited against a realistic plan block
+    and never flags one."""
+    return _ROUND_PLAN_BLOCK
 
 
 def test_a_clean_lens_brief_passes(store, ctx):
@@ -280,9 +299,9 @@ def test_an_ideation_booking_is_in_scope_by_its_assignment_attrs(store, ctx):
     assert check_lens_brief_contains_verdict_text(ctx).status == "fail"
 
 
-def test_the_skills_own_round_plan_block_passes_the_check(store, ctx):
-    """The block the skill says goes into every lens's prompt VERBATIM must
-    pass the check that audits lens prompts.
+def test_the_round_plan_block_passes_the_check(store, ctx):
+    """The block that goes into every lens's prompt VERBATIM must pass the
+    check that audits lens prompts.
 
     It did not: the acceptance gate read "every consolidated record
     dossiered", and the marker list carries the bare word -- so a brief

@@ -14,7 +14,7 @@ asks for, and what each part of it is guarding:
   "vacuous" column names exactly the hollow pass each criterion has to
   exclude. The twins here drive the real failure (a corpus with the wrong
   document count, a dashboard serving a program that is not the one under
-  test, a translator that answers instead of refusing, an offload stage that
+  test, an offload stage that
   ran locally instead of parking, emb rows carrying a fake model key), not a
   monkeypatched assertion.
 - The enumeration guard: every ``E-nn`` the catalogue marks automated is
@@ -121,7 +121,7 @@ def _open_store(program_root: Path, platform_root: Path):
     return open_store(program_root, platform_root=platform_root)
 
 
-def _init_bare_program(base: Path, *, program_id: str, translator: str | None = None) -> tuple[Path, Path]:
+def _init_bare_program(base: Path, *, program_id: str) -> tuple[Path, Path]:
     """A scaffolded program with one open session and NO corpus -- the cheapest
     starting point a broken-case twin can fail from for the right reason."""
     program_root = base / "program"
@@ -141,8 +141,6 @@ def _init_bare_program(base: Path, *, program_id: str, translator: str | None = 
         assert proc.returncode == 0, proc.stdout + proc.stderr
     toml = program_root / "trialerror.toml"
     extra = '\n[paths]\ningest_roots = ["raw"]\n\n[ingest.ocr]\nbackend = "fake"\n\n[ingest.embed]\nbackend = "fake"\n'
-    if translator is not None:
-        extra += f'\n[feed.translator]\nbackend = "{translator}"\n'
     toml.write_text(toml.read_text(encoding="utf-8") + extra, encoding="utf-8")
     return program_root, platform_root
 
@@ -202,7 +200,7 @@ def test_backend_parity_is_blocked_not_passed_without_tantivy(tmp_path, caps, mo
     with an owner and drag the journey to `warn` -- never quietly pass on the
     FTS5 fallback, which would read as parity between one backend and itself."""
     degraded = Capabilities(
-        tantivy_pkg=False, tantivy_cli=False, translator=caps.translator,
+        tantivy_pkg=False, tantivy_cli=False,
         offload=caps.offload, plan_blob=caps.plan_blob,
     )
     result = run_e2e_corpus(
@@ -286,7 +284,7 @@ def test_e2e_ops_journey_runs_every_step(ops_run, caps):
     assert names[:4] == [
         "open_scratch_session", "hold_journey_launch", "feed_thread_post",
         "budget_book_spawn_return_reconcile",
-    ], "E-20 must read spawns_vs_bookings BEFORE the translator half consumes a booking no spawn returns"
+    ], "E-20 reads spawns_vs_bookings while every consumed launch has its subagent_return"
     assert names[-1] == "record_prior_checks"
 
 
@@ -301,98 +299,19 @@ def test_e2e_ops_post_task_hook_writes_subagent_return_with_launch_id(ops_run):
     assert consumed == returned == 3, "three journey launches, three subagent_return rows"
 
 
-def test_e2e_ops_translator_fails_closed_with_the_named_error(ops_run, caps):
-    if not caps.translator:
-        pytest.skip("this deployment has no feed translator; E-19's translator half records `blocked`")
-    detail = _steps(ops_run)["feed_translate_fail_closed"]["detail"]
-    assert "created_by_launch is empty" in detail["gate_error_head"]
-    assert "has no generation driver" not in detail["gate_error_head"]
-    assert detail["failure_class"] == "logic"
-    assert "has no generation driver" in detail["last_error_head"]
-    assert detail["launch_states_seen"] == ["PROVISIONAL", "RUNNING", "RECONCILED"]
-    assert len(detail["paused"]) == 2
-    assert detail["feed_panel_translation"] is None
-
-
-@pytest.fixture(scope="module")
-def no_translator_chain(tmp_path_factory, caps):
-    """A SECOND full chain -- corpus then ops -- with the translator reported
-    ABSENT.
-
-    This is the branch ``_doctor_after_close`` predicts for a deployment
-    without lane-b, and on a tree that HAS the translator it is unreachable
-    unless the capability is forced off. It needs the REAL corpus: the ops
-    journey's E-22 half re-embeds a document, so a corpus-less program dies
-    at E-22 and never reaches the shape under test. The dashboard journey is
-    skipped deliberately -- nothing in ops depends on it, and the launch
-    arithmetic E-20 asserts (exactly one dangling launch, its own) holds at two
-    journeys just as it does at three.
-    """
-    base = tmp_path_factory.mktemp("e2e-no-translator")
-    program_root = base / "program"
-    platform_root = base / "platform"
-    degraded = Capabilities(
-        tantivy_pkg=caps.tantivy_pkg, tantivy_cli=caps.tantivy_cli, translator=False,
-        offload=caps.offload, plan_blob=caps.plan_blob,
-    )
-    corpus = run_e2e_corpus(
-        program_root, platform_root, run_id=RUN_ID, repo_root=REPO_ROOT, caps=degraded
-    )
-    assert corpus.status in ("pass", "warn"), corpus.message
-    ops = run_e2e_ops(program_root, platform_root, run_id=RUN_ID, repo_root=REPO_ROOT, caps=degraded)
-    return {"ops": ops, "program_root": program_root, "platform_root": platform_root}
-
-
-def test_e2e_ops_translator_step_is_blocked_without_lane_b(no_translator_chain):
-    """The translator half records `blocked` with owner lane-b when the verb is
-    absent, and the ROW says so -- a blocked gating check that reads MISSING
-    would lose both its status and its owner."""
-    result = no_translator_chain["ops"]
-    assert result.status == "warn", result.message
-    steps = _steps(result)
-    assert steps["feed_translate_fail_closed"]["detail"]["blocked"] is True
-    assert steps["feed_translate_fail_closed"]["detail"]["owner"] == "lane-b"
-    store = _open_store(no_translator_chain["program_root"], no_translator_chain["platform_root"])
+def test_e2e_ops_records_e19_pass_from_the_thread_and_post_half(ops_run, corpus_run):
+    """E-19 is the feed thread + post + read-back half only. It must record
+    `pass` (not `blocked`) now that the translator half is gone."""
+    assert ops_run.status == "pass", ops_run.message
+    detail = _steps(ops_run)["feed_thread_post"]["detail"]
+    assert detail["thread_id"] and detail["post_id"]
+    assert "feed_translate_fail_closed" not in _steps(ops_run)
+    store = _open_store(corpus_run["program_root"], corpus_run["platform_root"])
     try:
         rows = read_recorded_checks(store, run_id=RUN_ID)
     finally:
         store.close()
-    assert rows["E-19"]["status"] == "blocked"
-    assert rows["E-19"]["owner"] == "lane-b"
-
-
-def test_e2e_ops_close_predicts_the_no_translator_reconciliation_shape(no_translator_chain):
-    """The OTHER ``spawns_vs_bookings`` branch, driven to the close on a real
-    corpus: with no handler-consumed booking there is no one-off mismatch, so
-    the criterion is `pass` with an empty mismatch list -- not the `warn` the
-    translator branch predicts. A `warn|fail` disjunction here would let either
-    branch satisfy the other's criterion."""
-    result = no_translator_chain["ops"]
-    steps = _steps(result)
-    assert [s["name"] for s in result.details["steps"]][-1] == "record_prior_checks"
-    after = steps["doctor_green_after_close"]["detail"]
-    assert after["translator_ran"] is False
-    assert after["doctor_failed"] == 0
-    assert after["spawns_vs_bookings"]["status"] == "pass"
-    assert after["spawns_vs_bookings"]["mismatched_sessions"] == []
-    assert after["spawns_vs_bookings"]["bad_launch_id_events"] == []
-    store = _open_store(no_translator_chain["program_root"], no_translator_chain["platform_root"])
-    try:
-        rows = read_recorded_checks(store, run_id=RUN_ID)
-    finally:
-        store.close()
-    assert rows["E-24"]["status"] == "pass"
-
-
-def test_e2e_ops_booking_gate_refusal_leaves_every_launch_state_alone(ops_run, caps):
-    """E-19(a) says "no launch row changed state", which a row COUNT cannot
-    see: the snapshot is the whole {launch_id: state} mapping, compared across
-    the unbooked translate job."""
-    if not caps.translator:
-        pytest.skip("this deployment has no feed translator; E-19's translator half records `blocked`")
-    detail = _steps(ops_run)["feed_translate_fail_closed"]["detail"]
-    assert detail["gate_launch_ledger_unchanged"] is True
-    assert detail["gate_launch_rows_seen"] >= 1
+    assert rows["E-19"]["status"] == "pass"
 
 
 def test_e2e_phase_fails_cleanly_when_there_is_no_open_session(tmp_path, caps):
@@ -460,24 +379,6 @@ def test_e2e_journeys_resolve_relative_roots(journey, tmp_path, caps, monkeypatc
     assert recorded_root == (tmp_path / "porgram").resolve()
 
 
-def test_e2e_ops_fails_when_the_translator_answers_instead_of_refusing(tmp_path, caps):
-    """BROKEN TWIN. Point the program at the ``pending`` translator backend --
-    which parks an envelope and settles the job `complete` -- and the
-    fail-closed criterion must FAIL. A translator that quietly succeeds is
-    precisely what E-19 is there to catch."""
-    if not caps.translator:
-        pytest.skip("this deployment has no feed translator")
-    program_root, platform_root = _init_bare_program(
-        tmp_path, program_id="e2e-ops-broken", translator="pending"
-    )
-    result = run_e2e_ops(
-        program_root, platform_root, run_id=RUN_ID, repo_root=REPO_ROOT, caps=caps
-    )
-    assert result.status == "fail", result.message
-    assert _failing_step(result) == "feed_translate_fail_closed"
-    assert "expected 'failed'" in result.message
-
-
 def test_e2e_ops_law_stale_pin_negative_control(ops_run):
     detail = _steps(ops_run)["law_append_verify_with_stale_control"]["detail"]
     assert detail["pin_none_before"] is True
@@ -511,14 +412,9 @@ def test_e2e_ops_close_needs_no_override_and_renders_handoff(ops_run, corpus_run
     assert resolved.is_file()
     after = _steps(ops_run)["doctor_green_after_close"]["detail"]
     assert after["doctor_failed"] == 0
-    if caps.translator:
-        assert after["spawns_vs_bookings"]["status"] == "warn"
-        mismatched = after["spawns_vs_bookings"]["mismatched_sessions"]
-        assert len(mismatched) == 1
-        assert mismatched[0]["consumed_launch_count"] == mismatched[0]["subagent_return_count"] + 1
-        assert after["spawns_vs_bookings"]["bad_launch_id_events"] == []
-    else:
-        assert after["spawns_vs_bookings"]["status"] == "pass"
+    assert after["spawns_vs_bookings"]["status"] == "pass"
+    assert after["spawns_vs_bookings"]["mismatched_sessions"] == []
+    assert after["spawns_vs_bookings"]["bad_launch_id_events"] == []
 
 
 def test_e2e_ops_copies_the_smoke_envelope_into_an_e2e_check_row(tmp_path, caps):
@@ -736,7 +632,7 @@ def test_offload_journeys_are_blocked_not_passed_without_the_lane(tmp_path, caps
     would lose the status and the owner together."""
     degraded = Capabilities(
         tantivy_pkg=caps.tantivy_pkg, tantivy_cli=caps.tantivy_cli,
-        translator=caps.translator, offload=False, plan_blob=caps.plan_blob,
+        offload=False, plan_blob=caps.plan_blob,
     )
     record_root = tmp_path / "program"   # the FIRST scratch program: where the record lives
     platform_root = tmp_path / "platform"
@@ -894,7 +790,7 @@ def test_accept_cli_e2e_phase_all_matches_direct_calls(tmp_path):
     assert result["summary"]["failed"] == 0
     assert result["summary"]["skipped"] == len(E2E_OPERATOR_ITEMS)
     assert result["run_id"] == RUN_ID
-    assert set(result["capabilities"]) == {"tantivy_pkg", "tantivy_cli", "translator", "offload", "plan_blob"}
+    assert set(result["capabilities"]) == {"tantivy_pkg", "tantivy_cli", "offload", "plan_blob"}
 
     report = _cli([
         "accept", "--suite", "e2e", "--phase", "report", "--run-id", RUN_ID,

@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -54,6 +56,11 @@ CSS = (STATIC_DIR / "dashboard.css").read_text(encoding="utf-8")
 #: (sweep test 22). The source assertions below follow it; `setHealth`, the
 #: half that touches the page, stays in dashboard.html.
 CONSOLE_RENDER = (STATIC_DIR / "console_render.js").read_text(encoding="utf-8")
+#: A8 (operator-notes pass) moved several developer-facing sentences from
+#: on-screen `text:` into `title:` tooltips; the invariants below live in
+#: this file's source-invariant half rather than test_dashboard_data*.py
+#: because they check the STATIC MARKUP/JS, not a builder's payload.
+EVIDENCE_RENDER = (STATIC_DIR / "evidence_render.js").read_text(encoding="utf-8")
 
 
 def _fn_body(name: str, source: str = HTML) -> str:
@@ -563,6 +570,48 @@ def test_course_criterion_labels_carry_their_full_text():
 
 
 # ===========================================================================
+# A4 -- COURSE-CHECK LOG reads the real course_check shape instead of
+# dumping raw JSON and a made-up `on_course` field.
+# ===========================================================================
+def test_course_check_log_no_longer_dumps_raw_json():
+    """Live data's ``course_check`` has no ``on_course`` key, so the old
+    ``JSON.stringify(cc)`` + ``cc.on_course`` reading always showed the raw
+    object with a literal-\\n on screen and a false-positive checkmark. The
+    renderer must read ``drift_flagged`` and never hand ``cc`` to
+    ``JSON.stringify``."""
+    course = _fn_body("renderCourse")
+    assert "JSON.stringify(cc)" not in course
+    assert "cc.on_course" not in course
+    assert re.search(r"cc\.drift_flagged\s*===\s*true", course)
+
+
+def test_course_check_log_falls_back_through_raw_then_instance_then_placeholder():
+    course = _fn_body("renderCourse")
+    assert "cc.raw" in course
+    assert "no text recorded" in course
+
+
+def test_drift_entry_quote_wraps_instead_of_running_off_the_line():
+    assert ".drift-entry .quote" in CSS
+    quote_rule = re.search(r"\.drift-entry \.quote\s*\{[^}]*\}", CSS)
+    assert quote_rule and "white-space: pre-wrap" in quote_rule.group(0)
+
+
+# ===========================================================================
+# A4 -- fmtHM stamps a past UTC day with an "MM-DD " prefix instead of
+# reading like it happened minutes ago.
+# ===========================================================================
+def test_fmt_hm_has_a_date_prefix_branch_for_a_past_utc_day():
+    fn = _fn_body("fmtHM")
+    assert re.search(r"getUTCFullYear\(\)\s*===\s*now\.getUTCFullYear\(\)", fn)
+    assert re.search(r"getUTCMonth\(\)\s*===\s*now\.getUTCMonth\(\)", fn)
+    assert re.search(r"getUTCDate\(\)\s*===\s*now\.getUTCDate\(\)", fn)
+    # falls back to the bare "HH:MM" on the same-day path, and otherwise
+    # prepends a zero-padded "MM-DD ".
+    assert re.search(r'"-"\s*\+', fn)
+
+
+# ===========================================================================
 # W3 / P-2 -- the client half of the write-path batch
 #
 # Same two kinds of test as everything above, for the same reason: these
@@ -937,14 +986,38 @@ def test_every_determination_button_takes_its_disabled_state_from_writesEnabled(
     guarded, literal = _assert_every_button_is_guarded(body)
 
     # A test that finds nothing must not pass. Six wired controls plus the
-    # two permanently-disabled placeholders is what C6/C7 shipped; MORE is
-    # fine, fewer means the loop above stopped seeing the buttons it is
-    # supposed to police.
+    # one permanently-disabled placeholder (disabledPair's "NO ACTION WIRED
+    # HERE") is what C6/C7/A5 shipped -- A5 dropped the acquisition arm's
+    # second placeholder, OTHER TRANSITION, which named a verb the dashboard
+    # was never going to wire. MORE is fine, fewer means the loop above
+    # stopped seeing the buttons it is supposed to police.
     assert len(guarded) >= 6, f"only found {sorted(guarded)}"
-    assert len(literal) >= 2
+    assert len(literal) >= 1
     for role in ("prereg-reveal-btn", "gate-verify-btn", "gate-send-back-btn",
                  "memory-keep-", "MARK DELIVERED", "ACCEPT MERGE"):
         assert role in body, f"{role} is no longer drawn by this function"
+
+
+def test_acquisition_other_transition_button_is_gone():
+    """A5: OTHER TRANSITION sat beside MARK DELIVERED, permanently
+    `disabled`, naming ``trialerror ingest request --to <state>`` -- a verb
+    this dashboard has never called. A button that only ever refuses is not
+    a control; the CLI verb it named now lives in the 'wanted' row's own
+    note, where it is an actual next step."""
+    body = _fn_body("buildDeterminationActions")
+    assert not re.search(r'text:\s*"OTHER TRANSITION"', body)
+    assert "otherBtn" not in body
+
+
+def test_acquisition_wanted_row_note_names_the_real_ingest_request_command():
+    """The note a 'wanted' row shows must be the CLI verb that exists
+    (``trialerror ingest request --source-id <id> --to <state>``,
+    ``trialerror/cli/ingest.py``'s ``p_request`` parser), not an invented
+    flag."""
+    body = _fn_body("buildDeterminationActions")
+    assert "wanted — nobody has asked for this yet" in body
+    assert "trialerror ingest request --source-id " in body
+    assert "--to requested" in body
 
 
 @pytest.mark.parametrize(
@@ -1160,3 +1233,526 @@ def test_memory_conflict_items_carry_both_sides_with_their_bodies(program_root, 
         for key in ("memory_item_id", "tier", "kind", "account_id", "updated_ts", "l0_abstract"):
             assert key in v, key
     assert item["version_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# A2 -- DECIDE draws every non-term kind, term kinds go to the LEXICON link,
+# the badge counts what is drawn instead of the server's raw `total`.
+#
+# There is no Node harness for the inline script yet (that is
+# ``console_render.js``'s half of the page only), so this follows the file's
+# own "source invariants" half: brace-matched function bodies and the
+# KIND_ORDER/KIND_LABELS object literals, read as text.
+# ---------------------------------------------------------------------------
+
+
+def _kind_order_list():
+    """``KIND_ORDER``'s array literal, as the Python list it spells out."""
+    table = HTML.split("var KIND_ORDER = [", 1)[1].split("];", 1)[0]
+    return [k.strip().strip('"') for k in re.findall(r'"([^"]+)"', table)]
+
+
+def test_kind_order_draws_the_new_offload_and_webfetch_kinds_after_room_escalation():
+    """A2 item 4: ``webfetch_proposals`` (web hosts awaiting approval on the
+    operator's own machine) and ``offload_backlog`` (documents parked behind
+    the DEV GPU worker) join the queue DECIDE already draws, inserted right
+    after ``room_escalation`` -- neither is a term kind, so neither belongs
+    behind the LEXICON link, and both used to be silently dropped for not
+    appearing in this list at all."""
+    order = _kind_order_list()
+    assert "webfetch_proposals" in order and "offload_backlog" in order
+    i = order.index("room_escalation")
+    assert order[i + 1] == "webfetch_proposals"
+    assert order[i + 2] == "offload_backlog"
+    # term kinds are decided on LEXICON, never drawn as a DECIDE row/group
+    assert "term_duplicate" not in order and "term_conflict" not in order
+
+    kind_labels_block = HTML.split("var KIND_LABELS = {", 1)[1].split("};", 1)[0]
+    assert re.search(r'webfetch_proposals:\s*"WEB HOSTS', kind_labels_block)
+    assert re.search(r'offload_backlog:\s*"GPU BACKLOG', kind_labels_block)
+
+
+def test_determ_item_title_reads_the_summary_for_the_two_new_kinds():
+    """A2 item 4: ``determItemTitle`` must have a case for each new kind (the
+    default case returns ``item.id``, which is not a title a human reads)."""
+    body = _fn_body("determItemTitle")
+    assert re.search(r'case "offload_backlog":\s*return item\.summary', body)
+    assert re.search(r'case "webfetch_proposals":\s*return item\.summary', body)
+
+
+def test_the_two_new_kinds_get_a_short_row_body_not_the_full_consequence():
+    """A2 item 4: the list row stays scannable -- these two kinds show a
+    one-line body (pending/claimed counts; the host list) instead of the
+    long ``consequence`` text every other kind's row still shows. The detail
+    pane is unaffected: ``renderDeterminationDetail`` reads ``item.consequence``
+    for its own CONSEQUENCE card regardless of kind."""
+    body = _fn_body("determItemRowBody")
+    assert '"offload_backlog"' in body and "pending" in body and "claimed" in body
+    assert '"webfetch_proposals"' in body and "hosts" in body
+    assert "item.consequence" in body, "every other kind must still fall through to the full text"
+
+
+def test_determ_badge_counts_the_drawn_set_not_the_servers_raw_total():
+    """A2 item 1: the DECIDE rail badge used to be ``determ.total``, which
+    counts the term_duplicate/term_conflict rows DECIDE hands off to
+    LEXICON. It must now count what DECIDE actually draws (blocking first),
+    and hide only when that count is zero."""
+    assert "determ.total" not in HTML, "the badge (or anything else) must not read the raw total any more"
+    body = _fn_body("setHealth")
+    assert "isTermKind" in body, "the badge's count must exclude term kinds the same way DECIDE's rows do"
+    assert "determ.blocking_count" in body
+    assert "rail-badge--calm" in body, "a non-blocking, non-empty queue must read calm, not red"
+    assert "is-blocking" in body, "red is toggled by a class the CSS scopes to blocking, not always-on"
+
+
+def test_determ_rail_item_and_badge_css_are_scoped_to_blocking():
+    """A2 item 1: without ``is-blocking``, the DECIDE rail item must look
+    like any other rail item -- the three colour rules from the old
+    always-red version must be scoped to ``.rail-item--decide.is-blocking``,
+    and the badge needs a calm (amber) variant for the non-blocking case."""
+    assert ".rail-item.rail-item--decide { color:" not in CSS, \
+        "the decide rail item's red must not apply unconditionally any more"
+    for selector in (
+        ".rail-item.rail-item--decide.is-blocking {",
+        ".rail-item.rail-item--decide.is-blocking svg {",
+        ".rail-item.rail-item--decide.is-blocking .rail-label {",
+    ):
+        assert selector in CSS, f"missing scoped rule: {selector!r}"
+    assert re.search(r"\.rail-badge--calm\s*\{[^}]*background:\s*var\(--warn\)", CSS)
+
+
+def test_renderDeterminations_folds_term_items_into_a_lexicon_link():
+    """A2 item 2: the header reads "<blocking> BLOCKING · <drawn> TO DECIDE"
+    and, only when term items exist, appends a "<n> LEXICON CANDIDATES ->
+    LEXICON" control that navigates by the same mechanism the rest of the
+    page already uses for a deep link (``location.hash``), rather than a
+    plain non-interactive string."""
+    body = _fn_body("renderDeterminations")
+    assert "BLOCKING · \" + drawn.length + \" TO DECIDE" in body
+    assert "LEXICON CANDIDATES" in body
+    assert 'location.hash = "lexicon"' in body
+    assert "isTermKind" in body
+
+
+def test_renderDeterminations_default_selection_prefers_the_first_blocking_drawn_item():
+    """A2 item 3: default selection (nothing selected, or the previous
+    selection fell out of the drawn set) must be the first BLOCKING item in
+    DISPLAY order (determDisplayOrder), else the first item at the top of the list -- never ``p.items[0]``, which
+    can be a term row this panel never draws a card for."""
+    body = _fn_body("renderDeterminations")
+    assert "p.items[0]" not in body, "must not default off the raw, undrawn-aware items array"
+    assert "var shown = determDisplayOrder(drawn);" in body
+    assert re.search(r"shown\.filter\(function \(i\) \{ return i\.blocking; \}\)\[0\]", body)
+    assert "drawn.some(function (i) { return i.id === state.determSelectedId; })" in body
+
+
+def test_renderDeterminations_draws_an_unnamed_kind_instead_of_dropping_it():
+    """A2 item 5: a kind this build does not name in KIND_ORDER (and is not
+    a term kind) used to vanish -- the loop only ever walked KIND_ORDER. It
+    must now get its own group, headed by the kind name upper-cased."""
+    body = _fn_body("renderDeterminations")
+    assert "otherKinds" in body
+    assert "String(kind).toUpperCase()" in body
+
+
+def test_keyboard_nav_flat_list_is_rebuilt_from_the_same_drawn_order():
+    """A2 item 6: j/k walk ``state.determItemsFlat``; it must be rebuilt
+    from the same (KIND_ORDER groups, then leftover-kind groups) walk that
+    paints the rows, so the keyboard order always matches what is on
+    screen."""
+    body = _fn_body("renderDeterminations")
+    assert "state.determItemsFlat = []" in body
+    # the push must happen inside paintGroup -- the one function that also
+    # draws a row -- not a second, independently-ordered pass that could
+    # drift out of sync with what is actually on screen.
+    paint_group_start = body.index("function paintGroup")
+    paint_group_body = body[paint_group_start:body.index("\n    }\n", paint_group_start)]
+    assert "state.determItemsFlat.push(item.id)" in paint_group_body
+
+
+def test_home_needs_card_counts_and_orders_the_same_set_decide_draws():
+    """A2: HOME's "N AWAITING DECISION" is DECIDE's drawn set (term candidates
+    excluded), its top item is the first blocking one in DECIDE's display
+    order, and the default selection on DECIDE reads that same order."""
+    needs = _fn_body("renderNeeds")
+    assert "p.total" not in needs
+    assert "isTermKind" in needs and "determDisplayOrder" in needs
+    determ = _fn_body("renderDeterminations")
+    assert "determDisplayOrder(drawn)" in determ
+
+
+# ===========================================================================
+# A5 -- say why a button is disabled, on screen
+# ===========================================================================
+def test_disabled_button_colour_rule_uses_ink_3_not_disabled_ink():
+    """``--disabled-ink`` (#3A4A40) sits almost on top of ``--bg``
+    (#070B09) -- a disabled button whose whole point is the reason printed
+    on its face (12.11) must still be legible. The hairline border keeps
+    saying "not clickable"; only the label colour moves to ``--ink-3``."""
+    rule = re.search(r'\.btn:disabled,\s*\.btn\[aria-disabled="true"\]\s*\{[^}]*\}', CSS)
+    assert rule, "the .btn:disabled rule is no longer there to check"
+    block = rule.group(0)
+    assert "var(--ink-3)" in block
+    assert "var(--disabled-ink)" not in block
+    assert "var(--hairline-soft)" in block, "the border must still say not-clickable"
+
+
+def test_rooms_action_buttons_surface_their_disabled_reason_or_collapse_to_one_note():
+    """SCORE THE ROUND / FREEZE AND ESCALATE collapse to one shared
+    ``read-only snapshot`` note when writes are off globally (rather than
+    repeating the same reason twice); EXPORT TRANSCRIPT's reason is
+    unrelated to write mode, so it always shows."""
+    fn = _fn_body("renderRooms")
+    assert "read-only snapshot — writes are off" in fn
+    assert re.search(r'"SCORE THE ROUND — " \+ scoreBtn\.title', fn)
+    assert re.search(r'"FREEZE AND ESCALATE — " \+ freezeBtn\.title', fn)
+    assert re.search(r'"EXPORT TRANSCRIPT — " \+ exportBtn\.title', fn)
+
+
+def test_room_turn_and_feed_transmit_notes_mirror_the_disabled_title():
+    compose_fn = _fn_body("setRoomTurnComposeEnabled")
+    assert "showDisabledReason(qs('[data-role=\"room-turn-note\"]'), btn)" in compose_fn
+
+    feed_fn = _fn_body("renderFeed")
+    assert "showDisabledReason(qs('[data-role=\"feed-compose-note\"]'), transmitBtn)" in feed_fn
+
+    # the note line also carries a write's result message: an enabled button
+    # clears only a reason the helper itself put there.
+    helper = _fn_body("showDisabledReason")
+    assert "data-disabled-reason" in helper
+    assert 'note.getAttribute("data-disabled-reason")' in helper
+
+
+def test_acquisition_note_names_the_ingest_request_cli_verb_from_the_real_parser():
+    """The CLI verb the note points to must be the one ``trialerror/cli/ingest.py``
+    actually registers (``ingest request --source-id <id> --to <state>``,
+    ``trialerror/ingest/requests.py``'s ``transition``), not an invented flag."""
+    import trialerror.cli.ingest as cli_ingest
+
+    src = Path(cli_ingest.__file__).read_text(encoding="utf-8")
+    assert '"request"' in src
+    assert '"--source-id"' in src
+    assert '"--to"' in src
+    assert 'dest="to_state"' in src
+
+
+# ---------------------------------------------------------------------------
+# A6: red (--crit-*) is reserved for blocking or destructive states (HALIDE's
+# own rule). The three sites below used it to decorate a state that is
+# neither -- posting to a thread is not destructive, an artifact's purpose is
+# never blocking, and a DECIDE item's summary card must only read as urgent
+# when the item actually blocks.
+# ---------------------------------------------------------------------------
+
+def test_feed_transmit_button_is_primary_not_destructive():
+    """TRANSMIT posts a reply into a thread -- ordinary, reversible, not a
+    destructive action -- so it must not wear the same class as CONFIRM
+    FREEZE / FREEZE AND ESCALATE."""
+    m = re.search(r'<button[^>]*data-role="feed-transmit-btn"[^>]*>', HTML)
+    assert m is not None
+    assert "btn--primary" in m.group(0)
+    assert "btn--destructive" not in m.group(0)
+    # wireWriteAction's two-click arm/disarm only ever re-adds
+    # btn--destructive to a button that carries data-confirm-label; TRANSMIT
+    # must not carry one, or arming it would put the class straight back.
+    assert "data-confirm-label" not in m.group(0)
+
+
+def test_purpose_strip_uses_no_crit_token():
+    """DOSSIER's PURPOSE strip is informational, never blocking -- its left
+    border and label must use the warn token, not crit."""
+    strip_rule = re.search(r"\.purpose-strip\s*\{[^}]*\}", CSS)
+    label_rule = re.search(r"\.purpose-strip \.k\s*\{[^}]*\}", CSS)
+    assert strip_rule is not None and label_rule is not None
+    assert "--crit" not in strip_rule.group(0), "PURPOSE strip border must not use a crit token"
+    assert "--crit" not in label_rule.group(0), "PURPOSE label must not use a crit token"
+    assert "var(--warn)" in strip_rule.group(0)
+    assert "var(--warn)" in label_rule.group(0)
+
+
+def test_card_accent_warn_css_exists():
+    """The non-blocking twin of ``card--accent-crit``, used by the WHAT'S
+    BEING ASKED band when the item does not block."""
+    assert re.search(r"\.card--accent-warn\s*\{[^}]*border-left:\s*2px solid var\(--warn\)", CSS)
+
+
+def test_determination_summary_card_picks_crit_only_when_blocking():
+    """A6 item 3: the WHAT'S BEING ASKED band must read crit only for a
+    blocking item -- a non-blocking determination is neither destructive nor
+    blocking, so its accent and label must fall back to warn."""
+    body = _fn_body("renderDeterminationDetail")
+    assert 'item.blocking ? "card--accent-crit" : "card--accent-warn"' in body
+    assert 'item.blocking ? "var(--crit-text)" : "var(--warn)"' in body
+    # the header's own BLOCKING chip is a separate, already-correct gate
+    # (item.blocking ? chip("BLOCKING", "crit") ...) and must not be touched.
+    assert 'item.blocking ? chip("BLOCKING", "crit")' in body
+
+
+def test_determ_item_selection_border_is_not_crit():
+    """A6 item 4: ``.determ-item.is-active`` marks whichever row is merely
+    SELECTED in the queue, independent of ``item.blocking`` (a click on any
+    row toggles it) -- red there would say "blocking" about a row that may
+    not be. It must not use a crit token."""
+    rule = re.search(r"\.determ-item\.is-active\s*\{[^}]*\}", CSS)
+    assert rule is not None
+    assert "--crit" not in rule.group(0)
+
+
+def test_feed_directive_card_operator_chip_is_not_crit():
+    """A6 item 4: the OPERATOR chip on an unread directive names WHO sent
+    it (a role label), not a blocking or destructive state -- it must not
+    use a crit token."""
+    fn = _fn_body("renderFeed")
+    chip_call = re.search(r'"class": "chip--role"[^}]*\}', fn)
+    assert chip_call is not None
+    assert "--crit" not in chip_call.group(0)
+    assert "var(--warn)" in chip_call.group(0)
+
+
+def test_home_needs_card_border_is_red_only_while_something_blocks():
+    """A6: the needs card's left accent follows blocking_count like its
+    title does -- crit while something blocks, warn otherwise; a selected
+    DECIDE row uses the selection colour (--live), as DOSSIER's rows do."""
+    needs = _fn_body("renderNeeds")
+    assert 'card.classList.toggle("card--accent-crit", p.blocking_count > 0)' in needs
+    assert 'card.classList.toggle("card--accent-warn", !(p.blocking_count > 0))' in needs
+    rule = re.search(r"\.determ-item\.is-active\s*\{[^}]*\}", CSS).group(0)
+    assert "var(--live)" in rule
+
+
+# ===========================================================================
+# A7 -- human titles before machine IDs in DOSSIER and ROOMS
+# ===========================================================================
+#
+# Screenshots showed each registry/rooms row's most prominent line was the
+# raw ULID, wrapping mid-ID (`.id`'s global `overflow-wrap: anywhere`) and
+# putting a horizontal scrollbar in the DOSSIER registry pane, with the
+# human title/topic small and grey below it. The fix is one shared helper,
+# `midTruncId`, plus reordering the row builders and the two detail
+# headers so the title/topic leads and the id becomes a quiet,
+# middle-truncated second line that cannot wrap or overflow.
+#: `_fn_body` returns just the brace-matched `{ ... }` block (see its own
+#: docstring above), not the `function midTruncId(id)` signature -- re-attach
+#: it so the extracted SHIPPED source is a callable function under Node.
+_MIDTRUNCID_SRC = "function midTruncId(id) " + _fn_body("midTruncId")
+requires_node = pytest.mark.skipif(
+    shutil.which("node") is None, reason="node not on PATH -- midTruncId's behaviour needs Node"
+)
+
+
+def _node_eval_midtruncid(expr: str):
+    """Evaluate one call to the SHIPPED `midTruncId` source under Node and
+    read back its JSON result -- the pattern this file's docstring points
+    at ("evaluate the function under node: extract its source text from
+    HTML with a regex and run it with a few inputs via subprocess node -e;
+    skip if node is missing")."""
+    script = _MIDTRUNCID_SRC + "\nprocess.stdout.write(JSON.stringify(" + expr + "));"
+    proc = subprocess.run([shutil.which("node"), "-e", script], capture_output=True, text=True, encoding="utf-8")
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+@requires_node
+def test_midtruncid_short_ids_pass_through_whole():
+    # exactly 16 chars: returned whole, no ellipsis
+    assert _node_eval_midtruncid('midTruncId("ART-01M2XVM0VSZT")') == "ART-01M2XVM0VSZT"
+    assert _node_eval_midtruncid('midTruncId("ART-1")') == "ART-1"
+    assert _node_eval_midtruncid('midTruncId("")') == ""
+    assert _node_eval_midtruncid('midTruncId(null)') == ""
+
+
+@requires_node
+def test_midtruncid_seventeen_chars_is_the_truncation_boundary():
+    # one char past the 16-char cutoff: the ellipsis form kicks in
+    assert _node_eval_midtruncid('midTruncId("ART-01M2XVM0VSZTA")') == "ART-01M2…VSZTA"
+
+
+@requires_node
+def test_midtruncid_middle_truncates_long_ids_keeping_prefix_and_last_five():
+    # the sweep's own repro id, and the doc's own worked ROOM example
+    assert (
+        _node_eval_midtruncid('midTruncId("ART-01M2XVM0VSZTA2JKK11CCVPNF4")')
+        == "ART-01M2…VPNF4"
+    )
+    assert (
+        _node_eval_midtruncid('midTruncId("ROOM-01M2XVM0VSZTA2JKK11CCZTEJ4")')
+        == "ROOM-01M2…ZTEJ4"
+    )
+
+
+@requires_node
+def test_midtruncid_with_no_dash_keeps_first_eight_chars():
+    assert _node_eval_midtruncid('midTruncId("ABCDEFGHIJKLMNOPQRSTUVWXYZ")') == "ABCDEFGH"
+
+
+def test_dossier_registry_row_puts_title_before_id():
+    """The registry row's top line is now the title (falling back to the
+    id when a title is empty) with the status chip alongside it; the id
+    itself drops to a quiet second line, middle-truncated, with the full
+    id preserved in `title=` so a hover/tooltip still shows it whole."""
+    dossier = _fn_body("renderDossier")
+    row_block = re.search(
+        r'var row = el\("div", \{ "class": "registry-row".*?registryList\.appendChild\(row\);',
+        dossier, re.S,
+    )
+    assert row_block is not None
+    block = row_block.group(0)
+    title_idx = block.index('"class": "title", text: a.title || a.artifact_id')
+    id_idx = block.index('"class": "id", text: midTruncId(a.artifact_id)')
+    assert title_idx < id_idx, "title line must come before the id line"
+    assert 'title: a.artifact_id' in block, "the full id must survive in title= even once truncated on screen"
+    assert 'a.status' in block, "the status chip stays on the (now title-led) top line"
+
+
+def test_dossier_detail_header_puts_title_before_id():
+    dossier = _fn_body("renderDossier")
+    header_idx = dossier.index('var header = el("div", { "class": "subbar" }')
+    detail_appendchild_idx = dossier.index("detail.appendChild(header)")
+    header_block = dossier[header_idx:detail_appendchild_idx]
+    title_idx = header_block.index('text: a.title || a.artifact_id')
+    id_idx = header_block.index('text: midTruncId(a.artifact_id)')
+    assert title_idx < id_idx
+    assert 'title: a.artifact_id' in header_block
+
+
+def test_rooms_list_row_puts_topic_before_id():
+    """The rooms row's top line is now the topic (falling back to the room
+    id when empty) with the OPEN/FROZEN/CONVERGED state chip alongside it;
+    the room id drops to a quiet, middle-truncated second line."""
+    rooms = _fn_body("renderRooms")
+    row_block = re.search(
+        r'var row = el\("div", \{ "class": "room-row".*?list\.appendChild\(row\);',
+        rooms, re.S,
+    )
+    assert row_block is not None
+    block = row_block.group(0)
+    title_idx = block.index('"class": "title", text: (r.topic || r.room_id)')
+    id_idx = block.index('"class": "id", text: midTruncId(r.room_id)')
+    assert title_idx < id_idx, "topic line must come before the id line"
+    assert 'title: r.room_id' in block
+    assert "stateEl2" in block, "the OPEN/FROZEN/CONVERGED chip stays on the (now topic-led) top line"
+
+
+def test_rooms_detail_header_puts_topic_before_id():
+    rooms = _fn_body("renderRooms")
+    topic_idx = rooms.index('text: p.active_room.topic || p.active_room.room_id')
+    id_idx = rooms.index('text: midTruncId(p.active_room.room_id)')
+    assert topic_idx < id_idx
+    assert 'title: p.active_room.room_id' in rooms
+
+
+def test_registry_and_room_id_lines_cannot_wrap_or_overflow():
+    """The bug screenshots showed a wrapped, mid-broken ULID and a
+    horizontal scrollbar in the DOSSIER registry pane -- both come from
+    `.id`'s page-wide `overflow-wrap: anywhere`. The row-local rule below
+    must force the id line onto one line and clip it instead."""
+    rule = re.search(r"\.registry-row \.id,\s*\.room-row \.id\s*\{[^}]*\}", CSS)
+    assert rule is not None, "a shared, row-scoped .id rule must exist for both panes"
+    body = rule.group(0)
+    assert "white-space: nowrap" in body
+    assert "overflow: hidden" in body
+    assert "text-overflow: ellipsis" in body
+    assert "var(--ink-3)" in body, "the id line reads quiet, not prominent"
+
+
+# ---------------------------------------------------------------------------
+# A8 -- operator notes: implementer detail moves off screen into `title`,
+# never deleted outright (dashboard's ITEM A8). One plain sentence a rule
+# is not enough on its own to prove a UI reads well, but it is exactly the
+# kind of regression a future edit can reintroduce quietly by pasting the
+# developer sentence back into a `text:` -- these are that tripwire.
+# ---------------------------------------------------------------------------
+
+
+def _owning_key(source, fragment):
+    """Which of `text`/`title` introduces the string literal that contains
+    `fragment`, found by proximity: the nearest `text:`/`text="` or
+    `title:`/`title="` occurring BEFORE `fragment` in the source. Handles
+    both dashboard.html's plain-HTML attributes and its inline JS object
+    literals (including ones built by string concatenation, e.g.
+    `title: count + " ...fragment..."`), which a strict
+    `key\\s*:\\s*"literal"` regex would miss entirely."""
+    idx = source.index(fragment)
+    candidates = {
+        "text": max(source.rfind("text:", 0, idx), source.rfind('text="', 0, idx)),
+        "title": max(source.rfind("title:", 0, idx), source.rfind('title="', 0, idx)),
+    }
+    assert max(candidates.values()) != -1, f"no text:/title: found before {fragment!r}"
+    return max(candidates, key=lambda k: candidates[k])
+
+
+@pytest.mark.parametrize("fragment", [
+    "context_frame is not populated on this artifact yet",
+    "No coverage/theory/validation rollups here",
+    "term_sense_evidence row yet -- the migration-from-proxy backlog",
+    "USE THE CLI VERB THIS ITEM'S KIND MAPS TO FOR ANYTHING NOT WIRED HERE",
+    "every row carries its own anchor",
+    "NO RESULTS NEVER READS",
+])
+def test_moved_operator_notes_are_titles_not_screen_text(fragment):
+    """A8: each of these developer-facing sentences must still exist
+    somewhere in the shipped page (information is not deleted), but only as
+    a `title` tooltip -- never as the text a viewer reads without hovering."""
+    assert HTML.count(fragment) == 1, f"{fragment!r} expected exactly once in dashboard.html"
+    assert _owning_key(HTML, fragment) == "title", f"{fragment!r} must render as a title, not on-screen text"
+
+
+def test_console_tagline_no_longer_repeats_the_developer_sentence():
+    """A8 item (j): this one is a straight replacement, not a move -- the
+    old tagline names no implementation detail worth keeping in a tooltip,
+    so it is simply gone from the served page (it survives only as a code
+    comment in console_render.js, describing the design source)."""
+    assert "everything the old landing page used to be" not in HTML
+    assert 'session, budget, jobs and launches' in HTML
+    assert "LOOPBACK ONLY, NO AUTHENTICATION" in HTML, "the security fact stays exactly as it was"
+
+
+def test_evidence_empty_state_no_longer_says_no_live_claims_yet():
+    """A8 item (l): the old empty-state wording named the read model
+    ('live claims'); the on-screen sentence now names the operator-visible
+    fact (extraction has not run), and does not preserve the old wording
+    anywhere -- there is no implementer detail here worth a tooltip."""
+    assert "no live claims yet" not in EVIDENCE_RENDER
+    assert "No claims have been extracted yet — extraction has not run." in EVIDENCE_RENDER
+
+
+def test_ask_panel_shows_a_prompt_not_a_fake_zero_before_any_query():
+    """A8 item (k): '0 RESULTS' before a query has ever been asked reads as
+    a real, alarming answer ('we searched and found nothing'); the initial
+    static markup must instead invite the question, and the function that
+    renders a REAL query's zero-hit explanation must be untouched."""
+    section_head = re.search(
+        r'data-role="search-results-count">([^<]*)</span>', HTML
+    )
+    assert section_head is not None
+    assert section_head.group(1) == "ask a question to search the corpus"
+    assert '>0 RESULTS<' not in HTML
+    # a real, answered query that comes back empty still explains itself --
+    # this codepath is untouched by A8 and must keep saying so.
+    render = _fn_body("renderSearchResults")
+    assert "0 RESULTS" in render
+
+
+def test_goal_card_note_col_is_gone_not_just_emptied():
+    """A8 item (f): removing the note from the COURSE goal card's 218px
+    column must remove the (now-empty) column element and its CSS rule
+    too, not leave a blank strip standing."""
+    course = _fn_body("renderCourse")
+    assert "note-col" not in course
+    assert re.search(r"\.goal-card\s+\.note-col", CSS) is None
+
+
+def test_determination_kind_chip_and_detail_table_humanize_underscores():
+    """A8 item (m): the raw `item.kind` (e.g. "acquisition") and the raw
+    field names in the generic DETAIL kv-table (request_state, source_kind)
+    read with underscores turned to spaces on screen -- the humanizing must
+    be scoped to the DECIDE detail table, not the shared ext-panel dumper
+    (`renderGeneric`'s own call keeps raw keys)."""
+    header = _fn_body("renderDeterminationDetail")
+    assert 'chip(humanizeKey(item.kind), "neutral")' in header
+    fields = _fn_body("renderDeterminationFields")
+    assert "renderObjectG(item, true)" in fields
+    generic = _fn_body("renderGeneric")
+    assert "renderObjectG(data)" in generic, "ext panels keep raw keys"
+    humanize = _fn_body("humanizeKey")
+    assert 'replace(/_/g, " ")' in humanize

@@ -1,9 +1,28 @@
-"""Tiers, config, and the throughput / TTL / cost model.
+"""Tiers, config, and the throughput / TTL / cost model. Two lanes share
+this module (round 3, the superset of the public TrialError copy's embedding
+backend):
 
-Every number here is labelled the way ``docs/VASTAI_EMBED_DESIGN.md``
-section 3 labels it: **measured** on this laptop's DEV GPU, or an
-**estimate**. None is an observed vast.ai price -- ``max_dph`` values are
-ceilings the operator sets, not prices.
+* the embedding lane's names, ported verbatim from the public copy:
+  :data:`DEV_TOKENS_PER_S`, :data:`TOKENS_PER_BYTE`,
+  :data:`DEFAULT_GPU_FACTORS`, :class:`VastConfig`, :class:`PlanRefused`,
+  :class:`Plan`, :func:`load_vast_config` (the embedding lane's loader of
+  ``[vastai]``), :func:`estimate_tokens`, :func:`ttl_for`,
+  :func:`rank_offers` and :func:`plan_run`;
+* the shared tiers and the billed-price arithmetic, plus the OCR lane's
+  additions: :meth:`Tier.refusals`, ``Tier.admits(disk_gb=)`` (the OCR lane
+  compares a tier's ``max_dph`` with the *effective* hourly price, disk
+  included; without ``disk_gb`` it is the public comparison with the listed
+  ``dph_total``), :func:`make_tier` and :data:`RENTAL_TYPE`. The OCR lane's
+  throughput model (pages, not tokens) is :mod:`trialerror.vastai.pricing`,
+  and its loader of the same table is :func:`trialerror.vastai.config.load_vast_config`.
+
+There is ONE :class:`VastConfigError`: the executor's own
+(:mod:`trialerror.vastai.errors`, a ``VastError`` and a ``ValueError``),
+re-exported here.
+
+Every number here is labelled the way the embedding design labels it:
+**measured** on the DEV GPU, or an **estimate**. None is an observed vast.ai
+price -- ``max_dph`` values are ceilings the operator sets, not prices.
 """
 
 from __future__ import annotations
@@ -13,6 +32,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from trialerror.vastai.errors import VastConfigError
+
 __all__ = [
     "DEV_TOKENS_PER_S",
     "TOKENS_PER_BYTE",
@@ -21,13 +42,17 @@ __all__ = [
     "DEFAULT_GPU_FACTORS",
     "DEFAULT_TIERS",
     "FORBIDDEN_KEYS",
+    "RENTAL_TYPE",
+    "HOURS_PER_MONTH",
     "Tier",
+    "make_tier",
     "VastConfig",
     "VastConfigError",
     "PlanRefused",
     "Plan",
     "load_vast_config",
     "normalise_gpu_name",
+    "effective_dph",
     "estimate_tokens",
     "ttl_for",
     "rank_offers",
@@ -75,14 +100,17 @@ DEFAULT_GPU_FACTORS: dict[str, float] = {
     "H100 SXM": 6.0,
 }
 
-#: Keys whose presence is refused by name: design section 4.2 item 7 says
-#: no keep-alive exists, and a config that asks for one must fail loudly
-#: rather than be silently ignored.
+#: Keys whose presence is refused by name, in any ``[vastai*]`` table: no
+#: keep-alive, reuse or TTL extension exists by design, and a config that asks
+#: for one must fail loudly rather than be silently ignored.
 FORBIDDEN_KEYS = ("keep_alive", "keepalive", "reuse_instance", "ttl_extend", "extend_ttl")
 
+#: The only rental type. Interruptible (``type = "bid"``) instances are
+#: refused by name: a preempted lease strands the document on the host.
+RENTAL_TYPE = "ondemand"
 
-class VastConfigError(ValueError):
-    pass
+#: vast.ai prices storage per GB-month; an hour is 1/730 of a month.
+HOURS_PER_MONTH = 730.0
 
 
 class PlanRefused(RuntimeError):
@@ -93,6 +121,19 @@ def normalise_gpu_name(name: str) -> str:
     return re.sub(r"\s+", " ", str(name).replace("_", " ")).strip().upper()
 
 
+def effective_dph(offer: dict[str, Any], disk_gb: float | None) -> float:
+    """What the instance bills per hour for THIS lease: the GPU price plus
+    storage for the disk the lease rents. The search's ``dph_total`` prices a
+    small default disk instead (observed 2026-09-18 by the public copy: an
+    offer listed at $0.143/h billed $0.181/h with a 40 GB disk -- exactly
+    ``dph_base + 40 * storage_cost / 730``). Falls back to ``dph_total`` when
+    the offer lacks the fields."""
+    base, storage = offer.get("dph_base"), offer.get("storage_cost")
+    if disk_gb is None or base is None or storage is None:
+        return float(offer.get("dph_total") or 0)
+    return float(base) + float(disk_gb) * float(storage) / HOURS_PER_MONTH
+
+
 @dataclass(frozen=True)
 class Tier:
     name: str
@@ -101,15 +142,29 @@ class Tier:
     max_dph: float
     min_reliability: float
 
-    def admits(self, offer: dict[str, Any]) -> bool:
+    def refusals(self, offer: dict[str, Any], *, disk_gb: float | None = None) -> list[str]:
+        """Why this tier does not admit ``offer`` (empty = admitted). The
+        price compared with ``max_dph`` is :func:`effective_dph` at
+        ``disk_gb`` -- what the lease will bill, not what the search lists."""
+        out: list[str] = []
         if normalise_gpu_name(offer.get("gpu_name", "")) not in self.gpus:
-            return False
+            out.append(f"gpu {offer.get('gpu_name')!r} is not in tier {self.name!r}")
         if float(offer.get("gpu_ram") or 0) / 1024.0 < self.min_vram_gb:  # vast.ai gpu_ram is MB
-            return False
-        if float(offer.get("dph_total") or 1e9) > self.max_dph:
-            return False
+            out.append(f"gpu_ram {offer.get('gpu_ram')} MB < {self.min_vram_gb} GB")
+        dph = effective_dph(offer, disk_gb)
+        if dph <= 0 or dph > self.max_dph:
+            out.append(f"effective price ${dph:.4f}/h is not within (0, {self.max_dph}]")
         rel = offer.get("reliability", offer.get("reliability2", 0))
-        return float(rel or 0) >= self.min_reliability
+        if float(rel or 0) < self.min_reliability:
+            out.append(f"reliability {rel} < {self.min_reliability}")
+        return out
+
+    def admits(self, offer: dict[str, Any], *, disk_gb: float | None = None) -> bool:
+        return not self.refusals(offer, disk_gb=disk_gb)
+
+
+def make_tier(name: str, gpus: list[str] | tuple[str, ...], vram: float, dph: float, rel: float) -> Tier:
+    return Tier(name, tuple(normalise_gpu_name(g) for g in gpus), float(vram), float(dph), float(rel))
 
 
 def _tier(name: str, gpus: list[str], vram: float, dph: float, rel: float) -> Tier:
@@ -117,14 +172,14 @@ def _tier(name: str, gpus: list[str], vram: float, dph: float, rel: float) -> Ti
 
 
 DEFAULT_TIERS: dict[str, Tier] = {
-    "low": _tier("low", ["RTX 4060 Ti", "RTX 5060 Ti", "RTX A4000", "RTX 4000Ada"], 16, 0.25, 0.95),
-    "mid": _tier(
+    "low": make_tier("low", ["RTX 4060 Ti", "RTX 5060 Ti", "RTX A4000", "RTX 4000Ada"], 16, 0.25, 0.95),
+    "mid": make_tier(
         "mid",
         ["RTX 3090", "RTX 3090 Ti", "RTX A5000", "RTX 4070S Ti", "RTX 4070 Ti Super", "RTX 4080",
          "RTX 4080S", "RTX 5070 Ti", "RTX 5080"],
         16, 0.45, 0.97,
     ),
-    "high": _tier(
+    "high": make_tier(
         "high",
         ["RTX 4090", "RTX 5090", "L40S", "A100 PCIE", "A100 SXM4", "H100 PCIE", "H100 SXM"],
         24, 2.50, 0.98,
@@ -224,22 +279,6 @@ def ttl_for(compute_s: float, cfg: VastConfig) -> tuple[float, float]:
     capped at ``cfg.ttl_cap_s`` (itself <= :data:`ABSOLUTE_TTL_CAP_S`)."""
     uncapped = cfg.startup_s + cfg.safety * compute_s + cfg.grace_s
     return min(uncapped, cfg.ttl_cap_s, ABSOLUTE_TTL_CAP_S), uncapped
-
-
-HOURS_PER_MONTH = 730.0
-
-
-def effective_dph(offer: dict[str, Any], disk_gb: float | None) -> float:
-    """What the instance bills per hour for THIS lease: the GPU price plus
-    storage for the disk the lease rents. The search's ``dph_total`` prices a
-    small default disk instead (first live run, 2026-09-18: offer listed at
-    $0.143/h, instance billed $0.181/h with a 40 GB disk -- exactly
-    ``dph_base + 40 * storage_cost / 730``). Falls back to ``dph_total`` when
-    the offer lacks the fields."""
-    base, storage = offer.get("dph_base"), offer.get("storage_cost")
-    if disk_gb is None or base is None or storage is None:
-        return float(offer.get("dph_total") or 0)
-    return float(base) + float(disk_gb) * float(storage) / HOURS_PER_MONTH
 
 
 def rank_offers(

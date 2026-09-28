@@ -4,7 +4,7 @@ subsystem's ``checks.py`` (design Section 5.2 doctor row: "framework +
 license-audit in M0; each module registers its own checks") — dropping
 this file is the entire registration step, no shared file touched.
 
-Three checks, all scoped to ``DoctorContext.program_root`` (ops.db is
+Four checks, all scoped to ``DoctorContext.program_root`` (ops.db is
 per-program):
 
 - ``gated_type_without_gate``: a ``registered`` artifact of a ``gated=1``
@@ -28,6 +28,13 @@ per-program):
   first place (again: only reachable via a direct write bypassing
   ``trialerror.artifacts.gates``, since that module is "the ONLY mutation
   path").
+
+- ``registration_disposition_consistent``: an artifact registered through
+  ``register_with_deviation`` or ``register_failed`` carries a disposition, and
+  so does its gate; the artifact's, the gate's and the ``evidence.path`` of the
+  gate's last transition must name the same path, and both rows must be
+  ``registered``. A disposition on one side only, or two that disagree, is a
+  registration somebody wrote around the two functions.
 
 Any DB file that doesn't exist yet, or a program with no artifacts/gates
 at all, is reported ``skip`` — not a doctor failure.
@@ -55,6 +62,7 @@ exempted count is stated in the check's own message.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 from trialerror.artifacts.state_machine import is_legal_transition
@@ -67,6 +75,7 @@ __all__ = [
     "check_gated_type_without_gate",
     "check_orphan_gate_transition",
     "check_gate_illegal_transition_history",
+    "check_registration_disposition_consistent",
 ]
 
 
@@ -222,6 +231,82 @@ def check_gate_illegal_transition_history(ctx: DoctorContext) -> CheckResult:
         return CheckResult(
             name="gate_illegal_transition_history", category="artifacts", status=status, message=message,
             details={"illegal_edges": illegal_edges, "state_mismatches": state_mismatches},
+        )
+    finally:
+        conn.close()
+
+
+#: artifact.disposition -> (gate.disposition, gate_transition evidence path)
+_DISPOSITION_PAIRS = {
+    "registered_with_deviation": ("deviation_disclosed", "register_with_deviation"),
+    "registered_failed": ("failure_registered", "register_failed"),
+}
+
+
+@register_check("registration_disposition_consistent", category="artifacts")
+def check_registration_disposition_consistent(ctx: DoctorContext) -> CheckResult:
+    conn = _ops_conn_or_none(ctx)
+    if conn is None:
+        return CheckResult(
+            name="registration_disposition_consistent",
+            category="artifacts",
+            status="skip",
+            message="ops.db not found (program_root not configured, or program not yet initialized)",
+        )
+    try:
+        offenders: list[dict] = []
+        checked = 0
+        rows = conn.execute(
+            """
+            SELECT a.artifact_id, a.status AS artifact_status, a.disposition AS artifact_disposition,
+                   g.gate_id, g.state AS gate_state, g.disposition AS gate_disposition
+            FROM artifact a
+            LEFT JOIN gate g ON a.gate_id = g.gate_id
+            WHERE a.disposition IS NOT NULL OR g.disposition IS NOT NULL
+            """
+        ).fetchall()
+        for r in rows:
+            checked += 1
+            problems: list[str] = []
+            expected = _DISPOSITION_PAIRS.get(r["artifact_disposition"])
+            if r["gate_id"] is None:
+                problems.append("the artifact has a disposition but no gate")
+            elif expected is None:
+                problems.append(f"the artifact has no disposition but its gate is {r['gate_disposition']!r}")
+            else:
+                want_gate, want_path = expected
+                if r["artifact_status"] != "registered" or r["gate_state"] != "registered":
+                    problems.append(
+                        f"artifact is {r['artifact_status']!r} and gate is {r['gate_state']!r}; both must be 'registered'"
+                    )
+                if r["gate_disposition"] != want_gate:
+                    problems.append(
+                        f"artifact disposition {r['artifact_disposition']!r} needs gate disposition {want_gate!r}, "
+                        f"the gate has {r['gate_disposition']!r}"
+                    )
+                last = conn.execute(
+                    "SELECT evidence FROM gate_transition WHERE gate_id = ? ORDER BY id DESC LIMIT 1", (r["gate_id"],)
+                ).fetchone()
+                path = None
+                if last is not None and last["evidence"]:
+                    try:
+                        parsed = json.loads(last["evidence"])
+                        path = parsed.get("path") if isinstance(parsed, dict) else None
+                    except json.JSONDecodeError:
+                        path = None
+                if path != want_path:
+                    problems.append(f"the gate's last transition records path {path!r}, expected {want_path!r}")
+            if problems:
+                offenders.append({"artifact_id": r["artifact_id"], "gate_id": r["gate_id"], "problems": problems})
+        status = "fail" if offenders else "pass"
+        message = (
+            f"{len(offenders)} registration(s) whose disposition disagrees between artifact, gate and transition"
+            if offenders
+            else f"{checked} artifact(s) with a disposition; artifact, gate and last transition agree on each"
+        )
+        return CheckResult(
+            name="registration_disposition_consistent", category="artifacts", status=status, message=message,
+            details={"offenders": offenders, "checked": checked},
         )
     finally:
         conn.close()

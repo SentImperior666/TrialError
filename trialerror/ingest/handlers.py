@@ -14,12 +14,7 @@ Stage graph as built (design Section 6):
                               paths converge here)
     chunk        -> embed
     embed        -> index
-    index        -> (terminal; ``extract`` is registered but NOT
-                      auto-chained -- opt-in only, see its own docstring
-                      below; ``extract`` -> nothing further -- candidates
-                      land in the merge-review queue, ``trialerror.ingest.extract``,
-                      for an explicit accept/reject step, never auto-chained
-                      onward into entity/relation/claim)
+    index        -> (terminal; the ``extract`` handler was retired in Phase 0)
 
 Restart-safety (design Section 6: "each idempotent, content-hash-keyed,
 and resumable via the jobs ledger"): every handler below re-derives "what's
@@ -79,7 +74,6 @@ __all__ = [
     "run_chunk",
     "run_embed",
     "run_index",
-    "run_extract",
 ]
 
 
@@ -1134,74 +1128,3 @@ def run_index(ctx) -> None:
     # `fulltext_index_stale`, which reads the index rather than the status.
     if not fulltext_only:
         update(store, "document", pk_column="doc_id", pk_value=doc_id, changes={"status": "indexed"})
-
-
-@register_handler("extract")
-def run_extract(ctx) -> None:
-    """design Section 6 stage 8 / Section 11 v1 deliverable: "full
-    entity/relation extraction + merge review + graph retrieval tier."
-    Deliberately NOT auto-chained from ``index`` (opt-in only, unchanged
-    from v0) -- a caller enqueues ``kind="extract"`` explicitly, same as
-    the v0 stub always required.
-
-    **No LLM-calling infrastructure exists in this offline jobs/CLI layer**
-    (design Section 5.3: "one-shot orchestration lives [in skills], not in
-    servers") -- unchanged by this v1 upgrade. What changes: this handler
-    now does REAL work when the caller supplies ``payload["judgments_path"]``
-    -- a JSON file, already written to disk by an agent that ran the real
-    per-chunk extraction judgment OUT-OF-BAND (disk-to-disk, design Section
-    6 preamble: "page text never transits the orchestrator's context;
-    agents get ids + stats back", C-0007) -- shaped
-    ``{"<chunk_id>": {"entities": [...], "relations": [...], "claims":
-    [...]}}`` (:func:`trialerror.ingest.extract.build_extraction_judgment_envelope`'s
-    own docstring names the exact per-chunk shape). This handler reads that
-    file, builds a plain dict-lookup ``judge`` callable from it (the exact
-    ``trialerror.cli.verify._judge_from_table`` pattern), and calls
-    :func:`trialerror.ingest.extract.run_extract_document` -- checkpointing
-    (``ctx.set_checkpoint``) after every chunk, so a kill-mid-document
-    resume skips whatever chunks already have their
-    ``kg_extract_chunk_processed`` event (restart-safety, same convention
-    every other handler in this module documents).
-
-    Omitting ``judgments_path`` preserves the ORIGINAL v0 stub behavior
-    exactly (schema-ready settle, zero claims/entities/relations queued) --
-    a caller that just wants to prove the queue wiring works, or a job
-    enqueued before an agent has produced judgments yet, still settles
-    cleanly rather than failing."""
-    payload = ctx.payload
-    judgments_path = payload.get("judgments_path")
-    if not judgments_path:
-        ctx.set_checkpoint({"claims_extracted": 0, "note": "v0 stub -- no judgments_path given, see docstring"})
-        return
-
-    from trialerror.ingest.extract import run_extract_document
-
-    doc_id = payload["doc_id"]
-    created_by_launch = payload["created_by_launch"]
-    store = ctx.store
-
-    judgments_file = Path(judgments_path)
-    if not judgments_file.is_file():
-        raise RuntimeError(f"extract: judgments_path {judgments_path!r} does not exist")
-    judgments = json.loads(judgments_file.read_text(encoding="utf-8"))
-
-    def judge(envelope: dict[str, Any]) -> Any:
-        chunk_id = envelope["chunk_id"]
-        if chunk_id not in judgments:
-            raise RuntimeError(f"extract: no judgment supplied for chunk_id={chunk_id!r} in {judgments_path}")
-        return judgments[chunk_id]
-
-    def on_chunk(totals: dict[str, Any]) -> None:
-        ctx.set_checkpoint(totals)
-
-    result = run_extract_document(store, doc_id, judge=judge, created_by_launch=created_by_launch, on_chunk=on_chunk)
-    ctx.set_checkpoint(
-        {
-            "chunks_processed": result["chunks_processed"],
-            "chunks_skipped": result["chunks_skipped"],
-            "entities_queued": result["entities_queued"],
-            "relations_queued": result["relations_queued"],
-            "claims_queued": result["claims_queued"],
-            "done": True,
-        }
-    )

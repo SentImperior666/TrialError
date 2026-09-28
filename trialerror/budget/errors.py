@@ -20,6 +20,7 @@ __all__ = [
     "ModelPolicyViolationError",
     "UnknownOverrideRulingError",
     "UnknownAssignmentError",
+    "LensNameRefusedError",
 ]
 
 
@@ -65,3 +66,16 @@ class UnknownAssignmentError(BudgetError):
     linked none would read as a lens launch that declares no slice -- which
     is the shape both of those treat as "unrestricted" and "not a lens",
     i.e. the barrier off."""
+
+
+class LensNameRefusedError(BudgetError):
+    """A booking's declared lens name (or its ``phase`` label) cannot stand:
+    an empty/over-long/multi-line name, a ``phase`` on a booking that names
+    no assignment rows, or -- the one that matters -- a ``lens_name`` that
+    DISAGREES with the name the booking's own assignment rows resolve to.
+
+    The assignment rows are authoritative: they are what the seeded draw
+    wrote, and a launch that says it is one lens while being bound to
+    another's slice is a launch every later reading of the round gets wrong
+    in two directions at once. Refused before the ``launch`` row exists, so
+    a mistyped name leaves no PROVISIONAL booking holding pool headroom."""
