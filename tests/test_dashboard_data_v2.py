@@ -547,13 +547,16 @@ def test_determinations_panel_ok_when_knowledge_db_absent(tmp_path, monkeypatch)
         rostore.close()
 
 
-def test_determinations_panel_term_conflict_item(seeded):
-    """The shared fixture's own pending, term-scoped conflicts_with relation
-    (tests/_store_fixtures.py, "lane e" comment) surfaces as one
-    term_conflict determination item -- design §5."""
+def test_term_conflict_items_builder_still_works_for_lexicon(seeded):
+    """L10 part B (design §3, B2): ``term_conflict`` is "not built for
+    DECIDE any more: the lexicon is a lazy reference. The builders stay for
+    the LEXICON page" -- so ``_term_conflict_items`` itself is unchanged
+    (the fixture's own pending, term-scoped conflicts_with relation still
+    surfaces from it), but ``build_determinations_panel`` no longer unions
+    it in."""
     rostore, ids = seeded
-    panel = data.build_determinations_panel(rostore)
-    item = next(i for i in panel["items"] if i["kind"] == "term_conflict")
+    items = data._term_conflict_items(rostore)
+    item = next(i for i in items if i["kind"] == "term_conflict")
     assert item["id"] == ids["term_relation"]
     assert item["term_id"] == ids["term"]
     assert item["lemma"] == "Test Term"
@@ -561,12 +564,17 @@ def test_determinations_panel_term_conflict_item(seeded):
     assert item["marked_by_kind"] == "system"
     assert item["blocking"] is False
     assert "disambiguator" in item["consequence"]
-    assert panel["counts_by_kind"]["term_conflict"] == 1
+
+    panel = data.build_determinations_panel(rostore)
+    assert panel["counts_by_kind"].get("term_conflict", 0) == 0
+    assert all(i["kind"] != "term_conflict" for i in panel["items"])
 
 
-def test_determinations_panel_term_duplicate_item(seeded, program_root, platform_root):
+def test_term_duplicate_items_builder_still_works_for_lexicon(seeded, program_root, platform_root):
     """A pending term-to-term same_as candidate (engram-F4's shape) surfaces
-    as one term_duplicate item, distinct from term_conflict."""
+    from ``_term_duplicate_items`` directly, distinct from term_conflict --
+    L10 part B: the builder stays for the LEXICON page, but is no longer
+    unioned into the DECIDE panel (see the term_conflict test above)."""
     rostore, ids = seeded
     store = open_store(program_root, platform_root=platform_root)
     from trialerror.lexicon.api import open_relation, propose
@@ -596,8 +604,8 @@ def test_determinations_panel_term_duplicate_item(seeded, program_root, platform
     rostore.close()
     rostore = _reopen_ro(program_root, platform_root)
     try:
-        panel = data.build_determinations_panel(rostore)
-        item = next(i for i in panel["items"] if i["kind"] == "term_duplicate" and i["id"] == rel["rel_id"])
+        items = data._term_duplicate_items(rostore)
+        item = next(i for i in items if i["kind"] == "term_duplicate" and i["id"] == rel["rel_id"])
         assert item["src_term_id"] == other["term_id"]
         assert item["src_lemma"] == "Test Terms Alt"
         assert item["dst_term_id"] == ids["term"]
@@ -605,6 +613,10 @@ def test_determinations_panel_term_duplicate_item(seeded, program_root, platform
         assert item["marked_by_kind"] == "system"
         assert item["blocking"] is False
         assert "SAME AS" in item["consequence"]
+
+        panel = data.build_determinations_panel(rostore)
+        assert panel["counts_by_kind"].get("term_duplicate", 0) == 0
+        assert all(i["kind"] != "term_duplicate" for i in panel["items"])
     finally:
         rostore.close()
 
@@ -702,7 +714,7 @@ def test_dossier_panel_passes_disposition_through(seeded, program_root, platform
 
 
 def test_dossier_panel_defaults_to_the_newest_registered_artifact(seeded, program_root, platform_root):
-    """te-dash A7: with no artifact asked for, the panel opens the newest
+    """With no artifact asked for, the panel opens the newest
     REGISTERED artifact, not a newer draft that decides nothing; with no
     registered artifact at all it falls back to the newest row."""
     rostore, ids = seeded

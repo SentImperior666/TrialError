@@ -103,7 +103,6 @@ from typing import Any, Callable, Mapping
 from trialerror.budget.policy import meets_minimum
 from trialerror.eval.errors import GateSuiteRunnerError, UnknownGateSuiteError
 from trialerror.stores import get as store_get
-from trialerror.stores import update as store_update
 from trialerror.stores.store import Store
 from trialerror.verify.verdicts import record_verdict
 
@@ -1641,21 +1640,59 @@ def run_gate_suite_for_gate(
 
     Raises :class:`~trialerror.eval.errors.GateSuiteRunnerError` (via
     :func:`run_gate_suite`) if the gate id doesn't resolve or the suite
-    itself failed to run at all."""
+    itself failed to run at all.
+
+    **A decided gate keeps the evidence it was decided on.** On a gate in
+    ``failed`` or ``registered`` the suite still runs, but its result is
+    recorded only as a ``gate_suite_rerun`` event: ``gate.reproduction_status``
+    and ``gate.reproduction_ref`` are not rewritten and no ``knowledge.verdict``
+    row is written."""
     gate = store_get(store, "gate", pk_column="gate_id", pk_value=gate_id)
     if gate is None:
         raise GateSuiteRunnerError(f"no such gate: {gate_id!r}")
 
     run_result = run_gate_suite(suite_id, subject, timeout=timeout)
     reproduction_status = "match" if run_result["overall"] == "PASS" else "mismatch"
+
     reproduction_ref = json.dumps(
         {"kind": "gate_suite", "suite_id": suite_id, "returncode": run_result["returncode"], "checks": run_result["checks"]},
         ensure_ascii=False,
     )
-    store_update(
-        store, "gate", pk_column="gate_id", pk_value=gate_id,
-        changes={"reproduction_status": reproduction_status, "reproduction_ref": reproduction_ref},
-    )
+    # One conditional UPDATE decides which way this goes: it writes the gate's
+    # reproduction columns only while the gate is not yet decided, so a gate
+    # that failed (or registered) while the suite was running keeps the
+    # evidence it was decided on.
+    with store.ops:
+        written = store.ops.execute(
+            "UPDATE gate SET reproduction_status = ?, reproduction_ref = ? "
+            "WHERE gate_id = ? AND state NOT IN ('failed', 'registered')",
+            (reproduction_status, reproduction_ref, gate_id),
+        ).rowcount == 1
+
+    if not written:
+        # The re-run is recorded as an event and nothing else: the gate's
+        # columns stay as they were, and no verdict row is written.
+        from trialerror.events.api import append_event
+
+        event = append_event(
+            store,
+            event_type="gate_suite_rerun",
+            launch_id=issued_by_launch,
+            payload={
+                "gate_id": gate_id,
+                "suite_id": suite_id,
+                "reproduction_status": reproduction_status,
+                "checks": run_result["checks"],
+            },
+        )
+        return {
+            **run_result,
+            "gate_id": gate_id,
+            "reproduction_status": reproduction_status,
+            "verdict": None,
+            "frozen": True,
+            "event_id": event["event_id"],
+        }
 
     verdict_row = record_verdict(
         store, subject_kind="artifact", subject_id=gate["artifact_id"], procedure="gate",

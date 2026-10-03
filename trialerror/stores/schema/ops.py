@@ -909,6 +909,19 @@ _V12 = (
     "CHECK (disposition IN ('registered_with_deviation','registered_failed'))",
 )
 
+# ---- v13: the gate records the corrected bytes' hash itself -----------------
+# Additive (ADD COLUMN only). When the call that verifies a gate's last
+# blocking edit reads the artifact's file, it stores that file's sha256 here,
+# with the moment it did so, in the same transaction. Only that code path
+# writes these two columns (no verb or event does), which is what lets a
+# registration bind to "the corrected bytes" on the gate's own record rather
+# than on a hash somebody supplies afterwards. NULL on every existing row and
+# on every gate whose blocking edits were not verified through it.
+_V13 = (
+    "ALTER TABLE gate ADD COLUMN post_edit_sha256 TEXT",
+    "ALTER TABLE gate ADD COLUMN post_edit_ts TEXT",
+)
+
 MIGRATIONS = (
     Migration(version=1, name="ops_v1_initial_schema", statements=_V1),
     Migration(version=2, name="ops_v2_memory_item_account_id_nullable_and_thread_status_refs", statements=_V2),
@@ -922,4 +935,5 @@ MIGRATIONS = (
     Migration(version=10, name="ops_v10_lens_assignment_lens_launch_id", statements=_V10),
     Migration(version=11, name="ops_v11_lens_assignment_launch", statements=_V11),
     Migration(version=12, name="ops_v12_prereg_plan_check_and_registration_dispositions", statements=_V12),
+    Migration(version=13, name="ops_v13_gate_post_edit_sha256", statements=_V13),
 )

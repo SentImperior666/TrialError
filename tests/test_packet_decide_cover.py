@@ -8,7 +8,7 @@ from __future__ import annotations
 import io
 import json
 from contextlib import redirect_stdout
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -42,7 +42,7 @@ def settings(tmp_path, monkeypatch):
     root = tmp_path / "prog"
     root.mkdir()
     (root / "trialerror.toml").write_text('[program]\nid = "demo"\n', encoding="utf-8")
-    monkeypatch.setattr(pb, "_decide_entries", lambda _settings, _platform_root: ([dict(RAW_ROOM), dict(RAW_EDIT)], None))
+    monkeypatch.setattr(pb, "_decide_entries", lambda _settings, _platform_root: ([dict(RAW_ROOM), dict(RAW_EDIT)], [], None))
     return packet_settings(root)
 
 
@@ -117,14 +117,37 @@ def test_only_an_exact_id_covers(settings, ref):
     assert "DECIDE:ROOM-TEST-1" in [i["id"] for i in packet["items"]]
 
 
-def test_an_answered_or_withdrawn_item_covers_nothing(settings):
-    answered = _add(settings, "Close the trial room?", [("the trial room", "ROOM-TEST-1")])
-    ps.answer_item(settings, answered["id"], "a")
+def test_a_withdrawn_item_covers_nothing(settings):
     withdrawn = _add(settings, "Close the trial room again?", [("the trial room", "ROOM-TEST-1")])
     ps.withdraw_item(settings, withdrawn["id"], "asked twice")
     packet = _build(settings)["packet"]
-    assert packet["decide_covered"] == []
+    assert packet["decide_covered"] == []  # covering via an OPEN item's --ref is untouched by withdrawal
     assert "DECIDE:ROOM-TEST-1" in [i["id"] for i in packet["items"]]
+
+
+def test_an_answered_item_keeps_covering_within_the_grace_period(settings):
+    """L10 part C (design §4 item 4, the review's N-1 finding): "an answered item
+    keeps covering its DECIDE entry for 7 days after its answer" -- this
+    REPLACES the old rule ("answered items do not cover"), which made an
+    entry reappear as a brand-new decision the instant its covering item
+    was answered, before the answer's action had any chance to happen."""
+    answered = _add(settings, "Close the trial room?", [("the trial room", "ROOM-TEST-1")])
+    ps.answer_item(settings, answered["id"], "a", now=T0)
+    packet = _build(settings)["packet"]
+    assert packet["decide_covered"] == []  # this is a DIFFERENT mechanism than an open item's --ref cover
+    assert "DECIDE:ROOM-TEST-1" not in [i["id"] for i in packet["items"]]
+    already = packet["already_answered"]
+    assert len(already) == 1 and already[0]["item_id"] == answered["id"] and already[0]["choice"] == "a"
+    # the unrelated raw edit entry is untouched
+    assert "DECIDE:CR-001::EDIT-1" in [i["id"] for i in packet["items"]]
+
+
+def test_an_answer_older_than_the_grace_period_stops_covering(settings):
+    answered = _add(settings, "Close the trial room?", [("the trial room", "ROOM-TEST-1")])
+    ps.answer_item(settings, answered["id"], "a", now=T0 - timedelta(days=pb.ANSWERED_COVER_DAYS, hours=1))
+    packet = _build(settings)["packet"]
+    assert "DECIDE:ROOM-TEST-1" in [i["id"] for i in packet["items"]]
+    assert packet["already_answered"] == []
 
 
 def test_the_first_item_in_packet_order_is_named_when_two_cover_one_entry(settings):
@@ -188,7 +211,7 @@ def _capped(tmp_path, monkeypatch, max_minutes, entries):
     (root / "trialerror.toml").write_text(
         f'[program]\nid = "demo"\n[packet]\nmax_minutes = {max_minutes}\n', encoding="utf-8"
     )
-    monkeypatch.setattr(pb, "_decide_entries", lambda _s, _p: ([dict(e) for e in entries], None))
+    monkeypatch.setattr(pb, "_decide_entries", lambda _s, _p: ([dict(e) for e in entries], [], None))
     return packet_settings(root)
 
 

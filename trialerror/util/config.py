@@ -23,18 +23,56 @@ from typing import Any, Mapping
 __all__ = [
     "ConfigError",
     "ProgramConfig",
+    "ProgramRootIsHarnessError",
     "load_config",
     "find_program_root",
     "resolve_configured_path",
     "configured_path_value",
     "foreign_absolute_kind",
+    "resolve_program_id",
 ]
 
 CONFIG_FILENAME = "trialerror.toml"
 
+#: L8 part F (F1): the directory that holds the *running* ``trialerror``
+#: package -- ``trialerror/util/config.py`` -> ``trialerror/util`` ->
+#: ``trialerror`` -> its parent, the checkout (or worktree) root. Computed
+#: once at import time from this module's own ``__file__`` (not
+#: ``sys.modules["trialerror"].__file__``) so a test can monkeypatch it
+#: directly to point at a fixture directory without needing to fake an
+#: import.
+_HARNESS_PACKAGE_PARENT = Path(__file__).resolve().parent.parent.parent
+
+_PROGRAM_ROOT_ENV = "TRIALERROR_PROGRAM_ROOT"
+_ALLOW_HARNESS_PROGRAM_ROOT_ENV = "TRIALERROR_ALLOW_HARNESS_PROGRAM_ROOT"
+
 
 class ConfigError(Exception):
     """Raised for a missing, unreadable, or structurally invalid trialerror.toml."""
+
+
+class ProgramRootIsHarnessError(ConfigError):
+    """Raised by :func:`find_program_root` (L8 part F, F1) when no program
+    root was given (no ``--program-root``, no ``TRIALERROR_PROGRAM_ROOT``)
+    and the walked-up fallback lands on the repository that holds the
+    running ``trialerror`` package -- its root, or a git worktree of it: a
+    ``trialerror.toml`` next to ``trialerror/__init__.py``.
+
+    DEV's ``research-harness/stores/ops.db``, the store behind the harness
+    repository's own ``trialerror.toml``, was already at ops v13 before
+    batch 6 landed -- something running a lane's code had opened it as its
+    program root by accident. It was additive and did no harm, but the
+    fallback is refused from here on."""
+
+    code = "program_root_is_harness"
+
+    def __init__(self, path: Path):
+        self.path = path
+        super().__init__(
+            "no program root was given, and the fallback is the harness's own repository; "
+            "pass --program-root or set TRIALERROR_PROGRAM_ROOT (set "
+            "TRIALERROR_ALLOW_HARNESS_PROGRAM_ROOT=1 to use it on purpose)"
+        )
 
 
 @dataclass(frozen=True)
@@ -112,15 +150,73 @@ def load_config(path: str | Path) -> ProgramConfig:
     return ProgramConfig(program_id=str(program["id"]), path=path, raw=raw)
 
 
-def find_program_root(start: str | Path | None = None) -> Path | None:
+def _harness_repo_root() -> Path | None:
+    """The checkout/worktree root that holds the running ``trialerror``
+    package, when it looks like one (a ``trialerror/__init__.py`` under
+    :data:`_HARNESS_PACKAGE_PARENT`). ``None`` for an installed package with
+    no such sibling (nothing to ever match against)."""
+    parent = _HARNESS_PACKAGE_PARENT
+    if (parent / "trialerror" / "__init__.py").is_file():
+        return parent
+    return None
+
+
+def find_program_root(start: str | Path | None = None, *, refuse_harness: bool = True) -> Path | None:
     """Walk up from ``start`` (default: CWD) looking for a ``trialerror.toml``.
     Returns the containing directory, or ``None`` if none is found before
-    the filesystem root."""
+    the filesystem root.
+
+    ``TRIALERROR_PROGRAM_ROOT`` overrides the walk-up entirely and is
+    returned as-is: it was *given*, not discovered, so it is never subject
+    to the refusal below (lane brief rule 6).
+
+    L8 part F (F1): when ``refuse_harness`` (the default) and the walked-up
+    result is the repository that holds the running ``trialerror`` package,
+    raises :class:`ProgramRootIsHarnessError` instead of returning it --
+    unless ``TRIALERROR_ALLOW_HARNESS_PROGRAM_ROOT=1`` says this is on
+    purpose. A caller for which a program root is optional (for example
+    ``trialerror probes status``, which degrades gracefully with ``None``)
+    passes ``refuse_harness=False`` to opt out: the fallback landing there is
+    not itself a problem when nothing is written through it on that
+    assumption alone."""
+    env_override = os.environ.get(_PROGRAM_ROOT_ENV)
+    if env_override:
+        return Path(env_override)
     cur = Path(start if start is not None else Path.cwd()).resolve()
+    found = None
     for candidate in (cur, *cur.parents):
         if (candidate / CONFIG_FILENAME).is_file():
-            return candidate
-    return None
+            found = candidate
+            break
+    if found is None:
+        return None
+    if refuse_harness and os.environ.get(_ALLOW_HARNESS_PROGRAM_ROOT_ENV) != "1":
+        harness_root = _harness_repo_root()
+        if harness_root is not None and found == harness_root.resolve():
+            raise ProgramRootIsHarnessError(found)
+    return found
+
+
+def resolve_program_id(program_root: Path | str) -> str:
+    """``program_root``'s own declared ``[program].id`` (``trialerror.toml``
+    directly under it), or ``str(program_root)`` as a fallback when there is
+    no ``trialerror.toml`` there or it cannot be parsed.
+
+    L3 fix round, B-2: a probe result recorded in the machine-wide
+    ``platform.db`` needs to say WHICH program it is about (``probe_run.
+    program_id``) so the answer stamp can scope "is search degraded" to one
+    program instead of averaging every program a host happens to run --
+    this is the one place that resolution happens, so every caller
+    (``trialerror.hooks.session_start``, ``trialerror.retrieve.handlers``,
+    ``trialerror.cli.probes``) agrees on the same id for the same root."""
+    program_root = Path(program_root)
+    cfg_path = program_root / CONFIG_FILENAME
+    if cfg_path.is_file():
+        try:
+            return load_config(cfg_path).program_id
+        except ConfigError:
+            pass
+    return str(program_root)
 
 
 #: the import-design notes (internal, not in this export) Sec 2/5 (C-0067(c)(i)): the ``[paths]`` table in a

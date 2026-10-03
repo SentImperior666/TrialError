@@ -59,7 +59,7 @@ from trialerror.vastai.pricing import (
 A4_PT = (595.0, 842.0)
 
 
-def _pub_line(seed: bytes, comment: str = "te-vastai test") -> str:
+def _pub_line(seed: bytes, comment: str = "vastai test") -> str:
     """A well-formed openssh public-key line over a synthetic blob. No real
     key material is read or written anywhere in this file."""
     key = hashlib.sha256(seed).digest()

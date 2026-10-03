@@ -97,6 +97,22 @@ def _open(args: argparse.Namespace, cmd: str) -> tuple[Store | None, dict | None
     return open_store(program_root, platform_root=args.platform_root), None
 
 
+def _attach_stamp(store: Store, result: dict) -> None:
+    """design Section 3.5: same attach point as the MCP ``search`` tool
+    (:mod:`trialerror.mcp.knowledge`). Best-effort -- a stamp failure must
+    never break a search that otherwise succeeded."""
+    try:
+        from trialerror.probes.stamps import answer_stamp
+
+        stamp = answer_stamp(store)
+    except Exception:  # noqa: BLE001
+        return
+    result["stamp"] = stamp
+    if stamp.get("degraded") and not result.get("results"):
+        reason = stamp.get("degraded_reason") or "search is degraded"
+        result["absence_note"] = f"search is degraded ({reason}); an empty result is not evidence of absence"
+
+
 def _run_no_action(_args: argparse.Namespace) -> dict:
     return error_envelope(
         "query", "no_action", "specify an action: search|quote|similar|stats",
@@ -228,6 +244,7 @@ def _run_search(args: argparse.Namespace) -> dict:
             store, query=args.query, k=args.k, mode=args.mode, filters=filters or None,
             unfenced=args.unfenced, launch_id=args.launch_id,
         )
+        _attach_stamp(store, result)
         actions = list(_rerun_without_zero_terms(args, result))
         if (result.get("stats") or {}).get("vector_skipped_reason"):
             actions.append(

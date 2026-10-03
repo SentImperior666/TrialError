@@ -100,6 +100,86 @@ def populate_one_of_everything(store: Store) -> dict[str, str]:
         },
     )
 
+    # L3 (platform v3): unit/unit_msg/probe_run. unit_key is a computed TEXT
+    # PK (design Section 2.1), not a new_id()-minted typed id.
+    ids["unit"] = f"testhost/{ids['session']}/-"
+    insert(
+        store,
+        "unit",
+        {
+            "unit_key": ids["unit"],
+            "host": "testhost",
+            "kind": "main",
+            "session_id": ids["session"],
+            "project_slug": "proj",
+            "usage_source": "transcript",
+            "extractor_version": "units-1",
+            "scanned_ts": now(),
+        },
+    )
+
+    ids["unit_msg"] = "msg-test-1"
+    insert(store, "unit_msg", {"msg_id": ids["unit_msg"], "unit_key": ids["unit"], "ts": now()})
+
+    # probe_run.id is INTEGER PRIMARY KEY AUTOINCREMENT -- there is no typed
+    # id to mint or return; "1" is a placeholder key for the `ids` dict
+    # (nothing looks it up as a real row id), not a claim about the actual
+    # autoincremented value.
+    ids["probe_run"] = "1"
+    insert(
+        store,
+        "probe_run",
+        {
+            "name": "test_probe",
+            "kind": "conformance",
+            "host": "testhost",
+            "started_ts": now(),
+            "status": "pass",
+        },
+    )
+
+    # L4 (platform v4): quota_capture/quota_rate/quota_notice. All three have
+    # an INTEGER PRIMARY KEY AUTOINCREMENT id -- same "no typed id to mint"
+    # shape as probe_run above, so each gets the same "1" placeholder key.
+    ids["quota_capture"] = "1"
+    insert(
+        store,
+        "quota_capture",
+        {
+            "host": "testhost",
+            "epoch": 1_790_000_000.0,
+            "captured_ts": now(),
+        },
+    )
+
+    ids["quota_rate"] = "1"
+    insert(
+        store,
+        "quota_rate",
+        {
+            "account_label": "",
+            "window": "five_hour",
+            "points_per_usd": 0.4,
+            "n_windows": 1,
+            "excluded_windows": 0,
+            "fit_from_ts": now(),
+            "fit_to_ts": now(),
+            "fitted_ts": now(),
+            "method": "ratio",
+        },
+    )
+
+    ids["quota_notice"] = "1"
+    insert(
+        store,
+        "quota_notice",
+        {
+            "account_label": "",
+            "kind": "rate_stale",
+            "created_ts": now(),
+        },
+    )
+
     # ---- ops.db ------------------------------------------------------------
     ids["ruling"] = "C-0001"
     insert(

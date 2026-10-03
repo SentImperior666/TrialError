@@ -43,6 +43,22 @@ def test_enqueue_creates_pending_job(store):
     assert [e["type"] for e in events] == ["enqueued"]
 
 
+def test_enqueue_with_defer_s_is_not_immediately_claimable(store):
+    """Second fix round: the ledger has no priority column, so a low-urgency
+    background job (the vector-canary probe) keeps ``claim_next``'s
+    ``created_ts ASC`` ordering from favouring it over real work created a
+    little later by stamping ``next_attempt_ts`` at creation instead."""
+    deferred = _enqueue(store, defer_s=60.0)
+    assert deferred["state"] == "pending"
+    assert deferred["next_attempt_ts"] is not None
+
+    real = _enqueue(store)  # created after `deferred`, but not deferred
+    claimed = ledger.claim_next(store, worker_id="111:ts1")
+    assert claimed["job_id"] == real["job_id"], "the deferred row must not jump ahead of real work"
+
+    assert ledger.claim_next(store, worker_id="111:ts1") is None, "the deferred row is still not due"
+
+
 def test_claim_next_claims_oldest_pending_and_transitions_state(store):
     job = _enqueue(store)
     claimed = ledger.claim_next(store, worker_id="111:ts1")

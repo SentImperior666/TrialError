@@ -57,7 +57,7 @@ that parser recognizes.
 |---|---|---|
 | `program` | `init` | Scaffolds a fresh program: `trialerror program init <name> [--dir <path>]` (default `--dir`: `./<name>` under CWD). Writes a commented starter `trialerror.toml`, the design's per-program layout (`raw/`, `archive/`, `memory/`, `law/`, `handoffs/`, `artifacts/`, `requests/`), and runs the initial migration. Refuses (`already_scaffolded`) rather than overwrite an existing `trialerror.toml`. `list`/`info` (named in the design doc) are NOT implemented — v0 has no cross-program registry to back them; see `trialerror/cli/program.py`'s own docstring. |
 | `session` | `boot`, `close`, `render-handoff`, `status`, `abandon` | `boot` reuses an already-open session idempotently unless `--fresh`; first-ever boot needs `--create-account <label>`. `close` requires `--course-check '<json>'` and **refuses** on dangling launches, an unread inbox, or a stale law-digest pin. `abandon` is a real fifth verb not named in the design doc's table — for marking a crashed/never-closed session `abandoned`. |
-| `budget` | `book`, `heartbeat`, `reconcile`, `status`, `check`, `pools`, `snapshot-ingest`, `calibrate`, `rollup`, `quota` | **`book --session-id` and `--program-id` are optional**: with neither flag it books under the program's single OPEN session (bound at `session boot`) and under `[program] id` from `trialerror.toml`, reporting which of the two it resolved in `result.resolved_from` (`flag` | `open_session` | `config`) — a booking that silently chose its own session is otherwise indistinguishable in the envelope from one that was told which. With no open session it refuses naming both ways out; with **more than one** it refuses by name (`multiple_open_sessions`) rather than picking, because that is exactly the state that produces bookings nothing can reconcile; a program with no readable `[program] id` refuses (`program_id_unresolved`). Explicit flags always win. The MCP `book_launch` tool takes the same defaults and no longer requires `program_id`. `book --assign-id A` (repeatable) links a lens booking to the `lens_assignment` rows it covers, additively — the first binding of a row is never overwritten, and `--phase LABEL` names which binding this is (refused without `--assign-id`). `book --lens-name NAME` declares who the launch IS (`launch.attrs.lens_name`), which is the identity a room counts turns by; with `--assign-id` the assignment rows stay authoritative and a disagreeing name refuses the booking outright. See *Ideation rounds* below. `book` returns a `launch_id` token (also in `meta.prompt_fragment`) and refuses without an open session or against model policy — but **not** for a missing pool: with no `budget_pool` row configured for the account/model-class yet, `book` books unconditionally as `PROVISIONAL` (pools only start capping once one exists via `pools --create`). `pools --create` makes a new pool; without `--create` it lists. `reconcile --spawned-model <model>` records what the launch ACTUALLY ran on in `launch.attrs.spawned_model` — the post-hoc half of the spawn gate's `agent_model_matches_booking` guard, and what the doctor check of that name reads; without it a launch simply makes no claim about its model. `rollup` sums est/actual tokens over a `parent_launch` tree. **`heartbeat --launch-id L`** is what a still-running launch says instead of reconciling early: it refreshes that booking's `booked_ts` and NOTHING else (not `est_tokens`, not `booking_ttl_s`, not the state), so a launch that outlived the TTL guessed for it stops reading as past-TTL. Refused unless the program's OPEN session is the one that booked it (`no_open_session` / `launch_not_owned`), refused with `multiple_open_sessions` when two sessions are open (a heartbeat needs one session to speak for the booking, and this is the state that produces orphan-looking bookings in the first place), refused for a settled booking, and every refresh writes a `launch_heartbeat` event — a TTL that keeps moving must be visible in the ledger. **`status --account-id` is optional**: with no flag it reads the account the program's OPEN session is bound to (`session.account_id`, the same row every booking reads), reporting which it used in `account_resolved_from`. With no open session it refuses naming both ways out (the flag, or `session boot`); with more than one open session it surfaces that refusal rather than picking one. Each pool also carries **`visible_headroom_to_soft`** (`max(soft_cap − projected, 0) / billed_multiplier` — the headroom in the unit a booking's `--est-tokens` is written in, not the plan meter's) and **`binding_limit`** (`soft` until the soft line is crossed, then `hard`); the envelope's top-level `binding_limit` names the tightest pool of the account, or is `null` for an account with no pool at all (uncapped and unmeasured, which is not the same as unlimited). **`check`** prints `status` and `quota` in one envelope with that binding limit named in a sentence; it composes the two and adds no arithmetic of its own, and with nothing captured the quota half degrades to `available: false` plus its own note rather than failing. |
+| `budget` | `book`, `heartbeat`, `cancel`, `release`, `reconcile`, `status`, `check`, `pools`, `snapshot-ingest`, `calibrate`, `rollup`, `quota` | **`book --session-id` and `--program-id` are optional**: with neither flag it books under the program's single OPEN session (bound at `session boot`) and under `[program] id` from `trialerror.toml`, reporting which of the two it resolved in `result.resolved_from` (`flag` | `open_session` | `config`) — a booking that silently chose its own session is otherwise indistinguishable in the envelope from one that was told which. With no open session it refuses naming both ways out; with **more than one** it refuses by name (`multiple_open_sessions`) rather than picking, because that is exactly the state that produces bookings nothing can reconcile; a program with no readable `[program] id` refuses (`program_id_unresolved`). Explicit flags always win. The MCP `book_launch` tool takes the same defaults and no longer requires `program_id`. `book --assign-id A` (repeatable) links a lens booking to the `lens_assignment` rows it covers, additively — the first binding of a row is never overwritten, and `--phase LABEL` names which binding this is (refused without `--assign-id`). `book --lens-name NAME` declares who the launch IS (`launch.attrs.lens_name`), which is the identity a room counts turns by; with `--assign-id` the assignment rows stay authoritative and a disagreeing name refuses the booking outright. See *Ideation rounds* below. `book` returns a `launch_id` token (also in `meta.prompt_fragment`) and refuses without an open session or against model policy — but **not** for a missing pool: with no `budget_pool` row configured for the account/model-class yet, `book` books unconditionally as `PROVISIONAL` (pools only start capping once one exists via `pools --create`). `pools --create` makes a new pool; without `--create` it lists. `reconcile --spawned-model <model>` records what the launch ACTUALLY ran on in `launch.attrs.spawned_model` — the post-hoc half of the spawn gate's `agent_model_matches_booking` guard, and what the doctor check of that name reads; without it a launch simply makes no claim about its model. `rollup` sums est/actual tokens over a `parent_launch` tree. **`heartbeat --launch-id L`** is what a still-running launch says instead of reconciling early: it refreshes that booking's `booked_ts` and NOTHING else (not `est_tokens`, not `booking_ttl_s`, not the state), so a launch that outlived the TTL guessed for it stops reading as past-TTL. Refused unless the program's OPEN session is the one that booked it (`no_open_session` / `launch_not_owned`), refused with `multiple_open_sessions` when two sessions are open (a heartbeat needs one session to speak for the booking, and this is the state that produces orphan-looking bookings in the first place), refused for a settled booking, and every refresh writes a `launch_heartbeat` event — a TTL that keeps moving must be visible in the ledger. **`status --account-id` is optional**: with no flag it reads the account the program's OPEN session is bound to (`session.account_id`, the same row every booking reads), reporting which it used in `account_resolved_from`. With no open session it refuses naming both ways out (the flag, or `session boot`); with more than one open session it surfaces that refusal rather than picking one. Each pool also carries **`visible_headroom_to_soft`** (`max(soft_cap − projected, 0) / billed_multiplier` — the headroom in the unit a booking's `--est-tokens` is written in, not the plan meter's) and **`binding_limit`** (`soft` until the soft line is crossed, then `hard`); the envelope's top-level `binding_limit` names the tightest pool of the account, or is `null` for an account with no pool at all (uncapped and unmeasured, which is not the same as unlimited). **`check`** prints `status` and `quota` in one envelope with that binding limit named in a sentence; it composes the two and adds no arithmetic of its own, and with nothing captured the quota half degrades to `available: false` plus its own note rather than failing. **`cancel --launch-id L --reason TEXT`** gives up a booking nobody will spawn (`PROVISIONAL → ABANDONED`); **`release --launch-id L --reason TEXT`** gives back a booking whose spawn was refused with no failure notice (`RUNNING → PROVISIONAL`) and refuses when an agent started; `status` reports `stranded_count` / `stranded_ids` (see *A spawn that never started* below). |
 | `law` | `append`, `lookup`, `digest`, `verify`, `diff-foreign` | `append` and the digest regeneration are one atomic write — there is no way to add a ruling without the digest moving in lockstep. `verify --pin vNN@date` is the exact check the spawn gate runs. `diff-foreign` lists rulings appended (by any session/account) since a given pin. |
 | `events` | `append`, `tail`, `export` | Free-form `--type` key + JSON `--payload`; a secret-redaction pass runs before every write. `export` renders byte-stable jsonl, optionally `--split-by-workpackage`. |
 | `feed` | `post`, `threads`, `read` | Full-text agent voices. Authorship is **never** a free-text flag — it's derived from `--launch-id` (or, if omitted, the open session as `orchestrator:<session_id>`). `post --new-thread <title>` opens a thread (requires `--launch-id`); `post --thread-id <id>` posts into an existing one. The plain-English translator was retired in Phase 0 (never used). |
@@ -69,8 +69,8 @@ that parser recognizes.
 | `query` | `search`, `quote`, `similar`, `stats` | The same retrieval engine the `trialerror-knowledge` MCP server serves live agents. `search --unfenced` is the one CLI-only, human-flagged escape hatch past the commercial-license serving fence — the MCP `search` tool never exposes it. **A search that returns nothing explains itself**: when the result set is empty, the query is not blank and the full-text tier actually ran, `stats` gains a per-term candidate count (at most 8 terms, through the same backend that served the search) and the list of terms no chunk matches. Both counts are scoped to the filters the search itself ran under (`--source-id`, `--kind`, `--license-tier`, `--year`, and a launch's declared slice), so a zero means "nothing under these filters", not "nothing in the corpus". Every lexical backend ANDs a multi-term query, so one unknown term — a typo, a term of art this corpus does not use — returns nothing for a query whose other terms have hundreds of hits. The envelope's `nextActions` then carries the same search with exactly those terms dropped (the largest subset that can match), and nothing is emitted when every term is dead or when no single term is at fault. The MCP `search` tool inherits both keys; its input schema is unchanged. |
 | `verify` | `citecheck`, `hypothesis`, `reproduce` | `citecheck <file\|claim-set.json\|artifact_id> --by-launch X` — mechanical pass first (6-word-shingle/number match + anchor resolve), unresolved pairs escalate (supply `--judgments-file` or they come back `escalation_selected`/`escalation_not_sampled`). `hypothesis` REQUIRES `--judgments-file` covering every retrieved chunk (this process never calls an LLM itself — judgments are supplied by the caller). `reproduce <verdict_id>` re-runs a verdict's `reproduction_ref` script and byte-compares its sha. |
 | `prereg` | `commit`, `check`, `reveal`, `status` | `commit` hash-locks a procedure+params blind, escrowed under the **platform** tree (`~/.trialerror/escrow/<program>/`, outside the program repo — a physical, not conventional, blind). `reveal` tamper-checks against the committed hash before copying content into the program tree. `commit --plan-suite` checks the plan against the round's gate requirements before anything is written, and `check` is the same check as a dry run — see *Checking a round's plan before it is pre-registered* below. |
-| `artifact` | `create`, `register`, `list`, `show` | `create` makes a `draft` row. `register` is refused for a `gated=1` template type unless its gate is in `union_applied` — or unless the operator decided otherwise and it is run with `--with-deviation` or `--as-failed` (a critic's `FAIL`, or a gate failed by `gate fail-reproduction`; see *Registering a result whose gate did not pass cleanly* below). `show` and `list` carry each artifact's `disposition`. |
-| `gate` | `open`, `submit`, `verdict`, `apply-union`, `verify-edit`, `advance`, `fail-reproduction` | The state machine: `draft → submitted → gated|failed → union_applied → registered`. `advance` is the generic low-level entry point (refuses any illegal edge); the others are named shortcuts for specific legal transitions. `fail-reproduction` is the operator's decision that a `gated` gate whose reproduction read `mismatch` is a failed result (see *A gate the critic passed but whose reproduction failed* below). `apply-union` is the terminal-pass gate: it enforces verdict ∈ {PASS, PASS_WITH_EDITS}, every **blocking** edit `verified=true`, and `reproduction_status != mismatch`. |
+| `artifact` | `create`, `register`, `list`, `show` | `create` makes a `draft` row. `register` is refused for a `gated=1` template type unless its gate is in `union_applied` — or unless the operator decided otherwise and it is run with `--with-deviation` or `--as-failed` (a critic's `FAIL`, or a gate failed by `gate fail-reproduction`; see *Registering a result whose gate did not pass cleanly* below). `show` and `list` carry each artifact's `disposition`; `show` also prints the registered hash, `registered_bytes` and `registered_path` of a registration. `gate show` prints a gate row, including the corrected file's hash the gate recorded (`post_edit_sha256`, `post_edit_ts`). |
+| `gate` | `open`, `submit`, `verdict`, `apply-union`, `verify-edit`, `advance`, `fail-reproduction`, `show` | The state machine: `draft → submitted → gated|failed → union_applied → registered`. `advance` is the generic low-level entry point (refuses any illegal edge); the others are named shortcuts for specific legal transitions. `fail-reproduction` is the operator's decision that a `gated` gate whose reproduction read `mismatch` is a failed result (see *A gate the critic passed but whose reproduction failed* below). `apply-union` is the terminal-pass gate: it enforces verdict ∈ {PASS, PASS_WITH_EDITS}, every **blocking** edit `verified=true`, and `reproduction_status != mismatch`. |
 | `memory` | `search`, `put`, `sync-export`, `sync-import`, `merge`, `candidates`, `judge`, `stale`, `reviewed` | `search --id <item_id>` fetches one item's full body (the progressive-disclosure "step 2"); `search --boot-bundle` returns the same L0-index-plus-targeted-abstracts payload session boot injects. `put` upserts by `(key, account)`. `sync-export`/`sync-import` round-trip `memory/*.md` for git sync; a merge conflict from `sync-import` is never auto-resolved — list it with bare `memory merge`, resolve with `--group <id> --keep left\|right\|both`. `candidates`/`judge` are the 2026-09 mining adoption (engram-F4): every `put` runs a BM25 pass over existing items and files anything similar as an **unjudged, advisory** candidate — the save is never blocked, delayed, or altered, and no machine writes a verdict (`judge --actor-kind system` is refused; an agent rules under its own name). `stale`/`reviewed` are engram-F5: `stale` computes, per item kind, whether a review half-life has elapsed (rule 365d, fact/lesson 180d, preference/index 90d) and `reviewed <id>` records that you looked and left it standing. Decay **only surfaces** — nothing expires, unpins, or downgrades on a timer. |
 | `lens` | `roster`, `stratify`, `assign`, `log`, `slice-distances`, `intake`, `export`, `screen`, `recheck` | AMENDMENT-3 ideation machinery, generalized (the round's own mechanics — what a plant tests, what a judge sees, what a record must carry — have their own section, *Ideation rounds*, below). `stratify` is a dry-run score+tercile-cut (no write); `assign` does the real seeded quota draw and writes `lens_assignment` rows (default weights 40/40/20 near/moderate/far, far-arm floor 2). **`assign --arm-per-lens`** switches the semantics: the weights then split the ROSTER across the arms rather than each lens's own slice, so every lens gets ONE arm and draws its whole slice from it (roster 6 → 3 near / 1 moderate / 2 far; roster 12 → 5/5/2), the `assumption_buster` seat is pre-placed far and the `control` seat lands in the modal arm, and `--far-floor` counts far LENSES instead of far slices. **`assign --slice-salt {roster-id,lens-name}`** says what the seeded draw is a function of: `roster-id` (the default, and what every round before the flag ran under) salts each lens's stream with its minted `roster_id` and processes the roster in insertion order, so re-adding a row moves the draw; `lens-name` salts with `<round-id>::<lens-name>` and processes the roster in ascending lens name, so the draw depends on the design and not on minted ids (names must then be unique in the round, and a repeat is refused before anything is written). The scheme is recorded in every row's `slice_spec.salt_scheme`, reported by `log`/`export`/`slice-distances`, and absent means `roster-id` — see *What the slice draw depends on* below. **`assign --plan-file PATH --launch-id L`** writes the rows a planner's plan file lists instead of drawing them: every check first, one transaction, a read-back that rolls everything back on any difference, and none of the draw flags accepted — see *Writing slices a planner chose* below. `roster --add --seat control` is the matched-budget measurement seat (no card, no `requirements` field); `--recipe-card CARD` is repeatable and **order-preserving** — it is the lens's seeded card block — and a control seat carrying a card is refused. `log` returns the round's assignment rows AND its per-lens reconciliation — `rows` (one per assigned lens, with `posted`, `n_ideas`, `n_feed_posts` and the lens's own launch), `n_lenses` and `offenders`, each offender saying why — which is the shape the `aiif_round` gate suite's `lens_log_reconciled` check consumes. `intake --round-id R --records FILE --author-launch L [--assign-id A ...] [--arm ARM]` writes a lens's returned records as `idea` rows, validating the whole file before writing any of it. `export` hands back rows shaped for `budget book`, with `arm_mode`, `arm`, `recipe_cards` and `assign_ids` in `attrs`. **`screen`** is the novelty screen, in three separate invocations because they run in three different launches. `screen --mechanical` (no model, incremental) merges near-duplicates at cosine >= 0.92 *with the same home cell*, flags records sitting on an inventory row at the same threshold, records `d_prov`/`d_home`/`leap`/`H_prior` and within-round terciles, retrieves prior art stratified 40/40/20 (far floor 2), queries the external index under `--external-query-mode none|neutral_abstract|statement` paired with `--external-provider none|arxiv-index|litapi` — the mode says what text may leave the machine, the provider says where it goes, and naming one without the other is refused rather than half-done (every query logged as a `novelty_external_query` event with its launch and its mode, logged even when the provider raises) — and reports declared-operation entropy, the pairwise-similarity distribution and template mass against `--alarms` (descriptive when none are pre-registered). It writes one dossier per record and an adjudication draft under `artifacts/rounds/<round>/`; re-running screens only what arrived since. `screen --judged-prep --seed S` reads those dossiers back and builds the judge's batch: scope = flagged + retrieval hits + a seeded 20% sample of the rest, envelopes carrying raw record fields and retrieved text only (no rationale, seat, card or assumed circle, and self-assessment sentences stripped), five inventory plants and five paraphrase plants shuffled in among them, and a 10% second-judge sample. `screen --record-verdicts FILE --launch-id L` takes the discrete labels back (`same/variant/recombination/new-mechanism/unscreenable` against the inventory, `stated/implied/adjacent/absent` against corpus and external hits), scores the plants FIRST, writes `verdict` rows with `procedure=custom`, `procedure_version=novelty-v2` and the round's `--prereg-id`, and consolidates **every survivor** — the judged ones under their labels, the rest under the mechanical `no-close-neighbour`/`unjudged` pair written as its own row, because Phase 5 rooms every consolidated idea and nothing is pruned on a proxy. An idea that WAS scoped and came back unlabelled is the one case that is not consolidated: those ids are reported in `unlabelled_scope`, and a share above 10% caveats the batch. `prereg_compliant` is stamped only when `--executed-procedure` / `--executed-procedure-file` (with `--executed-params`) names what the round actually ran — otherwise the column stays NULL and the envelope says why, and a mismatch says WHICH of the two hashes disagreed. A second recording for the same subjects is refused unless `--supersede` is passed, and the superseding rows name the rows they replace. **A missed inventory plant fails the batch**: status `reopened_with_caveat`, the labels still written and marked, nothing consolidated. Distances are recorded and never thresholded into "novel" — an unjudged record reads `no-close-neighbour, unjudged`, which is not `new-mechanism`. **`screen --baseline`** is a read-only pass over a round's records giving each one's corpus nearest-neighbour cosine and the distribution over any `--status`/`--where` subset, with the percentile convention named in the output; **`slice-distances`** evaluates a pre-registered "farthest from the nearest home medoid" rule and hashes the picks — both are in *Ideation rounds* below. **`recheck --round-id R`** enqueues the scheduled convergent-discovery pass as a `custom` ledger job (`handler: convergent_recheck`) rather than running it inline: it is a whole-round pass, it reaches an external index when a mode names one, and it is meant to be resumable, which is what the job ledger is for and what a CLI process that exits is not. The pass re-retrieves every non-`raw` record of the round against the corpus AS IT STANDS NOW (and, under `--external-query-mode` paired with `--external-provider`, the external index), compares what it finds with what that record's own dossier already recorded, and writes anything new onto `idea.convergent_with` with an `idea_convergent_linked` event beside it. **It never re-scores**: not a label, not a status, not a verdict row — a convergence found after a round closed is logged, never applied, and the only write the handler can reach is that one column. `merged` and `eliminated` rows are re-checked too (they stay in the reference sets forever, and an eliminated idea whose twin surfaces later is exactly the finding this pass exists to log); `--status` narrows that, `--idea-id` names records outright — and the status filter applies to a named list too, because naming a record does not screen it. **A record with no novelty dossier on file is refused**, with the reason carried in the job checkpoint and the rest of the round still re-checked: "new" is measured against what the screen recorded, so with nothing recorded every neighbour comes back as a convergent discovery, which is the screen run late under another name. `--allow-unscreened` takes that reading deliberately and lifts the status filter with it. The job checkpoints per record, so a paused run does not re-issue an external query it has already made. Run it with `jobs start-worker --job-id <JOB-id>`, or leave it for an open-queue worker. |
 | `room` | `create`, `status`, `post`, `score`, `stance`, `extracts`, `freeze`, `close`, `converge-check`, `export`, `admission-order` | The brainstorm-rooms runtime. `create` opens a room over 2-3 participants and its discussion points; `post` appends one turn; `score` records the moderator's judgment; `freeze` escalates an `open` room to the operator, and `close` records the operator's decision to close a `frozen` one (see *Closing a frozen room* below); `converge-check` reports (or, with `--apply`, applies) the `open → converged` transition at the fixed **>90% agreement bar**, refusing unless EVERY idea point is at or above it. The framework procedure is add-only on top of that and off unless asked for. `create --blind-first-turn` makes round 1 simultaneous: no participant envelope carries a prior turn until round 1 is complete. `post --kind position|question|closure` records the turn's kind, and a `closure` in the author's OWN first round on a point is refused — weak entailment first. `create --rank-all` appends one procedural `RANK-ALL` point; each participant files a complete ranking and a discrete per-point stance through `stance --file` (refused whole if it does not cover every point on both criteria), and `converge-check --apply` refuses until every seat has filed. Once stances exist, **`score` takes `--label` and refuses `--agreement-pct`**: the number is computed from the structured stances (per criterion, the modal share; the WEAKER criterion binds, because the rule is both-or-eliminated) and the judge's job is the discrete label, which is stated first in the result and in the event. `extracts --file` records the neutral extract pass for a point — one extract per turn, all five fields, refused if partial — after which the moderator's envelope carries the extracts and withholds the raw prose; `score --require-extracts` turns a missing pass into a refusal. `create --buster <participant>` names the assumption-buster seat so its recorded position is re-injected VERBATIM into its own envelopes. `author_launch` is dropped from every moderator envelope. NEITHER ownership is checked by LENS NAME at `create` and again at `score` — a re-spawned lens posts under a new launch id every turn, so the launch comparison alone never fires twice for the same lens. **Spawning one agent per turn**: book each turn's launch with `budget book --lens-name <seat>`, naming the seat it writes as. A room counts turns, rounds, blind-first-turn envelopes and final stances by that name, so a seat that is a different launch every turn is still ONE author across them — its round-2 `closure` is admitted, and `room_turn.author_launch` records the launch that actually wrote it rather than the seat's first one. A launch that declares no name keeps answering by launch id exactly as before. When a room declares its participants, a declared name that is not one of them is refused by name (the refusal lists the room's seats): the name is the identity the room counts by, so an unseated one would post as an author the room does not have. **`admission-order --round-id R --seed S`** is the order every consolidated idea of a round is roomed in: a seeded draw stratified on (arm, card), packed into rooms of 6 in batches of 4-8 (the charter band, overridable with `--no-enforce-batch-band`), the trailing partial room carried as the remainder in that same order. Each cell's members are sorted before the seeded shuffle, so the same pool handed over in a different order draws the same order and the same hash. A pool smaller than ONE room seats nobody: every record is carried in the remainder and the result says so in a `note` naming `--ideas-per-room` (a two-idea dry run is a declared room size of 2, not a failed draw). Nothing from a dossier is a parameter of it, and its `hash` is what a round escrows so the order it ran can be compared with the order it committed to. That escrow is a SECOND `prereg commit`, taken after the judged screen and before the first room opens: the pool is the round's consolidated records, so the order does not exist at frame time, and a hash in the frame-time params is either invented or back-filled. The `aiif_round` gate suite reads either place and names which one it read. |
@@ -239,7 +239,36 @@ characters. Beyond that, **file contents and environment dumps never enter the
 digest at all** — only paths, command text, hosts and counts — and the input
 keys that carry file bodies are not even scanned. Each list is capped
 (`volume.caps`) with the drop counted (`volume.truncated`); `volume`'s totals
-are computed before capping, so a spike stays visible in a capped digest.
+are computed before capping, so a spike stays visible in a capped digest. A
+cap keeps AT LEAST ONE ROW FROM EVERY UTC DAY THAT HAS AN ENTRY (largest-remainder
+by count, a day's guaranteed row reserved before the remainder is shared out — a
+plain proportional split floors a quiet day's share to zero next to a busy one,
+which is the gap between "every UTC day" and what capping chronologically, or
+capping by an unguarded share, actually kept), not only the earliest rows, and
+within a day the kept share is split between that day's EARLIEST AND LATEST
+rows rather than one contiguous block, so a single busy day's own middle hours
+are the ones a cap does not cover; only a cap smaller than the day count
+itself makes full coverage impossible, and
+`volume.sample.<section>` states in words which rows survived either way.
+`volume.aggregates.<section>` is the
+complement: complete counts by UTC day and by session over EVERY entry,
+computed before the cap, plus the one dimension each section's own judgement
+needs: `by_tag` for `shell_commands` (its cap also keeps an anomaly tag —
+`destructive`/`permission`/`secret_path`/`encode`/`exfil_suspect` — ahead of
+an ordinary one, ahead of untagged); `by_path_prefix` (first two path
+components) plus `outside_allowed_roots`/`by_path_prefix_outside` for
+`file_writes` (its cap keeps an outside-root write first); `not_allowed`/
+`by_host` for `network` (its cap keeps a not-allowed host first, and the
+aggregate names it even past the cap); `by_matched` for `sensitive_reads`;
+`by_match` for `permission_flags` — so volume and targets are judgeable in
+full even when the list itself is a sample. `spawns.unmatched_bookings[]`
+lists, by launch id, every booking in the window no spawn entry names — matched
+against the complete set of spawns, before their own cap — with `booked_ts`,
+`agent_kind`, `model`, `state` and the first 120 characters of `purpose`. The
+list itself is generously capped too (`volume.caps.unmatched_bookings`, drop
+counted in `volume.truncated.unmatched_bookings`); `spawns.bookings_unmatched`
+is always the complete count. Any `by_session` breakdown inside an aggregate
+carries the same generous cap, with `by_session_truncated` when it bites.
 
 Two things to expect when reading a digest. **Masking is the last step, never
 the first** — a command is classified and its hosts extracted from the raw text,
@@ -345,6 +374,44 @@ Claude Code round trip.
 Skills: `gate-critic` and `sandbox-audit`. The other skills were retired in Phase 0 (never used). They are
 restorable from git.
 
+Agents: `plugin/agents/{critic,verifier,lens,prompt-only}.md`. `prompt-only` is the generic
+one, for a launch whose whole input must be its rendered prompt. Spawn it as
+**`trialerror:prompt-only`** — the bare name is refused ("Agent type 'prompt-only' not
+found") once the plugin is loaded via `--plugin-dir`, because that loads every agent under
+the plugin's own namespace. It is tool-locked to **`TaskStop`** (the one native tool
+confirmed live to read nothing at all — its whole schema is an optional `task_id`, and it
+cannot stop anything it does not own), plus `disallowedTools: mcp__*` blocking every MCP
+server regardless of which ones a session has configured. Model is pinned `opus`; book it
+`--model-class top`.
+
+It still receives, beside its prompt, whatever Claude Code itself injects and no frontmatter
+line removes: the git status of the spawning session's working directory (current branch,
+git user, and the five latest commit subjects), the operator's account email, an environment
+snapshot (working directory, platform, shell), and the date. Setting
+`CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1` in the spawning session's own environment removes the
+git status block entirely — **confirmed live**: with it set, a `prompt-only` launch reported
+no branch, no commits, no git user and no untracked files, only a bare `Is a git repository:
+true` line left in the environment snapshot. That variable is **session-wide**, though, not
+launch-scoped: it also removes the *spawning* session's own git status and its built-in
+commit/PR workflow instructions, orchestrator included — confirmed live by a control run with
+the variable unset, which had its git status back. Reach for a dedicated spawning session (one
+whose own job is only to spawn launches like this) rather than setting it in a session that
+also does its own committing.
+
+The environment snapshot's **working-directory path** (and the scratchpad path derived from
+it) reaches every launch regardless of that variable — confirmed live, it survives even with
+the git block removed. The frontmatter's "ignore it" instruction is the only guard on that
+path; no setting strips it. So a launch whose whole input must be its prompt is only that in
+practice when it is also spawned from a working directory whose **path**, as well as its git
+state, carries nothing about the task — never a directory or checkout named after the round,
+the request, or anything else task-specific.
+
+`TaskStop`'s own error text, given an id it does not recognize, lists every other currently
+running background agent by id **and description** ("Running background agents: `<id>`
+(`<description>`)"). Keep every concurrent `Agent` call's `description` content-free — an id,
+nothing else — whenever a `prompt-only` launch runs alongside others, or its own attempt to
+call the tool (which its prompt should never ask it to do) reads that listing back.
+
 ## The enforcement model — what refuses what
 
 TrialError's stated thesis (commitment 1, `docs/DESIGN_v0.md` §1) is "enforcement over
@@ -358,9 +425,11 @@ real code (not policy text):
 | **`trialerror session close`** | The same dangling-launch/stale-digest condition, plus an unread inbox, plus (unless `--override-ruling-id` cites an existing ruling) a session where hooks were never observed to fire at all (`hook_alive` event count = 0) | Returns a structured error naming the exact fix in `nextActions` — reconcile a launch, read the inbox, or `law diff-foreign`. |
 | **`trialerror gate` / `trialerror artifact register`** | Registering a `gated=1` artifact type whose gate isn't in `union_applied`; any gate-state transition that isn't a legal edge in the state machine; entering `union_applied` with an unverified blocking edit or a `reproduction_status=mismatch` | `IllegalTransitionError`/`GateEntryConditionError` → structured error; `gate advance` is the one mutation path and rejects every illegal edge (property-tested). |
 
-**A hook that fails closed still has to run at all.** `plugin/hooks/hooks.json` invokes all
-four hooks through the `trialerror` console script — `trialerror hook session-start`,
-`hook spawn-gate`, `hook post-task`, `hook stop-check` — rather than `python <path>/<name>.py`,
+**A hook that fails closed still has to run at all.** `plugin/hooks/hooks.json` invokes its
+hooks through the `trialerror` console script — `trialerror hook session-start`,
+`hook spawn-gate`, `hook post-task`, `hook stop-check` (and the record-only ones, among them
+`hook spawn-failure`, which gives a never-started spawn's booking back — see *A spawn that never
+started* below) — rather than `python <path>/<name>.py`,
 because a bare `python` does not exist on a stock Linux install (only `python3` does) and a
 hook whose interpreter is missing exits 127 without ever evaluating anything. That turns the
 spawn gate's fail-closed refusal into a silent no-op, which is strictly worse than a refusal;
@@ -684,6 +753,31 @@ same reading as the served-model check.
 reads the GGUF's vocabulary and **no model weights**, so a CLI process that embeds one query
 allocates kilobytes for it, not gigabytes.
 
+**Determinism needs `--slot-save-path`.** The vector of a text depends on what the sidecar's
+slot held before it — leftover KV-cache state that changes the float reduction order, not
+prompt-cache reuse (`"cache_prompt": false` per request, or `--no-cache-prompt --cache-ram 0`
+on the whole server, change nothing). Measured on the reference build the drift is small
+(1 − cos ≈ 1.6e-4) but real: the same text does not embed to the same vector twice unless the
+slot is erased first, and a request can land in any of the server's slots (nothing in
+`/embedding` or in `/props` says in advance which one it will be, on a server started with
+more than one). So this client erases every slot the server reports (`/props`' `total_slots`
+— just slot 0 when that is absent or 1) before every embed, under a cross-process lock —
+`[ingest.embed] slot_erase` /
+`[ingest.embed.query] slot_erase`, default on — so two harness processes sharing one sidecar
+cannot interleave between the erase and the embed. That guarantee holds for harness processes
+belonging to one user, talking to the sidecar by one spelling of its URL (the scheme and host
+are normalised — lower-cased, `localhost` read as `127.0.0.1` — so those two spellings of the
+same loopback address still serialise through the same lock; a DNS alias, a different port
+forward onto the same sidecar, or a second user with a different `HOME`/`XDG_STATE_HOME` are
+still outside it, and any non-harness client that posts to the sidecar bypasses the lock
+entirely). That route (`POST /slots/<id>?action=erase`)
+exists only on a server started with `--slot-save-path <dir>`; without it the sidecar answers
+501, which is read as a warning, not a refusal — once per sidecar URL, then the client embeds
+without erasing, exactly as it did before this existed. **Start the sidecar with
+`--slot-save-path`** (the reference command below does) so a rehearsal can reproduce any
+embedding-derived value byte-for-byte; a hashed, already-committed vector is unaffected either
+way, since nothing re-embeds it.
+
 **The wheel's own log never reaches stdout.** Loading that vocabulary prints
 `llama_context: n_ctx_seq (512) > n_ctx_train (0) -- possible training context overflow` on
 some builds, and it printed it to file descriptor 1, ahead of the JSON envelope the CLI
@@ -793,7 +887,16 @@ command = [
   "--embedding", "--pooling", "last", "--embd-normalize", "-1",
   "-c", "2049", "-b", "2049", "-ub", "2049",   # MAX_SEQ + 1 — see the off-by-one above
   "-t", "8",                                   # threads, not more than the cgroup quota
+  "-np", "1",                                   # one slot -- see the determinism note above
   "--host", "127.0.0.1", "--port", "8871",
+  # Needed for the slot erase above. A directory the sidecar's OWN user owns (never
+  # /var/run -- root-owned, tmpfs, cleared at boot) and that must already EXIST: the
+  # flag does not create it, and it may refuse to start when it is missing (not
+  # checked on the reference binary). Under the program's own run/ is a natural
+  # choice, since that is already where this sidecar's pid/log/lock files live --
+  # but run/ is gitignored and gets deleted freely (see below), so recreate this
+  # directory whenever you do that, before starting the sidecar again.
+  "--slot-save-path", "run/llama-server-slots",
 ]
 env = { LD_LIBRARY_PATH = "/opt/llama.cpp" }   # a vendored runtime usually needs this
 health_url = "http://127.0.0.1:8871/health"
@@ -806,7 +909,10 @@ program's `run/` directory — `run/sidecars/<name>.json` carries the pid, the a
 health URL, `started_at`, `heartbeat_at` and the log path, and `run/sidecars/<name>.log`
 carries the process's own output. Any later process can therefore report on it and stop it.
 Running the verb inside a tmux window is a convenience, not a requirement. `run/` is
-gitignored and is worthless after a reboot: delete it freely while nothing is running.
+gitignored and is worthless after a reboot: delete it freely while nothing is running --
+except `--slot-save-path`'s own directory, if you point it under `run/` as the reference
+command above does: nothing recreates that one, so make it again before the sidecar's next
+start.
 
 **Supervision is a poll, and nothing here pretends otherwise.** `restart = "always"` means
 "`status` restarts this if it finds it dead" — so the thing doing the supervising is whatever
@@ -2358,7 +2464,7 @@ now have an honest way in, and both need an operator decision, cited by id.
   `trialerror artifact register --id ART --by-launch L --with-deviation --deviation
   CHECK=REASON@REPORT_REF --decided-by DECISION-ID`, once per failing check: the deviations must
   cover **exactly** the checks that failed, and each `REPORT_REF` must appear verbatim in the
-  artifact file (which must still match the checksum recorded when it was submitted). Exactly one
+  registered bytes (see *Which bytes a registration binds to* below). Exactly one
   `@` separates the reason from the reference; a `--deviation` with two or more is refused as
   ambiguous, and a reason or reference that needs an `@` goes in `--deviations-file PATH` (a
   UTF-8 JSON list of `{check, reason, report_ref}`, instead of `--deviation`). The artifact is registered with
@@ -2366,8 +2472,9 @@ now have an honest way in, and both need an operator decision, cited by id.
   deviation an artifact can disclose and is refused.
 - **A failed result that belongs on the record.** The critic's verdict was `FAIL`.
   `trialerror artifact register --id ART --by-launch L --as-failed --failure-ref REPORT_REF
-  --decided-by DECISION-ID`. The artifact's own text must contain `REPORT_REF`, its statement of
-  what failed. A review abandoned without a verdict cannot be registered this way. The artifact
+  --decided-by DECISION-ID`. The registered bytes must contain `REPORT_REF`, the artifact's
+  statement of what failed. (A gate failed by the operator's own decision needs no `--failure-ref`:
+  see *A gate the critic passed but whose reproduction failed* below.) A review abandoned without a verdict cannot be registered this way. The artifact
   is registered with `disposition = registered_failed`.
 
 The two modes are exclusive; without either, `register` is unchanged and the normal path leaves
@@ -2394,6 +2501,12 @@ trialerror artifact register --id ART --by-launch L --as-failed \
     --failure-ref "a string from the artifact that states what failed" --decided-by DECISION-ID
 ```
 
+The failure is also stated by the gate's own record: the operator's decision, and the checks that
+failed, frozen as they stood when the gate was failed. So `--failure-ref` is **optional** on this
+path: leave it out and the registration rests on that record (when it is given, it must still
+appear in the registered bytes). It stays required on the critic's `FAIL` path, where no decision
+states the failure.
+
 The first moves the gate `gated → failed` and nothing else. Every flag shown is required. A missing
 flag is a usage error (exit 2, no envelope); a blank value is `fail_refused`, and so is a gate whose
 recorded reproduction is anything but `mismatch` (`match`, `unrun`, or none) or whose state is
@@ -2404,16 +2517,77 @@ the decision, the reason, the reproduction status and the reproduction reference
 transaction. It moves a gate only toward `failed`: a failed gate never reaches `union_applied`,
 and the normal registration and `--with-deviation` both refuse it.
 
-The second is the `--as-failed` registration above, with every check it already had (the
-artifact's own text must contain `--failure-ref`, the file must match its recorded checksum, a
-decision is required). It accepts a gate whose verdict is not `FAIL` only when that gate reached
+The second is the `--as-failed` registration above, with the checks it already had (a
+`--failure-ref` that is given must appear in the registered bytes, the registered bytes must be
+ones the gate holds, a decision is required). It accepts a gate whose verdict is not `FAIL` only when that gate reached
 `failed` through `fail-reproduction` and its reproduction still reads `mismatch`; a gate abandoned
 with a plain `gate advance --to failed` is still refused. The registration's transition records
-`basis: operator_failed_reproduction` and the decision that failed the gate (`failed_by`) beside
-its own. `gate advance` refuses evidence that claims `operator_failed_reproduction` (or either
+`basis: operator_failed_reproduction`, the decision that failed the gate (`failed_by`) and
+`failure_basis` (that decision and the failing checks, read from the failing transition's own
+evidence, never from the live gate columns) beside its own. Once a gate is `failed` or
+`registered`, a later gate-suite run on it is recorded as a `gate_suite_rerun` event and nothing
+else: the gate's reproduction columns are not rewritten and no verdict row is written. `gate advance` refuses evidence that claims `operator_failed_reproduction` (or either
 registration path), so a generic transition cannot pass for this decision. No schema change: the
 gate's CHECKs already allow `failed` and `mismatch`, and the dispositions are the existing
 `failure_registered` / `registered_failed`.
+
+### Which bytes a registration binds to
+
+**In plain words.** A result is registered against bytes the gate itself can vouch for: **the
+submitted file, or the corrected file whose hash the gate recorded when its last blocking
+correction was verified.** Nothing else, and no hash supplied afterwards.
+
+- The submitted bytes are the ones whose hash was declared at `artifact create --sha256`.
+- When the last blocking edit of a gate is verified (`gate verify-edit`), the gate reads the
+  artifact's file and keeps its hash and the moment as `post_edit_sha256` / `post_edit_ts`
+  (`gate show` prints them). If the file cannot be read then, they stay empty and the call's result
+  says so. No verb and no event can set them. Gates whose edits were verified before this existed
+  have none.
+- `artifact register --with-deviation` and `--as-failed` read the artifact's own file, or the file
+  named by `--file PATH` (`--note TEXT` keeps a sentence in the evidence). The file's hash must be
+  one of the two above. A refusal names what it saw: the file's hash, the submitted hash, and the
+  corrected hash (or none).
+- The registration evidence records `registered_sha256`, `registered_bytes` (`submitted` or
+  `post_edit`) and `registered_path`; `artifact show` prints them.
+
+Worked sequence, when the file on disk has been corrected since it was submitted and the gate
+holds no corrected hash: fail the gate on reproduction, then register it as failed with the copy
+of the file that was submitted (check first that its sha256 equals the artifact's recorded hash):
+
+```
+trialerror gate fail-reproduction --id GATE --reason "why it is a failure, in words" \
+    --decided-by DECISION-ID --by-launch L
+trialerror artifact register --id ART --by-launch L --as-failed --file PATH/TO/COPY-OF-SUBMITTED \
+    --decided-by DECISION-ID --note "the corrected report states the failure in its own text"
+```
+
+### A spawn that never started
+
+**In plain words.** The spawn gate marks a booking `RUNNING` before Claude Code checks the
+agent's name and tools. A spawn that fails at that check (a mistyped agent name, a refused tool
+list) used to leave a `RUNNING` booking with no agent behind it. Now:
+
+- The gate stores the spawn's `tool_use_id`, the moment (`spawn_ts`, never moved by a heartbeat)
+  and the session's transcript folder on the launch.
+- The `PostToolUseFailure` hook (`trialerror hook spawn-failure`) records the failure (ids, an
+  error class and a length, never the error text) and gives the booking back —
+  `RUNNING → PROVISIONAL` — **only** when no subagent started: a `meta.json` under the session's
+  `subagents/` folder carrying that `tool_use_id` means one did, and then nothing is released. An
+  interrupt, an unclassified error, a search that ran out of time or met an unreadable file, or a
+  launch gated before these columns existed, are all left `RUNNING`, with
+  `attrs.spawn_failure_after_start` noted. Each outcome writes one event
+  (`launch_spawn_released` or `launch_spawn_failed_after_start`). A corrected retry with the same
+  prompt then passes the gate while the booking's time-to-live has not run out.
+- A denial after the gate has consumed a booking (a permission dialog, a deny rule) fires no
+  failure hook. `trialerror budget release --launch-id L --reason TEXT` gives the booking back after
+  the same search over the whole folder; a found `meta.json` refuses with `agent_started` and names
+  the file, and `--even-if-started --decided-by REF` overrides that (recorded); the same flag covers a search that
+  could not finish and a launch gated before spawn identities were recorded. `--force` is a different override, for
+  a launch another session booked, and never waives these refusals. `budget cancel` gives up a
+  `PROVISIONAL` booking for good. Both verbs follow `heartbeat`'s ownership rule: they act only on a launch
+  the program's open session booked (`launch_not_owned` / `no_open_session` otherwise), unless
+  `--force --decided-by REF` is given, which is recorded (for `release`, `--force` is only this ownership override). `budget status` reports `stranded_count` / `stranded_ids` for
+  `RUNNING` bookings older than 30 minutes with no agent behind them; it only reports.
 
 ## The transcript archive — nothing is lost when the host clears its own transcripts
 
@@ -2562,6 +2736,25 @@ DECIDE, and shows the close in the room's history and in *Since you left*; the r
 treat it as neither stuck nor
 owing a deliverable. `room.state` has no CHECK constraint, so there is no migration.
 
+## Resolving an id — what it is, in words
+
+**In plain words.** A bare id (`ROOM-01M2XAX6268A0YE6WMR2ABETFY`, `CR-01J...`) says nothing on its
+own. `trialerror resolve` says what kind of thing it names, what it is called, what state it is
+in, what it is for (in one line, or that the store has no purpose recorded — it never guesses),
+and which other things it is tied to:
+
+```
+trialerror resolve ID [ID...] [--json]
+```
+
+Prints one short paragraph per id by default; `--json` gives the full structured fields instead.
+An id this build does not recognise the shape of answers "unknown kind of id"; a recognised shape
+with no matching row answers "not found in <store>". It reads the same store every dashboard panel
+does and is **never** exposed to a seat — the knowledge MCP server's slice-scoped tools are
+unchanged, and a bare "not found" still covers both "does not exist" and "exists, out of scope".
+The DECIDE panel, the dashboard and the weekly packet (below) all use this lookup, so a bare id is
+never the only thing shown any more.
+
 ## The weekly packet — one list of decisions, read once, before the next session
 
 **In plain words.** Decisions pile up while agents work: a gate edit that needs verifying, a
@@ -2571,7 +2764,10 @@ weekly limit is nearly spent). Each decision says what is being decided, why it 
 options and what each leads to, the recommendation, and what happens if nobody decides. The packet
 is capped at 30 minutes of reading and announced by **one** phone notification, with one reminder
 mid-week if items are still open. The operator answers before the next session; the answers are
-recorded, and the next session's start asks for them with `packet list --answered-since`.
+recorded, and `packet list --answered-since <last boot>` (or the pure read
+`trialerror.packet.store.answered_since(program_root, ts)`) hands them back. **Not yet wired to
+the next session's boot itself** — no boot code calls it today; that is L11's own job (design
+§0's SessionStart digest), which this lane's `answered_since()` exists for it to call.
 
 ### How an item gets in
 
@@ -2600,7 +2796,7 @@ envelope's `warnings`; `--strict` turns them into a refusal (`lint_refused`) and
 | Command | What it does |
 |---|---|
 | `packet add` | validates and stores one item (above) |
-| `packet list [--open] [--answered-since ISO]` | the open items (the default), and/or the answers recorded since a time, each joined to its question and the label of the option chosen. The next session's boot calls `--answered-since <last boot>` — that is how answers get back |
+| `packet list [--open] [--answered-since ISO]` | the open items (the default), and/or the answers recorded since a time, each joined to its question and the label of the option chosen. Run `--answered-since <last boot>` by hand for now; no boot code calls it yet (L11's job) |
 | `packet build --trigger session_close\|weekly_limit\|manual [--dry-run] [--when-weekly-pct N] [--push]` | builds `packet/built/PACKET_<ts>.md` and `.json`, leaving out a determination an open item already covers; see below |
 | `packet push [--packet ID] [--force]` | announces a packet with one notification through the configured notifier |
 | `packet answer ITEM --choice KEY [--note TEXT] [--by NAME]` | records the decision and marks the item answered |
@@ -2608,40 +2804,67 @@ envelope's `warnings`; `--strict` turns them into a refusal (`lint_refused`) and
 | `packet remind` | one reminder for the last pushed packet, once it is `remind_after_days` old and some of its items are still open; at most one per packet |
 
 **`build`** takes the open items — blocking first, then by `needed_by`, then priority, then age —
-and adds (1) the store's **blocking determinations** (the determinations queue), each counted as
-3 minutes and labelled *from DECIDE: not yet in plain words* until those items carry the plain-words
-fields themselves; (2) the **failed checks of the transcript archive's latest audit**, when
-`[archive] dirs` names the archive folders; a clean audit adds one line to the opening lines
-instead. It opens with the first 3 lines of `course_file`, fills the packet up to `max_minutes`
-in that order (an item that does not fit, and everything after it, is listed by its `what` under
-"waiting for the next packet"; a first item longer than the cap still opens the packet), and writes
-one markdown section per item with the recommended option marked and the answer line: the
-configured `link`, or the `packet answer` command. `--dry-run` shows the packet and writes nothing.
+and adds (1) the determinations queue's **operator-owned, fully explained** items, each counted as
+3 minutes and labelled *from the determinations queue* (a room escalation, an acquisition, a web
+host awaiting approval — see "Who owns a DECIDE item" below); (2) the **failed checks of the
+transcript archive's latest audit**, when `[archive] dirs` names the archive folders; a clean audit
+adds one line to the opening lines instead. It opens with the first 3 lines of `course_file`, fills
+the packet up to `max_minutes` in that order (an item that does not fit, and everything after it,
+is listed by its `what` under "waiting for the next packet"; a first item longer than the cap still
+opens the packet), and writes one markdown section per item with the recommended option marked, a
+*Related* line naming what each ref actually is (through `resolve`, not the bare id), and the
+answer line: the configured `link`, or the `packet answer` command. An operator item the queue
+cannot yet explain in full never reaches the packet as a raw entry — it is counted instead, in one
+line near the bottom ("N more decisions are waiting for an explanation..."), and the build's own
+output lists their ids for the custodian or the orchestrator to fix (`packet add --ref
+"<label>::DECIDE:<id>"` covers one by hand in the meantime). An item answered within the last 7
+days keeps covering its entry, listed once under *Already answered, being carried out* rather than
+asked again. `--dry-run` shows the packet and writes nothing.
 
 **`push`** sends the title `Decisions for you: N (about M min)` and a body of at most 600
-characters: how many decisions, the first one's `what` cut to 200 characters, and where to read.
-At most one push per packet and at most one push per 24 hours across packets; `--force` overrides
-and is recorded in `sent.jsonl`. A notifier that fails records nothing, so the push can be repeated: the hourly weekly-limit job
-announces its own unannounced packet again on its next run.
+characters carrying **counts and the link only** — no item's own wording ever reaches the
+notification service, whichever channel finally delivers it. At most one push per packet and at
+most one push per 24 hours across packets (a still-queued, not-yet-delivered push counts too, so a
+second push cannot queue a duplicate); `--force` overrides. A notifier that fails, or a receipt
+that reports a failure (below), records nothing, so the push can be repeated: the hourly
+weekly-limit job announces its own unannounced packet again on its next run.
+
+### Who owns a DECIDE item
+
+**In plain words.** Most of the determinations queue is work waiting for an agent, not a decision
+for the operator: a gate edit waiting to be verified is the orchestrator's; a stopped helper is the
+custodian's. Each kind now names its owner (the dashboard's DECIDE page groups items by it), and
+only the operator's own kinds — a stopped discussion room, a source only the operator can obtain,
+a web host awaiting approval — can ever reach the weekly packet, and then only once the kind's
+builder has given it every plain-words field: what is being decided and why, the options (each
+with its consequence), a recommendation, what happens if nobody decides, and when the answer is
+needed. Everything else stays in the dashboard, with its own plain-words *what*/*why* and a
+*next step* naming who acts.
 
 ### A determination an item already explains
 
-**In plain words.** A raw determination from the queue carries only an id and a one-line text,
-which says little to someone who was not there. When an open item of your own explains it in
-plain words, `build` shows the item and leaves the raw entry out, so the operator reads it once.
+**In plain words.** An operator determination the packet cannot yet render in full (above) never
+reaches it as a raw entry either way. For one it CAN render, when an open item of your own already
+explains the same thing in plain words, `build` shows your item and leaves the queue's own entry
+out, so the operator reads it once.
 
 The item covers an entry when one of its `--ref`s names the entry's id exactly: `DECIDE:<id>` as
 the packet prints it, or the bare `<id>` as the dashboard's queue shows it (a room id, a gate's
 `GATE::EDIT` pair; the text after the first `::` of `--ref` is kept whole, so a pair with its own
-`::` works). A look-alike (a longer id, a path containing the id) covers nothing. Only open items
-cover: an answered or withdrawn item does not, and the raw entry comes back until the thing
-itself is resolved (for a frozen room, `room close`). When two items cover one entry, the first in
-packet order is named. The built packet lists what it left out in `decide_covered`, one
-`{id, covered_by}` per entry, and the covering item's section ends with an *Also answers* line
-naming the entry. The left-out entry's minutes are not counted. An entry is left out only while
-its covering item is in the packet itself: when the `max_minutes` cap moves the item to *waiting*, the
-raw entry is printed in its own place instead, so a blocking decision never drops out of the packet
-because someone explained it. An entry no item covers is printed as before.
+`::` works). A look-alike (a longer id, a path containing the id) covers nothing. An open item
+covers immediately; an item you already **answered** keeps covering for 7 days after the answer (so
+the entry does not reappear as a fresh decision the moment you answer, before the action it promised
+has had a chance to happen) — after that, or once the thing itself is resolved (for a frozen room,
+`room close`), the entry returns if it is still in the queue. A withdrawn item never covers
+anything. When two items cover one entry, the first in packet order is named. The built packet
+lists what it left out in `decide_covered`, one `{id, covered_by}` per entry, and the covering
+item's section ends with an *Also answers* line naming the entry; an answered covering item is
+listed instead under *Already answered, being carried out*. The left-out entry's minutes are not
+counted. An entry is left out only while its covering item is in the packet itself: when the
+`max_minutes` cap moves the item to *waiting*, the raw entry is printed in its own place instead, so
+a blocking decision never drops out of the packet because someone explained it. An entry no item
+covers is printed as before. Several non-blocking items of the same kind (several sources awaiting
+delivery) become one packet entry, so they cannot together push another decision past the cap.
 
 ### The triggers
 
@@ -2672,6 +2895,8 @@ notify_cmd = ["ssh", "<sandbox-host>", "<path of the sandbox notifier script>"]
 link = "https://..."        # where the operator reads the packet (a page or a file path)
 remind_after_days = 3
 course_file = "course.txt"  # its first 3 lines open the packet
+outbox = false               # off by default -- see "The container-to-host outbox" below
+outbox_dir = "packet/outbox"  # default shown; only used when outbox = true
 
 [archive]
 dirs = ["D:/te-archive/transcripts"]   # archive folders whose audits feed the packet
@@ -2689,9 +2914,35 @@ store table, so there is no migration. Errors worth knowing: `no_notify_cmd`, `e
 `already_pushed`, `push_limit_24h`, `push_failed`, `bad_config`, `not_found`, `not_open`,
 `bad_choice`.
 
+### The container-to-host outbox — the orchestrator sends the packet itself
+
+**In plain words.** Today the notifier lives on the host and its secret never enters the
+container, so the custodian announces every packet by hand from DEV. With `[packet] outbox = true`
+and no `notify_cmd` configured, `push`/`remind` write a notification file into `outbox/` (inside
+`dir`) instead of refusing with `no_notify_cmd`, and return `{queued: true}`. A host job
+(`deploy/sandbox/containment/te-outbox.sh`, every 5 minutes) sends it — treating every entry as
+untrusted data, since the container that wrote it runs with permissions bypassed — and writes a
+receipt back into `outbox/receipts/`. **Queued is not sent**: only a receipt with `delivered: true`
+counts as pushed (appends `sent.jsonl`); a queued or failed entry still counts against the 24-hour
+and one-push-per-packet limits, so a second push cannot queue a duplicate. The body still carries
+only counts and the link, same as `notify_cmd` — an item's own wording never crosses this boundary
+either. `packet list` says in words when a queued notification has waited more than 15 minutes with
+no receipt ("the host job may not be running"), or when the last one's receipt reports a failure.
+This is infrastructure only: the custodian installs the host script and its cron line and sets
+`outbox = true`; the orchestrator can then build and push the packet itself, with the custodian's
+DEV route still available as a fallback.
+
+**Install note (review finding N-9).** The cron line runs `te-outbox.sh` with no
+`TE_OUTBOX_DIR` set, so it sweeps its own default (`$TE_WORKSPACE_DIR/$TE_OUTBOX_PROGRAM_REL/
+packet/outbox`, i.e. `outbox/` under the *default* `[packet] dir`). **A program that relocates
+`[packet] outbox_dir` away from that default needs its own `TE_OUTBOX_DIR` set in the cron line**
+(or in an environment file the cron line sources first) — pointed at the same folder the
+program's `trialerror.toml` names — or the host job will run every 5 minutes finding nothing to
+send, and `packet list` will read as "the host job may not be running" even though it is.
+
 ## Doctor checks catalog
 
-`trialerror doctor` runs every check registered by every subsystem (**95 checks across 24
+`trialerror doctor` runs every check registered by every subsystem (**96 checks across 24
 categories**); each subsystem owns its own `checks.py`, auto-discovered — adding a new one
 never touches a shared file. That figure had drifted twice before anyone noticed, precisely
 because nothing enforced it, so it is now pinned by a test against the live registry

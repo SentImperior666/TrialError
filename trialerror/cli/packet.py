@@ -113,9 +113,16 @@ def _settings(args: argparse.Namespace, command: str) -> tuple[PacketSettings | 
             "no trialerror.toml found walking up from the current directory, and --program-root not given",
         )
     try:
-        return pstore.packet_settings(root_path), None
+        settings = pstore.packet_settings(root_path)
     except ConfigError as exc:
         return None, error_envelope(command, "bad_config", str(exc))
+    if settings.outbox:
+        # design §5 D1: "at the start of every packet verb, reconcile_receipts()
+        # reads outbox/receipts/*.json" -- one place, so every verb gets it.
+        from trialerror.packet.outbox import reconcile_receipts
+
+        reconcile_receipts(settings)
+    return settings, None
 
 
 def _refusal(command: str, exc: PacketError) -> dict:
@@ -184,7 +191,7 @@ def run_list(args: argparse.Namespace) -> dict:
         return err
     try:
         result = pstore.list_items(
-            settings, open_only=bool(args.open) or not args.answered_since, answered_since=args.answered_since
+            settings, open_only=bool(args.open) or not args.answered_since, since=args.answered_since
         )
     except PacketError as exc:
         return _refusal("packet list", exc)
@@ -220,9 +227,24 @@ def run_build(args: argparse.Namespace) -> dict:
                 actions.append(next_action(argv, "announce this packet with one notification"))
     except PacketError as exc:
         return _refusal("packet build", exc)
-    warnings = [{"code": "packet_note", "message": n} for n in (result.get("packet") or {}).get("notes", [])]
+    packet = result.get("packet") or {}
+    warnings = [{"code": "packet_note", "message": n} for n in packet.get("notes", [])]
     if "push_error" in result:
         warnings.append({"code": result["push_error"]["code"], "message": result["push_error"]["message"]})
+    # N-10: lint warnings and the needs_explaining count sat only in the result JSON,
+    # easy to miss on a `packet build` a human runs by hand -- surface both in the
+    # envelope's own warnings, which every trialerror command already prints on screen.
+    needs_explaining = packet.get("needs_explaining") or []
+    if needs_explaining:
+        n = len(needs_explaining)
+        warnings.append({
+            "code": "needs_explaining",
+            "message": f"{n} operator decision{'s' if n != 1 else ''} waiting for an explanation: "
+                       + ", ".join(str(e.get("id")) for e in needs_explaining),
+        })
+    for entry in packet.get("lint_warnings") or []:
+        for w in entry.get("warnings") or []:
+            warnings.append({"code": "plain_words", "message": f"{entry.get('id')}: {w}"})
     return ok_envelope("packet build", result=result, next_actions=actions, warnings=warnings or None)
 
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import errno
 import hashlib
 import json
 import math
@@ -38,6 +39,7 @@ import subprocess
 import sys
 import threading
 import time
+import warnings
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,6 +65,13 @@ from trialerror.ingest.errors import (
 # handler-level seam. ``trialerror.offload.marker`` is deliberately
 # dependency-free so this import can sit at module level without a cycle.
 from trialerror.offload.marker import OFFLOAD_BACKEND_NAME, OffloadMarker
+
+# REQ-2026-09-27-09: the slot-erase lock reuses trialerror.offload.lock's own
+# primitive (single_instance_lock) rather than a new one -- see
+# LlamaServerEmbedBackend._slot_erase_guard for how a "raise if busy" lock
+# becomes a "wait your turn" one. Same dependency-free precedent as the
+# offload marker import above: no cycle.
+from trialerror.offload.lock import WorkerAlreadyRunning, single_instance_lock, worker_state_dir
 
 # FIX V-1: the resume cache's one write primitive. A range file that is only
 # partly on disk reads back as a shorter document, and a shorter document is
@@ -92,6 +101,8 @@ __all__ = [
     "LLAMA_SERVER_EMBED_PATH",
     "LLAMA_SERVER_HEALTH_PATH",
     "LLAMA_SERVER_PROPS_PATH",
+    "LLAMA_SERVER_SLOT_ERASE_PATH",
+    "DEFAULT_SLOT_ERASE",
     "DEFAULT_QUERY_PROMPT",
     "embeddable_text",
     "cgroup_cpu_quota",
@@ -2574,6 +2585,37 @@ class RealQwenEmbedBackend:
         return out["vectors"]
 
 
+#: ``bool(config.get("slot_erase", ...))`` turned the STRING
+#: ``"false"`` into ``True`` (``bool`` of any non-empty string is truthy) --
+#: a switch whose "off" spelling can silently mean "on" is worth a strict
+#: parse. Matched case-insensitively; a TOML boolean needs none of this
+#: (``isinstance(value, bool)`` catches it first).
+_TRUE_STRINGS = frozenset({"true", "1", "yes", "on"})
+_FALSE_STRINGS = frozenset({"false", "0", "no", "off"})
+
+
+def _parse_bool_switch(value: Any, *, key: str) -> bool:
+    """``value`` as a strict boolean for a config switch, naming ``key`` in
+    the refusal. Real booleans pass straight through; a string is matched
+    against the usual true/false spellings; anything else -- a bare
+    integer, a float, a list, an unrecognised string -- raises rather than
+    coercing, because a config switch that can silently mean the opposite
+    of what it says is worse than one that refuses to load."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in _TRUE_STRINGS:
+            return True
+        if lowered in _FALSE_STRINGS:
+            return False
+    raise ValueError(
+        f"{key} = {value!r} is not a recognised boolean -- use true/false, or one of these "
+        f"STRINGS: {sorted(_TRUE_STRINGS | _FALSE_STRINGS)} (an integer 0/1 is not one of them; "
+        f'write them quoted, e.g. {key} = "1")'
+    )
+
+
 def load_embed_backend(config: dict[str, Any], *, table: str = "ingest.embed") -> EmbedBackend:
     """``config`` = the program's ``trialerror.toml`` ``[ingest.embed]`` table.
     Defaults to the fake backend when unconfigured.
@@ -2648,6 +2690,14 @@ def load_embed_backend(config: dict[str, Any], *, table: str = "ingest.embed") -
             # Optional, and only ever used to spell the remedy in a refusal:
             # which [sidecars.<name>] serves this URL.
             sidecar_name=config.get("sidecar_name"),
+            # REQ-2026-09-27-09: on by default -- see DEFAULT_SLOT_ERASE.
+            # A strict parse, not bool(...) -- bool("false") is True.
+            slot_erase=_parse_bool_switch(
+                config.get("slot_erase", DEFAULT_SLOT_ERASE), key=f"{table}.slot_erase"
+            ),
+            # So a lock refusal names THIS table's slot_erase, not always
+            # [ingest.embed]'s -- [ingest.embed.query] on the query side.
+            config_table=table,
         )
     if backend_name == OFFLOAD_BACKEND_NAME:
         # Lane L0-C: the embedding model runs on DEV. ``model_key``/``dims``
@@ -3788,6 +3838,33 @@ DEFAULT_LLAMA_SERVER_N_CTX = 2049
 #: ``/v1/embeddings`` deliberately -- see the class docstring.
 LLAMA_SERVER_EMBED_PATH = "/embedding"
 
+#: The slot-management action that erases the KV cache state a previous
+#: request left behind (see the guide's "Determinism needs
+#: `--slot-save-path`" paragraph, REQ-2026-09-27-09): measured on the
+#: reference build, the vector of a text depends on what its slot held before
+#: it (1 - cos ~1.6e-4 between a "warm" and a "cold" slot), and erasing the
+#: slot before every embed made every case byte-identical. Only present on a
+#: server started with ``--slot-save-path``; otherwise it answers 501, which
+#: :meth:`LlamaServerEmbedBackend._erase_slots` reads as "fall back, never
+#: refuse" -- same reading the rest of this class gives an absent feature.
+LLAMA_SERVER_SLOT_ERASE_PATH = "/slots/{slot_id}?action=erase"
+
+#: ``[ingest.embed] slot_erase`` / ``[ingest.embed.query] slot_erase``
+#: default -- on, because the determinism it buys costs one small POST per
+#: embed and the alternative is a vector that a rehearsal cannot reproduce.
+DEFAULT_SLOT_ERASE = True
+
+#: Statuses that mean "the erase route is not available on this
+#: build", read as a warning rather than a refusal, the same as 501. A 404
+#: is a server with no ``/slots`` route at all (an older build, or a proxy
+#: in front of the sidecar that does not forward it); a 405 is the same
+#: route answering the wrong method. Either way the embed that follows
+#: would have worked, so refusing here would fail a request the erase was
+#: never able to help in the first place. A 5xx or a transport error is NOT
+#: this case -- the server state is unknown, not "feature absent" -- and
+#: still refuses.
+SLOT_ERASE_UNAVAILABLE_STATUSES = (404, 405, 501)
+
 #: Liveness (200 = the model is loaded and serving; 503 = still loading).
 LLAMA_SERVER_HEALTH_PATH = "/health"
 
@@ -3906,6 +3983,185 @@ def _served_n_ctx(props: Any) -> int | None:
     return None
 
 
+def _served_total_slots(props: Any) -> int | None:
+    """How many slots a ``/props`` (or ``/health``) body says this server
+    serves -- ``None`` when the build does not say, which
+    :meth:`LlamaServerEmbedBackend._erase_slots` reads as 1 (a single-slot
+    sidecar, ``-np 1``, has nothing else to report anyway).
+
+    ``/embedding`` takes no ``id_slot`` and nothing in a
+    ``/props``/``/health`` body says which slot the NEXT request will land
+    in -- a server started with ``-np N > 1`` picks one per request (by
+    prompt similarity, else least recently used). So there is no "the slot
+    id the server reports" to read here; ``total_slots`` is what lets
+    :meth:`_erase_slots` erase all of them instead."""
+    if not isinstance(props, dict):
+        return None
+    value = props.get("total_slots")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value > 0:
+        return value
+    return None
+
+
+#: Sidecar URLs this process has already warned about answering slot erase
+#: with one of :data:`SLOT_ERASE_UNAVAILABLE_STATUSES` -- so a corpus of
+#: thousands of embeds prints the operator's one actionable line once, not
+#: once per document.
+_SLOT_ERASE_UNAVAILABLE_WARNED: set[str] = set()
+
+
+def _warn_slot_erase_unavailable_once(url: str, status: int) -> None:
+    if url in _SLOT_ERASE_UNAVAILABLE_WARNED:
+        return
+    _SLOT_ERASE_UNAVAILABLE_WARNED.add(url)
+    warnings.warn(
+        f"the embedding sidecar at {url} answered slot erase with HTTP {status} (no "
+        "--slot-save-path, or this build has no /slots route at all): embedding without "
+        "erasing the slot first, exactly as before this fix. Vectors from this process are "
+        "not guaranteed byte-identical to a rehearsal's -- start the sidecar with "
+        "--slot-save-path to fix this.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
+def _slot_erase_lock_path(url: str) -> Path:
+    """One lock file per sidecar URL, under the harness's existing DEV-local
+    scratch root (:func:`trialerror.offload.lock.worker_state_dir`) rather
+    than a new one: two harness processes pointed at the SAME llama-server
+    serialise their erase-then-embed step there, and two processes on
+    different sidecars never wait on each other.
+
+    The scheme and host are lower-cased and ``localhost`` is
+    read as ``127.0.0.1`` first, so a program that spells the same sidecar
+    two ways (``http://localhost:8871``, ``http://127.0.0.1:8871``) still
+    serialises through ONE lock file instead of two that never see each
+    other. This is not a general fix: a DNS alias, a different port
+    forward onto the same sidecar, or two harness users with different
+    ``HOME``/``XDG_STATE_HOME`` are still each their own lock file -- the
+    guarantee holds for harness processes of one user using one spelling
+    of the URL, which is what a program's own config gives every process
+    that reads it."""
+    import urllib.parse
+
+    parsed = urllib.parse.urlsplit(url)
+    host = (parsed.hostname or "").lower()
+    if host == "localhost":
+        host = "127.0.0.1"
+    netloc = f"{host}:{parsed.port}" if parsed.port else host
+    normalised = f"{parsed.scheme.lower()}://{netloc}"
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", normalised).strip("_") or "sidecar"
+    return worker_state_dir() / "ingest_slot_erase" / f"{safe}.lock"
+
+
+#: The errno ``single_instance_lock`` reports for lock CONTENTION
+#: specifically -- ``msvcrt.locking`` raises ``EACCES`` when the byte range is
+#: already locked; ``fcntl.flock(..., LOCK_NB)`` raises ``EAGAIN``
+#: (``EWOULDBLOCK``, the same value on every platform this runs on). Anything
+#: else chained onto :class:`~trialerror.offload.lock.WorkerAlreadyRunning`
+#: (``EINVAL``, ``ENOLCK``, ...) is not "someone else has it" and retrying
+#: cannot fix it -- see :meth:`LlamaServerEmbedBackend._slot_erase_guard`.
+_LOCK_CONTENTION_ERRNOS = (errno.EACCES,) if sys.platform == "win32" else (errno.EAGAIN, errno.EWOULDBLOCK)
+
+
+def _lock_owner_path(lock_path: Path) -> Path:
+    """The sibling file :func:`_write_lock_owner_pid` writes the current
+    holder's pid into, and :func:`_lock_holder_pid` reads it from --
+    ``<lock_path>.owner``, a sibling file which, unlike the lock file itself,
+    no mandatory lock covers on Windows.
+
+    A SEPARATE file, not a second reader of ``lock_path`` itself: on win32,
+    ``msvcrt.locking`` is a MANDATORY byte-range lock on ``lock_path``'s
+    first byte, enforced against every other handle on THAT file -- probed
+    directly, a second handle's read of that byte while held raises
+    ``PermissionError`` (errno 13). A sibling file has no such lock on it,
+    so a waiter can always read the pid the current holder wrote, on every
+    platform this runs on."""
+    return lock_path.parent / f"{lock_path.name}.owner"
+
+
+def _write_lock_owner_pid(lock_path: Path) -> None:
+    """Record this process as ``lock_path``'s current holder, for a later
+    waiter's timeout refusal to name -- called right after
+    :func:`trialerror.offload.lock.single_instance_lock` acquires it. The
+    owner file holds ``"<pid> <lock file st_mtime_ns>"``: the mtime is the
+    one THIS acquisition just gave the lock file (it truncates and rewrites
+    it), so :func:`_lock_holder_pid` can tell a live holder's record from a
+    stale one left by an earlier holder, or by one that never wrote any.
+    Best-effort: a write failure here must not fail the embed the lock is
+    guarding, so any error is swallowed."""
+    try:
+        mtime_ns = os.stat(lock_path).st_mtime_ns
+        _lock_owner_path(lock_path).write_text(f"{os.getpid()} {mtime_ns}\n", encoding="ascii")
+    except OSError:
+        pass
+
+
+def _lock_holder_pid(lock_path: Path) -> str:
+    """The pid the current holder of ``lock_path`` wrote into its sibling
+    owner file (:func:`_write_lock_owner_pid`), for a timeout refusal to
+    name -- but only when the mtime recorded beside it equals the lock
+    file's CURRENT mtime, i.e. that record was written by the acquisition
+    that is still in force. Otherwise ``"unknown"``: a stale record from an
+    earlier holder would name the wrong process, which is worse than naming
+    none. Also ``"unknown"`` on any read error (no such file: a holder from
+    before this existed, or one that does not go through
+    :meth:`LlamaServerEmbedBackend._slot_erase_guard` at all), best-effort
+    and never worth failing over."""
+    try:
+        text = _lock_owner_path(lock_path).read_text(encoding="ascii", errors="replace").strip()
+        pid, _, recorded_mtime = text.partition(" ")
+        if pid.isdigit() and recorded_mtime == str(os.stat(lock_path).st_mtime_ns):
+            return pid
+    except OSError:
+        pass
+    return "unknown"
+
+
+#: A waiter's ``<lock>.want`` is "fresh" for this long after its last touch,
+#: and a batch holder that sees a fresh one sleeps :data:`_STEP_ASIDE_S`
+#: before its next text -- longer than the waiter's 50 ms poll, so the
+#: waiter is certain to find the lock free in that gap. Uncontended, no
+#: ``.want`` exists (or it is stale) and nothing sleeps.
+_WAITER_FRESH_S = 0.2
+_STEP_ASIDE_S = 0.1
+
+
+def _lock_want_path(lock_path: Path) -> Path:
+    """``<lock_path>.want``: touched by every poll of a waiter that finds
+    the lock busy, so a holder working through a batch can see someone is
+    queued behind it (:meth:`LlamaServerEmbedBackend._step_aside_for_waiter`).
+    Within one ``embed_batch`` the holder otherwise releases the lock and
+    takes it again about a millisecond later, which a 50 ms poll almost never
+    lands in -- a waiter would wait for the whole batch."""
+    return lock_path.parent / f"{lock_path.name}.want"
+
+
+def _signal_waiting(lock_path: Path) -> None:
+    """Touch ``<lock>.want``; best-effort, never worth failing over."""
+    want = _lock_want_path(lock_path)
+    try:
+        with open(want, "ab"):
+            pass
+        os.utime(want, None)
+    except OSError:
+        pass
+
+
+def _clear_waiting(lock_path: Path) -> None:
+    """Called right after this process acquires the lock: set ``<lock>.want``
+    back to the epoch, so a process that was itself a waiter does not step
+    aside for its OWN last touch (fresh for 0.2 s) at the first boundaries of
+    its batch. A real waiter re-touches it within one 50 ms poll. No
+    ``.want`` at all is the normal uncontended case; nothing is created."""
+    try:
+        os.utime(_lock_want_path(lock_path), (0, 0))
+    except OSError:
+        pass
+
+
 def _extract_server_embedding(body: Any) -> Any:
     """The vector out of a ``/embedding`` response body, across the shapes
     the endpoint has returned: ``{"embedding": [...]}``,
@@ -4005,8 +4261,12 @@ class LlamaServerEmbedBackend:
         query_prompt: str = DEFAULT_QUERY_PROMPT,
         tokenizer_model_path: str | None = None,
         sidecar_name: str | None = None,
+        slot_erase: bool = DEFAULT_SLOT_ERASE,
+        config_table: str = "ingest.embed",
         _http: Any = None,
         _tokenizer: Any = None,
+        _lock_path: Path | str | None = None,
+        _lock_deadline_s: float | None = None,
     ):
         self.model_key = str(model_key)
         self.dims = int(dims)
@@ -4021,6 +4281,34 @@ class LlamaServerEmbedBackend:
         #: refusal names the verb without inventing a name (V-10: it used to
         #: say "embed" whatever the sidecar was called).
         self.sidecar_name = str(sidecar_name) if sidecar_name else None
+        #: REQ-2026-09-27-09: erase the slot before every embed (config
+        #: switch, default on -- see :data:`DEFAULT_SLOT_ERASE`). ``False``
+        #: restores the pre-fix behaviour byte-for-byte: no lock file, no
+        #: extra round trip, nothing else changes.
+        self.slot_erase = bool(slot_erase)
+        #: Which config table this instance's ``slot_erase`` (and every
+        #: other key on it) reads from -- ``"ingest.embed"`` for the
+        #: document side, ``"ingest.embed.query"`` for a query-side table
+        #: that named its own backend. Used ONLY to spell the remedy in a
+        #: lock refusal, the same reason ``sidecar_name`` exists: a query
+        #: table's own key, not the document table's, is the one that
+        #: actually turns this backend's erase off.
+        self.config_table = str(config_table)
+        #: Set once the sidecar has answered slot erase with HTTP 501 (no
+        #: ``--slot-save-path``): every later embed on THIS instance skips
+        #: the erase attempt, since the reason it failed cannot change
+        #: mid-process.
+        self._slot_erase_unsupported = False
+        #: Test-only seam (the precedent is ``_http``/``_tokenizer`` below):
+        #: a path for the cross-process lock other than the harness's real
+        #: DEV-local scratch root, so tests can exercise the real OS lock
+        #: without touching it.
+        self._lock_path_override = Path(_lock_path) if _lock_path is not None else None
+        #: Test-only seam: overrides :meth:`_lock_deadline_duration_s`'s
+        #: computed default outright, so a test can see the refusal without
+        #: waiting for a production-sized deadline. ``None`` (the normal
+        #: case) means "compute it from ``served_total_slots``".
+        self._lock_deadline_s = float(_lock_deadline_s) if _lock_deadline_s is not None else None
         self._http_client = _http
         self._tokenizer = _tokenizer
         self._prompt_ids: list[int] | None = None
@@ -4035,6 +4323,12 @@ class LlamaServerEmbedBackend:
         self.context_check: str = CONTEXT_CHECK_UNVERIFIED
         self.context_check_note: str = "not checked yet"
         self.served_n_ctx: int | None = None
+        #: How many slots :meth:`_erase_slots` erases (0..total_slots-1),
+        #: read off ``/props``/``/health`` when the build reports
+        #: ``total_slots`` -- ``None`` until :meth:`runnable` has run once,
+        #: read as 1 from then on (a single-slot sidecar, ``-np 1``, has
+        #: nothing else to report anyway).
+        self.served_total_slots: int | None = None
         if self.dims > self.native_dims:
             raise ValueError(
                 f"{QUERY_EMBED_TABLE} dims = {self.dims} exceeds native_dims = {self.native_dims}: "
@@ -4109,6 +4403,9 @@ class LlamaServerEmbedBackend:
             "context_check_note": self.context_check_note,
             "served_n_ctx": self.served_n_ctx,
             "sidecar_name": self.sidecar_name,
+            "slot_erase": self.slot_erase,
+            "slot_erase_unsupported": self._slot_erase_unsupported,
+            "served_total_slots": self.served_total_slots,
         }
 
     def runnable(self) -> tuple[bool, str]:
@@ -4219,6 +4516,10 @@ class LlamaServerEmbedBackend:
                 props = body
         except Exception:  # noqa: BLE001 - no /props on this build: fall back, never refuse
             props = None
+        total_slots = _served_total_slots(props)
+        if total_slots is None:
+            total_slots = _served_total_slots(self.last_health.get("body"))
+        self.served_total_slots = total_slots
         ok, reason = self._served_model_runnable(props)
         if not ok:
             return ok, reason
@@ -4334,7 +4635,35 @@ class LlamaServerEmbedBackend:
         ok, reason = self.runnable()
         if not ok:
             raise EmbedBackendNotRunnable(reason)
-        return [self._embed_one(text, kind=kind) for text in texts]
+        vectors: list[list[float]] = []
+        for index, text in enumerate(texts):
+            if index:
+                self._step_aside_for_waiter()
+            vectors.append(self._embed_one(text, kind=kind))
+        return vectors
+
+    def _resolved_lock_path(self) -> Path:
+        return self._lock_path_override or _slot_erase_lock_path(self.url)
+
+    def _step_aside_for_waiter(self) -> None:
+        """Between two texts of a batch, with the lock released: if a waiter
+        touched ``<lock>.want`` within the last :data:`_WAITER_FRESH_S`, sleep
+        :data:`_STEP_ASIDE_S` so its next poll finds the lock free. Without
+        this a query arriving mid-batch waits for the whole batch (the
+        holder re-takes the lock about a millisecond after each release).
+        Uncontended, there is no ``.want`` (or a stale one) and this costs
+        one ``stat``."""
+        if not self.slot_erase:
+            return
+        try:
+            age = time.time() - _lock_want_path(self._resolved_lock_path()).stat().st_mtime
+        except OSError:
+            return
+        # A ``.want`` stamped in the future (the clock stepped back, or the
+        # lock directory sits on a skewed file server) is not a waiter: it
+        # would make every boundary sleep until wall time caught up.
+        if 0 <= age < _WAITER_FRESH_S:
+            time.sleep(_STEP_ASIDE_S)
 
     def _embed_one(self, text: str, *, kind: str) -> list[float]:
         prepared = self.prepared_text(text, kind=kind)
@@ -4347,13 +4676,16 @@ class LlamaServerEmbedBackend:
             # scaling, and the L2 below recovers the same unit vector.
             "embd_normalize": -1,
         }
-        try:
-            status, body = self._http().post_json(LLAMA_SERVER_EMBED_PATH, payload)
-        except Exception as exc:  # noqa: BLE001 - a timeout or a dead sidecar mid-batch
-            raise EmbedBackendNotRunnable(
-                f"the embedding sidecar at {self.url} failed on {LLAMA_SERVER_EMBED_PATH} "
-                f"({type(exc).__name__}: {exc})"
-            ) from exc
+        with self._slot_erase_guard():
+            if self.slot_erase:
+                self._erase_slots()
+            try:
+                status, body = self._http().post_json(LLAMA_SERVER_EMBED_PATH, payload)
+            except Exception as exc:  # noqa: BLE001 - a timeout or a dead sidecar mid-batch
+                raise EmbedBackendNotRunnable(
+                    f"the embedding sidecar at {self.url} failed on {LLAMA_SERVER_EMBED_PATH} "
+                    f"({type(exc).__name__}: {exc})"
+                ) from exc
         if status != 200:
             detail = body if isinstance(body, str) else json.dumps(body)[:300]
             raise EmbedBackendNotRunnable(
@@ -4362,3 +4694,140 @@ class LlamaServerEmbedBackend:
             )
         raw = _extract_server_embedding(body)
         return _finalise_recipe_vector(raw, native_dims=self.native_dims, dims=self.dims)
+
+    def _lock_deadline_duration_s(self) -> float:
+        """How long :meth:`_slot_erase_guard` waits for NO PROGRESS on the
+        lock before refusing (see there for what "progress" means) --
+        overridable via the test-only ``_lock_deadline_s`` seam.
+
+        Sized off one legitimate hold: ``served_total_slots`` erases plus one
+        embed, each bounded by ``timeout_s``, plus 10 s of slack. Absent a
+        ``served_total_slots`` reading (single slot, or ``runnable()`` has
+        not run yet), that is one erase, matching the pre-multi-slot count."""
+        if self._lock_deadline_s is not None:
+            return self._lock_deadline_s
+        slots = self.served_total_slots if self.served_total_slots else 1
+        return (slots + 1) * self.timeout_s + 10.0
+
+    @contextlib.contextmanager
+    def _slot_erase_guard(self) -> Any:
+        """Hold the cross-process lock around erase+embed while
+        ``slot_erase`` is on; a no-op while it is off, so turning the switch
+        off costs nothing -- no lock file, no extra round trip, byte-for-byte
+        the pre-fix path.
+
+        Reuses :func:`trialerror.offload.lock.single_instance_lock` (an
+        exclusive, non-blocking OS lock -- ``msvcrt``/``fcntl``, released the
+        moment the holder's handle closes or the holder dies) in a short
+        retry loop, rather than a new locking primitive: the loop is what
+        turns "raise if busy" into "wait your turn", which is what two
+        harness processes sharing one sidecar need so neither can observe
+        the other's erase interleaved with its own embed.
+
+        A holder that is not moving (stopped, suspended, a breakpoint) is
+        not the same as a busy one, and would otherwise block every embed on
+        this sidecar forever, with no message. But the deadline
+        (:meth:`_lock_deadline_duration_s`) counts time WITHOUT PROGRESS, not
+        total wait time: ``single_instance_lock`` rewrites the lock file
+        (truncate, then its pid) on every acquisition, so its mtime moves
+        each time the lock changes hands, even between two different holders
+        taking it right after one another with no idle gap. So each time
+        this loop is still busy-waiting, it reads the lock file's mtime and
+        pushes the deadline out whenever that value has changed since the
+        last look -- the deadline then means "no NEW holder for that long",
+        which is the stuck-holder case, and is never true of a healthy
+        sidecar being asked for one embed after another back to back (a
+        query arriving mid-batch, say), no matter how long the batch runs.
+
+        A lock call that fails for a reason OTHER than contention -- ``EINVAL``
+        or ``ENOLCK`` on a filesystem without real ``flock``, say -- reads as
+        "busy" to a bare ``except WorkerAlreadyRunning`` and would spin
+        forever; ``trialerror.offload.lock.single_instance_lock`` chains the
+        original ``OSError`` (``raise WorkerAlreadyRunning(...) from exc``),
+        so that errno is checked against the two real contention errnos and
+        anything else refuses at once instead of retrying a lock call that
+        can only ever fail the same way again."""
+        if not self.slot_erase:
+            yield
+            return
+        lock_path = self._resolved_lock_path()
+        deadline_s = self._lock_deadline_duration_s()
+        deadline = time.monotonic() + deadline_s
+        last_mtime: int | None = None
+        while True:
+            try:
+                with single_instance_lock(lock_path):
+                    _write_lock_owner_pid(lock_path)
+                    _clear_waiting(lock_path)
+                    yield
+                return
+            except WorkerAlreadyRunning as werr:
+                cause = werr.__cause__
+                if isinstance(cause, OSError) and cause.errno not in _LOCK_CONTENTION_ERRNOS:
+                    raise EmbedBackendNotRunnable(
+                        f"the embedding sidecar lock at {lock_path} failed with "
+                        f"{type(cause).__name__} (errno {cause.errno}): {cause} -- this is not "
+                        "lock contention, and waiting will not help; set "
+                        f"[{self.config_table}] slot_erase = false to embed without the erase"
+                    ) from werr
+                _signal_waiting(lock_path)
+                try:
+                    mtime = os.stat(lock_path).st_mtime_ns
+                except OSError:
+                    mtime = None
+                if last_mtime is not None and mtime != last_mtime:
+                    deadline = time.monotonic() + deadline_s
+                last_mtime = mtime
+                if time.monotonic() >= deadline:
+                    pid = _lock_holder_pid(lock_path)
+                    raise EmbedBackendNotRunnable(
+                        f"the embedding sidecar lock at {lock_path} has had no new holder for "
+                        f"{deadline_s:g}s (pid last written to it: {pid}) -- set "
+                        f"[{self.config_table}] slot_erase = false to embed without the erase"
+                    ) from werr
+                time.sleep(0.05)
+
+    def _erase_slots(self) -> None:
+        """POST the slot-erase action, for every slot the server reports,
+        before an embed (the guide's "Determinism needs `--slot-save-path`"
+        paragraph, REQ-2026-09-27-09): the vector of a text depends on what
+        the slot it lands in held before it, and a server started with more
+        than one slot (``-np`` > 1) can serve the embed from ANY idle one --
+        ``/embedding`` takes no ``id_slot`` and nothing says in advance which
+        one it will be. So every slot ``0..served_total_slots-1``
+        is erased here, inside the same lock, rather than guessing one;
+        with one slot (``served_total_slots`` absent or 1) that is slot 0
+        alone, exactly as before this fix. Must run inside
+        :meth:`_slot_erase_guard`'s lock -- see there for why.
+
+        A status in :data:`SLOT_ERASE_UNAVAILABLE_STATUSES` (501: no
+        ``--slot-save-path``; 404/405: no ``/slots`` route at all, or the
+        wrong method) is read the same way an absent ``/props``
+        field is elsewhere in this class: a warning, not a refusal, and only
+        once per sidecar URL per process
+        (:func:`_warn_slot_erase_unavailable_once`) -- it also stops the loop
+        over the remaining slots, since the reason is common to all of them.
+        Every later embed on THIS instance then skips the attempt entirely.
+        Any OTHER failure (a 5xx -- the server state is unknown, not
+        "feature absent" -- or a transport error) is not that case and
+        refuses loudly, the same as the embed call right after it would."""
+        if self._slot_erase_unsupported:
+            return
+        total_slots = self.served_total_slots if self.served_total_slots else 1
+        for slot_id in range(total_slots):
+            path = LLAMA_SERVER_SLOT_ERASE_PATH.format(slot_id=slot_id)
+            try:
+                status, body = self._http().post_json(path, {})
+            except Exception as exc:  # noqa: BLE001 - the embed call right after reports a dead sidecar itself
+                raise EmbedBackendNotRunnable(
+                    f"the embedding sidecar at {self.url} failed on {path} ({type(exc).__name__}: {exc})"
+                ) from exc
+            if status in SLOT_ERASE_UNAVAILABLE_STATUSES:
+                self._slot_erase_unsupported = True
+                _warn_slot_erase_unavailable_once(self.url, status)
+                return
+            if status != 200:
+                detail = body if isinstance(body, str) else json.dumps(body)[:300]
+                raise EmbedBackendNotRunnable(
+                    f"the embedding sidecar at {self.url} answered {path} with HTTP {status}: {detail}"
+                )

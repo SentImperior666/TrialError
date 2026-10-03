@@ -124,11 +124,45 @@ def _check_runs(db: sqlite3.Connection, host: str, period_start: datetime, now: 
     return _check(1, "Runs", PASS, f"{len(seq)} runs in the period; the last was {_hours(tail)} hours ago", runs=len(seq))
 
 
-def _check_coverage(db: sqlite3.Connection, host: str, src: Path | None) -> dict[str, Any]:
+def _latest_finished_scope(db: sqlite3.Connection, host: str) -> list[str] | None:
+    """B6.4: the host's latest FINISHED run's scope (a list of globs), or
+    ``None`` for "everything" -- either no scope was recorded (an
+    unscoped run, or an index from before B6), or nothing has finished."""
+    row = db.execute(
+        "SELECT scope FROM run WHERE host = ? AND finished_ts IS NOT NULL ORDER BY id DESC LIMIT 1", (host,)
+    ).fetchone()
+    if row is None or not row["scope"]:
+        return None
+    try:
+        parsed = json.loads(row["scope"])
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, list) and parsed else None
+
+
+def _scope_changed_on(db: sqlite3.Connection, host: str, period_start: datetime) -> str | None:
+    """B6.4: the ISO date scope first differed from the previous finished
+    run's, among finished runs at or after ``period_start`` -- ``None`` when
+    it never changed in the period."""
+    rows = db.execute(
+        "SELECT started_ts, scope FROM run WHERE host = ? AND finished_ts IS NOT NULL AND started_ts >= ? "
+        "ORDER BY id",
+        (host, utc_iso(period_start)),
+    ).fetchall()
+    prev, prev_set = None, False
+    for row in rows:
+        if prev_set and row["scope"] != prev:
+            return row["started_ts"][:10]
+        prev, prev_set = row["scope"], True
+    return None
+
+
+def _check_coverage(db: sqlite3.Connection, host: str, src: Path | None, period_start: datetime | None = None) -> dict[str, Any]:
     if src is None:
         return _check(2, "Coverage", WARN, "not checked: no --src was given, so the source folder was not rescanned")
     if not src.is_dir():
         return _check(2, "Coverage", FAIL, f"the source folder {src} does not exist, so coverage cannot be shown")
+    scope = _latest_finished_scope(db, host)
     last = db.execute("SELECT MAX(started_ts) AS t FROM run WHERE host = ?", (host,)).fetchone()["t"]
     last_epoch = parse_ts(last).timestamp() if last else None
     known = {
@@ -139,7 +173,15 @@ def _check_coverage(db: sqlite3.Connection, host: str, src: Path | None) -> dict
     never: list[str] = []  # files the archive cannot copy: over the size limit, or not readable
     newer = 0
     scanned = 0
-    for rel, _path, st, skip in store.walk_source(src):
+    project_folders = 0
+    if scope:
+        try:
+            project_folders = sum(
+                1 for p in src.iterdir() if p.is_dir() and store.scope_matches(p.name, scope)
+            )
+        except OSError:
+            project_folders = 0
+    for rel, _path, st, skip in store.walk_source(src, scope):
         if skip == "secret":
             continue
         if skip is not None or st is None:
@@ -157,6 +199,22 @@ def _check_coverage(db: sqlite3.Connection, host: str, src: Path | None) -> dict
             newer += 1
         else:
             missing.append(rel)
+    scope_note = ""
+    out_of_scope_note = ""
+    if scope:
+        try:
+            all_top = [p.name for p in src.iterdir() if p.is_dir()]
+        except OSError:
+            all_top = []
+        out_of_scope = len(all_top) - project_folders
+        scope_note = f" (scope: {', '.join(scope)})"
+        if out_of_scope > 0:
+            out_of_scope_note = (
+                f"; {out_of_scope} project folder{'s' if out_of_scope != 1 else ''} on the host "
+                "are outside the scope and are not archived"
+            )
+    changed_on = _scope_changed_on(db, host, period_start) if period_start is not None else None
+    changed_note = f"; the scope changed on {changed_on}" if changed_on else ""
     if missing or never:
         parts = []
         if missing:
@@ -173,14 +231,25 @@ def _check_coverage(db: sqlite3.Connection, host: str, src: Path | None) -> dict
             2,
             "Coverage",
             FAIL,
-            "; ".join(parts),
+            "; ".join(parts) + out_of_scope_note + changed_note,
             missing=missing[:20],
             missing_total=len(missing),
             never_archived=never[:20],
             never_archived_total=len(never),
+            scope=scope,
         )
     note = f"; {newer} changed since the last run started (expected, the next run takes them)" if newer else ""
-    return _check(2, "Coverage", PASS, f"all {scanned} files in the source are covered{note}", scanned=scanned, newer=newer)
+    scope_words = f"in the {project_folders} project folder{'s' if project_folders != 1 else ''} in scope" if scope else ""
+    return _check(
+        2,
+        "Coverage",
+        PASS,
+        f"all {scanned} files{(' ' + scope_words) if scope_words else ''} are covered{scope_note}{note}"
+        f"{out_of_scope_note}{changed_note}",
+        scanned=scanned,
+        newer=newer,
+        scope=scope,
+    )
 
 
 def _session_version(dest: Path, db: sqlite3.Connection, host: str, project: str, session: str, cache: dict) -> str:
@@ -212,14 +281,19 @@ def _session_version(dest: Path, db: sqlite3.Connection, host: str, project: str
 
 
 def _check_missing_transcripts(
-    dest: Path, db: sqlite3.Connection, host: str, previous: dict[str, Any] | None
+    dest: Path, db: sqlite3.Connection, host: str, previous: dict[str, Any] | None, scope: list[str] | None = None
 ) -> dict[str, Any]:
+    """B6.4: ``scope`` (the host's latest finished run's scope) counts only
+    paths in the current scope -- an out-of-scope project's own subagent
+    records were never re-checked by this run and are not this run's
+    concern."""
     paths = {r["rel_path"] for r in db.execute("SELECT rel_path FROM path_state WHERE host = ?", (host,))}
     metas = [
         r["rel_path"]
         for r in db.execute(
             "SELECT rel_path FROM path_state WHERE host = ? AND kind = 'subagent_meta' AND gone_ts IS NULL", (host,)
         )
+        if scope is None or store.scope_matches(r["rel_path"], scope)
     ]
     by_group: dict[str, dict[str, int]] = {}
     total = 0
@@ -569,10 +643,11 @@ def run_audit(
         now_iso = utc_iso(now)
         previous = _previous(dest_p, host, now_iso)
         period_start = parse_ts(previous["generated_ts"]) if previous and previous.get("generated_ts") else now - timedelta(days=DEFAULT_PERIOD_DAYS)
+        scope = _latest_finished_scope(db, host)
         checks = [
             _check_runs(db, host, period_start, now),
-            _check_coverage(db, host, src_p),
-            _check_missing_transcripts(dest_p, db, host, previous),
+            _check_coverage(db, host, src_p, period_start),
+            _check_missing_transcripts(dest_p, db, host, previous, scope),
             _check_gaps(dest_p, db, host, Path(gap_file) if gap_file else None, now),
             _check_integrity(dest_p, db, sample, rng or random.Random()),
             _check_retention(db, host, settings, previous),

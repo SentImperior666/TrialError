@@ -32,6 +32,11 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     p_run.add_argument(
         "--no-prune", action="store_true", help="do not delete old superseded object files after this run"
     )
+    p_run.add_argument(
+        "--include", action="append", default=None, metavar="GLOB",
+        help="B6: scope this run to project folders (the first path component under --src) matching this glob "
+        "(repeatable); without it, everything is archived, as before",
+    )
     p_run.set_defaults(handler=run_run)
 
     p_restore = actions.add_parser("restore", help="write the exact original bytes of an archived file to --out")
@@ -73,7 +78,8 @@ def _refusal(command: str, exc: store.ArchiveError) -> dict:
 def run_run(args: argparse.Namespace) -> dict:
     try:
         result = store.run_archive(
-            args.src, args.dest, args.host, dry_run=args.dry_run, prune=not args.no_prune
+            args.src, args.dest, args.host, dry_run=args.dry_run, prune=not args.no_prune,
+            include=getattr(args, "include", None),
         )
     except store.ArchiveError as exc:
         return _refusal("archive run", exc)

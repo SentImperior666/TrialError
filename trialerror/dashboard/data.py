@@ -1271,13 +1271,19 @@ def _gate_edit_items(conn_ops: sqlite3.Connection) -> list[dict[str, Any]]:
     """One row PER unverified blocking edit (not per gate -- REDESIGN S20/
     S21: the determination queue's unit of work is the edit an operator can
     individually verify or send back), each with a ``consequence`` string
-    naming what unblocks if it is resolved."""
+    naming what unblocks if it is resolved.
+
+    Review finding S-4: also excludes gates in ``failed`` (design §3 B2 --
+    "excludes gates in failed, whose edits can no longer be acted on", the
+    trap the code map names: ``verify_edit`` refuses a non-``gated`` gate,
+    so a failed gate's unverified edits would otherwise sit in DECIDE for
+    good, with a button nobody can ever use)."""
     rows = conn_ops.execute(
         "SELECT g.gate_id, g.artifact_id, g.state, g.verdict, g.edits, g.reproduction_status, "
         "g.critic_launch, g.verdict_ts, a.title, a.type "
         "FROM gate g JOIN artifact a ON g.artifact_id = a.artifact_id "
         "WHERE g.edits IS NOT NULL AND g.edits != '' AND g.edits != '[]' "
-        "AND g.state NOT IN ('union_applied', 'registered')"
+        "AND g.state NOT IN ('union_applied', 'registered', 'failed')"
     ).fetchall()
     items: list[dict[str, Any]] = []
     for r in rows:
@@ -1396,6 +1402,7 @@ def _acquisition_items(rostore: RoStore) -> list[dict[str, Any]]:
                 "title": d["title"],
                 "request_state": d["request_state"],
                 "source_kind": d["kind"],
+                "requested_ts": d.get("requested_ts") or d.get("registered_ts"),
                 "blocking": False,
                 "consequence": f"Needed by literature request {d['source_id']}.",
             }
@@ -1691,11 +1698,173 @@ def _term_duplicate_items(rostore: RoStore) -> list[dict[str, Any]]:
     return items
 
 
+#: L10 part B, design §3 table B2: every kind's owner. ``room_escalation``,
+#: ``acquisition`` and ``webfetch_proposals`` are the operator's; most of
+#: the rest are work waiting for an agent, not a decision for the operator
+#: (the design's own framing: "a review correction waiting to be checked is
+#: the orchestrator's; a stopped worker is the custodian's"). A kind this
+#: table does not name (there should be none, in a build that has landed
+#: this lane) owns as ``"none"`` rather than crashing the panel.
+KIND_OWNERS: dict[str, str] = {
+    "room_escalation": "operator",
+    "acquisition": "operator",
+    "webfetch_proposals": "operator",
+    "gate_edit": "orchestrator",
+    "prereg_reveal": "orchestrator",
+    "memory_conflict": "orchestrator",
+    "memory_conflict_candidate": "orchestrator",
+    "memory_stale": "orchestrator",
+    "kg_merge": "orchestrator",
+    "webfetch_sidecar_down": "custodian",
+    "offload_backlog": "custodian",
+}
+
+
+def _room_escalation_words(item: Mapping[str, Any], rostore: RoStore) -> dict[str, Any]:
+    from trialerror.resolve import describe
+
+    desc = describe(str(item["id"]), rostore)
+    why_bits = [f"It was {desc.state_words}." if desc.state_words else f"It was stopped because {item.get('reason')}."]
+    if desc.purpose:
+        why_bits.append(f"It {desc.purpose}.")
+    recommend_close = False
+    for related_id, _label, _title in desc.related:
+        idea = rostore.is_available("knowledge") and _row_by_pk(rostore.knowledge, "idea", "idea_id", related_id)
+        if idea and idea.get("status") in ("eliminated", "merged"):
+            recommend_close = True
+    return {
+        "what": f"Close or keep the stopped discussion room '{item.get('topic')}'",
+        "why": " ".join(why_bits),
+        "options": [
+            {"key": "close", "label": "Close the room",
+             "consequence": "The room leaves every list; nothing reads it again."},
+            {"key": "keep", "label": "Keep it stopped",
+             "consequence": "It stays stopped and listed."},
+        ],
+        "recommended": "close" if recommend_close else "keep",
+        "if_undecided": "It stays listed; nothing waits on it.",
+        "needed_by": "next-session",
+    }
+
+
+def _row_by_pk(conn, table: str, pk_column: str, pk_value: str) -> dict[str, Any] | None:
+    if conn is None:
+        return None
+    row = conn.execute(f"SELECT * FROM {table} WHERE {pk_column} = ?", (pk_value,)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _acquisition_words(item: Mapping[str, Any]) -> dict[str, Any]:
+    when = str(item.get("requested_ts") or "an unknown date")[:10]
+    return {
+        "what": f"Deliver the source '{item.get('title')}'",
+        "why": f"Requested on {when}; only you can obtain it.",
+        "options": [
+            {"key": "deliver", "label": "Deliver it",
+             "consequence": "It is marked delivered, and ingestion can proceed."},
+            {"key": "not_now", "label": "Not now",
+             "consequence": "It stays requested and returns in a later packet."},
+            {"key": "drop", "label": "Drop the request",
+             "consequence": "Nothing further happens unless it is requested again."},
+        ],
+        "recommended": "deliver",
+        "if_undecided": "It stays requested and reappears in a later packet.",
+        "needed_by": "next-session",
+    }
+
+
+def _webfetch_proposals_words(item: Mapping[str, Any]) -> dict[str, Any]:
+    hosts = ", ".join(item.get("hosts") or [])
+    return {
+        "what": f"Allow fetching from {hosts}?",
+        "why": (
+            "New URLs cannot be fetched until their hosts are approved, and approval only happens "
+            "on the operator's own machine (ruling L-A2) -- that is what keeps an injected agent "
+            "from naming a host to send data to."
+        ),
+        "options": [
+            {"key": "review", "label": "Review and approve the hosts",
+             "consequence": f"Approving lets fetching begin for {item.get('host_count', 0)} host(s)."},
+            {"key": "wait", "label": "Leave them for now",
+             "consequence": "They stay queued and unapproved; nothing is fetched from them."},
+        ],
+        "recommended": "review",
+        "if_undecided": "They stay queued, unapproved; nothing is fetched from them.",
+        "needed_by": "next-session",
+    }
+
+
+#: Owners other than the operator only need ``what``/``why``/``next_step``
+#: (B1): who does what next, not a menu of options for an operator who does
+#: not own the decision.
+_NEXT_STEP_WORDS: dict[str, tuple[str, str]] = {
+    "gate_edit": (
+        "Verify the correction on {artifact_title!r}: {text}",
+        "the orchestrator checks that the review's correction was applied",
+    ),
+    "prereg_reveal": (
+        "Reveal the committed pre-registration {title!r}?",
+        "the orchestrator reveals it once the result is ready to check, or leaves it committed",
+    ),
+    "memory_conflict": (
+        "Resolve the memory conflict over {key!r}",
+        "the orchestrator reviews both versions and keeps one, the other, or both",
+    ),
+    "memory_conflict_candidate": (
+        "Judge whether {key!r} and {target_key!r} conflict",
+        "the orchestrator judges the candidate",
+    ),
+    "memory_stale": (
+        "Review the memory item {key!r}",
+        "the orchestrator reviews it, which resets its review clock",
+    ),
+    "kg_merge": (
+        "Merge the knowledge-graph entities into {canonical_entity!r}?",
+        "the orchestrator accepts or rejects the merge",
+    ),
+    "webfetch_sidecar_down": (
+        "Restart the web-fetch helper",
+        "the custodian restarts the helper (`trialerror webfetch sidecar --foreground`)",
+    ),
+    "offload_backlog": (
+        "Start the GPU offload worker",
+        "the custodian runs the GPU worker on DEV",
+    ),
+}
+
+
+def _next_step_words(item: Mapping[str, Any]) -> dict[str, Any]:
+    what_tpl, next_step = _NEXT_STEP_WORDS.get(item["kind"], ("{consequence}", "unassigned"))
+    try:
+        what = what_tpl.format(**item)
+    except (KeyError, IndexError):
+        what = str(item.get("consequence") or item["kind"])
+    return {"what": what, "why": str(item.get("consequence") or ""), "next_step": next_step}
+
+
+def _add_owner_and_plain_words(items: list[dict[str, Any]], rostore: RoStore) -> None:
+    """L10 part B: every item gains ``owner`` and, per B1, either the
+    operator's full plain-words fields or (every other owner) ``what``/
+    ``why``/``next_step``. Mutates ``items`` in place."""
+    for item in items:
+        owner = KIND_OWNERS.get(item["kind"], "none")
+        item["owner"] = owner
+        if owner == "operator":
+            if item["kind"] == "room_escalation":
+                item.update(_room_escalation_words(item, rostore))
+            elif item["kind"] == "acquisition":
+                item.update(_acquisition_words(item))
+            elif item["kind"] == "webfetch_proposals":
+                item.update(_webfetch_proposals_words(item))
+        elif owner in ("orchestrator", "custodian"):
+            item.update(_next_step_words(item))
+
+
 def build_determinations_panel(rostore: RoStore) -> dict[str, Any]:
     """The one determination queue -- REDESIGN S20 (``build_review_panel``
     unioning three existing reads, no new tables) plus S21 (a
     ``consequence`` field per item, "what happens if you verify") and S26
-    (memory-merge conflicts, "queue kind, not drawn"). Nine kinds today:
+    (memory-merge conflicts, "queue kind, not drawn"). Eleven kinds today:
     gate edits awaiting verification, KG merge proposals, acquisition
     requests, pre-registration reveals, room freeze-and-escalate events,
     memory-sync conflicts, -- from the 2026-09 mining adoptions --
@@ -1703,13 +1872,21 @@ def build_determinations_panel(rostore: RoStore) -> dict[str, Any]:
     items past their type-keyed review half-life (engram-F5), and (lane
     L0-C) documents waiting for the DEV GPU worker, and -- lane a --
     web-ingestion hosts awaiting a human's approval and a stopped fetch
-    process with URLs queued behind it, and -- lane e (E4), design §5 --
-    ``term_conflict`` (a pending disjoint-source sense conflict) and
-    ``term_duplicate`` (a pending term-to-term ``same_as`` candidate). Most
-    of the newer kinds are non-blocking by construction: they are prompts to
-    LOOK at something, never gates on anything. ``webfetch_sidecar_down`` is
-    the exception and says so -- a queued fetch does not move at all while
-    the process that drains it is gone."""
+    process with URLs queued behind it. Most of the newer kinds are
+    non-blocking by construction: they are prompts to LOOK at something,
+    never gates on anything. ``webfetch_sidecar_down`` is the exception and
+    says so -- a queued fetch does not move at all while the process that
+    drains it is gone.
+
+    L10 part B: every item also gains ``owner``
+    (``operator``/``orchestrator``/``custodian``) and plain words (design
+    §3's B2 table). ``term_conflict``/``term_duplicate`` (lane e, E4) are
+    NOT unioned in any more -- B2: "not built for DECIDE any more: the
+    lexicon is a lazy reference." ``_term_conflict_items``/
+    ``_term_duplicate_items`` are unchanged (review finding N-8: kept for
+    reference/reuse, not "still called" anywhere -- ``build_lexicon_panel``
+    has its own, separate reads, and the client never drew term kinds from
+    DECIDE either; nothing calls these two builders now but one test)."""
     if not rostore.is_available("ops"):
         return {"status": "not_initialized", "message": "ops.db not found"}
 
@@ -1723,10 +1900,9 @@ def build_determinations_panel(rostore: RoStore) -> dict[str, Any]:
     items.extend(_memory_conflict_items(rostore))
     items.extend(_memory_conflict_candidate_items(rostore))
     items.extend(_memory_stale_items(rostore))
-    items.extend(_term_conflict_items(rostore))
-    items.extend(_term_duplicate_items(rostore))
     items.extend(offload_backlog_items(rostore))
     items.extend(webfetch_items(rostore))
+    _add_owner_and_plain_words(items, rostore)
 
     counts_by_kind: dict[str, int] = {}
     for item in items:
@@ -1791,7 +1967,7 @@ def build_dossier_panel(rostore: RoStore, *, artifact_id: str | None = None) -> 
     registry = list_artifacts(rostore, limit=200)
     type_filters = [dict(r) for r in conn.execute("SELECT type_key, title, gated FROM template ORDER BY type_key").fetchall()]
 
-    # te-dash A7: with nothing asked for, open the newest REGISTERED artifact
+    # With nothing asked for, open the newest REGISTERED artifact
     # -- the newest row is often a draft that "decides nothing" -- and fall
     # back to the newest row of any status. ``list_artifacts`` is newest
     # first.

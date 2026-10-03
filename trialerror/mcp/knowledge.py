@@ -218,7 +218,26 @@ def _tool_search(args: Mapping[str, Any], *, store: Store, launch_id: str | None
         launch_id=launch_id,
         # `unfenced` is deliberately NEVER read from `args` -- see module docstring.
     )
+    _attach_stamp(store, result)
     return ok_envelope("search", result=result)
+
+
+def _attach_stamp(store: Store, result: dict[str, Any]) -> None:
+    """design Section 3.5: "add stamp to the envelope's result" -- and, when
+    the corpus is degraded and this particular search came back empty, the
+    ``absence_note`` that keeps "nothing found" from reading as "nothing
+    exists". Best-effort: a stamp failure must never break a search that
+    otherwise succeeded."""
+    try:
+        from trialerror.probes.stamps import answer_stamp
+
+        stamp = answer_stamp(store)
+    except Exception:  # noqa: BLE001
+        return
+    result["stamp"] = stamp
+    if stamp.get("degraded") and not result.get("results"):
+        reason = stamp.get("degraded_reason") or "search is degraded"
+        result["absence_note"] = f"search is degraded ({reason}); an empty result is not evidence of absence"
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +302,7 @@ def _tool_similar(args: Mapping[str, Any], *, store: Store, launch_id: str | Non
         # surfaces enforce one barrier or neither of them does.
         launch_id=launch_id,
     )
+    _attach_stamp(store, result)
     return ok_envelope("similar", result=result)
 
 

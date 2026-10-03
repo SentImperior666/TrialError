@@ -56,7 +56,7 @@ from pathlib import Path
 
 from trialerror.arxiv_index.query import MAX_BATCH_QUERIES
 from trialerror.ingest.errors import IngestError
-from trialerror.litapi.client import LitApiClient, build_default_providers
+from trialerror.litapi.client import DEFAULT_CLIENTS, LitApiClient, build_default_providers
 from trialerror.litapi.config import load_litapi_config, resolve_api_key
 from trialerror.litapi.errors import AllProvidersFailedError, LitApiError
 from trialerror.stores.errors import StoreError
@@ -199,7 +199,23 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
         help="passed to every provider verbatim -- read the per-provider scope above before comparing "
              "their hit counts (a title-only provider returning nothing is not evidence the paper is absent)",
     )
-    p_search.add_argument("--limit", type=int, default=10)
+    p_search.add_argument(
+        "--limit", type=int, default=10,
+        help="records asked of each provider, and kept (at least 1; a smaller value is refused before any provider is called)",
+    )
+    p_search.add_argument(
+        "--per-provider", action="store_true",
+        help="keep each provider's OWN first --limit records (in its own order) instead of the first --limit "
+             "of the merged list, so a provider after the first is not crowded out; up to --limit x providers "
+             "records. A record two providers returned still appears once, with both names. Each record gains "
+             "provider_ranks ({provider: rank}) and the result gains selection. Still one call per provider",
+    )
+    p_search.add_argument(
+        "--provider", action="append", dest="providers", metavar="NAME", default=None,
+        help="search only this provider (repeat the option to name several; default: all). Valid names: "
+             + ", ".join(cls.name for cls in DEFAULT_CLIENTS)
+             + ". An unknown name is refused, listing the valid ones, before any provider is called",
+    )
     p_search.set_defaults(handler=_cmd_search)
 
     p_acquire = sub.add_parser(
@@ -446,9 +462,21 @@ def _search_next_actions(args: argparse.Namespace, result) -> list:
 
 
 def _cmd_search(args: argparse.Namespace) -> dict:
+    if args.limit < 1:
+        # refused before a client is built, so no provider is reached: a limit below 1 asks for
+        # nothing, and the empty answer it used to earn read as "no provider found anything"
+        return error_envelope(
+            "lit.search", "usage", f"--limit {args.limit} asks for no records -- pass a count of 1 or more"
+        )
     client = _build_client(args)
     try:
-        result = client.search(args.query, limit=args.limit)
+        # the options are passed only when given, so the default call is the one it always was
+        options: dict = {}
+        if getattr(args, "per_provider", False):
+            options["per_provider"] = True
+        if getattr(args, "providers", None):
+            options["providers"] = list(args.providers)
+        result = client.search(args.query, limit=args.limit, **options)
         return ok_envelope(
             "lit.search", result=result.to_dict(), next_actions=_search_next_actions(args, result)
         )

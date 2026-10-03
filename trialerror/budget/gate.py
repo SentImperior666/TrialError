@@ -324,12 +324,21 @@ def evaluate_spawn(
     agent_model: str | None = None,
     model_classes: Mapping[str, str] | None = None,
     now_ts: str | None = None,
+    tool_use_id: str | None = None,
+    transcript_dir: str | None = None,
 ) -> GateResult:
     """The spawn gate's core decision, given an explicit ``session_id``
     (the caller - normally :func:`evaluate_spawn_for_open_session` - is
     responsible for resolving which session that is). Deterministic and
     side-effect-free EXCEPT for the one conditional ``UPDATE`` that fires
     only when every check upstream of it has already passed.
+
+    ``tool_use_id`` and ``transcript_dir`` are the spawn's identity, both
+    optional: when given, the consuming ``UPDATE`` also stores them (and the
+    gate's own moment as ``spawn_ts``) on the launch, so a later
+    ``PostToolUseFailure`` can tell whether that spawn ever started an agent.
+    Neither adds a way to refuse: absent, the gate behaves exactly as it
+    did before they existed.
     """
     ts = now_ts or now()
 
@@ -416,12 +425,25 @@ def evaluate_spawn(
     # not expired since booking. WAL + busy_timeout (trialerror.stores.connection)
     # serialize concurrent attempts against the SAME row; whichever commits
     # first wins the WHERE clause, the loser's rowcount is 0.
+    params: dict[str, Any] = {"launch_id": token, "session_id": session_id, "now": ts}
+    identity_sql = ""
+    if (isinstance(tool_use_id, str) and tool_use_id) or (isinstance(transcript_dir, str) and transcript_dir):
+        # Same single conditional UPDATE: the identity is written in the
+        # statement that consumes the booking, never in a second one.
+        identity_sql = (
+            ", spawn_tool_use_id = :spawn_tool_use_id, spawn_ts = :now, "
+            "spawn_transcript_dir = :spawn_transcript_dir"
+        )
+        params["spawn_tool_use_id"] = tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None
+        params["spawn_transcript_dir"] = (
+            transcript_dir if isinstance(transcript_dir, str) and transcript_dir else None
+        )
     with store.platform:
         cur = store.platform.execute(
-            "UPDATE launch SET state = 'RUNNING' "
+            "UPDATE launch SET state = 'RUNNING'" + identity_sql + " "
             "WHERE launch_id = :launch_id AND state = 'PROVISIONAL' AND session_id = :session_id "
             "AND julianday(:now) <= julianday(booked_ts) + (booking_ttl_s / 86400.0)",
-            {"launch_id": token, "session_id": session_id, "now": ts},
+            params,
         )
         consumed = cur.rowcount == 1
 
@@ -465,6 +487,8 @@ def evaluate_spawn_for_open_session(
     agent_model: str | None = None,
     model_classes: Mapping[str, str] | None = None,
     now_ts: str | None = None,
+    tool_use_id: str | None = None,
+    transcript_dir: str | None = None,
 ) -> GateResult:
     """Convenience wrapper the hook script uses: resolves the program's
     open session itself (rather than requiring the caller to know it) and
@@ -486,4 +510,6 @@ def evaluate_spawn_for_open_session(
         agent_model=agent_model,
         model_classes=model_classes,
         now_ts=now_ts,
+        tool_use_id=tool_use_id,
+        transcript_dir=transcript_dir,
     )

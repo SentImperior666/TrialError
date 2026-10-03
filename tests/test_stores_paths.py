@@ -9,13 +9,21 @@ argument) -- see ``trialerror.stores.store.open_store``'s own module docstring.
 
 from __future__ import annotations
 
+import os
 import sqlite3
+from pathlib import Path
 
 import pytest
 
 from trialerror.stores import paths
 from trialerror.stores.store import open_store
 from trialerror.util.config import ConfigError
+
+#: Captured at COLLECTION time (module import), before any per-test fixture
+#: (including conftest.py's autouse ``_isolated_default_platform_root``) has
+#: had a chance to redirect ``HOME``/``USERPROFILE`` -- so this is genuinely
+#: this machine's real platform.db path, for the negative check below.
+_REAL_HOME_PLATFORM_DB = Path(os.path.expanduser("~")).resolve() / ".trialerror" / "platform.db"
 
 
 # ---------------------------------------------------------------------------
@@ -180,3 +188,21 @@ def test_open_store_relocated_stores_dir_still_migrates_all_three_dbs(tmp_path, 
                 conn.close()
     finally:
         store.close()
+
+
+def test_the_real_default_platform_root_is_never_opened_by_a_test(monkeypatch, real_home):
+    """conftest.py's isolation fixtures (the session-scoped
+    ``_isolate_machine_state`` and the per-test ``_isolated_default_platform_root``) must
+    make the DEFAULT resolution path (no explicit ``platform_root``, no
+    ``TRIALERROR_PLATFORM_ROOT``) land somewhere temporary, not this laptop's
+    real ``~/.trialerror`` -- the incident that fixture exists to close (a
+    test in the full suite applied a migration to the real platform.db)."""
+    monkeypatch.delenv("TRIALERROR_PLATFORM_ROOT", raising=False)
+    resolved = paths.platform_db_path().resolve()
+    real_platform_db = real_home.resolve() / ".trialerror" / "platform.db"
+    assert real_platform_db == _REAL_HOME_PLATFORM_DB
+    assert resolved != real_platform_db
+    # ``HOME``/``USERPROFILE`` themselves must be the isolated ones too --
+    # not just TRIALERROR_PLATFORM_ROOT happening to still be set from an
+    # earlier test.
+    assert Path(os.path.expanduser("~")).resolve() != real_home.resolve()

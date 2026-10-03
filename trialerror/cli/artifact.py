@@ -84,8 +84,9 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     )
     mode.add_argument(
         "--as-failed", action="store_true", dest="as_failed",
-        help="register an artifact as a failed result: its critic verdict was FAIL, or its gate was failed on a "
-        "mismatched reproduction by `gate fail-reproduction` (needs --failure-ref and --decided-by)",
+        help="register an artifact as a failed result: its critic verdict was FAIL (needs --failure-ref), or "
+        "its gate was failed on a mismatched reproduction by `gate fail-reproduction` (--failure-ref is then "
+        "optional: the gate's own record states the failure). Needs --decided-by",
     )
     dev = p_register.add_mutually_exclusive_group()
     dev.add_argument(
@@ -104,6 +105,16 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     p_register.add_argument(
         "--decided-by", default=None, dest="decided_by", metavar="REF",
         help="the operator decision (or request) id behind --with-deviation / --as-failed",
+    )
+    p_register.add_argument(
+        "--file", default=None, dest="file", metavar="PATH",
+        help="with --with-deviation / --as-failed: register the bytes of this file instead of the artifact's own "
+        "path. Its sha256 must be one the gate holds: the submitted hash, or the corrected hash the gate recorded "
+        "when its last blocking edit was verified",
+    )
+    p_register.add_argument(
+        "--note", default=None,
+        help="with --with-deviation / --as-failed: a plain-words note kept in the registration evidence",
     )
     p_register.set_defaults(handler=_run_register)
 
@@ -226,8 +237,8 @@ def _register_mode_problem(args: argparse.Namespace) -> str | None:
         if args.failure_ref:
             return "--failure-ref is only for --as-failed"
     elif args.as_failed:
-        if not args.failure_ref:
-            return "--as-failed needs --failure-ref (a string from the artifact that states what failed)"
+        # --failure-ref may be left out when the gate itself records the failure
+        # (an operator-decided failure); register_failed decides, and names what is missing.
         if not args.decided_by:
             return "--as-failed needs --decided-by (the operator decision that puts the failure on the record)"
         if args.deviation or args.deviations_file:
@@ -235,7 +246,7 @@ def _register_mode_problem(args: argparse.Namespace) -> str | None:
     else:
         stray = [
             flag
-            for flag, value in (("--deviation", args.deviation), ("--deviations-file", args.deviations_file), ("--failure-ref", args.failure_ref), ("--decided-by", args.decided_by))
+            for flag, value in (("--deviation", args.deviation), ("--deviations-file", args.deviations_file), ("--failure-ref", args.failure_ref), ("--decided-by", args.decided_by), ("--file", args.file), ("--note", args.note))
             if value
         ]
         if stray:
@@ -273,11 +284,13 @@ def _run_register(args: argparse.Namespace) -> dict:
                 row = register_with_deviation(
                     store, gate_id=artifact["gate_id"], deviations=deviations,
                     decided_by=args.decided_by, by_launch=args.by_launch, supersedes=args.supersedes,
+                    file=args.file, note=args.note,
                 )
             else:
                 row = register_failed(
                     store, gate_id=artifact["gate_id"], failure_ref=args.failure_ref,
                     decided_by=args.decided_by, by_launch=args.by_launch, supersedes=args.supersedes,
+                    file=args.file, note=args.note,
                 )
         else:
             row = register_artifact(
@@ -309,11 +322,38 @@ def _run_show(args: argparse.Namespace) -> dict:
         return err
     try:
         row = get_artifact(store, args.artifact_id)
+        registration = _registered_bytes(store, row) if row is not None else None
     finally:
         store.close()
     if row is None:
         return error_envelope("artifact show", "not_found", f"no such artifact: {args.artifact_id!r}")
+    if registration is not None:
+        row = {**row, **registration}
     return ok_envelope("artifact show", result=row)
+
+
+def _registered_bytes(store: Store, artifact: dict) -> dict | None:
+    """The bytes a registration bound to (hash, which version, where), read from
+    the evidence of the gate's ``-> registered`` transition. ``None`` for an
+    artifact that was not registered through a path that records them."""
+    gate_id = artifact.get("gate_id")
+    if artifact.get("status") != "registered" or not gate_id:
+        return None
+    transition = store.ops.execute(
+        "SELECT evidence FROM gate_transition WHERE gate_id = ? AND to_state = 'registered' "
+        "ORDER BY ts DESC, rowid DESC LIMIT 1",
+        (gate_id,),
+    ).fetchone()
+    try:
+        evidence = json.loads(transition["evidence"]) if transition and transition["evidence"] else None
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(evidence, dict) or "registered_sha256" not in evidence:
+        return None
+    shown = {k: evidence[k] for k in ("registered_sha256", "registered_bytes", "registered_path", "note") if k in evidence}
+    return {"registered_sha256": shown.get("registered_sha256"), "registered_bytes": shown.get("registered_bytes"),
+            "registered_path": shown.get("registered_path"),
+            **({"registered_note": shown["note"]} if "note" in shown else {})}
 
 
 def _run_templates(args: argparse.Namespace) -> dict:
