@@ -24,11 +24,43 @@
         ]
       }
     ],
+    "SubagentStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "trialerror hook subagent-start" }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "trialerror hook subagent-stop" }
+        ]
+      }
+    ],
     "Stop": [
       {
         "matcher": "",
         "hooks": [
           { "type": "command", "command": "trialerror hook stop-check" }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "^(Task|Agent)$",
+        "hooks": [
+          { "type": "command", "command": "trialerror hook spawn-failure" }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "trialerror hook stop-failure" }
         ]
       }
     ]

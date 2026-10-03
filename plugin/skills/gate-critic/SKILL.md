@@ -169,9 +169,10 @@ closes that gap, in four digests:
    Never quietly re-hash and carry on.
 
 4. **At apply-union.** After the applier has applied the blocking edits and
-   each one is `verify-edit`-ed, recompute once more and record it:
-   `--evidence '{"body_sha256_after_edits":"<hex>"}'` on `gate apply-union`.
-   The pair (pre-review digest, post-edit digest) is the audit trail that the
+   each one is `verify-edit`-ed, nothing more is recorded by hand: the gate
+   records the corrected file's hash when the last blocking edit is verified
+   (`trialerror gate show --id <CR-id>` prints it as `post_edit_sha256`).
+   The pair (pre-review digest, that recorded hash) is the audit trail that the
    only change between verdict and registration was the verified edit union.
 
 Source: Harness-of-Harness §3.4.3 — "Freezing separates artifact production

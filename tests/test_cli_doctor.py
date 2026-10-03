@@ -7,7 +7,12 @@ from trialerror.stores.store import open_store
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_cli_doctor_license_audit_fails_on_headerless_vendored_fixture(tmp_path, capsys):
+def test_cli_doctor_license_audit_fails_on_headerless_vendored_fixture(tmp_path, capsys, monkeypatch):
+    # L8 part F (second fix step): a program-scoped check with no --program-root
+    # falls back to find_program_root(), which must never resolve to the
+    # harness's own checkout -- a temporary program root keeps this test's
+    # default off the real cwd walk-up entirely.
+    monkeypatch.setenv("TRIALERROR_PROGRAM_ROOT", str(tmp_path / "program"))
     vroot = tmp_path / "vendored"
     item = vroot / "some-lib"
     item.mkdir(parents=True)
@@ -28,7 +33,8 @@ def test_cli_doctor_license_audit_fails_on_headerless_vendored_fixture(tmp_path,
     assert "adapted.py" in " ".join(lic["details"]["offenders"])
 
 
-def test_cli_doctor_license_audit_passes_on_well_headered_fixture(tmp_path, capsys):
+def test_cli_doctor_license_audit_passes_on_well_headered_fixture(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("TRIALERROR_PROGRAM_ROOT", str(tmp_path / "program"))
     vroot = tmp_path / "vendored"
     item = vroot / "some-lib"
     item.mkdir(parents=True)
@@ -67,6 +73,7 @@ def test_cli_doctor_runs_all_registered_checks_by_default(tmp_path, monkeypatch,
     # what this test is about is that the registry is run by default, not what
     # any one check found.
     monkeypatch.setenv("TRIALERROR_PLATFORM_ROOT", str(tmp_path / "platform"))
+    monkeypatch.setenv("TRIALERROR_PROGRAM_ROOT", str(tmp_path / "program"))
     rc = main(["doctor", "--vendored-root", str(tmp_path / "vendored")])
     out = capsys.readouterr().out.strip()
     env = json.loads(out)
@@ -75,9 +82,10 @@ def test_cli_doctor_runs_all_registered_checks_by_default(tmp_path, monkeypatch,
     assert "license_audit" in names
 
 
-def test_cli_doctor_on_repo_own_vendored_dir_is_clean(capsys):
+def test_cli_doctor_on_repo_own_vendored_dir_is_clean(tmp_path, capsys, monkeypatch):
     """Sanity/regression: the real vendored/VENDORED.md this module ships
     must itself pass the audit it defines."""
+    monkeypatch.setenv("TRIALERROR_PROGRAM_ROOT", str(tmp_path / "program"))
     rc = main(["doctor", "--license-audit", "--repo-root", str(_REPO_ROOT)])
     out = capsys.readouterr().out.strip()
     env = json.loads(out)
@@ -85,12 +93,13 @@ def test_cli_doctor_on_repo_own_vendored_dir_is_clean(capsys):
     assert env["ok"] is True
 
 
-def test_cli_doctor_license_audit_ignores_pyc_under_vendored_pycache(tmp_path, capsys):
+def test_cli_doctor_license_audit_ignores_pyc_under_vendored_pycache(tmp_path, capsys, monkeypatch):
     """M15 regression test at the CLI layer (INTEGRATION_NOTES.md item 4 /
     M11 flag chip task_2fe5d707) -- see
     tests/test_license_audit_check.py for the unit-level version of this
     same fix. A ``.pyc`` under a vendored item's own ``__pycache__/`` must
     not fail the audit `trialerror doctor --license-audit` runs."""
+    monkeypatch.setenv("TRIALERROR_PROGRAM_ROOT", str(tmp_path / "program"))
     vroot = tmp_path / "vendored"
     item = vroot / "some-lib"
     item.mkdir(parents=True)

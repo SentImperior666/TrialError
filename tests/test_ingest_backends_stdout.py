@@ -60,6 +60,15 @@ def _clear_caches():
     backends._VOCAB_ONLY_INSTANCES.clear()
 
 
+@pytest.fixture(autouse=True)
+def _slot_erase_lock_in_tmp_path(monkeypatch, tmp_path):
+    """Both backends this module builds (directly, and via
+    ``program_with_a_noisy_backend``) call ``embed_batch`` with no explicit
+    ``_lock_path``, and must not otherwise take the real lock under
+    ``%LOCALAPPDATA%\\trialerror\\offload\\ingest_slot_erase\\``."""
+    monkeypatch.setattr(backends, "_slot_erase_lock_path", lambda url: tmp_path / "slot_erase.lock")
+
+
 @pytest.fixture()
 def noisy_wheel(monkeypatch, tmp_path):
     module = types.ModuleType("llama_cpp")

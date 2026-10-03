@@ -107,15 +107,32 @@ def test_a_valid_item_gets_an_id_a_status_and_defaults(settings):
 
 
 def test_lint_flags_an_unexplained_id_hex_run_and_path():
-    item = good(what="Merge TE-104 into the plan?", why="See a1b2c3d4e5 and docs/plan_v2.md for the background.")
+    """L10 part C (design §4 item 3): the id pattern now catches a
+    ULID-shaped id -- ``ROOM-01M2XAX6268A0YE6WMR2ABETFY``, the exact shape
+    of the operator's own complaint -- which the old ``\\b[A-Z]{2,}-\\d+\\b``
+    pattern missed entirely."""
+    item = good(
+        what="Close ROOM-01M2XAX6268A0YE6WMR2ABETFY?",
+        why="See a1b2c3d4e5 and docs/plan_v2.md for the background.",
+    )
     text = " | ".join(ps.lint_item(item))
-    assert "'TE-104'" in text and "'a1b2c3d4e5'" in text and "'docs/plan_v2.md'" in text
+    assert "'ROOM-01M2XAX6268A0YE6WMR2ABETFY'" in text
+    assert "'a1b2c3d4e5'" in text and "'docs/plan_v2.md'" in text
+
+
+def test_the_old_generic_ticket_style_token_is_no_longer_flagged():
+    """L10 part C (design §4 item 3): the new pattern replaces the old
+    generic ``[A-Z]{2,}-\\d+`` match with ULID ids plus the two named legacy
+    styles (``CR-\\d+``, ``C-\\d{3,}``) -- a plain ticket-style token like
+    ``TE-104`` (never one of this harness's own id shapes) is not an id the
+    lint needs to explain any more."""
+    assert ps.lint_item(good(what="Merge TE-104 into the plan?")) == []
 
 
 def test_a_ref_label_that_explains_the_token_silences_the_lint():
     item = good(
-        what="Merge TE-104 into the plan?",
-        refs=[{"label": "TE-104: the retention proposal", "ref": "notes/retention.md"}],
+        what="Close ROOM-01M2XAX6268A0YE6WMR2ABETFY?",
+        refs=[{"label": "ROOM-01M2XAX6268A0YE6WMR2ABETFY: the retention proposal", "ref": "notes/retention.md"}],
     )
     assert ps.lint_item(item) == []
 
@@ -132,13 +149,13 @@ def test_lint_flags_a_long_sentence_and_an_empty_consequence():
 
 
 def test_lint_warns_but_the_item_is_stored(settings):
-    item, warnings = ps.add_item(settings, good(what="Merge TE-104?"))
+    item, warnings = ps.add_item(settings, good(what="Close ROOM-01M2XAX6268A0YE6WMR2ABETFY?"))
     assert warnings and ps.read_jsonl(settings.pending)[0]["id"] == item["id"]
 
 
 def test_strict_turns_the_warnings_into_a_refusal_and_stores_nothing(settings):
     with pytest.raises(PacketError) as exc:
-        ps.add_item(settings, good(what="Merge TE-104?"), strict=True)
+        ps.add_item(settings, good(what="Close ROOM-01M2XAX6268A0YE6WMR2ABETFY?"), strict=True)
     assert exc.value.code == "lint_refused" and exc.value.details["warnings"]
     assert ps.read_jsonl(settings.pending) == []
 
@@ -170,7 +187,7 @@ def test_cli_add_from_flags_and_from_a_file(prog, capsys, tmp_path):
 
 
 def test_cli_add_reports_lint_as_warnings_and_refuses_under_strict(prog, capsys):
-    argv = ["packet", "add", "--program-root", str(prog), "--what", "Merge TE-104?", "--why", "Because.",
+    argv = ["packet", "add", "--program-root", str(prog), "--what", "Close ROOM-01M2XAX6268A0YE6WMR2ABETFY?", "--why", "Because.",
             "--option", "a=Yes::It merges.", "--option", "b=No::It stays.", "--recommend", "a",
             "--if-undecided", "Nothing.", "--needed-by", "next-session"]
     code, env = cli(capsys, *argv)
@@ -198,10 +215,14 @@ def test_answer_and_list_answered_since_round_trip(settings):
     assert ans == {"item_id": item["id"], "choice": "b", "note": "one year is plenty",
                    "decided_by": "the operator", "decided_ts": "2026-03-02T14:00:00Z"}
     assert [r["id"] for r in ps.list_items(settings)["open"]] == [other["id"]]
-    since = ps.list_items(settings, open_only=False, answered_since="2026-03-02T12:00:00Z")
+    since = ps.list_items(settings, open_only=False, since="2026-03-02T12:00:00Z")
     assert "open" not in since and len(since["answered"]) == 1
     assert since["answered"][0]["choice_label"] == "Keep one year" and since["answered"][0]["what"] == item["what"]
-    assert ps.list_items(settings, open_only=False, answered_since="2026-03-02T15:00:00Z")["answered"] == []
+    assert since["answered"][0]["asked_by"] == item["asked_by"]
+    # L10 part C item 5: answered_since(program_root, ts) is the same pure
+    # read `packet list --answered-since` now goes through.
+    assert ps.answered_since(settings.program_root, "2026-03-02T12:00:00Z") == since["answered"]
+    assert ps.list_items(settings, open_only=False, since="2026-03-02T15:00:00Z")["answered"] == []
     assert ps.read_jsonl(settings.answers) == [ans]
     assert [r["status"] for r in ps.read_jsonl(settings.pending)] == ["answered", "open"]
 

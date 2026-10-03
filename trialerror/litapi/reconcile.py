@@ -38,7 +38,7 @@ from typing import Sequence
 
 from trialerror.litapi.models import WorkRecord
 
-__all__ = ["merge_one", "reconcile_many"]
+__all__ = ["merge_one", "reconcile_many", "reconcile_ranked"]
 
 
 def _prefer(*values):
@@ -127,19 +127,57 @@ def reconcile_many(records: Sequence[WorkRecord]) -> list[WorkRecord]:
     (``merged[:limit]``) gets the same top results a naive dedup-free list
     would have, just deduplicated.
     """
+    return [merge_one(group) for group in _group_records(records)]
+
+
+def _group_records(records: Sequence[WorkRecord], *, in_place: bool = False) -> list[list[WorkRecord]]:
+    """The groups :func:`reconcile_many` merges: one group per identity, in
+    first-appearance order, and every record with no identity as a group of
+    its own -- listed after all the identity groups (``reconcile_many``'s
+    order), or, with ``in_place=True``, at the position it holds in
+    ``records``, like every other group's first member."""
     groups: dict[str, list[WorkRecord]] = {}
-    order: list[str] = []
-    standalone: list[WorkRecord] = []
+    order: list[list[WorkRecord]] = []
+    standalone: list[list[WorkRecord]] = []
     for r in records:
         key = r.identity_key()
         if key is None:
-            standalone.append(r)
+            (order if in_place else standalone).append([r])
             continue
         if key not in groups:
             groups[key] = []
-            order.append(key)
+            order.append(groups[key])
         groups[key].append(r)
+    return order + standalone
 
-    merged = [merge_one(groups[key]) for key in order]
-    merged.extend(standalone)
-    return merged
+
+def reconcile_ranked(
+    per_provider: Sequence[tuple[str, Sequence[WorkRecord]]],
+) -> list[tuple[WorkRecord, dict[str, int]]]:
+    """Like :func:`reconcile_many`, for records that arrive as one ordered
+    list per provider: every merged record comes back with the 1-based rank
+    it held in each provider's own list (``{provider: rank}``).
+
+    ``per_provider`` is ``[(provider name, that provider's records in its own
+    order), ...]``. The merge is :func:`reconcile_many`'s: one record per
+    identity, holding every provider that returned it. Order is provider
+    order, then each provider's own rank -- a record already met under an
+    earlier provider stays where that provider put it and is not repeated.
+    A record with no identity (no title, DOI or arXiv id) is never merged and
+    keeps its own place in its provider's block. A provider that lists one
+    identity twice is ranked at its better position.
+    """
+    flat: list[WorkRecord] = []
+    rank_of: dict[int, tuple[str, int]] = {}
+    for name, records in per_provider:
+        for rank, record in enumerate(records, start=1):
+            flat.append(record)
+            rank_of[id(record)] = (name, rank)
+    out: list[tuple[WorkRecord, dict[str, int]]] = []
+    for group in _group_records(flat, in_place=True):
+        ranks: dict[str, int] = {}
+        for member in group:
+            name, rank = rank_of[id(member)]
+            ranks[name] = min(rank, ranks.get(name, rank))
+        out.append((merge_one(group), ranks))
+    return out

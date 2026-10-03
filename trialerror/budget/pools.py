@@ -58,6 +58,9 @@ __all__ = [
     "PHASE_LABEL_MAX_LEN",
     "check_booking_preconditions",
     "heartbeat_launch",
+    "cancel_launch",
+    "release_launch",
+    "find_stranded_launches",
     "reconcile_launch",
     "reconcile_launch_from_event",
     "latest_subagent_return",
@@ -1220,11 +1223,18 @@ def list_pools(store: Store, *, account_id: str | None = None) -> list[dict[str,
     return [dict(r) for r in rows]
 
 
-def budget_status(store: Store, *, account_id: str, model_class: str | None = None) -> dict[str, Any]:
+def budget_status(
+    store: Store, *, account_id: str, model_class: str | None = None, include_stranded: bool = False
+) -> dict[str, Any]:
     """Design Section 5.1 ``budget_status`` tool: "pools, headroom,
     multiplier, DEFER advisories." Reports the CURRENT pool (latest
     ``period_start``) per model class, each with projected headroom against
-    its own hard/soft caps."""
+    its own hard/soft caps.
+
+    ``include_stranded`` adds ``stranded_count`` / ``stranded_ids`` -- a search
+    of the filesystem, bounded at 2 s -- and is asked for only by the ``budget
+    status`` and ``budget check`` verbs. The dashboard's panel and session open
+    call this on every refresh and boot and leave it off."""
     classes = [model_class] if model_class else list(dict.fromkeys(
         r["model_class"] for r in list_pools(store, account_id=account_id)
     ))
@@ -1255,12 +1265,20 @@ def budget_status(store: Store, *, account_id: str, model_class: str | None = No
                 }
             )
 
-    return {
+    result = {
         "account_id": account_id,
         "pools": pools_out,
         "defer_advisories": defer_advisories,
         "binding_limit": _binding_limit(pools_out),
     }
+    if include_stranded:
+        try:
+            stranded_ids = find_stranded_launches(store, account_id=account_id)
+        except Exception:  # noqa: BLE001 - a report that cannot be made is not a failed status
+            stranded_ids = []
+        result["stranded_count"] = len(stranded_ids)
+        result["stranded_ids"] = stranded_ids
+    return result
 
 
 def _binding_limit(pools_out: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -1402,3 +1420,321 @@ def calibrate(
         )
 
     return calib_row
+
+
+# ---------------------------------------------------------------------------
+# giving a booking back: cancel, release, and the stranded report
+# ---------------------------------------------------------------------------
+
+#: A RUNNING launch whose spawn is older than this, with no agent id and no
+#: meta.json, is reported as stranded by ``budget status`` (reporting only).
+STRANDED_AFTER_S = 30 * 60
+
+#: How long ``budget release`` and the stranded report may search for a
+#: started agent's meta.json.
+RELEASE_SEARCH_BUDGET_S = 2.0
+
+
+def _launch_attrs(row: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        data = json.loads(row["attrs"]) if row["attrs"] else {}
+    except (TypeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _append_launch_event(
+    store: Store, event_type: str, row: Mapping[str, Any], payload: dict[str, Any]
+) -> tuple[str | None, str | None]:
+    """The event follows the launch update (two database files, no shared
+    transaction): a failure is reported to the caller, never raised, because
+    the launch change already stands."""
+    from trialerror.events.api import append_event
+
+    try:
+        event = append_event(
+            store,
+            event_type=event_type,
+            session_id=row["session_id"],
+            launch_id=row["launch_id"],
+            payload=payload,
+        )
+        return event["event_id"], None
+    except Exception as exc:  # noqa: BLE001
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _require_launch_owner(
+    store: Store, row: Mapping[str, Any], *, force: bool, decided_by: str | None
+) -> bool:
+    """``budget heartbeat``'s ownership rule, for ``cancel`` and ``release``:
+    only the session that booked a launch (the program's OPEN session) may act
+    on it, unless ``force`` with ``decided_by`` says otherwise, which is
+    recorded. Returns whether the rule was overridden."""
+    from trialerror.budget.errors import LaunchActionRefusedError
+    from trialerror.budget.gate import resolve_open_session
+
+    if force and not (decided_by and str(decided_by).strip()):
+        raise LaunchActionRefusedError("decided_by_required", "--force needs --decided-by REF: it is recorded")
+    if force:
+        try:
+            session = resolve_open_session(store)
+        except RuntimeError:
+            session = None
+        return session is None or session["session_id"] != row["session_id"]
+    try:
+        session = resolve_open_session(store)
+    except RuntimeError as exc:
+        raise LaunchActionRefusedError(
+            "multiple_open_sessions",
+            f"{exc} -- close one, or act from the session that owns this launch (or add --force --decided-by REF)",
+        ) from exc
+    if session is None:
+        raise LaunchActionRefusedError(
+            "no_open_session",
+            "no OPEN session in this program's ops.db: a launch may only be changed from the session that booked "
+            "it (`trialerror session boot`), or with --force --decided-by REF",
+        )
+    if session["session_id"] != row["session_id"]:
+        raise LaunchActionRefusedError(
+            "launch_not_owned",
+            f"launch {row['launch_id']!r} was booked by session {row['session_id']!r}, but the OPEN session is "
+            f"{session['session_id']!r}: only the session that owns the booking may change it. To act across "
+            "sessions add --force --decided-by REF",
+            booked_by=row["session_id"],
+            open_session=session["session_id"],
+        )
+    return False
+
+
+def cancel_launch(
+    store: Store,
+    *,
+    launch_id: str,
+    reason: str,
+    by: str | None = None,
+    force: bool = False,
+    decided_by: str | None = None,
+    now_ts: str | None = None,
+) -> dict[str, Any]:
+    """PROVISIONAL -> ABANDONED: a booking nobody will spawn any more. Any
+    other state is refused, in plain words (a RUNNING booking may have a
+    subagent behind it; ``budget release`` decides that, and ``budget
+    reconcile`` settles a spawn that ran)."""
+    from trialerror.budget.errors import LaunchActionRefusedError
+
+    row = get(store, "launch", pk_column="launch_id", pk_value=launch_id)
+    if row is None:
+        raise LaunchActionRefusedError("unknown_launch", f"unknown launch_id {launch_id!r}")
+    if not reason or not str(reason).strip():
+        raise LaunchActionRefusedError("reason_required", "say why in --reason: a cancellation is recorded")
+    cross_session = _require_launch_owner(store, row, force=force, decided_by=decided_by)
+    if row["state"] != "PROVISIONAL":
+        hint = {
+            "RUNNING": "its spawn was allowed, so a subagent may exist; use `budget release` if the spawn "
+            "never started, or `budget reconcile` if it ran",
+            "RECONCILED": "it was already settled",
+            "ABANDONED": "it was already cancelled",
+        }.get(row["state"], "only a booking that has not been used can be cancelled")
+        raise LaunchActionRefusedError(
+            "wrong_state",
+            f"launch {launch_id!r} is {row['state']}, not PROVISIONAL (booked, not yet used): {hint}",
+            state=row["state"],
+        )
+    ts = now_ts or now()
+    attrs = _launch_attrs(row)
+    attrs["cancel"] = {"reason": str(reason), "by": by, "ts": ts}
+    if force:
+        attrs["cancel"].update({"forced": True, "decided_by": decided_by, "cross_session": cross_session})
+    with store.platform:
+        cur = store.platform.execute(
+            "UPDATE launch SET state = 'ABANDONED', attrs = ? WHERE launch_id = ? AND state = 'PROVISIONAL'",
+            (json.dumps(attrs, ensure_ascii=False), launch_id),
+        )
+        if cur.rowcount != 1:
+            raise LaunchActionRefusedError(
+                "wrong_state", f"launch {launch_id!r} changed state while cancelling; nothing was changed"
+            )
+    event_row = {**row, "session_id": None} if cross_session else row  # another program's session is no FK target here
+    event_id, event_error = _append_launch_event(
+        store,
+        "launch_cancelled",
+        event_row,
+        {
+            "launch_id": launch_id,
+            "reason": str(reason),
+            "by": by,
+            "forced": bool(force),
+            "decided_by": decided_by if force else None,
+        },
+    )
+    return {
+        "launch_id": launch_id,
+        "state": "ABANDONED",
+        "cancel": attrs["cancel"],
+        "event_id": event_id,
+        "event_error": event_error,
+    }
+
+
+def release_launch(
+    store: Store,
+    *,
+    launch_id: str,
+    reason: str,
+    by: str | None = None,
+    force: bool = False,
+    even_if_started: bool = False,
+    decided_by: str | None = None,
+    now_ts: str | None = None,
+) -> dict[str, Any]:
+    """RUNNING -> PROVISIONAL for a spawn that was refused without any
+    failure notice reaching the harness. Only when nothing says an agent
+    started: the same search the ``spawn-failure`` hook makes, over the whole
+    ``spawn_transcript_dir`` (no time filter), with a 2 s budget.
+
+    Two separate overrides, each needing ``decided_by`` and each recorded:
+
+    * ``force`` is the ownership override (a launch another session booked).
+      It says nothing about whether an agent started.
+    * ``even_if_started`` waives the "did an agent start?" refusals: a
+      matching meta.json (``agent_started``, naming the file), a search that
+      could not finish (``search_incomplete``), and a launch gated before the
+      spawn identity was recorded (``needs_force``: nothing to search by)."""
+    import os
+
+    from trialerror.budget import spawn_release
+    from trialerror.budget.errors import LaunchActionRefusedError
+
+    row = get(store, "launch", pk_column="launch_id", pk_value=launch_id)
+    if row is None:
+        raise LaunchActionRefusedError("unknown_launch", f"unknown launch_id {launch_id!r}")
+    if not reason or not str(reason).strip():
+        raise LaunchActionRefusedError("reason_required", "say why in --reason: a release is recorded")
+    cross_session = _require_launch_owner(store, row, force=force, decided_by=decided_by)
+    if even_if_started and not (decided_by and str(decided_by).strip()):
+        raise LaunchActionRefusedError("decided_by_required", "--even-if-started needs --decided-by REF: it is recorded")
+    if row["state"] != "RUNNING":
+        hint = (
+            "it has not been used yet, so there is no spawn to give back (cancel it with `budget cancel` "
+            "if you no longer need it)"
+            if row["state"] == "PROVISIONAL"
+            else "only a booking whose spawn was allowed can be given back"
+        )
+        raise LaunchActionRefusedError(
+            "wrong_state", f"launch {launch_id!r} is {row['state']}, not RUNNING: {hint}", state=row["state"]
+        )
+
+    tuid = row["spawn_tool_use_id"]
+    spawn_dir = row["spawn_transcript_dir"]
+    meta_path: str | None = None
+    search_complete = False
+    searched = bool(row["spawn_ts"]) and isinstance(spawn_dir, str) and os.path.isabs(spawn_dir) and bool(tuid)
+    if searched:
+        result = spawn_release.search_started_agent(spawn_dir, tuid, budget_s=RELEASE_SEARCH_BUDGET_S)
+        meta_path, search_complete = result.found, result.complete
+        if meta_path is not None and not even_if_started:
+            raise LaunchActionRefusedError(
+                "agent_started",
+                f"launch {launch_id!r} started an agent: {meta_path} carries this spawn's tool_use_id. "
+                "Its cost is real and is settled with `budget reconcile`. To release it anyway, add "
+                "--even-if-started --decided-by REF (--force only covers a launch another session booked)",
+                meta_file=meta_path,
+            )
+        if meta_path is None and not search_complete and not even_if_started:
+            raise LaunchActionRefusedError(
+                "search_incomplete",
+                f"launch {launch_id!r}: the search for a started agent could not finish (time or an "
+                "unreadable file), so nothing is released. Retry, or add --even-if-started --decided-by REF",
+            )
+    elif not even_if_started:
+        raise LaunchActionRefusedError(
+            "needs_force",
+            f"launch {launch_id!r} was gated before the spawn's identity was recorded, so the harness "
+            "cannot tell whether an agent started. Check the session's subagents folder yourself, then "
+            "add --even-if-started --decided-by REF",
+        )
+
+    ts = now_ts or now()
+    entry = {
+        "ts": ts,
+        "reason": str(reason),
+        "by": by,
+        "forced": bool(force),
+        "even_if_started": bool(even_if_started),
+        "decided_by": decided_by if (force or even_if_started) else None,
+        "cross_session": cross_session,
+        "meta_found": (meta_path is not None) if searched else None,
+        "search_complete": search_complete if searched else None,
+    }
+    store.platform.commit()  # end any implicit transaction before the explicit BEGIN inside
+    moved = spawn_release.release_running_launch(
+        store.platform, launch_id, spawn_tool_use_id=tuid, attrs_key="spawn_releases", entry=entry
+    )
+    if not moved:
+        raise LaunchActionRefusedError(
+            "wrong_state", f"launch {launch_id!r} changed state while releasing; nothing was changed"
+        )
+    event_row = {**row, "session_id": None} if cross_session else row  # another program's session is no FK target here
+    event_id, event_error = _append_launch_event(
+        store,
+        "launch_spawn_released",
+        event_row,
+        {
+            "launch_id": launch_id,
+            "tool_use_id": tuid,
+            "via": "budget release",
+            "forced": bool(force),
+            "even_if_started": bool(even_if_started),
+            "decided_by": decided_by if (force or even_if_started) else None,
+            "meta_found": entry["meta_found"],
+            "search_complete": entry["search_complete"],
+        },
+    )
+    return {
+        "launch_id": launch_id,
+        "state": "PROVISIONAL",
+        "release": entry,
+        "event_id": event_id,
+        "event_error": event_error,
+    }
+
+
+def find_stranded_launches(
+    store: Store, *, account_id: str, now_ts: str | None = None, budget_s: float = RELEASE_SEARCH_BUDGET_S
+) -> list[str]:
+    """Launch ids that look stranded: RUNNING, the gate stored a spawn
+    identity, no agent id was recorded, the spawn is older than
+    :data:`STRANDED_AFTER_S`, and the meta.json search finished and found
+    none. Reporting only. A search that could not finish is not reported:
+    when in doubt, the launch is not called stranded."""
+    from datetime import timedelta
+
+    from trialerror.budget import spawn_release
+    from trialerror.util.timeutil import parse
+
+    cutoff = parse(now_ts or now()) - timedelta(seconds=STRANDED_AFTER_S)
+    rows = store.platform.execute(
+        "SELECT launch_id, spawn_tool_use_id, spawn_ts, spawn_transcript_dir FROM launch "
+        "WHERE account_id = ? AND state = 'RUNNING' AND spawn_tool_use_id IS NOT NULL "
+        "AND agent_id IS NULL AND spawn_ts IS NOT NULL AND spawn_transcript_dir IS NOT NULL "
+        "ORDER BY spawn_ts",
+        (account_id,),
+    ).fetchall()
+    stranded: list[str] = []
+    deadline = spawn_release._clock() + budget_s
+    for row in rows:
+        try:
+            if parse(row["spawn_ts"]) > cutoff:
+                continue
+        except (TypeError, ValueError):
+            continue
+        remaining = deadline - spawn_release._clock()
+        if remaining <= 0:
+            break
+        result = spawn_release.search_started_agent(
+            row["spawn_transcript_dir"], row["spawn_tool_use_id"], budget_s=remaining
+        )
+        if result.complete and result.found is None:
+            stranded.append(row["launch_id"])
+    return stranded

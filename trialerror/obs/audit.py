@@ -169,10 +169,21 @@ SIZE CAPS
 Each list is capped (:data:`CAPS`); ``volume.caps`` states the caps and
 ``volume.truncated`` how many entries each cap dropped. ``volume``'s own totals
 are computed BEFORE capping, so a spike stays visible even in a capped digest.
-``shell_commands`` keeps tagged commands first when it has to drop something --
-an untagged ``ls`` is the entry worth losing. ``sessions`` keeps the most recent
-when it has to drop something, then restores the slug order for the reader: a
-slug is a project path plus a uuid, so dropping "the last ones alphabetically"
+A cap keeps at least one row from every UTC day that has an entry (never a
+quiet day dropped to zero next to a busy one), split between that day's
+earliest and latest rows, and states which rows survived as
+``volume.sample.<section>`` -- see :func:`_spread_by_day`. ``volume.aggregates.<section>``
+counts every entry of a capped section BEFORE the cap: ``by_day`` and
+``by_session`` always, plus a target dimension the rubric's NOTIFY clauses need
+even for rows a cap drops -- ``by_tag`` and an anomaly-tags-first order for
+``shell_commands`` (an untagged ``ls`` is the entry worth losing to a cap, and
+an ordinary ``network``/``git_push`` tag must not crowd out a ``destructive``
+one); ``outside_allowed_roots``/``by_path_prefix_outside`` and an
+outside-root-first order for ``file_writes``; ``not_allowed``/``by_host`` and a
+not-allowed-first order for ``network``; ``by_matched`` for ``sensitive_reads``;
+``by_match`` for ``permission_flags``. ``sessions`` keeps the most recent when
+it has to drop something, then restores the slug order for the reader: a slug
+is a project path plus a uuid, so dropping "the last ones alphabetically"
 would be dropping at random, and the entry worth keeping is today's.
 """
 
@@ -237,7 +248,17 @@ CAPS: dict[str, int] = {
     "spawn_entries": 200,
     "program_events": 300,
     "doctor_rows": 200,
+    # generous safety valves (review finding N7): today's volumes are two
+    # orders of magnitude under either -- a runaway booking loop or a
+    # session-id typo generator must not grow the digest without bound.
+    "unmatched_bookings": 2000,
 }
+
+#: A generous cap on any per-key breakdown inside an aggregate whose key
+#: space is not naturally bounded by the window (a session id, a host, a
+#: path prefix) -- the same N7 safety valve as ``CAPS["unmatched_bookings"]``,
+#: for ``by_session`` specifically (the dimension every aggregate carries).
+AGGREGATE_KEY_CAP = 2000
 
 #: One command's text is truncated to this many characters (after redaction),
 #: with a trailing marker -- a pasted heredoc must not turn the digest into a
@@ -280,7 +301,30 @@ _READ_TOOLS = {"read", "grep", "glob", "notebookread"}
 _SPAWN_TOOLS = {"agent", "task"}
 _BASH_TOOLS = {"bash", "bashoutput"}
 
+#: The bare id anywhere in the prompt -- a fallback only (see
+#: :func:`_extract_launch_id`), because a prompt that merely DISCUSSES another
+#: booking ("review the output of LNCH-A") is not a claim on it.
 _LAUNCH_ID_RE = re.compile(r"\bLNCH-[A-Za-z0-9_-]+")
+#: The explicit-claim form (``launch_id: LNCH-...`` / ``launch_id=LNCH-...``),
+#: mirroring `trialerror.budget.gate.LAUNCH_ID_RE` but over the same permissive
+#: id charset as `_LAUNCH_ID_RE` above (a transcript is not the gate's own
+#: input, so it is read tolerantly rather than to the gate's exact ULID shape).
+_LAUNCH_ID_KEYED_RE = re.compile(r"\blaunch_id\s*[:=]\s*(LNCH-[A-Za-z0-9_-]+)")
+
+
+def _extract_launch_id(prompt: str) -> str | None:
+    """The launch id a spawn prompt claims, if any. Prefers the explicit
+    ``launch_id: LNCH-...`` form the budget gate itself reads
+    (:data:`_LAUNCH_ID_KEYED_RE`) over the first bare ``LNCH-`` id anywhere in
+    the prompt -- a prompt that mentions a DIFFERENT booking's id in passing
+    ("review the output of LNCH-A ... launch_id: LNCH-B") must be read as
+    B's spawn, not A's, or A reads as a spawn it never had and B reads as a
+    booking with none."""
+    keyed = _LAUNCH_ID_KEYED_RE.search(prompt)
+    if keyed:
+        return keyed.group(1)
+    bare = _LAUNCH_ID_RE.search(prompt)
+    return bare.group(0) if bare else None
 
 # ---------------------------------------------------------------------------
 # redaction
@@ -1061,7 +1105,7 @@ def _collect_tool_uses(
                     )
         elif lower in _SPAWN_TOOLS:
             prompt = tool_input.get("prompt")
-            launch = _LAUNCH_ID_RE.search(prompt) if isinstance(prompt, str) else None
+            launch_id = _extract_launch_id(prompt) if isinstance(prompt, str) else None
             # ``prompt`` is a _CONTENT_KEYS key, so the generic scanner below
             # never looks at it -- and the rubric's permission clause opens
             # with "a subagent spawned with permissions skipped", which is a
@@ -1092,7 +1136,7 @@ def _collect_tool_uses(
                     "tool": name,
                     "subagent_type": _safe(tool_input.get("subagent_type") or tool_input.get("agent") or ""),
                     "description": _safe(tool_input.get("description") or ""),
-                    "launch_id": launch.group(0) if launch else None,
+                    "launch_id": launch_id,
                     "agent_id": _safe(agent_id) if agent_id else None,
                     "_sort": base_sort,
                 }
@@ -1286,23 +1330,35 @@ def _payload_summary(payload: Any) -> str:
     return ", ".join(parts)
 
 
-def _read_events(opts: AuditOptions) -> tuple[list[dict[str, Any]], int, dict[str, Any]]:
+def _purpose_excerpt(text: Any) -> str:
+    """The first 120 characters of a launch's ``purpose`` -- booking text an
+    agent wrote, never transcript message text -- after the same redaction
+    every other string in the digest goes through."""
+    s = "" if text is None else str(text)
+    return redact(s)[:120]
+
+
+def _read_events(opts: AuditOptions) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     """Event rows in the window, through a READ-ONLY connection. Returns
-    ``(rows, bookings_booked, coverage)``."""
+    ``(rows, bookings, coverage)`` -- ``bookings`` is every launch booked
+    inside the window (launch id, ``booked_ts``, ``agent_kind``, ``model``,
+    ``state``, a ``purpose`` excerpt), so the caller can match each one
+    against the spawn entries' launch ids and name the ones that match
+    nothing."""
     if opts.program_root is None:
-        return [], 0, {"present": False, "detail": "no --program-root given"}
+        return [], [], {"present": False, "detail": "no --program-root given"}
     from trialerror.stores import paths
 
     ops_path = paths.ops_db_path(opts.program_root)
     if not Path(ops_path).is_file():
-        return [], 0, {"present": False, "detail": f"ops store not found: {ops_path}"}
+        return [], [], {"present": False, "detail": f"ops store not found: {ops_path}"}
     from trialerror.stores.connection import connect
 
     rows: list[dict[str, Any]] = []
     try:
         conn = connect(ops_path, read_only=True)
     except Exception as exc:  # noqa: BLE001 - a missing source is a coverage row
-        return [], 0, {"present": False, "detail": f"ops store unreadable: {type(exc).__name__}: {exc}"}
+        return [], [], {"present": False, "detail": f"ops store unreadable: {type(exc).__name__}: {exc}"}
     try:
         placeholders = ",".join("?" for _ in PROGRAM_EVENT_TYPES)
         # The window is applied in PYTHON, not in SQL: stored timestamps carry
@@ -1328,24 +1384,40 @@ def _read_events(opts: AuditOptions) -> tuple[list[dict[str, Any]], int, dict[st
                     "session_id": row.get("session_id"),
                     "launch_id": row.get("launch_id"),
                     "summary": _safe(_payload_summary(row.get("payload"))),
+                    "_sort": (ts_dt, str(row.get("session_id") or ""), len(rows)),
                 }
             )
     except Exception as exc:  # noqa: BLE001
         conn.close()
-        return [], 0, {"present": False, "detail": f"event query failed: {type(exc).__name__}: {exc}"}
+        return [], [], {"present": False, "detail": f"event query failed: {type(exc).__name__}: {exc}"}
     conn.close()
 
-    bookings = 0
+    bookings: list[dict[str, Any]] = []
     booking_detail = ""
     platform_path = paths.platform_db_path(root=opts.platform_root)
     if Path(platform_path).is_file():
         try:
             pconn = connect(platform_path, read_only=True)
             try:
-                for r in pconn.execute("SELECT booked_ts FROM launch").fetchall():
-                    dt = _parse_ts(dict(r).get("booked_ts"))
-                    if dt is not None and opts.since_dt <= dt <= opts.until_dt:
-                        bookings += 1
+                cur = pconn.execute(
+                    "SELECT launch_id, booked_ts, agent_kind, model, purpose, state FROM launch "
+                    "ORDER BY booked_ts ASC, launch_id ASC"
+                )
+                for r in cur.fetchall():
+                    row = dict(r)
+                    dt = _parse_ts(row.get("booked_ts"))
+                    if dt is None or not (opts.since_dt <= dt <= opts.until_dt):
+                        continue
+                    bookings.append(
+                        {
+                            "launch_id": row.get("launch_id"),
+                            "booked_ts": row.get("booked_ts"),
+                            "agent_kind": _safe(row.get("agent_kind")),
+                            "model": _safe(row.get("model")),
+                            "state": row.get("state"),
+                            "purpose": _purpose_excerpt(row.get("purpose")),
+                        }
+                    )
             finally:
                 pconn.close()
         except Exception as exc:  # noqa: BLE001
@@ -1497,16 +1569,282 @@ def _sort_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(entries, key=key)
 
 
-def _sort_and_cap(entries: list[dict[str, Any]], cap: int, *, tagged_first: bool = False) -> tuple[list[dict[str, Any]], int]:
+def _utc_day(ts_dt: datetime | None) -> str:
+    return ts_dt.date().isoformat() if ts_dt is not None else "(undated)"
+
+
+def _path_prefix(path: Any) -> str:
+    """The first two path components -- the level the rubric judges targets
+    at (a lane worktree, a parser fragment, a program subtree), not the full
+    path, which would make the aggregate as long as the list it summarizes."""
+    p = _normalize_path(str(path or ""))
+    drive = ""
+    if re.match(r"^[A-Za-z]:/", p):
+        drive, p = p[:2], p[2:]
+    parts = [seg for seg in p.split("/") if seg]
+    prefix = "/".join(parts[:2]) if parts else "(empty)"
+    if p.startswith("/"):
+        return drive + "/" + prefix
+    return drive + prefix
+
+
+def _cap_key_breakdown(mapping: dict[str, int], limit: int = AGGREGATE_KEY_CAP) -> tuple[dict[str, int], int]:
+    """The top ``limit`` keys of ``mapping`` by count (ties broken by key,
+    for determinism), and how many distinct keys were dropped. A generous
+    safety valve (review finding N7) on a breakdown whose key space is not
+    naturally bounded by the window's length the way ``by_day`` is -- a
+    session id, a host, a path prefix -- so a runaway loop cannot grow the
+    digest without bound."""
+    if len(mapping) <= limit:
+        return dict(mapping), 0
+    ranked = sorted(mapping.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+    return dict(sorted(ranked)), len(mapping) - limit
+
+
+def _aggregate_entries(entries: list[dict[str, Any]], *, extra: str | None = None) -> dict[str, dict[str, int]]:
+    """Complete counts over EVERY entry of a capped section -- computed before
+    the cap, so a section that had to drop rows still lets the auditor judge
+    its volume and its targets in full. Always ``by_day`` (UTC) and
+    ``by_session``; ``extra`` adds one more dimension named for what it is
+    (``"tag"`` for shell commands, ``"path_prefix"`` for writes)."""
+    by_day: dict[str, int] = {}
+    by_session: dict[str, int] = {}
+    by_extra: dict[str, int] = {}
+    for e in entries:
+        sort = e.get("_sort")
+        ts_dt = sort[0] if sort else None
+        day = _utc_day(ts_dt)
+        by_day[day] = by_day.get(day, 0) + 1
+        sid = str(e.get("session_id") or "(none)")
+        by_session[sid] = by_session.get(sid, 0) + 1
+        if extra == "tag":
+            for tag in e.get("tags") or ["(none)"]:
+                by_extra[tag] = by_extra.get(tag, 0) + 1
+        elif extra == "path_prefix":
+            prefix = _path_prefix(e.get("path"))
+            by_extra[prefix] = by_extra.get(prefix, 0) + 1
+    by_session_capped, by_session_dropped = _cap_key_breakdown(by_session, AGGREGATE_KEY_CAP)
+    out: dict[str, dict[str, int]] = {
+        "by_day": dict(sorted(by_day.items())),
+        "by_session": by_session_capped,
+    }
+    if by_session_dropped:
+        out["by_session_truncated"] = by_session_dropped
+    if extra == "tag":
+        out["by_tag"] = dict(sorted(by_extra.items()))
+    elif extra == "path_prefix":
+        out["by_path_prefix"] = dict(sorted(by_extra.items()))
+    return out
+
+
+def _count_by(entries: list[dict[str, Any]], key: str, *, default: str = "(unknown)") -> dict[str, int]:
+    out: dict[str, int] = {}
+    for e in entries:
+        value = str(e.get(key) or default)
+        out[value] = out.get(value, 0) + 1
+    return dict(sorted(out.items()))
+
+
+def _aggregate_file_writes(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """:func:`_aggregate_entries` plus the two things the rubric's NOTIFY
+    clause and Counts line need and a bare path breakdown cannot show: how
+    many writes (of ALL of them, before the cap) were judged outside the
+    declared write roots, and where those specifically land."""
+    agg = _aggregate_entries(entries, extra="path_prefix")
+    outside = [e for e in entries if e.get("inside_allowed_roots") is False]
+    agg["outside_allowed_roots"] = len(outside)
+    by_prefix_outside: dict[str, int] = {}
+    for e in outside:
+        prefix = _path_prefix(e.get("path"))
+        by_prefix_outside[prefix] = by_prefix_outside.get(prefix, 0) + 1
+    agg["by_path_prefix_outside"] = dict(sorted(by_prefix_outside.items()))
+    return agg
+
+
+def _aggregate_network(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """:func:`_aggregate_entries` plus ``not_allowed`` (a count) and
+    ``by_host`` over ALL entries -- a host outside `--allowed-host` must be
+    nameable even on a day the network cap dropped its only row, which a
+    plain by_day/by_session aggregate cannot do."""
+    agg = _aggregate_entries(entries)
+    agg["not_allowed"] = sum(1 for e in entries if e.get("allowed") is False)
+    agg["by_host"] = _count_by(entries, "host")
+    return agg
+
+
+def _aggregate_sensitive_reads(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    agg = _aggregate_entries(entries)
+    agg["by_matched"] = _count_by(entries, "matched")
+    return agg
+
+
+def _aggregate_permission_flags(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    agg = _aggregate_entries(entries)
+    agg["by_match"] = _count_by(entries, "match")
+    return agg
+
+
+def _spread_by_day(ordered: list[dict[str, Any]], cap: int) -> list[dict[str, Any]]:
+    """``ordered`` (already time-sorted) capped at ``cap``. EVERY UTC day that
+    has at least one entry keeps at least one row: a proportional share whose
+    floor is zero must not erase a day outright, which is exactly what a
+    quiet stretch (the small hours, a single write) next to a busy one did
+    under a plain largest-remainder split -- day one's 0.25 share floored to
+    0 and lost the remainder to day two's 0.75. Each day's guaranteed row is
+    reserved first; the REST of the cap is then shared out over what is left
+    in each day's bucket, by the same largest-remainder method. Within a
+    day's allotment the kept share is split between that day's earliest and
+    latest rows, for the same reason at finer grain.
+
+    When the cap itself is smaller than the number of distinct days, giving
+    every day a row is impossible; one row each goes to ``cap`` days spread
+    evenly across the sorted day list instead (not only the earliest), and
+    :func:`_day_coverage_note` says only some days are covered.
+    """
+    if cap <= 0:
+        return []
+    if len(ordered) <= cap:
+        return list(ordered)
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for e in ordered:
+        sort = e.get("_sort")
+        day = _utc_day(sort[0] if sort else None)
+        buckets.setdefault(day, []).append(e)
+    days = sorted(buckets)
+
+    if cap < len(days):
+        if cap <= 1:
+            chosen = [days[0]]
+        else:
+            chosen = []
+            seen: set[str] = set()
+            for i in range(cap):
+                d = days[round(i * (len(days) - 1) / (cap - 1))]
+                if d not in seen:
+                    seen.add(d)
+                    chosen.append(d)
+        return [buckets[d][0] for d in chosen]
+
+    alloc = {d: 1 for d in days}
+    remaining_cap = cap - len(days)
+    remaining_counts = {d: len(buckets[d]) - 1 for d in days}
+    remaining_total = sum(remaining_counts.values())
+    if remaining_cap > 0 and remaining_total > 0:
+        shares = {d: remaining_cap * remaining_counts[d] / remaining_total for d in days}
+        extra = {d: int(shares[d]) for d in days}
+        rem = remaining_cap - sum(extra.values())
+        for d in sorted(days, key=lambda d: (-(shares[d] - extra[d]), d))[:rem]:
+            extra[d] += 1
+        for d in days:
+            alloc[d] += extra[d]
+
+    kept: list[dict[str, Any]] = []
+    for d in days:
+        bucket = buckets[d]
+        n = min(alloc[d], len(bucket))
+        if n >= len(bucket):
+            kept.extend(bucket)
+        elif n > 0:
+            half = (n + 1) // 2
+            kept.extend(bucket[:half])
+            tail = n - half
+            if tail:
+                kept.extend(bucket[-tail:])
+    return kept
+
+
+def _day_coverage_note(entries: list[dict[str, Any]], cap: int) -> str:
+    """The digest's own statement of whether a day-spread sample covers every
+    UTC day that has an entry, or only some of them because the cap itself
+    is smaller than the number of days present."""
+    days = sorted({_utc_day(e.get("_sort", (None,))[0]) for e in entries})
+    if not days or cap >= len(days):
+        return (
+            "a share of rows from every UTC day in the window (by UTC-day share, at least one row "
+            "per day, split between that day's earliest and latest rows), not only the earliest"
+        )
+    return (
+        f"rows from only {cap} of {len(days)} UTC days in the window (the cap is smaller than the "
+        "number of days present, so full day coverage is not possible), not only the earliest"
+    )
+
+
+#: The tags the host pre-check's own ``COMMAND_ANOMALY_TAGS`` treats as an
+#: anomaly on their own (``te-audit.sh``'s PRECHECK block); ``network``,
+#: ``git_push``, ``container``, ``cron`` and ``package_install`` tag ordinary
+#: work and are judged elsewhere (hosts by ``network[].allowed``). Kept as
+#: the FIRST tier of ``shell_commands``' cap so a busy day's ordinary tagged
+#: traffic (a hundred ``git_push`` commands) cannot crowd out the one
+#: ``destructive`` command a cap has to choose between.
+_ANOMALY_TAGS = frozenset({"destructive", "permission", "secret_path", "encode", "exfil_suspect"})
+
+
+def _sort_and_cap(
+    entries: list[dict[str, Any]],
+    cap: int,
+    *,
+    tiers: list[tuple[Any, str]] | None = None,
+) -> tuple[list[dict[str, Any]], int, str]:
+    """Cap ``entries`` at ``cap``, keeping a share of every UTC day in the
+    window rather than only the earliest rows (see :func:`_spread_by_day`).
+
+    ``tiers`` is an optional list of ``(predicate, label)`` pairs, HIGHEST
+    PRIORITY FIRST: every row matching the first tier whose predicate accepts
+    it is kept before any row of a later tier or of the untiered remainder
+    (labelled ``"everything else"``), so a row the rubric would call an
+    anomaly is never the one a cap drops in favour of routine traffic. Rows
+    within a tier, and within the remainder, are still spread across every
+    UTC day rather than kept earliest-first.
+
+    Returns ``(kept, dropped, sample_note)`` -- ``sample_note`` is the
+    digest's own statement of which rows survived, for the reader who cannot
+    see what was dropped."""
     ordered = _sort_entries(entries)
-    if tagged_first and len(ordered) > cap:
-        ordered = [e for e in ordered if e.get("tags")] + [e for e in ordered if not e.get("tags")]
-    dropped = max(0, len(ordered) - cap)
-    kept = ordered[:cap]
+    total = len(ordered)
+    if total <= cap:
+        for e in ordered:
+            e.pop("_sort", None)
+            e.pop("seq", None)
+        return ordered, 0, "every row in the window (the cap was not reached)"
+
+    if tiers:
+        remaining = list(ordered)
+        groups: list[tuple[str, list[dict[str, Any]]]] = []
+        for predicate, label in tiers:
+            matched = [e for e in remaining if predicate(e)]
+            remaining = [e for e in remaining if not predicate(e)]
+            groups.append((label, matched))
+        groups.append(("everything else", remaining))
+
+        kept: list[dict[str, Any]] = []
+        budget = cap
+        notes: list[str] = []
+        for label, rows in groups:
+            if not rows:
+                continue
+            if budget <= 0:
+                notes.append(f"every {label} was dropped")
+                continue
+            if len(rows) <= budget:
+                kept.extend(rows)
+                budget -= len(rows)
+                notes.append(f"every {label} ({len(rows)} of {total})")
+            else:
+                spread = _spread_by_day(rows, budget)
+                kept.extend(spread)
+                notes.append(f"{label} only ({len(spread)} of {len(rows)}): {_day_coverage_note(rows, budget)}")
+                budget = 0
+        kept = _sort_entries(kept)
+        note = "; ".join(notes)
+    else:
+        kept = _spread_by_day(ordered, cap)
+        note = _day_coverage_note(ordered, cap)
+
+    dropped = total - len(kept)
     for e in kept:
         e.pop("_sort", None)
         e.pop("seq", None)
-    return kept, dropped
+    return kept, dropped, note
 
 
 def _mark_exfil_pairs(commands: list[dict[str, Any]]) -> None:
@@ -1578,17 +1916,57 @@ def build_digest(opts: AuditOptions) -> dict[str, Any]:
     # the encode-then-send pass runs over the FULL sorted list, before any cap:
     # a pair split by the cap would otherwise go unmarked.
     _mark_exfil_pairs(_sort_entries(collector.shell_commands))
-    shell_commands, dropped_shell = _sort_and_cap(collector.shell_commands, CAPS["shell_commands"], tagged_first=True)
-    file_writes, dropped_writes = _sort_and_cap(collector.file_writes, CAPS["file_writes"])
-    sensitive_reads, dropped_reads = _sort_and_cap(collector.sensitive_reads, CAPS["sensitive_reads"])
-    network, dropped_network = _sort_and_cap(collector.network, CAPS["network"])
-    permission_flags, dropped_perm = _sort_and_cap(collector.permission_flags, CAPS["permission_flags"])
-    spawn_entries, dropped_spawns = _sort_and_cap(collector.spawn_entries, CAPS["spawn_entries"])
+
+    # Every aggregate below is computed over ALL entries, before that section's
+    # cap runs -- the auditor can judge a capped section's volume and its
+    # targets in full even when the sample of rows kept for full text is
+    # small, and `_sort_and_cap`'s own `sample_note` says which rows those are.
+    aggregates = {
+        "shell_commands": _aggregate_entries(collector.shell_commands, extra="tag"),
+        "file_writes": _aggregate_file_writes(collector.file_writes),
+        "sensitive_reads": _aggregate_sensitive_reads(collector.sensitive_reads),
+        "network": _aggregate_network(collector.network),
+        "permission_flags": _aggregate_permission_flags(collector.permission_flags),
+        "spawn_entries": _aggregate_entries(collector.spawn_entries),
+        "program_events": _aggregate_entries(events),
+    }
+
+    shell_commands, dropped_shell, shell_sample = _sort_and_cap(
+        collector.shell_commands,
+        CAPS["shell_commands"],
+        tiers=[
+            (lambda e: bool(set(e.get("tags") or ()) & _ANOMALY_TAGS), "anomaly-tagged command"),
+            (lambda e: bool(e.get("tags")), "tagged command"),
+        ],
+    )
+    file_writes, dropped_writes, writes_sample = _sort_and_cap(
+        collector.file_writes,
+        CAPS["file_writes"],
+        tiers=[(lambda e: e.get("inside_allowed_roots") is False, "write outside the allowed roots")],
+    )
+    sensitive_reads, dropped_reads, reads_sample = _sort_and_cap(collector.sensitive_reads, CAPS["sensitive_reads"])
+    network, dropped_network, network_sample = _sort_and_cap(
+        collector.network,
+        CAPS["network"],
+        tiers=[(lambda e: e.get("allowed") is False, "network call to a host that is not allowed")],
+    )
+    permission_flags, dropped_perm, perm_sample = _sort_and_cap(collector.permission_flags, CAPS["permission_flags"])
+    spawn_entries, dropped_spawns, spawn_sample = _sort_and_cap(collector.spawn_entries, CAPS["spawn_entries"])
 
     spawns_seen = len(collector.spawn_entries)
     spawns_without_launch = sum(1 for e in collector.spawn_entries if not e.get("launch_id"))
     returns = [e for e in events if e["type"] == "subagent_return"]
-    program_events = events[: CAPS["program_events"]]
+    # matched against the COMPLETE set of spawn entries, before their own cap:
+    # a booking must not read as unmatched merely because its spawn fell to a
+    # cap that a busy day's tail end triggered.
+    matched_launch_ids = {e["launch_id"] for e in collector.spawn_entries if e.get("launch_id")}
+    unmatched_bookings_all = [b for b in bookings if b.get("launch_id") not in matched_launch_ids]
+    # already time-sorted (the SQL query orders by booked_ts): a generous cap
+    # (review finding N7) is enough here, since the count that matters for
+    # judging volume -- `bookings_unmatched` -- is always the COMPLETE count.
+    dropped_unmatched_bookings = max(0, len(unmatched_bookings_all) - CAPS["unmatched_bookings"])
+    unmatched_bookings = unmatched_bookings_all[: CAPS["unmatched_bookings"]]
+    program_events, dropped_program_events, program_events_sample = _sort_and_cap(events, CAPS["program_events"])
 
     digest: dict[str, Any] = {
         "window": {
@@ -1625,12 +2003,19 @@ def build_digest(opts: AuditOptions) -> dict[str, Any]:
             "seen_in_transcripts": spawns_seen,
             "without_launch_id": spawns_without_launch,
             "with_launch_id": spawns_seen - spawns_without_launch,
-            "bookings_booked": bookings,
+            "bookings_booked": len(bookings),
             "returns": len(returns),
             "returns_without_launch_id": sum(1 for e in returns if not e.get("launch_id")),
             "gate_refusals": sum(1 for e in events if e["type"] in GATE_REFUSAL_EVENT_TYPES),
             "entries": spawn_entries,
             "program_events": program_events,
+            # every launch booked in the window that no spawn entry (of the
+            # COMPLETE set, before its own cap) names by launch id -- the
+            # mirror image of `without_launch_id`, and the one the rubric asks
+            # to be matched by id rather than only counted. The COMPLETE
+            # count, even past `unmatched_bookings`' own generous cap.
+            "bookings_unmatched": len(unmatched_bookings_all),
+            "unmatched_bookings": unmatched_bookings,
         },
         "doctor": doctor,
         "containment": [],
@@ -1661,7 +2046,26 @@ def build_digest(opts: AuditOptions) -> dict[str, Any]:
                 "network": dropped_network,
                 "permission_flags": dropped_perm,
                 "spawn_entries": dropped_spawns,
-                "program_events": max(0, len(events) - len(program_events)),
+                "program_events": dropped_program_events,
+                "unmatched_bookings": dropped_unmatched_bookings,
+            },
+            # a complete accounting of every capped section, computed BEFORE
+            # its cap -- `by_day` and `by_session` always; `shell_commands`
+            # also `by_tag`, `file_writes` also `by_path_prefix` (first two
+            # path components). Judge volume and targets from here even when
+            # the list above is a sample.
+            "aggregates": aggregates,
+            # which rows the sample above actually is, in the reader's own
+            # words -- a capped section must say what it kept, not just how
+            # many it dropped.
+            "sample": {
+                "shell_commands": shell_sample,
+                "file_writes": writes_sample,
+                "sensitive_reads": reads_sample,
+                "network": network_sample,
+                "permission_flags": perm_sample,
+                "spawn_entries": spawn_sample,
+                "program_events": program_events_sample,
             },
         },
         "digest_sha256": "",

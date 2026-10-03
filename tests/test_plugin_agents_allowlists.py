@@ -75,10 +75,12 @@ def live_ops_tool_names() -> set[str]:
 # ---------------------------------------------------------------------------
 
 
-def test_agents_dir_exists_with_exactly_the_three_named_subagents():
+def test_agents_dir_exists_with_the_three_named_subagents_and_no_stray_files():
     assert AGENTS_DIR.is_dir(), "plugin/agents/ does not exist — this is the OB-3/FX-11 gap itself"
     names = {p.stem for p in AGENTS_DIR.glob("*.md")}
-    assert names == {"critic", "verifier", "lens"}
+    # OB-3/FX-11's own three, plus prompt-only (REQ-2026-09-27-08's generic,
+    # zero-server subagent; pinned in full by tests/test_plugin_agent_prompt_only.py).
+    assert names == {"critic", "verifier", "lens", "prompt-only"}
 
 
 @pytest.mark.parametrize("stem", ["critic", "verifier", "lens"])

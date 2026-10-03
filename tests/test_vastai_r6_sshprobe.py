@@ -42,7 +42,7 @@ from trialerror.vastai import shell as sh
 from trialerror.vastai import sshprobe
 from trialerror.vastai.api import VastClient
 
-def _pub_line(seed: bytes, comment: str = "te-vastai test") -> str:
+def _pub_line(seed: bytes, comment: str = "vastai test") -> str:
     """A well-formed openssh public-key line over a synthetic blob. No real key
     material is read or written anywhere in this file."""
     import base64

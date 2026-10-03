@@ -14,6 +14,7 @@ from pathlib import Path
 
 from trialerror.budget.errors import (
     BudgetError,
+    LaunchActionRefusedError,
     LaunchNotOwnedError,
     LensNameRefusedError,
     ModelPolicyViolationError,
@@ -27,17 +28,19 @@ from trialerror.budget.pools import (
     book_launch,
     budget_status,
     calibrate as calibrate_,
+    cancel_launch,
     check_booking_preconditions,
     create_pool,
     heartbeat_launch,
     pool_report,
     reconcile_launch,
     reconcile_launch_from_event,
+    release_launch,
     snapshot_ingest,
     tree_rollup,
 )
 from trialerror.stores.store import open_store
-from trialerror.util.config import ConfigError, load_config
+from trialerror.util.config import ConfigError, find_program_root, load_config
 from trialerror.util.envelope import error_envelope, next_action, ok_envelope
 
 GROUP_NAME = "budget"
@@ -147,6 +150,46 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     heartbeat.add_argument("--launch-id", required=True)
     heartbeat.set_defaults(handler=_run_heartbeat)
 
+    cancel = sub.add_parser(
+        "cancel",
+        help="cancel a booking nobody will spawn any more (PROVISIONAL -> ABANDONED)",
+    )
+    cancel.add_argument("--launch-id", "--launch", dest="launch_id", required=True)
+    cancel.add_argument("--reason", required=True, help="why: recorded on the launch and in an event")
+    cancel.add_argument("--by", default=None, help="who is cancelling (recorded)")
+    cancel.add_argument(
+        "--force",
+        action="store_true",
+        help="cancel a launch another session booked; needs --decided-by (recorded)",
+    )
+    cancel.add_argument("--decided-by", default=None, help="the decision that authorises --force (recorded)")
+    cancel.set_defaults(handler=_run_cancel)
+
+    release = sub.add_parser(
+        "release",
+        help="give back a booking whose spawn was refused without a failure notice "
+        "(RUNNING -> PROVISIONAL), unless an agent started",
+    )
+    release.add_argument("--launch-id", "--launch", dest="launch_id", required=True)
+    release.add_argument("--reason", required=True, help="why: recorded on the launch and in an event")
+    release.add_argument("--by", default=None, help="who is releasing (recorded)")
+    release.add_argument(
+        "--force",
+        action="store_true",
+        help="release a launch another session booked; needs --decided-by (recorded). Does not waive the "
+        "agent_started refusal: that is --even-if-started",
+    )
+    release.add_argument(
+        "--even-if-started",
+        action="store_true",
+        dest="even_if_started",
+        help="release although an agent started, or although the harness cannot tell whether one did "
+        "(a matching meta.json, an unfinished search, a launch gated before spawn identities were recorded); "
+        "needs --decided-by (recorded)",
+    )
+    release.add_argument("--decided-by", default=None, help="the decision that authorises --force (recorded)")
+    release.set_defaults(handler=_run_release)
+
     status = sub.add_parser("status", help="pools, headroom, multiplier, DEFER advisories for an account")
     status.add_argument(
         "--account-id",
@@ -213,8 +256,20 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     return parser
 
 
+def _default_program_root() -> Path:
+    """Fix check S5: this file resolved its own default as ``Path.cwd()``, a
+    second place besides ``find_program_root()`` (``trialerror/util/config.py``,
+    "the one place the default program root is resolved") that ignored
+    ``TRIALERROR_PROGRAM_ROOT`` and, worse, never raised L8 part F's
+    ``program_root_is_harness`` refusal -- a probe from a scratch copy of the
+    harness checkout showed ``budget pools``/``budget rollup`` creating
+    ``stores/{ops,knowledge,jobs}.db`` there with no refusal at all. Routing
+    through ``find_program_root()`` gives both back."""
+    return find_program_root() or Path.cwd()
+
+
 def _open_store(args: argparse.Namespace):
-    program_root = Path(args.program_root) if args.program_root else Path.cwd()
+    program_root = Path(args.program_root) if args.program_root else _default_program_root()
     platform_root = Path(args.platform_root) if args.platform_root else None
     return open_store(program_root, platform_root=platform_root)
 
@@ -493,6 +548,62 @@ def _run_heartbeat(args: argparse.Namespace) -> dict:
     )
 
 
+def _launch_action_error(command: str, exc: LaunchActionRefusedError) -> dict:
+    return error_envelope(command, exc.code, str(exc), details=exc.details or None)
+
+
+def _run_cancel(args: argparse.Namespace) -> dict:
+    store = _open_store(args)
+    try:
+        result = cancel_launch(
+            store,
+            launch_id=args.launch_id,
+            reason=args.reason,
+            by=args.by,
+            force=args.force,
+            decided_by=args.decided_by,
+        )
+    except LaunchActionRefusedError as exc:
+        return _launch_action_error("budget cancel", exc)
+    finally:
+        store.close()
+    return ok_envelope("budget cancel", result=result, warnings=_event_warning(result))
+
+
+def _run_release(args: argparse.Namespace) -> dict:
+    store = _open_store(args)
+    try:
+        result = release_launch(
+            store,
+            launch_id=args.launch_id,
+            reason=args.reason,
+            by=args.by,
+            force=args.force,
+            even_if_started=args.even_if_started,
+            decided_by=args.decided_by,
+        )
+    except LaunchActionRefusedError as exc:
+        return _launch_action_error("budget release", exc)
+    finally:
+        store.close()
+    return ok_envelope(
+        "budget release",
+        result=result,
+        warnings=_event_warning(result),
+        next_actions=[
+            next_action(
+                ["trialerror", "budget", "status"], "the booking is PROVISIONAL again: retry the spawn with its token"
+            )
+        ],
+    )
+
+
+def _event_warning(result: dict) -> list[str]:
+    if result.get("event_error"):
+        return [f"the launch was updated but its event could not be written: {result['event_error']}"]
+    return []
+
+
 def _resolve_account_id(store, args: argparse.Namespace, command: str) -> tuple[str | None, dict | None]:
     """``--account-id``, or the account the OPEN session is bound to.
 
@@ -543,11 +654,20 @@ def _run_status(args: argparse.Namespace) -> dict:
         account_id, err = _resolve_account_id(store, args, "budget status")
         if err is not None:
             return err
-        result = budget_status(store, account_id=account_id, model_class=args.model_class)
+        result = budget_status(store, account_id=account_id, model_class=args.model_class, include_stranded=True)
         result["account_resolved_from"] = "--account-id" if args.account_id else "open session"
     finally:
         store.close()
-    return ok_envelope("budget status", result=result, next_actions=_status_next_actions(result))
+    warnings = []
+    stranded_ids = result["stranded_ids"]
+    if stranded_ids:
+        warnings.append(
+            f"{len(stranded_ids)} bookings look stranded: their spawn never started an agent. "
+            "Release them with `trialerror budget release`, or cancel them."
+        )
+    return ok_envelope(
+        "budget status", result=result, next_actions=_status_next_actions(result), warnings=warnings
+    )
 
 
 def _status_next_actions(result: dict) -> list:
@@ -594,7 +714,7 @@ def _run_check(args: argparse.Namespace) -> dict:
         account_id, err = _resolve_account_id(store, args, "budget check")
         if err is not None:
             return err
-        status = budget_status(store, account_id=account_id, model_class=args.model_class)
+        status = budget_status(store, account_id=account_id, model_class=args.model_class, include_stranded=True)
         status["account_resolved_from"] = "--account-id" if args.account_id else "open session"
         program_root = store.program_root
     finally:
@@ -770,7 +890,7 @@ def _run_quota(args: argparse.Namespace) -> dict:
     # Lane FB-3 item 8: the bar is [budget] quota_max_age_s, not a hardcoded
     # 900 -- --fresh-within-s still wins, so a one-off reading at another bar
     # stays possible without editing config.
-    program_root = Path(args.program_root) if args.program_root else Path.cwd()
+    program_root = Path(args.program_root) if args.program_root else _default_program_root()
     config = _load_raw_config(program_root)
     fresh_within = resolve_max_age_s(config, override=args.fresh_within_s)
     status = quota_status(args.quota_dir, fresh_within_s=fresh_within)
@@ -813,6 +933,6 @@ def run(args: argparse.Namespace) -> dict:
     return error_envelope(
         "budget",
         "no_subcommand",
-        "specify a subcommand: book, heartbeat, reconcile, status, check, pools, "
+        "specify a subcommand: book, heartbeat, cancel, release, reconcile, status, check, pools, "
         "snapshot-ingest, calibrate, rollup, quota",
     )

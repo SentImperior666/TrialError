@@ -49,9 +49,16 @@ __all__ = [
     "append_jsonl",
     "locked",
     "PRIORITIES",
+    "ITEM_KINDS",
+    "answered_since",
 ]
 
 PRIORITIES = ("blocking", "normal", "low")
+#: design §4 item 1b: an item may carry ``kind`` -- ``"decision"`` (the
+#: default), ``"sample"`` (L6 D's calibration sample; may skip
+#: ``recommended``, because a recommendation would lean the operator's
+#: check), or ``"info"``.
+ITEM_KINDS = ("decision", "sample", "info")
 DEFAULT_MAX_MINUTES = 30
 DEFAULT_REMIND_AFTER_DAYS = 3
 MAX_WHAT = 300
@@ -103,6 +110,11 @@ class PacketSettings:
     remind_after_days: int = DEFAULT_REMIND_AFTER_DAYS
     course_file: Path | None = None
     archive_dirs: list[Path] = field(default_factory=list)
+    #: L10 part D: ``[packet] outbox`` (default off) and its folder, default
+    #: ``packet/outbox/`` under the program root -- independent of ``dir``,
+    #: which a program may relocate on its own.
+    outbox: bool = False
+    outbox_dir: Path | None = None
 
     @property
     def pending(self) -> Path:
@@ -119,6 +131,10 @@ class PacketSettings:
     @property
     def built(self) -> Path:
         return self.dir / "built"
+
+    @property
+    def outbox_receipts(self) -> Path:
+        return self.outbox_dir / "receipts"
 
 
 def _path_value(program_root: Path, raw: Any, what: str) -> Path:
@@ -176,6 +192,9 @@ def packet_settings(program_root: str | Path, raw: Mapping[str, Any] | None = No
     dirs = archive.get("dirs", []) if isinstance(archive, Mapping) else []
     if not isinstance(dirs, list) or not all(isinstance(d, str) for d in dirs):
         raise ConfigError("[archive] dirs must be a list of folder paths")
+    outbox = table.get("outbox", False)
+    if not isinstance(outbox, bool):
+        raise ConfigError(f"[packet] outbox must be true or false, got {outbox!r}")
     return PacketSettings(
         program_root=root,
         dir=_path_value(root, table.get("dir", "packet"), "[packet] dir"),
@@ -185,6 +204,8 @@ def packet_settings(program_root: str | Path, raw: Mapping[str, Any] | None = No
         remind_after_days=_positive_int(table, "remind_after_days", DEFAULT_REMIND_AFTER_DAYS),
         course_file=_path_value(root, course, "[packet] course_file") if course else None,
         archive_dirs=[_path_value(root, d, "[archive] dirs") for d in dirs],
+        outbox=outbox,
+        outbox_dir=_path_value(root, table.get("outbox_dir", "packet/outbox"), "[packet] outbox_dir"),
     )
 
 
@@ -244,7 +265,12 @@ def append_jsonl(path: Path, row: Mapping[str, Any]) -> None:
 
 # ------------------------------------------------------------------------- lint
 
-_ID_RE = re.compile(r"\b[A-Z]{2,}-\d+\b")
+#: L10 part C (design §4 item 3): the old pattern (`\b[A-Z]{2,}-\d+\b`)
+#: missed ULID-shaped ids (`ROOM-01J...`, 26 Crockford-base32 characters)
+#: entirely -- the exact bug behind the operator's own complaint about a
+#: bare room id reaching the packet unexplained. Also matches the two
+#: legacy, non-ULID numeric styles (`CR-###`, `C-####`).
+_ID_RE = re.compile(r"\b[A-Z]{2,6}-[0-9A-HJKMNP-TV-Z]{26}\b|\bCR-\d+\b|\bC-\d{3,}\b")
 _HEX_RE = re.compile(r"\b[0-9a-f]{7,}\b")
 _PATH_RE = re.compile(
     r"[A-Za-z]:[\\/]\S+"  # C:\x or C:/x
@@ -326,10 +352,16 @@ def make_item(raw: Mapping[str, Any], *, now: datetime | None = None) -> dict[st
         keys = [o["key"] for o in options if o["key"]]
         if len(set(keys)) != len(keys):
             problems.append("option keys must be different from each other")
+    kind = _clean_text(raw.get("kind")) or "decision"
+    if kind not in ITEM_KINDS:
+        problems.append(f"kind must be one of {list(ITEM_KINDS)}, got {kind!r}")
     recommended = _clean_text(raw.get("recommended"))
-    if not recommended:
+    # design §4 item 1b: "validation accepts recommended: null only for
+    # sample" -- L6 D's calibration sample, "because a recommendation would
+    # lean the operator's check." Every other kind still requires one.
+    if not recommended and kind != "sample":
         problems.append("recommended is required (the key of the option you recommend)")
-    elif options and recommended not in [o["key"] for o in options]:
+    elif options and recommended and recommended not in [o["key"] for o in options]:
         problems.append(f"recommended '{recommended}' is not one of the option keys {[o['key'] for o in options]}")
     if not _clean_text(raw.get("if_undecided")):
         problems.append("if_undecided is required (what happens by default if nobody decides)")
@@ -357,12 +389,13 @@ def make_item(raw: Mapping[str, Any], *, now: datetime | None = None) -> dict[st
         raise PacketError("bad_input", "; ".join(problems), {"problems": problems})
     return {
         "id": new_id("PKT"),
+        "kind": kind,
         "created_ts": utc_iso(now),
         "asked_by": _clean_text(raw.get("asked_by")) or "unspecified",
         "what": what,
         "why": why,
         "options": options,
-        "recommended": recommended,
+        "recommended": recommended or None,
         "if_undecided": _clean_text(raw.get("if_undecided")),
         "needed_by": needed_by,
         "est_minutes": est,
@@ -390,26 +423,47 @@ def add_item(
     return item, warnings
 
 
+def answered_since(program_root: str | Path, ts: str) -> list[dict[str, Any]]:
+    """Every item answered at or after ``ts``, with its choice, note and
+    ``asked_by`` (design §4 item 5) -- a pure function: it opens its own
+    settings from ``program_root`` and only reads. L11's SessionStart digest
+    calls this directly; ``packet list --answered-since`` (below) uses it
+    too."""
+    settings = packet_settings(program_root)
+    rows = read_jsonl(settings.pending)
+    by_id = {r.get("id"): r for r in rows}
+    cutoff = parse_ts(ts)
+    out: list[dict[str, Any]] = []
+    for ans in read_jsonl(settings.answers):
+        if parse_ts(ans["decided_ts"]) < cutoff:
+            continue
+        item = by_id.get(ans.get("item_id"), {})
+        label = next((o["label"] for o in item.get("options", []) if o.get("key") == ans.get("choice")), None)
+        out.append({**ans, "what": item.get("what"), "asked_by": item.get("asked_by"), "choice_label": label})
+    return out
+
+
 def list_items(
-    settings: PacketSettings, *, open_only: bool = True, answered_since: str | None = None
+    settings: PacketSettings, *, open_only: bool = True, since: str | None = None, now: datetime | None = None
 ) -> dict[str, Any]:
-    """Open items, and/or the answers recorded at or after ``answered_since``
-    (each joined to its item's question and the chosen option's label)."""
+    """Open items, and/or the answers recorded at or after ``since``
+    (:func:`answered_since`, each joined to its item's question and the
+    chosen option's label). With ``[packet] outbox`` on, also the outbox's
+    own status in words (design §5 D1) when there is something to say --
+    a queued notification stuck past its 15-minute deadline, or the last
+    one's failed receipt."""
     rows = read_jsonl(settings.pending)
     result: dict[str, Any] = {}
     if open_only:
         result["open"] = [r for r in rows if r.get("status") == "open"]
-    if answered_since:
-        cutoff = parse_ts(answered_since)
-        by_id = {r.get("id"): r for r in rows}
-        answered = []
-        for ans in read_jsonl(settings.answers):
-            if parse_ts(ans["decided_ts"]) < cutoff:
-                continue
-            item = by_id.get(ans.get("item_id"), {})
-            label = next((o["label"] for o in item.get("options", []) if o.get("key") == ans.get("choice")), None)
-            answered.append({**ans, "what": item.get("what"), "choice_label": label})
-        result["answered"] = answered
+    if since:
+        result["answered"] = answered_since(settings.program_root, since)
+    if settings.outbox:
+        from trialerror.packet.outbox import notification_status
+
+        note = notification_status(settings, now=now)
+        if note:
+            result["notification"] = note
     return result
 
 

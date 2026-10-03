@@ -33,7 +33,6 @@ from pathlib import Path
 from typing import Any
 
 from trialerror.stores import get as store_get
-from trialerror.stores import update as store_update
 from trialerror.stores.store import Store
 from trialerror.verify.errors import ReproductionRefError, VerdictNotFoundError
 from trialerror.verify.verdicts import record_verdict
@@ -141,16 +140,27 @@ def reproduce_verdict(
         issued_by_launch=issued_by_launch,
     )
 
+    gate_frozen = False
     if gate_id is not None:
-        store_update(
-            store, "gate", pk_column="gate_id", pk_value=gate_id,
-            changes={"reproduction_status": status, "reproduction_ref": reproduction_ref_str},
-        )
+        # A gate that is already decided (failed or registered) keeps the
+        # evidence it was decided on: the columns are written only while it
+        # is not, in one conditional UPDATE. The reproduction verdict above is
+        # this verb's own record and is written either way.
+        with store.ops:
+            written = store.ops.execute(
+                "UPDATE gate SET reproduction_status = ?, reproduction_ref = ? "
+                "WHERE gate_id = ? AND state NOT IN ('failed', 'registered')",
+                (status, reproduction_ref_str, gate_id),
+            ).rowcount == 1
+        gate_frozen = not written and store.ops.execute(
+            "SELECT 1 FROM gate WHERE gate_id = ?", (gate_id,)
+        ).fetchone() is not None
 
     return {
         "original_verdict_id": verdict_id,
         "verdict": new_verdict,
         "gate_id": gate_id,
+        "gate_frozen": gate_frozen,
         "status": status,
         "actual_sha256": actual_sha256,
         "expected_sha256": expected_sha256,

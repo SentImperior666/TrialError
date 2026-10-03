@@ -345,7 +345,7 @@ def test_quota_capture_stale_says_when_it_had_no_config_to_read(tmp_path, monkey
 # ---------------------------------------------------------------------------
 
 
-def test_the_suite_never_reads_the_machines_own_quota_capture(tmp_path):
+def test_the_suite_never_reads_the_machines_own_quota_capture(tmp_path, real_home):
     """The gate this file tests reads a file on disk, so every OTHER test in
     the suite -- every booking test -- reads one too. ``tests/conftest.py``'s
     autouse ``_isolated_quota_dir`` points ``TRIALERROR_QUOTA_DIR`` at an
@@ -365,7 +365,8 @@ def test_the_suite_never_reads_the_machines_own_quota_capture(tmp_path):
     # this test's tmp_path under the same pytest base), never the machine's
     # own capture dir -- that is the property this test guards.
     assert str(tmp_path.parent) in quota_dir and "quota_capture" in quota_dir
-    assert str(Path.home()) not in quota_dir
+    # (Not ``real_home`` alone: pytest's temp base is itself under the user profile.)
+    assert str(real_home / ".trialerror") not in quota_dir
     # Empty: absent is not stale, which is the one reading that cannot age.
     assert booking_quota_reading(tmp_path)["standing"] == "absent"
 

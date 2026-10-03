@@ -32,7 +32,12 @@ from trialerror.stores.store import SCHEMA_MODULES
 from trialerror.stores.xid import XID_REGISTRY
 from trialerror.util.doctor import CheckResult, DoctorContext, register_check
 
-__all__ = ["check_store_schema_version", "check_xid_dangling", "check_anchors_dangling"]
+__all__ = [
+    "check_store_schema_version",
+    "check_store_newer_than_code",
+    "check_xid_dangling",
+    "check_anchors_dangling",
+]
 
 _DB_KINDS = ("platform", "ops", "knowledge", "jobs")
 
@@ -196,6 +201,56 @@ def check_store_schema_version(ctx: DoctorContext) -> CheckResult:
     )
     return CheckResult(
         name="store_schema_version", category="stores", status=status, message=message, details=per_db
+    )
+
+
+@register_check("store_newer_than_code", category="stores")
+def check_store_newer_than_code(ctx: DoctorContext) -> CheckResult:
+    """L8 part F, F2: names the path of any present store whose schema
+    version is AHEAD of this client's latest known migration.
+
+    Standalone from :func:`check_store_schema_version`'s richer
+    additive/non-additive fail split -- this one check has a single job, to
+    warn by NAME the moment any store is newer than the code reading it, with
+    no judgment about whether that is safe. That is how
+    ``research-harness/stores/ops.db``, left at ops v13 by lane code that had
+    opened the harness repository's own ``trialerror.toml`` as its program
+    root by mistake, would have shown itself before anything wrote through it
+    -- a ``trialerror doctor`` run against that root would have named the
+    path. Part F's ``program_root_is_harness`` refusal (F1) stops the mistake
+    itself; this check is the independent tripwire for a store some OTHER
+    client already moved. Never ``fail``: whether a newer store is dangerous
+    is exactly the judgment ``store_schema_version`` already makes -- this
+    check only ever needs to say where to look.
+    """
+    newer: list[dict] = []
+    for db_kind in _DB_KINDS:
+        path = _db_path(ctx, db_kind)
+        if path is None or not path.exists():
+            continue
+        conn = connect(path, read_only=True)
+        try:
+            current = current_version(conn)
+            expected = latest_version(SCHEMA_MODULES[db_kind].MIGRATIONS)
+        finally:
+            conn.close()
+        if current > expected:
+            newer.append(
+                {"db": db_kind, "path": str(path), "current_version": current, "expected_version": expected}
+            )
+
+    status = "warn" if newer else "pass"
+    message = (
+        "; ".join(
+            f"{entry['path']} is at schema version {entry['current_version']}, newer than this "
+            f"client's latest known migration ({entry['expected_version']})"
+            for entry in newer
+        )
+        if newer
+        else "no present store is newer than this client's latest known migration"
+    )
+    return CheckResult(
+        name="store_newer_than_code", category="stores", status=status, message=message, details={"newer": newer}
     )
 
 

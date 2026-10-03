@@ -198,6 +198,18 @@ def refused(world, gid, **kw):
     return str(exc.value)
 
 
+def registered_bytes_evidence(world, aid, *, which="submitted"):
+    """The three keys every registration now records about the bytes it bound
+    to: the hash, which version, and the absolute path they were read from."""
+    artifact = get_artifact(world.store, aid)
+    path = (world.root / artifact["path"]).resolve()
+    return {
+        "registered_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "registered_bytes": which,
+        "registered_path": str(path),
+    }
+
+
 def assert_untouched(world, aid, gid, state="gated"):
     assert get_gate(world.store, gid)["state"] == state
     assert get_gate(world.store, gid)["disposition"] is None
@@ -252,9 +264,25 @@ def test_refused_when_report_ref_is_not_in_the_file(world):
     assert_untouched(world, aid, gid)
 
 
-def test_refused_when_the_file_changed_since_submission(world):
+def test_refused_when_the_file_changed_after_the_gate_recorded_its_hashes(world):
+    """The gate verified its blocking edit against the file as it stood, and
+    recorded that hash; a later change to the file matches neither hash."""
     aid, gid = world.gated(sha_of="the text that was submitted")
-    assert "sha256" in refused(world, gid)
+    gate = get_gate(world.store, gid)
+    assert gate["post_edit_sha256"]
+    artifact = get_artifact(world.store, aid)
+    (world.root / artifact["path"]).write_bytes((DEVIATION_TEXT + "\nand a later change\n").encode("utf-8"))
+    message = refused(world, gid)
+    assert "hash" in message and artifact["sha256"] in message and gate["post_edit_sha256"] in message
+    assert_untouched(world, aid, gid)
+
+
+def test_refused_when_the_file_changed_and_the_gate_recorded_no_corrected_hash(world):
+    """No blocking edit was verified, so the gate holds the submitted hash only."""
+    aid, gid = world.gated(sha_of="the text that was submitted", edits=[{"text": "a note", "blocking": False}])
+    assert get_gate(world.store, gid)["post_edit_sha256"] is None
+    message = refused(world, gid)
+    assert "corrected hash none" in message and "--file" in message
     assert_untouched(world, aid, gid)
 
 
@@ -314,7 +342,10 @@ def test_register_failed_happy(world):
     assert gate["state"] == "registered" and gate["disposition"] == "failure_registered"
     last = transitions(world.store, gid)[-1]
     assert (last["from_state"], last["to_state"]) == ("failed", "registered")
-    assert json.loads(last["evidence"]) == {"path": "register_failed", "decided_by": DEC, "failure_ref": FAILURE_TEXT}
+    assert json.loads(last["evidence"]) == {
+        "path": "register_failed", "decided_by": DEC, "failure_ref": FAILURE_TEXT,
+        **registered_bytes_evidence(world, aid),
+    }
     # a failed result on the record is closed: no new gate on it
     with pytest.raises(ValueError):
         open_gate(world.store, artifact_id=aid)
@@ -341,7 +372,7 @@ def test_register_failed_refusals(world):
     assert get_artifact(world.store, aid)["status"] == "in_gate"
 
     aid, gid = world.failed(sha_of="another text")
-    assert "sha256" in failed_refused(world, gid)
+    assert "hash" in failed_refused(world, gid)
 
     _aid, gated_gid = world.gated()
     assert "'gated'" in failed_refused(world, gated_gid)

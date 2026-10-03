@@ -42,8 +42,15 @@ backend it serves)::
       "/opt/llama.cpp/llama-server",
       "-m", "/models/an-embedding-model.gguf",
       "--embedding", "--pooling", "last", "--embd-normalize", "-1",
-      "-c", "2049", "-b", "2049", "-ub", "2049", "-t", "8",
+      "-c", "2049", "-b", "2049", "-ub", "2049", "-t", "8", "-np", "1",
       "--host", "127.0.0.1", "--port", "8871",
+      # A directory the sidecar's own user owns, that must already exist (never
+      # /var/run) -- needed so the query backend can erase the slot before each
+      # embed; see docs/OPERATOR_GUIDE.md's "Determinism needs --slot-save-path".
+      # Nothing recreates this directory -- not this flag, not `start` -- so if
+      # you ever delete run/ (gitignored, and safe to delete while nothing is
+      # running), make this one again before the sidecar's next start.
+      "--slot-save-path", "run/llama-server-slots",
     ]
     env = { LD_LIBRARY_PATH = "/opt/llama.cpp" }
     health_url = "http://127.0.0.1:8871/health"

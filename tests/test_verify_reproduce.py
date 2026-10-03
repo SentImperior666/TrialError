@@ -208,3 +208,26 @@ def test_reproduce_verdict_relative_script_resolves_under_program_root(store):
     )
     result = reproduce_verdict(store, verdict_id=original["verdict_id"], issued_by_launch=launch_id)
     assert result["status"] == "match"
+
+
+def test_reproduce_verdict_leaves_a_decided_gates_reproduction_columns_alone(store, tmp_path):
+    """A gate that is already failed keeps the evidence it was decided on: a
+    later reproduction run writes its own verdict, but not the gate's columns."""
+
+
+    launch_id = bootstrap_launch(store)
+    insert(store, "template", {"type_key": "note", "title": "Note", "version": "1", "path": "templates/note.md", "gated": 1})
+    gate = _open_submitted_gate(store, launch_id=launch_id)
+    gate_record_verdict(store, gate_id=gate["gate_id"], verdict="FAIL", by_launch=launch_id)
+    assert get(store, "gate", pk_column="gate_id", pk_value=gate["gate_id"])["state"] == "failed"
+    before = get(store, "gate", pk_column="gate_id", pk_value=gate["gate_id"])
+
+    script = _write_script(tmp_path, "repro_decided.py", _SCRIPT)
+    expected = hashlib.sha256(b"hello reproduction world").hexdigest()
+    original = _make_verdict_with_ref(store, launch_id=launch_id, script_path=script, expected_sha256=expected)
+    result = reproduce_verdict(store, verdict_id=original["verdict_id"], gate_id=gate["gate_id"], issued_by_launch=launch_id)
+
+    assert result["status"] == "match" and result["gate_frozen"] is True
+    after = get(store, "gate", pk_column="gate_id", pk_value=gate["gate_id"])
+    assert after == before
+    assert result["verdict"]["procedure"] == "reproduction"  # the verb's own record is still written

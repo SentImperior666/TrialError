@@ -19,7 +19,7 @@ import sqlite3
 
 import pytest
 
-from trialerror.stores.migrate import apply_migrations, current_version, latest_version
+from trialerror.stores.migrate import apply_migrations, current_version
 from trialerror.stores.schema import platform
 
 TS = "2026-09-15T12:00:00.000Z"
@@ -73,8 +73,20 @@ def _seed_v1(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def test_latest_version_is_two():
-    assert latest_version(platform.MIGRATIONS) == 2
+def test_v2_is_present_contiguous_and_uniquely_named():
+    """L3 added platform v3, so "v2 is the latest" is no longer a stable
+    invariant -- design's own renumbering rule (a later lane, L4, adds more
+    platform tables) means it never will be again. What IS stable: v2
+    exists, under this exact name, inside a contiguous, uniquely-named
+    migration list. Same pattern
+    tests/test_stores_migrate_v9_lens_seats.py::test_v9_is_contiguous_and_
+    uniquely_named uses for the same reason on ops.db."""
+    versions = [m.version for m in platform.MIGRATIONS]
+    assert versions == list(range(1, len(versions) + 1))
+    assert 2 in versions
+    assert len({m.name for m in platform.MIGRATIONS}) == len(platform.MIGRATIONS)
+    v2 = next(m for m in platform.MIGRATIONS if m.version == 2)
+    assert v2.name == "platform_v2_launch_usage_split_pool_id_and_event_source"
 
 
 def test_an_old_populated_store_migrates_and_keeps_every_row_and_the_booking_tree():
@@ -82,7 +94,11 @@ def test_an_old_populated_store_migrates_and_keeps_every_row_and_the_booking_tre
     _seed_v1(conn)
     assert current_version(conn) == 1
 
-    applied = apply_migrations(conn, platform.MIGRATIONS)
+    # Capped at v2 (_upto(2)), not the full platform.MIGRATIONS -- this test
+    # is about the v2 rebuild specifically; L3's v3 (unrelated: new tables,
+    # not a launch-table change) is exercised in its own
+    # test_stores_migrate_platform_v3.py.
+    applied = apply_migrations(conn, _upto(2))
     assert applied == [2]
     assert current_version(conn) == 2
 
@@ -111,8 +127,9 @@ def test_the_rebuild_recreates_every_index():
 def test_the_migration_is_idempotent_and_schema_identical_to_a_fresh_v2_store():
     upgraded = _platform_at(1)
     _seed_v1(upgraded)
-    apply_migrations(upgraded, platform.MIGRATIONS)
-    assert apply_migrations(upgraded, platform.MIGRATIONS) == []
+    # Capped at v2 (_upto(2)) -- see the note on the previous test for why.
+    apply_migrations(upgraded, _upto(2))
+    assert apply_migrations(upgraded, _upto(2)) == []
     assert current_version(upgraded) == 2
 
     fresh = _platform_at(2)

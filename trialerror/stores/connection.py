@@ -32,6 +32,7 @@ def connect(
     busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
     foreign_keys: bool = True,
     read_only: bool = False,
+    check_same_thread: bool = True,
 ) -> sqlite3.Connection:
     """Open one WAL-mode connection to the SQLite file at ``path``.
 
@@ -48,16 +49,24 @@ def connect(
     (same-file ``FK`` columns are enforced by SQLite itself; cross-file
     ``XID`` columns are NOT covered by this pragma — see
     ``trialerror.stores.xid`` for those).
+
+    ``check_same_thread`` (default ``True``, sqlite3's own default): pass
+    ``False`` for a connection a caller will hand to code that runs on a
+    DIFFERENT thread than the one that opened it -- e.g.
+    :mod:`trialerror.probes.registry`'s per-probe timeout thread, which joins
+    before the next probe starts, so the connection is still only ever used
+    by one thread AT A TIME, just not always the same one. Every other
+    caller keeps sqlite3's own same-thread guard.
     """
     p = Path(path)
     if read_only:
         if not p.is_file():
             raise FileNotFoundError(f"read-only connect: no such database file: {p}")
         uri = f"file:{p.as_posix()}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, timeout=busy_timeout_ms / 1000)
+        conn = sqlite3.connect(uri, uri=True, timeout=busy_timeout_ms / 1000, check_same_thread=check_same_thread)
     else:
         p.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(p), timeout=busy_timeout_ms / 1000)
+        conn = sqlite3.connect(str(p), timeout=busy_timeout_ms / 1000, check_same_thread=check_same_thread)
 
     conn.row_factory = sqlite3.Row
     # busy_timeout goes on BEFORE the journal-mode switch below -- see the

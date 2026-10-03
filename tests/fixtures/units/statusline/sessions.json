@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "sessions": {
+    "SESS-RC": {
+      "first_seen_ts": "2026-09-20T10:00:00.000Z",
+      "last_seen_ts": "2026-09-20T19:00:30.000Z",
+      "last_seen_epoch": 1789124430.0,
+      "model": "claude-opus-5-5",
+      "cc_version": "2.1.280",
+      "cost": {"total_cost_usd": 4.56, "total_duration_ms": 999999}
+    }
+  }
+}

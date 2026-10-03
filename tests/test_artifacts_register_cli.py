@@ -74,7 +74,6 @@ def test_refusals_carry_the_registration_refused_code(world):
         ["--with-deviation", "--deviation", DEV],  # no decision
         ["--with-deviation", "--deviation", "no separators", "--decided-by", DEC],
         ["--with-deviation", "--deviation", DEV, "--decided-by", DEC, "--failure-ref", "x"],
-        ["--as-failed", "--decided-by", DEC],  # no failure ref
         ["--as-failed", "--failure-ref", "x"],  # no decision
         ["--as-failed", "--failure-ref", "x", "--decided-by", DEC, "--deviation", DEV],
         ["--deviation", DEV],  # a mode flag's argument with no mode
@@ -89,6 +88,24 @@ def test_flag_misuse(world, extra):
         return
     rc, env = register(world, aid, *extra)
     assert rc == 1 and env["error"]["code"] == "bad_input", env
+    assert get_gate(world.store, gid)["state"] == "gated"
+
+
+def test_as_failed_without_a_failure_ref_is_decided_by_the_registration_not_the_flags(world):
+    """``--failure-ref`` is optional on the operator's path, so the flag check
+    no longer requires it: the registration itself decides (and here refuses,
+    because a gated gate is not a failed one)."""
+    aid, gid = world.gated()
+    rc, env = register(world, aid, "--as-failed", "--decided-by", DEC)
+    assert rc == 1 and env["error"]["code"] == "registration_refused"
+    assert get_gate(world.store, gid)["state"] == "gated"
+
+
+def test_file_and_note_only_apply_with_a_registration_mode(world):
+    aid, gid = world.gated()
+    for flag in (["--file", "x.md"], ["--note", "why"]):
+        rc, env = register(world, aid, *flag)
+        assert rc == 1 and env["error"]["code"] == "bad_input", env
     assert get_gate(world.store, gid)["state"] == "gated"
 
 

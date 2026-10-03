@@ -21,6 +21,7 @@ __all__ = [
     "UnknownOverrideRulingError",
     "UnknownAssignmentError",
     "LensNameRefusedError",
+    "LaunchActionRefusedError",
 ]
 
 
@@ -79,3 +80,15 @@ class LensNameRefusedError(BudgetError):
     another's slice is a launch every later reading of the round gets wrong
     in two directions at once. Refused before the ``launch`` row exists, so
     a mistyped name leaves no PROVISIONAL booking holding pool headroom."""
+
+
+class LaunchActionRefusedError(BudgetError):
+    """``budget cancel`` / ``budget release`` refused, with a short ``code``
+    a CLI can put in its envelope (``wrong_state``, ``agent_started``,
+    ``needs_force``, ``search_incomplete``, ``unknown_launch``) and the facts
+    behind it in ``details``."""
+
+    def __init__(self, code: str, message: str, **details: object) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = dict(details)

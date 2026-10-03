@@ -369,31 +369,63 @@ def advance_gate(
     return _require_gate(store, gate_id)
 
 
-def _read_frozen_artifact(store: Store, artifact: Mapping[str, Any]) -> str:
-    """The artifact file's text, refused unless it is the file that was
-    registered for review: it exists and its sha256 equals ``artifact.sha256``.
-    The disclosure a registration rests on must be in the very bytes the gate
-    looked at, not in an edited copy."""
-    path = Path(artifact["path"])
+def _artifact_file_path(store: Store, artifact: Mapping[str, Any], file: str | Path | None) -> tuple[Path, str]:
+    """The file a registration binds to: ``file`` when given, else
+    ``artifact.path``. A relative path is tried as given, then against the
+    program root. Returns ``(path, the name as written)``."""
+    raw = str(file) if file is not None else str(artifact["path"])
+    path = Path(raw)
     if not path.is_file() and not path.is_absolute():
         path = store.program_root / path
+    return path, raw
+
+
+def _read_frozen_artifact(
+    store: Store,
+    artifact: Mapping[str, Any],
+    gate: Mapping[str, Any],
+    *,
+    file: str | Path | None = None,
+) -> tuple[str, str, str, str]:
+    """The registered file's text, refused unless its sha256 is one the gate
+    holds: ``artifact.sha256`` (the submitted bytes, declared when the artifact
+    was created for review) or ``gate.post_edit_sha256`` (the corrected bytes,
+    recorded by :func:`verify_edit` when the gate's last blocking edit was
+    verified). The disclosure a registration rests on must be in bytes the
+    gate itself can vouch for, not in an edited copy whose hash nobody
+    recorded.
+
+    Returns ``(text, sha256_used, which, path_used)``: ``which`` is
+    ``submitted`` or ``post_edit``, and ``path_used`` is the absolute path the
+    bytes were read from."""
+    path, raw = _artifact_file_path(store, artifact, file)
     if not path.is_file():
         raise RegistrationRefusedError(
-            f"artifact {artifact['artifact_id']!r}: its file {str(artifact['path'])!r} is missing, so what it "
+            f"artifact {artifact['artifact_id']!r}: its file {raw!r} is missing, so what it "
             "discloses cannot be checked"
         )
     data = path.read_bytes()
-    if hashlib.sha256(data).hexdigest() != artifact["sha256"]:
+    digest = hashlib.sha256(data).hexdigest()
+    submitted = artifact.get("sha256")
+    corrected = gate.get("post_edit_sha256") or None
+    if digest == submitted:
+        which = "submitted"
+    elif corrected is not None and digest == corrected:
+        which = "post_edit"
+    else:
         raise RegistrationRefusedError(
-            f"artifact {artifact['artifact_id']!r}: its file no longer matches the sha256 recorded when it "
-            "was submitted for review; a disclosure in a changed file is not the disclosure the gate saw"
+            f"artifact {artifact['artifact_id']!r}: its file's hash is {digest}; the gate knows the submitted "
+            f"hash {submitted} (and the corrected hash {corrected or 'none'}). A disclosure in a changed file "
+            "is not the disclosure the gate saw. Pass `--file` with a copy of the submitted file, or register "
+            "the corrected file once the gate has recorded it"
         )
     try:
-        return data.decode("utf-8")
+        text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise RegistrationRefusedError(
             f"artifact {artifact['artifact_id']!r}: its file is not UTF-8 text ({exc})"
         ) from exc
+    return text, digest, which, str(path.resolve())
 
 
 def _require_registrable_artifact(store: Store, gate: dict[str, Any]) -> dict[str, Any]:
@@ -408,24 +440,36 @@ def _require_registrable_artifact(store: Store, gate: dict[str, Any]) -> dict[st
     return artifact
 
 
+def _gate_suite_record(raw: Any) -> dict[str, Any] | None:
+    """The gate-suite record a ``reproduction_ref`` string holds, or ``None``
+    when it is anything else (a byte-exact ``verify reproduce`` mismatch, say)."""
+    try:
+        record = json.loads(raw) if raw else None
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(record, dict) or record.get("kind") != "gate_suite" or not isinstance(record.get("checks"), list):
+        return None
+    return record
+
+
+def _failing_checks_of(record: Mapping[str, Any]) -> list[dict[str, Any]]:
+    from trialerror.eval.gate_suites import check_status
+
+    return [c for c in record["checks"] if isinstance(c, dict) and check_status(c) == "fail"]
+
+
 def _failing_gate_suite_checks(gate: dict[str, Any]) -> list[str]:
     """The names of the checks that failed in the gate-suite record
     ``reproduction_ref`` holds. Any other kind of reproduction record (a
     byte-exact ``verify reproduce`` mismatch, say) is not a disclosed
     deviation and is refused."""
-    from trialerror.eval.gate_suites import check_status
-
-    raw = gate.get("reproduction_ref")
-    try:
-        record = json.loads(raw) if raw else None
-    except (TypeError, json.JSONDecodeError):
-        record = None
-    if not isinstance(record, dict) or record.get("kind") != "gate_suite" or not isinstance(record.get("checks"), list):
+    record = _gate_suite_record(gate.get("reproduction_ref"))
+    if record is None:
         raise RegistrationRefusedError(
             f"gate {gate['gate_id']!r}: reproduction_ref is not a gate-suite record, so there is no failing check "
             "to disclose. A reproduction mismatch is not a deviation an artifact can disclose"
         )
-    return [str(c.get("name")) for c in record["checks"] if isinstance(c, dict) and check_status(c) == "fail"]
+    return [str(c.get("name")) for c in _failing_checks_of(record)]
 
 
 def _commit_registration(
@@ -500,6 +544,14 @@ def _commit_registration(
         raise
 
 
+def _registered_bytes_evidence(sha: str, which: str, path: str, note: str | None) -> dict[str, Any]:
+    """What the registration evidence says about the bytes it bound to."""
+    evidence: dict[str, Any] = {"registered_sha256": sha, "registered_bytes": which, "registered_path": path}
+    if note is not None and str(note).strip():
+        evidence["note"] = str(note)
+    return evidence
+
+
 def register_with_deviation(
     store: Store,
     *,
@@ -509,6 +561,8 @@ def register_with_deviation(
     by_launch: str,
     supersedes: str | None = None,
     ts: str | None = None,
+    file: str | Path | None = None,
+    note: str | None = None,
 ) -> dict[str, Any]:
     """Register an artifact whose gate suite failed on something the artifact
     itself discloses, by an operator decision (without this, a report that
@@ -529,9 +583,12 @@ def register_with_deviation(
     4. ``reproduction_ref`` is a gate-suite record, and the deviations cover
        its failing checks EXACTLY: each failing check at least once, no
        deviation naming a check that did not fail;
-    5. the artifact file (unchanged since submission: its sha256 matches)
-       contains every ``report_ref`` verbatim -- the disclosure has to be in
-       the artifact's own text;
+    5. the registered file contains every ``report_ref`` verbatim -- the
+       disclosure has to be in the artifact's own text. The file is ``file``
+       when given, else ``artifact.path``; either way its sha256 must be one
+       the gate holds: the submitted hash, or the corrected hash the gate
+       recorded when its last blocking edit was verified
+       (:func:`_read_frozen_artifact`);
     6. ``decided_by`` is non-empty.
 
     Then, in one transaction, the gate moves ``gated -> registered`` with
@@ -590,7 +647,9 @@ def register_with_deviation(
             f"not covered: {uncovered or 'none'}; named but not failing: {stray or 'none'}"
         )
     artifact = _require_registrable_artifact(store, gate)
-    text = _read_frozen_artifact(store, artifact)
+    text, registered_sha, registered_bytes, registered_path = _read_frozen_artifact(
+        store, artifact, gate, file=file
+    )
     absent = [d["report_ref"] for d in deviations if d["report_ref"] not in text]
     if absent:
         raise RegistrationRefusedError(
@@ -604,7 +663,10 @@ def register_with_deviation(
         store, gate_id=gate_id, artifact_id=artifact["artifact_id"], expected_state="gated",
         gate_changes={"disposition": "deviation_disclosed", "deviation_ref": json.dumps(recorded, ensure_ascii=False)},
         artifact_changes={"disposition": "registered_with_deviation"},
-        evidence={"path": "register_with_deviation", "decided_by": decided_by, "deviations": recorded},
+        evidence={
+            "path": "register_with_deviation", "decided_by": decided_by, "deviations": recorded,
+            **_registered_bytes_evidence(registered_sha, registered_bytes, registered_path, note),
+        },
         by_launch=by_launch, ts=ts, supersedes=supersedes, what="register_with_deviation",
     )
     return store_get(store, "artifact", pk_column="artifact_id", pk_value=artifact["artifact_id"])
@@ -713,11 +775,13 @@ def register_failed(
     store: Store,
     *,
     gate_id: str,
-    failure_ref: str,
+    failure_ref: str | None = None,
     decided_by: str,
     by_launch: str,
     supersedes: str | None = None,
     ts: str | None = None,
+    file: str | Path | None = None,
+    note: str | None = None,
 ) -> dict[str, Any]:
     """Register an artifact as a FAILED result: the gate failed and the
     operator decided the failure belongs on the record (without this, a
@@ -730,9 +794,22 @@ def register_failed(
        (the operator's decision on a ``mismatch`` reproduction, which must
        still read ``mismatch``). A review abandoned without either -- a bare
        ``gate advance --to failed`` -- is not a failed result;
-    3. the artifact file (sha256 unchanged) contains ``failure_ref``
-       verbatim, the artifact's own statement of what failed;
-    4. ``decided_by`` is non-empty.
+    3. ``failure_ref`` is given and the registered file contains it verbatim,
+       the artifact's own statement of what failed. On the operator's path
+       ``failure_ref`` is optional: the failure is stated by the gate's own
+       record instead (see below), and a ``failure_ref`` that IS given must
+       still appear in the registered file. On the critic's ``FAIL`` path it
+       stays mandatory;
+    4. ``decided_by`` is non-empty;
+    5. the registered file is ``file`` when given, else ``artifact.path``, and
+       its sha256 is one the gate holds (:func:`_read_frozen_artifact`).
+
+    **The failure basis is the gate's record.** On the operator's path the
+    evidence gains ``failure_basis``: the decision to fail the gate and the
+    checks that failed, both read from the ``gated -> failed`` transition's
+    own evidence (its frozen ``reproduction_ref``), never from the live
+    ``gate`` columns. When that reference is not a gate-suite record, the
+    registration is refused.
 
     Then, in one transaction, the gate moves ``failed -> registered`` with
     ``disposition='failure_registered'``, a ``gate_transition`` row records
@@ -762,18 +839,41 @@ def register_failed(
                 "'failed' by an operator decision on a mismatched reproduction (`trialerror gate "
                 "fail-reproduction`) -- a review that was abandoned is not a failed result"
             )
-        if gate.get("reproduction_status") != "mismatch":
+        if operator_fail.get("reproduction_status") != "mismatch":
             raise RegistrationRefusedError(
-                f"gate {gate_id!r}: it was failed on a mismatched reproduction, but its reproduction_status now "
-                f"reads {gate.get('reproduction_status')!r}; the basis of that decision no longer holds"
+                f"gate {gate_id!r}: the decision that failed it recorded reproduction_status "
+                f"{operator_fail.get('reproduction_status')!r}, not 'mismatch'; the basis of that decision does not hold"
             )
-    if not isinstance(failure_ref, str) or not failure_ref:
-        raise RegistrationRefusedError(
-            f"gate {gate_id!r}: failure_ref is required -- a string from the artifact that states what failed"
-        )
+        record = _gate_suite_record(operator_fail.get("reproduction_ref"))
+        if record is None:
+            raise RegistrationRefusedError(
+                f"gate {gate_id!r}: the failed checks cannot be read from the gate's record: the reproduction "
+                "reference frozen with the decision that failed it is not a gate-suite record"
+            )
+        failure_basis = {
+            "kind": OPERATOR_FAIL_PATH,
+            "decided_by": operator_fail.get("decided_by"),
+            "failing_checks": [
+                {"name": str(c.get("name")), "message": c.get("message")} for c in _failing_checks_of(record)
+            ],
+        }
+    else:
+        failure_basis = None
+    if failure_ref is None or not isinstance(failure_ref, str) or not failure_ref:
+        if failure_basis is None:
+            raise RegistrationRefusedError(
+                f"gate {gate_id!r}: failure_ref is required -- a string from the artifact that states what failed"
+            )
+        if failure_ref is not None:
+            raise RegistrationRefusedError(
+                f"gate {gate_id!r}: failure_ref is empty -- give a string from the artifact that states what "
+                "failed, or leave it out to register on the gate's own record"
+            )
     artifact = _require_registrable_artifact(store, gate)
-    text = _read_frozen_artifact(store, artifact)
-    if failure_ref not in text:
+    text, registered_sha, registered_bytes, registered_path = _read_frozen_artifact(
+        store, artifact, gate, file=file
+    )
+    if failure_ref and failure_ref not in text:
         raise RegistrationRefusedError(
             f"artifact {artifact['artifact_id']!r}: the artifact's own text does not contain {failure_ref!r}; a "
             "failed result is registered only when the artifact itself states the failure"
@@ -785,11 +885,13 @@ def register_failed(
         gate_changes={"disposition": "failure_registered"},
         artifact_changes={"disposition": "registered_failed"},
         evidence={
-            "path": "register_failed", "decided_by": decided_by, "failure_ref": failure_ref,
+            "path": "register_failed", "decided_by": decided_by,
+            **({"failure_ref": failure_ref} if failure_ref else {}),
             **(
-                {"basis": OPERATOR_FAIL_PATH, "failed_by": operator_fail.get("decided_by")}
+                {"basis": OPERATOR_FAIL_PATH, "failed_by": operator_fail.get("decided_by"), "failure_basis": failure_basis}
                 if operator_fail is not None else {}
             ),
+            **_registered_bytes_evidence(registered_sha, registered_bytes, registered_path, note),
         },
         by_launch=by_launch, ts=ts, supersedes=supersedes, what="register_failed",
     )
@@ -948,13 +1050,47 @@ def verify_edit(
         raise ValueError("verify_edit: by_launch is required")
     _require_launch_exists(store, by_launch, field_name="by_launch")
 
+    stamped = ts or now()
+    outcome: dict[str, Any] = {"post_edit_recorded": False, "post_edit_note": None}
+
     def _apply(entry: dict[str, Any]) -> None:
         entry["applied"] = True
         entry["applied_by_launch"] = by_launch
         entry["verified"] = True
         entry["verified_note"] = verified_note
+        entry["verified_ts"] = stamped
 
-    return _mutate_edit_in_txn(store, caller="verify_edit", gate_id=gate_id, edit_id=edit_id, mutate=_apply)
+    def _record_corrected_bytes(
+        gate: dict[str, Any], before: list[dict[str, Any]], after: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """When THIS call makes every blocking edit verified, the gate reads
+        the artifact's file and keeps its hash (and the moment) itself."""
+        def all_verified(entries: list[dict[str, Any]]) -> bool:
+            blocking = [e for e in entries if e.get("blocking")]
+            return bool(blocking) and all(e.get("verified") for e in blocking)
+
+        if not all_verified(after) or all_verified(before):
+            return {}
+        artifact = store_get(store, "artifact", pk_column="artifact_id", pk_value=gate["artifact_id"])
+        try:
+            if artifact is None:
+                raise OSError("its artifact row does not exist")
+            path, _raw = _artifact_file_path(store, artifact, None)
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as exc:
+            outcome["post_edit_note"] = (
+                f"the corrected file could not be read ({type(exc).__name__}), so the gate recorded no "
+                "corrected hash; a registration can still bind to the submitted bytes"
+            )
+            return {}
+        outcome["post_edit_recorded"] = True
+        return {"post_edit_sha256": digest, "post_edit_ts": stamped}
+
+    row = _mutate_edit_in_txn(
+        store, caller="verify_edit", gate_id=gate_id, edit_id=edit_id, mutate=_apply,
+        also_changes=_record_corrected_bytes,
+    )
+    return {**row, **outcome}
 
 
 def send_back_edit(
@@ -1042,6 +1178,7 @@ def _mutate_edit_in_txn(
     event: Callable[[dict[str, Any]], tuple[str, dict[str, Any]]] | None = None,
     ts: str | None = None,
     by_launch: str | None = None,
+    also_changes: Callable[[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """The ONE place a single entry of ``gate.edits`` is mutated, and the
     close of WA-1's worst case (see :func:`verify_edit`'s own docstring for
@@ -1058,7 +1195,11 @@ def _mutate_edit_in_txn(
     ``(event_type, payload)`` for one ``event`` row written inside the SAME
     transaction — so a mutation and its audit record land together or not
     at all. ``by_launch`` must already be XID-validated by the public
-    caller (``trialerror.artifacts._txn``'s contract)."""
+    caller (``trialerror.artifacts._txn``'s contract).
+
+    ``also_changes``, when given, is called inside the same transaction with
+    ``(fresh gate row, the edits before, the edits after)`` and returns extra
+    ``gate`` columns to write in the same UPDATE as the ``edits`` array."""
     conn = store.ops
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -1074,11 +1215,12 @@ def _mutate_edit_in_txn(
         match = next((e for e in edits if e["edit_id"] == edit_id), None)
         if match is None:
             raise ValueError(f"{caller}: no edit {edit_id!r} on gate {gate_id!r}")
+        edits_before = json.loads(json.dumps(edits))
         mutate(match)
-        raw_update(
-            conn, "gate", pk_column="gate_id", pk_value=gate_id,
-            changes={"edits": json.dumps(edits, ensure_ascii=False)},
-        )
+        changes: dict[str, Any] = {"edits": json.dumps(edits, ensure_ascii=False)}
+        if also_changes is not None:
+            changes.update(also_changes(gate, edits_before, edits))
+        raw_update(conn, "gate", pk_column="gate_id", pk_value=gate_id, changes=changes)
         if event is not None:
             event_type, payload = event(gate)
             append_event_in_txn(conn, event_type=event_type, payload=payload, launch_id=by_launch, ts=ts)
