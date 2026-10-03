@@ -26,6 +26,14 @@ from trialerror.ingest.backends import embeddable_text
 from trialerror.offload import stage, worker
 
 
+@pytest.fixture(autouse=True)
+def _slot_erase_lock_in_tmp_path(monkeypatch, tmp_path):
+    """This module builds a ``LlamaServerEmbedBackend`` with no
+    ``_lock_path``, so it must not touch the harness's real DEV-local
+    scratch root even though nothing here calls ``embed_batch`` today."""
+    monkeypatch.setattr(backends, "_slot_erase_lock_path", lambda url: tmp_path / "slot_erase.lock")
+
+
 # ---------------------------------------------------------------------------
 # one function, both call sites
 # ---------------------------------------------------------------------------

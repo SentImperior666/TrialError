@@ -24,12 +24,15 @@ URL_RE = re.compile(r"^https://pypi\.org/pypi/([^/]+)/([^/]+)/json$")
 
 
 @pytest.fixture(autouse=True)
-def _no_network(network_tripwire, monkeypatch):  # noqa: F811
+def _no_network(network_tripwire, monkeypatch, tmp_path):  # noqa: F811
     def pypi_tripwire(url, **_kw):
         raise AssertionError(f"lock-deps reached the real network: {url}")
 
     monkeypatch.setattr(envlock, "urllib_get", pypi_tripwire)
     monkeypatch.setattr(cli_vastai, "_out", io.StringIO())
+    # L8 part F (second fix step): no --program-root here falls back to
+    # find_program_root(), which must never resolve to the harness checkout.
+    monkeypatch.setenv("TRIALERROR_PROGRAM_ROOT", str(tmp_path / "no_program_root_given"))
 
 
 def _fake_pypi(seen: list[str]):

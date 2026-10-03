@@ -21,8 +21,10 @@ bytes; the audit module reads timestamps and a version string only.
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import gzip
 import hashlib
+import json
 import os
 import sqlite3
 import stat
@@ -38,6 +40,7 @@ __all__ = [
     "kind_of",
     "is_secret",
     "walk_source",
+    "scope_matches",
     "utc_iso",
     "parse_ts",
     "open_index",
@@ -50,7 +53,8 @@ __all__ = [
     "default_opener",
 ]
 
-SCHEMA_VERSION = "1"
+#: B6.3: bumped for `run.scope`; :func:`open_index` migrates an older index once.
+SCHEMA_VERSION = "2"
 #: A superseded object is pruned once it has been superseded for this long.
 PRUNE_AFTER_DAYS = 30
 #: Files above this size are skipped with a warning, never truncated.
@@ -73,7 +77,7 @@ CREATE TABLE IF NOT EXISTS snapshot (id INTEGER PRIMARY KEY AUTOINCREMENT, host 
     mtime_ns INTEGER NOT NULL, seen_ts TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS run (id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT NOT NULL,
     started_ts TEXT NOT NULL, finished_ts TEXT, scanned INTEGER, new_objects INTEGER,
-    bytes_stored INTEGER, superseded INTEGER, gone INTEGER, errors INTEGER);
+    bytes_stored INTEGER, superseded INTEGER, gone INTEGER, errors INTEGER, scope TEXT);
 CREATE INDEX IF NOT EXISTS snapshot_path ON snapshot(host, rel_path, id);
 CREATE INDEX IF NOT EXISTS snapshot_sha ON snapshot(sha256);
 """
@@ -156,15 +160,43 @@ def kind_of(rel_path: str) -> str:
     return "other"
 
 
-def walk_source(src: Path) -> Iterator[tuple[str, Path, os.stat_result | None, str | None]]:
+def scope_matches(rel_path: str, include: list[str] | None) -> bool:
+    """B6.1/B6.2: whether ``rel_path`` is in scope for ``include`` (a list of
+    globs, each matched against the path's FIRST component -- a project
+    folder's name -- case-folded via :func:`fnmatch.fnmatch`). ``None`` or
+    an empty list means "everything", the pre-B6 behaviour. A path with no
+    component at all (directly under ``--src``) is out of scope whenever
+    ``include`` is given (B6.1: "A file directly under --src, outside any
+    project folder, is out of scope when any --include is given")."""
+    if not include:
+        return True
+    parts = _parts(rel_path)
+    if not parts:
+        return False
+    first = parts[0].lower()
+    return any(fnmatch.fnmatch(first, pat.lower()) for pat in include)
+
+
+def walk_source(
+    src: Path, include: list[str] | None = None
+) -> Iterator[tuple[str, Path, os.stat_result | None, str | None]]:
     """Yield ``(rel_path, abs_path, stat, skip_reason)`` for every regular file
     under ``src``, in a stable order. ``skip_reason`` is ``"secret"`` or
-    ``"unreadable"``, else ``None``; secret folders are never entered."""
+    ``"unreadable"``, else ``None``; secret folders are never entered.
+
+    B6.1: with ``include`` (a list of globs matched against the first path
+    component), a top-level folder that matches none of them is pruned
+    before ``os.walk`` ever descends into it, and a file directly under
+    ``src`` (no project folder at all) is skipped outright."""
     for root, dirs, files in os.walk(src, followlinks=False):
         rel_root = Path(root).relative_to(src).as_posix()
         dirs[:] = sorted(d for d in dirs if d.lower() not in _SECRET_DIRS)
+        if include and rel_root == ".":
+            dirs[:] = [d for d in dirs if any(fnmatch.fnmatch(d.lower(), pat.lower()) for pat in include)]
         for name in sorted(files):
             rel = name if rel_root == "." else f"{rel_root}/{name}"
+            if include and rel_root == ".":
+                continue  # a file directly under src, out of scope when --include is given
             path = Path(root) / name
             if is_secret(rel):
                 yield rel, path, None, "secret"
@@ -263,8 +295,28 @@ def open_index(dest: Path, *, create: bool = True) -> sqlite3.Connection:
     db = sqlite3.connect(str(index), timeout=_BUSY_TIMEOUT_S, isolation_level=None)
     db.row_factory = sqlite3.Row
     db.executescript(_SCHEMA)
-    db.execute("INSERT OR IGNORE INTO meta(k, v) VALUES ('schema_version', ?)", (SCHEMA_VERSION,))
+    current = db.execute("SELECT v FROM meta WHERE k = 'schema_version'").fetchone()
+    if current is None:
+        db.execute("INSERT INTO meta(k, v) VALUES ('schema_version', ?)", (SCHEMA_VERSION,))
+    elif int(current["v"]) < int(SCHEMA_VERSION):
+        _migrate_index(db, from_version=current["v"])
+        db.execute("UPDATE meta SET v = ? WHERE k = 'schema_version'", (SCHEMA_VERSION,))
+    # N1 (fix check): a newer index (current > SCHEMA_VERSION -- opened by a client ahead of this
+    # one) is left exactly alone. Re-stamping it down to this version, as an unconditional !=
+    # check used to, would claim this client's migrations were applied when they were not, and
+    # would misrepresent to a later, newer client what state the index is actually in.
     return db
+
+
+def _migrate_index(db: sqlite3.Connection, *, from_version: str) -> None:
+    """B6.3: applied once to an older index. Today's only step is version 1
+    -> 2, ``run.scope`` -- a ``CREATE TABLE IF NOT EXISTS`` (in ``_SCHEMA``,
+    which already includes the column for a brand-new index) is a no-op on
+    an existing table, so an explicit ``ALTER TABLE`` is what actually adds
+    it here."""
+    cols = {row["name"] for row in db.execute("PRAGMA table_info(run)").fetchall()}
+    if "scope" not in cols:
+        db.execute("ALTER TABLE run ADD COLUMN scope TEXT")
 
 
 def object_path(dest: Path, sha: str) -> Path:
@@ -456,10 +508,15 @@ def run_archive(
     *,
     dry_run: bool = False,
     prune: bool = True,
+    include: list[str] | None = None,
     now: datetime | None = None,
     opener: Callable[..., Any] = default_opener,
 ) -> dict[str, Any]:
     """Copy every new or changed file under ``src`` into the archive at ``dest``.
+
+    ``include`` (B6.1) scopes the run to project folders (the first path
+    component) matching one of the globs; ``None`` or empty is "everything",
+    the pre-B6 behaviour.
 
     Returns the run's counters; ``{"locked": True, ...}`` when another run holds
     the archive. Raises :class:`ArchiveError` on a refusal."""
@@ -472,7 +529,7 @@ def run_archive(
     now = now or datetime.now(timezone.utc)
     if dry_run:
         with _dry_run_index(dest_p) as db:
-            return _run_locked(db, src_p, dest_p, host, dry_run=True, prune=prune, now=now, opener=opener)
+            return _run_locked(db, src_p, dest_p, host, dry_run=True, prune=prune, include=include, now=now, opener=opener)
     dest_p.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
         with contextlib.suppress(OSError):
@@ -483,7 +540,7 @@ def run_archive(
         _clear_tmp(dest_p)
         db = open_index(dest_p)
         try:
-            return _run_locked(db, src_p, dest_p, host, dry_run=False, prune=prune, now=now, opener=opener)
+            return _run_locked(db, src_p, dest_p, host, dry_run=False, prune=prune, include=include, now=now, opener=opener)
         finally:
             db.close()
 
@@ -522,6 +579,19 @@ def _dry_run_index(dest: Path) -> Iterator[sqlite3.Connection]:
         db.close()
 
 
+def _skipped_out_of_scope_folders(src: Path, include: list[str] | None) -> int:
+    """B6.3: the count of top-level project folders under ``src`` that
+    ``include`` prunes -- a cheap, non-recursive listing, independent of
+    :func:`walk_source`'s own pruning during the real (possibly large) walk."""
+    if not include:
+        return 0
+    try:
+        top_dirs = [p.name for p in src.iterdir() if p.is_dir() and p.name.lower() not in _SECRET_DIRS]
+    except OSError:
+        return 0
+    return sum(1 for name in top_dirs if not any(fnmatch.fnmatch(name.lower(), pat.lower()) for pat in include))
+
+
 def _run_locked(
     db: sqlite3.Connection,
     src: Path,
@@ -530,10 +600,12 @@ def _run_locked(
     *,
     dry_run: bool,
     prune: bool,
+    include: list[str] | None = None,
     now: datetime,
     opener: Callable[..., Any],
 ) -> dict[str, Any]:
     now_iso = utc_iso(now)
+    scope_json = json.dumps(sorted(include)) if include else None
     stats: dict[str, Any] = {
         "scanned": 0,
         "skipped_unchanged": 0,
@@ -545,15 +617,19 @@ def _run_locked(
         "gone": 0,
         "pruned": 0,
         "errors": [],
+        "scope": sorted(include) if include else None,
+        "skipped_out_of_scope_folders": _skipped_out_of_scope_folders(src, include),
     }
     run_id: int | None = None
     if not dry_run:
-        run_id = db.execute("INSERT INTO run(host, started_ts) VALUES (?, ?)", (host, now_iso)).lastrowid
+        run_id = db.execute(
+            "INSERT INTO run(host, started_ts, scope) VALUES (?, ?, ?)", (host, now_iso, scope_json)
+        ).lastrowid
     db.execute("BEGIN")
     seen: set[str] = set()
     to_unlink: list[str] = []
     pending = 0
-    for rel, path, st, skip in walk_source(src):
+    for rel, path, st, skip in walk_source(src, include):
         if skip == "secret":
             stats["skipped_secret"] += 1
             continue
@@ -585,7 +661,10 @@ def _run_locked(
             db.execute("BEGIN")
             pending = 0
     for row in db.execute("SELECT rel_path FROM path_state WHERE host = ? AND gone_ts IS NULL", (host,)).fetchall():
-        if row["rel_path"] not in seen:
+        # B6.2: a row outside this run's scope was never walked, so it is
+        # never in `seen` either -- without this guard it would be marked
+        # gone every scoped run even though nothing about it changed.
+        if row["rel_path"] not in seen and scope_matches(row["rel_path"], include):
             db.execute(
                 "UPDATE path_state SET gone_ts = ? WHERE host = ? AND rel_path = ?", (now_iso, host, row["rel_path"])
             )
@@ -734,8 +813,25 @@ def archive_status(dest: str | Path) -> dict[str, Any]:
                 (host,),
             ).fetchone()
             last = db.execute(
-                "SELECT started_ts, finished_ts, errors FROM run WHERE host = ? ORDER BY id DESC LIMIT 1", (host,)
+                "SELECT started_ts, finished_ts, errors, scope FROM run WHERE host = ? ORDER BY id DESC LIMIT 1",
+                (host,),
             ).fetchone()
+            scope: list[str] | None = None
+            if last is not None and last["scope"]:
+                try:
+                    scope = json.loads(last["scope"])
+                except (TypeError, ValueError):
+                    scope = None
+            files_in_scope, files_kept_out_of_scope = files, 0
+            if scope:
+                rel_paths = [
+                    r["rel_path"]
+                    for r in db.execute(
+                        "SELECT rel_path FROM path_state WHERE host = ? AND gone_ts IS NULL", (host,)
+                    )
+                ]
+                files_in_scope = sum(1 for rp in rel_paths if scope_matches(rp, scope))
+                files_kept_out_of_scope = len(rel_paths) - files_in_scope
             report[host] = {
                 "files": files,
                 "gone": gone,
@@ -743,6 +839,9 @@ def archive_status(dest: str | Path) -> dict[str, Any]:
                 "bytes_stored": objs["b"],
                 "superseded": objs["sup"],
                 "last_run": dict(last) if last else None,
+                "scope": scope,
+                "files_in_scope": files_in_scope,
+                "files_kept_out_of_scope": files_kept_out_of_scope,
             }
         return {"dest": str(dest_p), "hosts": report}
     finally:

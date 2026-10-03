@@ -468,6 +468,13 @@
   var TERM_KINDS = ["term_duplicate", "term_conflict"];
   function isTermKind(kind) { return TERM_KINDS.indexOf(kind) !== -1; }
 
+  //: L10 part B (design §3): "DECIDE shows the owner and the plain words,
+  //: and groups items by owner." An item with no owner field (a server
+  //: build that predates this lane) falls into "unspecified", last.
+  var OWNER_LABELS = { operator: "FOR YOU", orchestrator: "FOR THE ORCHESTRATOR", custodian: "FOR THE CUSTODIAN" };
+  var OWNER_ORDER = ["operator", "orchestrator", "custodian"];
+  function itemOwner(item) { return item.owner || "unspecified"; }
+
   var GATE_STEPS = ["draft", "submitted", "gated", "union_applied", "registered"];
 
   var state = {
@@ -2532,22 +2539,37 @@
       });
     }
 
+    // L10 part B (design §3): "groups items by owner" -- an outer partition
+    // by owner, painted operator/orchestrator/custodian (then any owner
+    // this build does not name, by first appearance), each still grouped
+    // and ordered by kind exactly as DECIDE always has been within it.
     var handledKinds = {};
-    KIND_ORDER.forEach(function (kind) {
-      handledKinds[kind] = true;
-      paintGroup(KIND_LABELS[kind], drawn.filter(function (i) { return i.kind === kind; }));
-    });
-
-    // Any kind this build does not name in KIND_ORDER (and is not a term
-    // kind) used to be silently dropped here -- it is drawn now, grouped by
-    // kind, in the order its kind was first seen, headed by the kind name
-    // itself since there is no human label for it yet.
-    var otherKinds = [];
-    drawn.forEach(function (i) {
-      if (!handledKinds[i.kind] && otherKinds.indexOf(i.kind) === -1) otherKinds.push(i.kind);
-    });
-    otherKinds.forEach(function (kind) {
-      paintGroup(String(kind).toUpperCase(), drawn.filter(function (i) { return i.kind === kind; }));
+    var ownerBuckets = {};
+    drawn.forEach(function (i) { var o = itemOwner(i); (ownerBuckets[o] = ownerBuckets[o] || []).push(i); });
+    var ownerSeq = OWNER_ORDER.concat(Object.keys(ownerBuckets).filter(function (o) { return OWNER_ORDER.indexOf(o) === -1; }));
+    ownerSeq.forEach(function (owner) {
+      var subset = ownerBuckets[owner];
+      if (!subset || !subset.length) return;
+      list.appendChild(el("div", {
+        "class": "determ-owner-label",
+        "style": "font-size:10px; letter-spacing:0.14em; color:var(--ink-3); margin-top:10px; text-transform:uppercase;",
+        text: OWNER_LABELS[owner] || String(owner).toUpperCase(),
+      }));
+      KIND_ORDER.forEach(function (kind) {
+        handledKinds[kind] = true;
+        paintGroup(KIND_LABELS[kind], subset.filter(function (i) { return i.kind === kind; }));
+      });
+      // Any kind this build does not name in KIND_ORDER (and is not a term
+      // kind) used to be silently dropped here -- it is drawn now, grouped
+      // by kind, in the order its kind was first seen within this owner,
+      // headed by the kind name itself since there is no human label yet.
+      var otherKinds = [];
+      subset.forEach(function (i) {
+        if (!handledKinds[i.kind] && otherKinds.indexOf(i.kind) === -1) otherKinds.push(i.kind);
+      });
+      otherKinds.forEach(function (kind) {
+        paintGroup(String(kind).toUpperCase(), subset.filter(function (i) { return i.kind === kind; }));
+      });
     });
 
     var selected = drawn.filter(function (i) { return i.id === state.determSelectedId; })[0];
@@ -2558,16 +2580,54 @@
   function renderDeterminationDetail(detail, item) {
     var header = el("div", { "class": "subbar" }, [
       el("span", { "class": "t", text: determItemTitle(item) }),
+      item.owner ? chip(OWNER_LABELS[item.owner] || item.owner.toUpperCase(), item.owner === "operator" ? "warn" : "neutral") : null,
       item.blocking ? chip("BLOCKING", "crit") : chip(humanizeKey(item.kind), "neutral"),
       el("span", { "class": "fill" })
     ]);
     detail.appendChild(header);
     var body = el("div", { "class": "panel-body-pad" });
+    // L10 part B: item.what/item.why are the plain-words framing this lane
+    // adds; a kind this build has not enriched yet (or an owner that only
+    // gets what/why/next_step, no options) still falls back to the raw
+    // text every kind has always shown.
     var summaryCard = el("div", { "class": "card " + (item.blocking ? "card--accent-crit" : "card--accent-warn") }, [
       el("div", { "class": "card-header" }, [el("span", { "class": "sub", "style": "color:" + (item.blocking ? "var(--crit-text)" : "var(--warn)") + "; letter-spacing:0.12em;", text: "WHAT'S BEING ASKED" })]),
-      el("div", { "class": "card-body", "style": "font-size:14px; color:var(--ink-hi); line-height:1.5;", text: (item.text || item.reason || item.consequence) })
+      el("div", { "class": "card-body", "style": "font-size:14px; color:var(--ink-hi); line-height:1.5;", text: (item.what || item.text || item.reason || item.consequence) })
     ]);
     body.appendChild(summaryCard);
+
+    if (item.why) {
+      body.appendChild(el("div", { "class": "card" }, [
+        el("div", { "class": "card-header" }, [el("span", { "class": "title", text: "WHY IT MATTERS" })]),
+        el("div", { "class": "card-body", "style": "font-size:12.5px; line-height:1.5; color:var(--ink);", text: item.why }),
+      ]));
+    }
+    if (item.next_step) {
+      body.appendChild(el("div", { "class": "card" }, [
+        el("div", { "class": "card-header" }, [el("span", { "class": "title", text: "NEXT STEP" })]),
+        el("div", { "class": "card-body", "style": "font-size:12.5px; line-height:1.5; color:var(--ink);", text: item.next_step }),
+      ]));
+    }
+    if (item.options && item.options.length) {
+      var optCard = el("div", { "class": "card" });
+      optCard.appendChild(el("div", { "class": "card-header" }, [
+        el("span", { "class": "title", text: "OPTIONS" }),
+        item.needed_by ? el("span", { "class": "sub", text: "needed by " + item.needed_by }) : null,
+      ]));
+      var optBody = el("div", { "class": "card-body", "style": "display:flex; flex-direction:column; gap:6px;" });
+      item.options.forEach(function (o) {
+        var mark = o.key === item.recommended ? " (RECOMMENDED)" : "";
+        optBody.appendChild(el("div", {}, [
+          el("span", { "style": "color:var(--ink-hi); font-weight:600;", text: o.label + mark + ": " }),
+          el("span", { "style": "color:var(--ink);", text: o.consequence }),
+        ]));
+      });
+      if (item.if_undecided) {
+        optBody.appendChild(el("div", { "class": "sub", "style": "margin-top:4px;", text: "If nobody decides: " + item.if_undecided }));
+      }
+      optCard.appendChild(optBody);
+      body.appendChild(optCard);
+    }
 
     // C7: an objection already recorded against this edit. It is still in the
     // queue -- a sent-back edit is an unverified one and the union is still

@@ -141,8 +141,10 @@ def test_store_schema_version_passes_on_freshly_migrated_store(store, program_ro
     # labels, which the recorder read for one kappa and then dropped, so a
     # number the round published could not be reproduced from the store).
     # ops v12 added (the plan-time check columns on ``prereg`` and the registration
-    # dispositions on ``gate``/``artifact``), ADD COLUMN only, so ADDITIVE.
-    assert r.details["ops"] == {"current_version": 12, "expected_version": 12, "match": True}
+    # dispositions on ``gate``/``artifact``), ADD COLUMN only, so ADDITIVE. ops
+    # v13 added the gate's own record of the corrected bytes' hash
+    # (``gate.post_edit_sha256``/``post_edit_ts``), ADD COLUMN only, so ADDITIVE.
+    assert r.details["ops"] == {"current_version": 13, "expected_version": 13, "match": True}
     assert r.details["jobs"] == {"current_version": 3, "expected_version": 3, "match": True}
     # Lane FB-acq item 4 added knowledge v14 (``source.license_grant`` /
     # ``license_grant_source``: ``license_tier`` records the ROUTE an acquisition
@@ -156,8 +158,14 @@ def test_store_schema_version_passes_on_freshly_migrated_store(store, program_ro
     # platform stayed on v1 from M1 until lane FB-3, whose D-FB-13/D-FB-14
     # work is the first thing to need a shape change in the money store:
     # ``launch`` gains the usage split and ``pool_id``, and
-    # ``reconcile_source`` gains ``'event'``.
-    assert r.details["platform"]["expected_version"] == 2
+    # ``reconcile_source`` gains ``'event'``. L3 added platform v3 (``unit``,
+    # ``unit_msg``, ``probe_run`` -- the transcript-derived cost/probe
+    # tables), CREATE TABLE only, so ADDITIVE. L4 added platform v4
+    # (``quota_capture``/``quota_rate``/``quota_notice`` -- the plan-quota
+    # exchange rate and monthly cap), CREATE TABLE only, so ADDITIVE too.
+    # Platform v5 adds the spawn identity columns to ``launch`` (ADD COLUMN
+    # only, so ADDITIVE).
+    assert r.details["platform"]["expected_version"] == 5
 
 
 def test_store_schema_version_skips_when_db_absent(tmp_path, platform_root):

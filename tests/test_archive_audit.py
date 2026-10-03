@@ -379,8 +379,8 @@ def test_coverage_fails_for_a_file_that_cannot_be_read(arc, monkeypatch):
     src, _, _ = arc
     real = store.walk_source
 
-    def walk(root):
-        yield from real(root)
+    def walk(root, include=None):
+        yield from real(root, include)
         yield "proj/deep.jsonl", root / "proj" / "deep.jsonl", None, "unreadable"
 
     monkeypatch.setattr(store, "walk_source", walk)

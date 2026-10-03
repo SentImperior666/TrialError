@@ -119,6 +119,7 @@ def open_store(
     *,
     platform_root: Path | str | None = None,
     config: dict | None = None,
+    check_same_thread: bool = True,
 ) -> Store:
     """Open (creating + migrating as needed) all four DBs for one program.
 
@@ -140,22 +141,29 @@ def open_store(
     resolved by their own owning subsystem (``trialerror.law.service``,
     ``trialerror.sessions.handoff``/``.lifecycle``, ``trialerror.ingest.requests``/
     ``.pipeline``, ``trialerror.cli.memory``).
+
+    ``check_same_thread`` (default ``True``): passed through to every one of
+    the four connections -- see ``trialerror.stores.connection.connect``'s own
+    docstring. A caller that will hand this ``Store`` to
+    :func:`trialerror.probes.registry.run_probes` (whose per-probe timeout
+    runs each probe body on its own thread -- ``trialerror.hooks.session_start``'s
+    canary call, ``trialerror.cli.probes``) needs ``False`` here.
     """
     program_root = Path(program_root)
     p_root = Path(platform_root) if platform_root is not None else paths.platform_root()
     if config is None:
         config = _auto_load_paths_config(program_root)
 
-    platform_conn = connect(paths.platform_db_path(root=p_root))
+    platform_conn = connect(paths.platform_db_path(root=p_root), check_same_thread=check_same_thread)
     apply_migrations(platform_conn, platform_schema.MIGRATIONS)
 
-    ops_conn = connect(paths.ops_db_path(program_root, config))
+    ops_conn = connect(paths.ops_db_path(program_root, config), check_same_thread=check_same_thread)
     apply_migrations(ops_conn, ops_schema.MIGRATIONS)
 
-    knowledge_conn = connect(paths.knowledge_db_path(program_root, config))
+    knowledge_conn = connect(paths.knowledge_db_path(program_root, config), check_same_thread=check_same_thread)
     apply_migrations(knowledge_conn, knowledge_schema.MIGRATIONS)
 
-    jobs_conn = connect(paths.jobs_db_path(program_root, config))
+    jobs_conn = connect(paths.jobs_db_path(program_root, config), check_same_thread=check_same_thread)
     apply_migrations(jobs_conn, jobs_schema.MIGRATIONS)
 
     return Store(

@@ -43,13 +43,21 @@ from __future__ import annotations
 
 import argparse
 
-from trialerror.hooks import post_task, session_start, spawn_gate, stop_check
+from trialerror.hooks import (
+    post_task,
+    session_start,
+    spawn_failure,
+    spawn_gate,
+    stop_check,
+    stop_failure,
+    subagent_probe,
+)
 
 GROUP_NAME = "hook"
 HELP = (
-    "Claude Code hook entry points (session-start, spawn-gate, post-task, stop-check). "
-    "Reads the hook payload as JSON on stdin and communicates via exit code, not an envelope -- "
-    "wired by plugin/hooks/hooks.json, not normally run by hand."
+    "Claude Code hook entry points (session-start, spawn-gate, post-task, spawn-failure, "
+    "stop-check, subagent-start, subagent-stop, stop-failure). Reads the hook payload as JSON on stdin and communicates "
+    "via exit code, not an envelope -- wired by plugin/hooks/hooks.json, not normally run by hand."
 )
 
 #: subcommand name -> the module implementing it. The CLI spelling is
@@ -57,10 +65,21 @@ HELP = (
 #: snake_case (matching the historical ``plugin/hooks/<name>.py`` files and
 #: the ``payload.hook`` marker values ``record_hook_alive_once`` writes).
 _HOOKS = {
-    "session-start": session_start,
-    "spawn-gate": spawn_gate,
-    "post-task": post_task,
-    "stop-check": stop_check,
+    "session-start": session_start.main,
+    "spawn-gate": spawn_gate.main,
+    "post-task": post_task.main,
+    "stop-check": stop_check.main,
+    # L3 (design Section 2.4): record-only, no plugin/hooks/*.py shim -- these
+    # are wired straight through the console-script convention from the
+    # start, unlike the original four (see trialerror.hooks's module docstring).
+    "subagent-start": subagent_probe.main_start,
+    "subagent-stop": subagent_probe.main_stop,
+    # L4 (design Section 2.6): record-only, no plugin/hooks/*.py shim, same
+    # convention as the two above.
+    "stop-failure": stop_failure.main,
+    # A record-then-release hook for a failed subagent spawn (PostToolUseFailure):
+    # no plugin/hooks/*.py shim either.
+    "spawn-failure": spawn_failure.main,
 }
 
 
@@ -68,22 +87,22 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(GROUP_NAME, help=HELP)
     actions = parser.add_subparsers(dest="action", metavar="<action>")
 
-    for name, module in _HOOKS.items():
+    for name, entry_point in _HOOKS.items():
         sub = actions.add_parser(
             name,
             help=f"run the {name} hook (payload on stdin; exit code is the verdict)",
         )
-        sub.set_defaults(handler=_make_handler(module))
+        sub.set_defaults(handler=_make_handler(entry_point))
 
     parser.set_defaults(handler=_run_no_action)
     return parser
 
 
-def _make_handler(module):
+def _make_handler(entry_point):
     def _handler(_args: argparse.Namespace) -> dict:
         # Raises rather than returns: see this module's docstring on why the
         # envelope path cannot carry a hook verdict.
-        raise SystemExit(module.main())
+        raise SystemExit(entry_point())
 
     return _handler
 

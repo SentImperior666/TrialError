@@ -42,6 +42,8 @@ import json
 import sys
 from pathlib import Path
 
+from trialerror.util.config import ProgramRootIsHarnessError
+
 
 def _evaluate(payload: dict) -> tuple[dict | None, str | None]:
     """Returns ``(hook_output_dict_or_None, stderr_diagnostic_or_None)``.
@@ -58,7 +60,10 @@ def _evaluate(payload: dict) -> tuple[dict | None, str | None]:
 
     program_root = find_program_root(cwd) or Path(cwd)
     try:
-        store = open_store(program_root)
+        # check_same_thread=False: the canary probes this hook runs
+        # (_run_canaries) execute on trialerror.probes.registry's own
+        # per-probe timeout thread.
+        store = open_store(program_root, check_same_thread=False)
     except Exception as exc:  # noqa: BLE001 - SessionStart must never crash the session
         return None, f"session_start: could not open program stores at {program_root}: {exc}"
 
@@ -72,17 +77,79 @@ def _evaluate(payload: dict) -> tuple[dict | None, str | None]:
         if not result.ok:
             return None, f"session_start: boot did not complete ({result.code}): {result.message}"
 
+        degraded_line = _run_canaries(store, session_id=session_id)
+
         context_text = (
             f"[trialerror session boot] session {session_id} booted for account "
             f"{result.account_id}. Boot bundle (pre-loaded — do not re-fetch):\n\n"
             + json.dumps(result.bundle, ensure_ascii=False, indent=2)
         )
+        if degraded_line:
+            context_text = degraded_line + "\n\n" + context_text
         return (
             {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context_text}},
             None,
         )
     finally:
         store.close()
+
+
+def _run_canaries(store, *, session_id: str | None) -> str | None:
+    """design Section 3.4: the fast full-text canary runs synchronously at
+    SessionStart (1.5s budget); the vector canary is enqueued as a
+    background job, at most once per hour. Best-effort throughout -- a
+    canary failure degrades to a context line, never a broken session.
+
+    B-1 fix round: the full-text canary now runs through
+    :func:`trialerror.probes.registry.run_probes` (not a direct call to
+    ``probe_fulltext_canary``), so its result is actually RECORDED in
+    ``probe_run`` (the row every answer stamp is built from) and the
+    registry's own 1.5 s timeout applies (S-1) -- a direct call bypassed
+    both. B-2: ``ProbeContext.program_id`` is set from this program's own
+    config, so the recorded row -- and every later stamp that reads it --
+    is scoped to THIS program, not averaged across every program a host
+    happens to run."""
+    try:
+        from trialerror.probes.registry import ProbeContext, discover_and_register_probes, run_probes
+        from trialerror.retrieve.handlers import enqueue_vector_canary_if_due
+        from trialerror.retrieve.probes import fulltext_canary_degraded_line
+        from trialerror.util.config import resolve_program_id
+
+        discover_and_register_probes()
+        host = _host_label()
+        program_root = store.program_root
+        program_id = resolve_program_id(program_root) if program_root is not None else None
+        ctx = ProbeContext(
+            host=host, platform_store=store, store=store,
+            program_root=program_root, program_id=program_id,
+        )
+        rows = run_probes(ctx, names=["fulltext_canary"])
+        row = rows[0] if rows else None
+        degraded_line = fulltext_canary_degraded_line(row.status, row.detail) if row is not None else None
+        enqueue_vector_canary_if_due(store, host=host)
+        return degraded_line
+    except Exception:  # noqa: BLE001 - canaries must never break session start
+        return None
+
+
+def _host_label() -> str:
+    import socket
+
+    try:
+        return socket.gethostname() or "unknown-host"
+    except OSError:
+        return "unknown-host"
+
+
+def _record_hook_keys(payload: dict) -> None:
+    """L3 (design Section 3.3, ``hook_payload_keys`` row): "SessionStart has
+    no record there yet: add one line to session_start.py that records its
+    payload's key names the same way" every SubagentStart/SubagentStop
+    record does (:mod:`trialerror.hooks.probe_log`). Best-effort and
+    swallowed at the call site -- this must never affect session boot."""
+    from trialerror.hooks.probe_log import append_hook_record
+
+    append_hook_record(payload, hook="session_start")
 
 
 def main() -> int:
@@ -93,7 +160,19 @@ def main() -> int:
         return 0
 
     try:
+        _record_hook_keys(payload)
+    except Exception:  # noqa: BLE001 - trap 1: must never break the session
+        pass
+
+    try:
         output, diagnostic = _evaluate(payload)
+    except ProgramRootIsHarnessError:
+        # cosmetic (review fix check, 2026-09-29): expected for a session
+        # whose cwd is the harness checkout, not a bug -- a plain note, not
+        # "internal error", matches the spawn gate's own wording for the
+        # same case.
+        print("session_start: no program root; skipping", file=sys.stderr)
+        return 0
     except Exception as exc:  # noqa: BLE001 - SessionStart must never crash the session
         print(f"session_start: internal error: {exc}", file=sys.stderr)
         return 0

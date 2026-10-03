@@ -1128,3 +1128,18 @@ def run_index(ctx) -> None:
     # `fulltext_index_stale`, which reads the index rather than the status.
     if not fulltext_only:
         update(store, "document", pk_column="doc_id", pk_value=doc_id, changes={"status": "indexed"})
+
+    # L3 (design Section 3.4): "after each ingest index job completes: find
+    # the index handler in the jobs registry, and add one best-effort
+    # enqueue after success." Never allowed to affect this job's own outcome.
+    try:
+        from trialerror.retrieve.handlers import default_host_label, enqueue_vector_canary_if_due
+
+        # N-4 fix round: this job's own payload never carries a "host" key
+        # (it is doc_id/created_by_launch/model_key), so this always fell
+        # back to the bare literal "default" -- diverging from
+        # SessionStart's real-hostname resolution for the SAME machine. Both
+        # now share trialerror.retrieve.handlers.default_host_label().
+        enqueue_vector_canary_if_due(store, host=payload.get("host") or default_host_label())
+    except Exception:  # noqa: BLE001 - best-effort background scheduling only
+        pass

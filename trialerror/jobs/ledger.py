@@ -272,24 +272,34 @@ def enqueue(
     payload: dict[str, Any],
     job_id: str | None = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    defer_s: float | None = None,
 ) -> dict[str, Any]:
     """Create a new ``pending`` job row. Plain validated insert (via
     ``trialerror.stores.writer.insert`` -- no business-logic conditional needed
     for a brand-new row); the ledger's atomicity concerns start at claim
-    time, not creation time."""
+    time, not creation time.
+
+    ``defer_s``, when given, stamps ``next_attempt_ts`` at creation
+    (``created_ts + defer_s``) so the row is not yet eligible under
+    :data:`_ELIGIBLE_PREDICATE` -- the ledger has no priority column, but a
+    caller enqueuing low-urgency background work alongside a real pipeline
+    (e.g. :func:`trialerror.retrieve.handlers.enqueue_vector_canary_if_due`)
+    can use this to keep :func:`claim_next`'s ``created_ts ASC`` ordering
+    from letting that background row jump ahead of real work created a
+    little later, without needing a schema change."""
     jid = job_id or new_id("JOB")
-    insert(
-        store,
-        "job",
-        {
-            "job_id": jid,
-            "kind": kind,
-            "payload": json.dumps(payload, ensure_ascii=False),
-            "state": "pending",
-            "max_attempts": max_attempts,
-            "created_ts": now(),
-        },
-    )
+    created_ts = now()
+    row_values: dict[str, Any] = {
+        "job_id": jid,
+        "kind": kind,
+        "payload": json.dumps(payload, ensure_ascii=False),
+        "state": "pending",
+        "max_attempts": max_attempts,
+        "created_ts": created_ts,
+    }
+    if defer_s is not None:
+        row_values["next_attempt_ts"] = _plus_seconds(created_ts, defer_s)
+    insert(store, "job", row_values)
     _log_event(store, jid, "enqueued", {"kind": kind})
     row = get_job(store, jid)
     assert row is not None  # just inserted, inside the same connection

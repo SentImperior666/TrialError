@@ -62,6 +62,7 @@ import sys
 from types import ModuleType
 
 from trialerror import __version__
+from trialerror.util.config import ProgramRootIsHarnessError
 from trialerror.util.envelope import PROTOCOL_VERSION, emit, error_envelope, next_action, ok_envelope
 
 __all__ = ["discover_groups", "build_parser", "main", "_force_utf8_stdio"]
@@ -128,9 +129,22 @@ def build_parser(groups: list[ModuleType] | None = None) -> argparse.ArgumentPar
 
 
 def _version_envelope() -> dict:
+    # L3 (design Section 3.2): `build` is a THIRD, reviewed, one-time
+    # exception to this file's "never edited again" rule, on the same
+    # grounds as FX-12/F12 above -- __version__ is a static "0.1.0" that
+    # cannot tell two builds apart (the design's own finding), and this is
+    # the one place every group's `trialerror --version` already goes
+    # through. Not a new group, not per-group business logic.
+    from trialerror.util.build import build_id
+
     return ok_envelope(
         "version",
-        result={"package": "trialerror", "version": __version__, "protocolVersion": PROTOCOL_VERSION},
+        result={
+            "package": "trialerror",
+            "version": __version__,
+            "protocolVersion": PROTOCOL_VERSION,
+            "build": build_id(),
+        },
         next_actions=[next_action(["trialerror", "doctor"], "run the health-check suite")],
     )
 
@@ -166,9 +180,51 @@ def _force_utf8_stdio() -> None:
             pass
 
 
+#: S-6 (L3 fix round), a FOURTH reviewed exception to this file's own "never
+#: edited again" rule, on the same grounds as FX-12/F12/L3's `build` field
+#: above: `trialerror hook <action>` is invoked on every subagent
+#: spawn/stop and every session start (design Section 2.4's own "within
+#: 300 ms" budget for the two newest bindings), and the ordinary
+#: discover_groups()/build_parser() path -- importing every
+#: trialerror.cli.<name> submodule, each pulling in its own subsystem
+#: (trialerror.obs alone costs ~140ms for OpenTelemetry) -- measured
+#: 650-700ms before this fix, none of it the hook's own logic (a lean
+#: direct import of the handler measured ~110ms). :func:`main` now
+#: special-cases the EXACT two-token shape hooks.json actually invokes
+#: (`["hook", "<action>"]`) and dispatches straight to
+#: ``trialerror.cli.hook``'s own handler map, bypassing discovery entirely
+#: -- not a new group, and every other invocation shape (bare `hook`,
+#: `hook --help`, any global flag before it) still goes through the
+#: ordinary path unchanged.
+#:
+#: A FIFTH reviewed exception, of the same kind and on the same grounds: the
+#: set below gains ``spawn-failure``, the ``PostToolUseFailure`` hook that
+#: gives a never-started spawn's booking back. It is one more hook action
+#: fired on a subagent tool call, so it takes the same lean path; it is not
+#: a new group, and no group's registration changes.
+_HOOK_FAST_PATH_ACTIONS = frozenset(
+    {
+        "session-start",
+        "spawn-gate",
+        "post-task",
+        "stop-check",
+        "subagent-start",
+        "subagent-stop",
+        "stop-failure",
+        "spawn-failure",
+    }
+)
+
+
 def main(argv: list[str] | None = None) -> int:
     _force_utf8_stdio()
     args_list = list(sys.argv[1:] if argv is None else argv)
+
+    if len(args_list) == 2 and args_list[0] == "hook" and args_list[1] in _HOOK_FAST_PATH_ACTIONS:
+        from trialerror.cli import hook as hook_group
+
+        raise SystemExit(hook_group._HOOKS[args_list[1]]())
+
     parser = build_parser()
     args = parser.parse_args(args_list)
     fmt = args.format
@@ -190,7 +246,17 @@ def main(argv: list[str] | None = None) -> int:
         emit(env, fmt)
         return 2
 
-    env = handler(args)
+    # L8 part F (F1): a SIXTH reviewed exception to this file's "never edited
+    # again" rule, on the same grounds as FX-12/F12/L3-build/S-6 above --
+    # find_program_root() (trialerror.util.config, the one place the
+    # default program root is resolved) raises this when the fallback would
+    # land on the harness's own repository, and every group's handler reaches
+    # this one call, so this is the one place to turn it into a clean
+    # envelope instead of a traceback.
+    try:
+        env = handler(args)
+    except ProgramRootIsHarnessError as exc:
+        env = error_envelope(group, exc.code, str(exc))
     emit(env, fmt)
     return 0 if env.get("ok") else 1
 

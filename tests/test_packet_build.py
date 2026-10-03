@@ -147,6 +147,14 @@ def test_max_minutes_comes_from_the_config(tmp_path):
 
 
 def test_blocking_determinations_are_included_and_labelled(tmp_path, program_root, platform_root):
+    """L10 part C: only EXPLAINED OPERATOR decisions reach the packet as a
+    raw DECIDE entry. ``gate_edit`` is the orchestrator's (design §3 B2), so
+    a blocking, unverified edit -- which used to reach every packet as a raw
+    "fix the tally" line -- must NOT appear here at all any more; a frozen
+    room (``room_escalation``, the operator's, and blocking) is what now
+    demonstrates "blocking determinations are included and labelled"."""
+    from trialerror.rooms.api import freeze_room
+
     store = open_store(program_root, platform_root=platform_root)
     ids = populate_one_of_everything(store)
     store_update(
@@ -159,16 +167,21 @@ def test_blocking_determinations_are_included_and_labelled(tmp_path, program_roo
             "reproduction_status": "unrun",
         },
     )
+    freeze_room(store, room_id=ids["room"], by_launch=ids["launch"], reason="the round ended")
     store.close()
     settings = packet_settings(program_root)
     add(settings, "An item of our own?")
     result = pb.build_packet(settings, "session_close", dry_run=True, platform_root=platform_root, now=T0)
     decide = [i for i in result["packet"]["items"] if i["source"] == "decide"]
-    gate = [i for i in decide if i["what"] == "fix the tally"]
-    assert len(gate) == 1
-    assert gate[0]["label"] == "from DECIDE: not yet in plain words" and gate[0]["est_minutes"] == 3
-    assert gate[0]["consequence"] and gate[0]["priority"] == "blocking"
-    assert "from DECIDE: not yet in plain words" in result["markdown"] and "fix the tally" in result["markdown"]
+    room = [i for i in decide if "test room" in i["what"]]
+    assert len(room) == 1
+    assert room[0]["label"] == pb.DECIDE_LABEL and room[0]["est_minutes"] == 3
+    assert room[0]["options"] and room[0]["priority"] == "blocking"
+    assert "test room" in result["markdown"]
+    # the orchestrator's raw gate_edit determination never reaches the
+    # packet as a decision -- the whole point of part C.
+    assert not any("fix the tally" in i["what"] for i in decide)
+    assert "fix the tally" not in result["markdown"]
     # non-blocking kinds of the queue are not pulled in
     assert all(i["priority"] == "blocking" for i in decide)
     assert result["packet"]["items"][-1]["what"] == "An item of our own?"  # blocking ones lead
@@ -349,24 +362,25 @@ def test_push_sends_title_and_body_as_the_last_two_arguments(env):
     (argv,) = calls(log)
     assert argv[-2:] == [result["title"], result["body"]]
     assert result["title"] == "Decisions for you: 2 (about 10 min)"
+    # L10 part D1: "the body carries no content ... item titles and topics
+    # never go to the notification service" -- counts and the link only.
     assert result["body"] == (
-        "2 decisions need you before the next session (about 10 minutes). "
-        "First: Should we keep the archive for ten years?. Read: https://example.invalid/packet."
+        "2 decisions need you before the next session (about 10 minutes). Read: https://example.invalid/packet."
     )
+    assert "Should we keep the archive" not in result["body"]
     sent = ps.read_jsonl(settings.sent)
     assert len(sent) == 1 and sent[0]["packet_id"] == built["packet"]["packet_id"]
     assert sent[0]["trigger"] == "session_close" and sent[0]["reminder"] is False and sent[0]["force"] is False
     assert len(sent[0]["body_sha256"]) == 64
 
 
-def test_the_body_is_at_most_600_characters_and_the_first_item_is_cut_to_200(env):
+def test_the_body_is_at_most_600_characters_and_carries_no_item_content(env):
     settings, log = env
     add(settings, "W" * 300)
     pb.build_packet(settings, "manual", now=T0)
     result = pb.push_packet(settings, now=T0)
     assert len(result["body"]) <= 600
-    first = result["body"].split("First: ")[1].split(". Read:")[0]
-    assert len(first) <= 200 and first.endswith("...")
+    assert "W" * 10 not in result["body"]  # the item's own wording never reaches the body
 
 
 def test_a_very_long_link_still_leaves_the_body_within_600(tmp_path):
@@ -525,7 +539,7 @@ def test_remind_waits_then_sends_once_and_never_twice(env):
     due = pb.remind(settings, now=T0 + timedelta(days=3))
     assert due["reminded"] is True and due["open_items"] == 1
     assert due["title"] == "Reminder: 1 decision still open (about 3 min)"
-    assert due["body"].startswith("1 decision from the last packet is still open (about 3 minutes). First: Still open?.")
+    assert due["body"] == "1 decision from the last packet is still open (about 3 minutes). Read: https://example.invalid/packet."
     assert len(calls(log)) == 2
     again = pb.remind(settings, now=T0 + timedelta(days=5))
     assert again["reminded"] is False and "already reminded" in again["reason"]

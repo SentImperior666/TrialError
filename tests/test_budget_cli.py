@@ -247,3 +247,45 @@ def test_budget_snapshot_ingest_and_calibrate(roots, account_and_session):
     rc, env = _run_cli(["budget", *common, "calibrate", "--account-id", account_id, "--model-class", "mid"])
     assert env["ok"] is False
     assert env["error"]["code"] == "calibrate_refused"
+
+
+# ---------------------------------------------------------------------------
+# Fix check S5: budget resolved its own default program root as Path.cwd(),
+# a second place besides find_program_root() that never gave F1's refusal.
+# ---------------------------------------------------------------------------
+
+
+def test_budget_pools_from_a_fake_harness_root_refuses(tmp_path, monkeypatch):
+    import trialerror.util.config as config_mod
+
+    repo = tmp_path / "fake_checkout"
+    (repo / "trialerror").mkdir(parents=True)
+    (repo / "trialerror" / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "trialerror.toml").write_text('[program]\nid = "fake"\n', encoding="utf-8")
+    monkeypatch.setattr(config_mod, "_HARNESS_PACKAGE_PARENT", repo)
+    monkeypatch.chdir(repo)
+
+    rc, env = _run_cli(["budget", "pools"])
+
+    assert rc == 1
+    assert env["ok"] is False
+    assert env["error"]["code"] == "program_root_is_harness"
+    assert not (repo / "stores").exists()  # no store was ever created there
+
+
+def test_budget_pools_with_an_explicit_program_root_is_unaffected(tmp_path, monkeypatch):
+    """The explicit --program-root path is untouched by S5's fix: it never
+    reaches find_program_root() at all."""
+    import trialerror.util.config as config_mod
+
+    repo = tmp_path / "fake_checkout"
+    (repo / "trialerror").mkdir(parents=True)
+    (repo / "trialerror" / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "trialerror.toml").write_text('[program]\nid = "fake"\n', encoding="utf-8")
+    monkeypatch.setattr(config_mod, "_HARNESS_PACKAGE_PARENT", repo)
+    platform_root = tmp_path / "platform_root"
+
+    rc, env = _run_cli(["budget", "--program-root", str(repo), "--platform-root", str(platform_root), "pools"])
+
+    assert rc == 0
+    assert env["ok"] is True

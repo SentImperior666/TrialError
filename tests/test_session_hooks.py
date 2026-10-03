@@ -12,6 +12,7 @@ non-live-Claude-Code pytest run can get to that same round trip.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -318,3 +319,71 @@ def test_post_task_unparseable_stdin_passes_through(roots):
         [sys.executable, str(POST_TASK)], input="not json {{{", capture_output=True, text=True, env=env, timeout=60
     )
     assert proc.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# cosmetic (review fix check, 2026-09-29): a program_root_is_harness case
+# prints a plain note, not "internal error: ...". Direct import + a fake
+# harness root, mirroring test_spawn_gate_hook.py's own N9 test, since
+# monkeypatching _HARNESS_PACKAGE_PARENT has no effect on a real subprocess
+# (each fork imports trialerror.util.config fresh).
+# ---------------------------------------------------------------------------
+
+
+def _fake_harness_root(tmp_path) -> Path:
+    repo = tmp_path / "fake_checkout"
+    (repo / "trialerror").mkdir(parents=True)
+    (repo / "trialerror" / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "trialerror.toml").write_text('[program]\nid = "fake"\n', encoding="utf-8")
+    return repo
+
+
+def test_session_start_prints_a_plain_note_not_internal_error(tmp_path, monkeypatch, capsys):
+    import trialerror.util.config as config_mod
+    from trialerror.hooks import session_start
+
+    repo = _fake_harness_root(tmp_path)
+    monkeypatch.setattr(config_mod, "_HARNESS_PACKAGE_PARENT", repo)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"cwd": str(repo)})))
+
+    rc = session_start.main()
+
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "internal error" not in err
+    assert "no program root" in err
+
+
+def test_post_task_prints_a_plain_note_not_internal_error(tmp_path, monkeypatch, capsys):
+    import trialerror.util.config as config_mod
+    from trialerror.hooks import post_task
+
+    repo = _fake_harness_root(tmp_path)
+    monkeypatch.setattr(config_mod, "_HARNESS_PACKAGE_PARENT", repo)
+    monkeypatch.setattr(
+        sys, "stdin",
+        io.StringIO(json.dumps({"cwd": str(repo), "tool_name": "Task", "tool_response": {}})),
+    )
+
+    rc = post_task.main()
+
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "internal error" not in err
+    assert "no program root" in err
+
+
+def test_stop_check_prints_a_plain_note_not_internal_error(tmp_path, monkeypatch, capsys):
+    import trialerror.util.config as config_mod
+    from trialerror.hooks import stop_check
+
+    repo = _fake_harness_root(tmp_path)
+    monkeypatch.setattr(config_mod, "_HARNESS_PACKAGE_PARENT", repo)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"cwd": str(repo)})))
+
+    rc = stop_check.main()
+
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "internal error" not in err
+    assert "no program root" in err

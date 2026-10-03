@@ -42,7 +42,7 @@ DOC_SHA = "ab" * 32
 
 
 @pytest.fixture(autouse=True)
-def _guarded(network_tripwire, isolated_state, monkeypatch):
+def _guarded(network_tripwire, isolated_state, monkeypatch, tmp_path):
     """Every test: no real vast.ai call, no real PyPI call, state in tmp."""
 
     def pypi_tripwire(url, **_kw):
@@ -50,6 +50,10 @@ def _guarded(network_tripwire, isolated_state, monkeypatch):
 
     monkeypatch.setattr(envlock, "urllib_get", pypi_tripwire)
     monkeypatch.setattr(cli_vastai, "_out", io.StringIO())
+    # L8 part F (second fix step): a command run with no --program-root falls
+    # back to find_program_root(), which must never resolve to the harness's
+    # own checkout -- an explicit --program-root always wins over this.
+    monkeypatch.setenv("TRIALERROR_PROGRAM_ROOT", str(tmp_path / "no_program_root_given"))
     yield isolated_state
 
 
@@ -128,6 +132,9 @@ def test_every_verb_takes_the_backend_config_root():
 
 
 def test_a_missing_root_is_a_named_refusal_with_next_actions(tmp_path, monkeypatch):
+    # this test's own point is "no program root resolves at all" -- undo the
+    # autouse TRIALERROR_PROGRAM_ROOT (a real, if empty, default) for it.
+    monkeypatch.delenv("TRIALERROR_PROGRAM_ROOT", raising=False)
     monkeypatch.chdir(tmp_path)
     env = _run("reap", "--ocr")
     assert env["ok"] is False and env["error"]["code"] == "no_backend_config_root"

@@ -38,6 +38,16 @@ def test_cli_version_in_process_emits_valid_envelope(capsys):
     assert env["meta"] == {}
 
 
+def test_cli_version_includes_a_build_identity(capsys):
+    """L3 (design Section 3.2): `--version` gains a `build` field so two
+    builds can be told apart -- __version__ alone is a static "0.1.0"."""
+    rc = main(["--version"])
+    assert rc == 0
+    env = json.loads(capsys.readouterr().out.strip())
+    assert "build" in env["result"]
+    assert isinstance(env["result"]["build"], str) and env["result"]["build"]
+
+
 def test_cli_version_text_format(capsys):
     rc = main(["--version", "--format", "text"])
     assert rc == 0

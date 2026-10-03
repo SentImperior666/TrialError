@@ -3,7 +3,7 @@
 The embedding lane (the public TrialError copy's embedding backend) reads
 ``[vastai]`` with its own loader, ``trialerror.vastai.tiers.load_vast_config``;
 the OCR lane reads it with ``trialerror.vastai.config.load_vast_config``. The
-decision (te-vastai, under D1): ours never refuses a toml that is valid for the
+rule here: ours never refuses a toml that is valid for the
 embedding lane --
 
 * every public key is accepted with its public default and meaning, the

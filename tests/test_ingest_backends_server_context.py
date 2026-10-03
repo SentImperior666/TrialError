@@ -91,6 +91,15 @@ def _props(model_path: str, n_ctx: int | None, *, nested: bool = True) -> dict:
     return body
 
 
+@pytest.fixture(autouse=True)
+def _slot_erase_lock_in_tmp_path(monkeypatch, tmp_path):
+    """This module builds ``LlamaServerEmbedBackend`` directly
+    with no ``_lock_path``, so it must not touch the harness's real
+    DEV-local scratch root even though nothing here calls ``embed_batch``
+    today."""
+    monkeypatch.setattr(backends, "_slot_erase_lock_path", lambda url: tmp_path / "slot_erase.lock")
+
+
 # ---------------------------------------------------------------------------
 # V-3: the served context
 # ---------------------------------------------------------------------------

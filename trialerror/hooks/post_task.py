@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from trialerror.hooks import SUBAGENT_TOOL_NAMES
+from trialerror.util.config import ProgramRootIsHarnessError
 
 #: The four numbers a provider-side ``usage`` object splits a turn into, in
 #: the spelling Claude Code's own recorded subagent result uses (live shape,
@@ -143,6 +144,44 @@ def extract_usage(tool_response: Any) -> dict[str, Any] | None:
     return {"total_tokens": total, "total_source": total_source, **split}
 
 
+def _record_agent(store: Any, launch_id: str | None, tool_use_id: Any, tool_response: Any) -> None:
+    """Best-effort (A3): when ``launch_id`` is a RUNNING launch the spawn gate
+    booked for THIS tool call (its ``spawn_tool_use_id`` equals the payload's
+    ``tool_use_id``) and the response names an ``agentId``, store it as
+    ``launch.agent_id``; and ``resolvedModel`` as ``attrs.spawned_model`` when
+    that key is absent. Any failure is swallowed: this hook runs after the
+    tool already ran."""
+    try:
+        if not launch_id or not isinstance(tool_use_id, str) or not tool_use_id:
+            return
+        if not isinstance(tool_response, Mapping):
+            return
+        agent_id = tool_response.get("agentId")
+        if not isinstance(agent_id, str) or not agent_id:
+            return
+        row = store.platform.execute(
+            "SELECT attrs FROM launch WHERE launch_id = ? AND state = 'RUNNING' AND spawn_tool_use_id = ?",
+            (launch_id, tool_use_id),
+        ).fetchone()
+        if row is None:
+            return
+        attrs_raw = row["attrs"]
+        attrs = json.loads(attrs_raw) if attrs_raw else {}
+        if not isinstance(attrs, dict):
+            attrs = {}
+        resolved = tool_response.get("resolvedModel")
+        if isinstance(resolved, str) and resolved and "spawned_model" not in attrs:
+            attrs["spawned_model"] = resolved
+        with store.platform:
+            store.platform.execute(
+                "UPDATE launch SET agent_id = ?, attrs = ? "
+                "WHERE launch_id = ? AND state = 'RUNNING' AND spawn_tool_use_id = ?",
+                (agent_id, json.dumps(attrs, ensure_ascii=False), launch_id, tool_use_id),
+            )
+    except Exception:  # noqa: BLE001 - best-effort observability
+        return
+
+
 def _evaluate(payload: dict) -> str | None:
     """Returns a stderr diagnostic, or ``None`` on success/no-op. Kept
     separate from ``main()`` for direct testing, mirroring
@@ -200,9 +239,18 @@ def _evaluate(payload: dict) -> str | None:
                 "usage": extract_usage(tool_response),
             },
         )
+        _record_agent(store, launch_id, payload.get("tool_use_id"), tool_response)
         return None
     finally:
         store.close()
+
+
+def _record_hook_keys(payload: dict) -> None:
+    """L3 (design Section 3.3, ``hook_payload_keys`` row: "tool_use_id
+    (Agent pre and post)"). Best-effort and swallowed at the call site."""
+    from trialerror.hooks.probe_log import append_hook_record
+
+    append_hook_record(payload, hook="post_task")
 
 
 def main() -> int:
@@ -213,7 +261,17 @@ def main() -> int:
         return 0
 
     try:
+        _record_hook_keys(payload)
+    except Exception:  # noqa: BLE001 - observability only, must never block
+        pass
+
+    try:
         diagnostic = _evaluate(payload)
+    except ProgramRootIsHarnessError:
+        # cosmetic (review fix check, 2026-09-29): expected for a session
+        # whose cwd is the harness checkout, not a bug.
+        print("post_task: no program root; skipping", file=sys.stderr)
+        return 0
     except Exception as exc:  # noqa: BLE001 - observability only, must never block
         print(f"post_task: internal error: {exc}", file=sys.stderr)
         return 0

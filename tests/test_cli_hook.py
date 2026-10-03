@@ -255,7 +255,9 @@ def test_post_task_never_blocks_for_renamed_agent_tool(open_session):
 # ---------------------------------------------------------------------------
 # unparseable stdin must never take the session down
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("action", ["session-start", "spawn-gate", "post-task", "stop-check"])
+@pytest.mark.parametrize(
+    "action", ["session-start", "spawn-gate", "post-task", "stop-check", "spawn-failure"]
+)
 def test_unparseable_stdin_passes_through(action, roots):
     platform_root, _ = roots
     proc = subprocess.run(
@@ -263,7 +265,16 @@ def test_unparseable_stdin_passes_through(action, roots):
         input="not json at all",
         capture_output=True,
         text=True,
-        env={**os.environ, "TRIALERROR_PLATFORM_ROOT": str(platform_root)},
+        env={
+            **os.environ,
+            "TRIALERROR_PLATFORM_ROOT": str(platform_root),
+            # The installed console script may belong to a different checkout
+            # (a git worktree's venv): pin the package to this tree, so the
+            # action under test is the one this tree defines.
+            "PYTHONPATH": os.pathsep.join(
+                [str(Path(__file__).resolve().parents[1]), os.environ.get("PYTHONPATH", "")]
+            ).rstrip(os.pathsep),
+        },
         timeout=60,
     )
     assert proc.returncode == 0, f"{action} must fail open on garbage stdin"
@@ -281,6 +292,13 @@ def test_bare_group_returns_an_envelope_listing_the_hooks():
     env = json.loads(proc.stdout)
     assert env["ok"] is False
     assert env["error"]["code"] == "no_action"
+    # This subprocess runs whatever `trialerror` console script is on PATH,
+    # which -- in a git worktree -- may resolve to a DIFFERENT checkout's
+    # installed copy than this file (see tests/test_hooks_usage_capture.py's
+    # own note on the same quirk), so this only asserts the names this
+    # group has ALWAYS had; the new subagent-start/subagent-stop actions are
+    # covered in-process (no installed-copy ambiguity) by
+    # tests/test_units_hooks.py::test_cli_hook_group_registers_the_new_actions.
     for name in ("session-start", "spawn-gate", "post-task", "stop-check"):
         assert name in env["error"]["message"]
 
@@ -298,7 +316,23 @@ def test_hooks_json_manifest_uses_the_console_script_not_a_bare_interpreter():
         for entry in entries
         for h in entry["hooks"]
     ]
-    assert len(commands) == 4
+    # L3 (design Section 2.4) added SubagentStart/SubagentStop -- four
+    # became six; L4 (design L4_quota-policy.md Section 2.6) added
+    # StopFailure -- six became seven; the spawn-failure hook added
+    # PostToolUseFailure -- seven became eight. The substantive guard
+    # (console script, never a bare interpreter) applies regardless of how
+    # many bindings exist.
+    assert set(manifest["hooks"]) == {
+        "SessionStart",
+        "PreToolUse",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "SubagentStart",
+        "SubagentStop",
+        "Stop",
+        "StopFailure",
+    }
+    assert len(commands) == 8
     for command in commands:
         assert command.startswith("trialerror hook "), command
         assert "python" not in command, f"{command!r} names an interpreter again"
@@ -318,7 +352,7 @@ def test_hooks_json_pretooluse_posttooluse_matchers_cover_task_and_agent_only():
     manifest_path = Path(__file__).resolve().parents[1] / "plugin" / "hooks" / "hooks.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-    for event_name in ("PreToolUse", "PostToolUse"):
+    for event_name in ("PreToolUse", "PostToolUse", "PostToolUseFailure"):
         matchers = [entry["matcher"] for entry in manifest["hooks"][event_name]]
         assert len(matchers) == 1, f"{event_name}: expected exactly one matcher entry, got {matchers!r}"
         pattern = matchers[0]

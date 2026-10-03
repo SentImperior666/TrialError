@@ -18,11 +18,17 @@ both injected fakes. Nothing in this module opens a socket.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
+import os
 import struct
+import sys
+import threading
+import time
 import types
+import warnings
 
 import pytest
 
@@ -43,6 +49,12 @@ from trialerror.ingest.backends import (
     load_embed_backend,
     load_query_embed_backend,
 )
+
+#: Captured before any test's autouse fixture monkeypatches
+#: ``backends._slot_erase_lock_path`` -- the one test of that function's own
+#: URL-normalisation logic needs the REAL implementation, not the tmp_path
+#: stand-in every other test gets.
+_REAL_SLOT_ERASE_LOCK_PATH = backends._slot_erase_lock_path
 
 NATIVE = 8
 DIMS = 4
@@ -101,6 +113,8 @@ class FakeHttp:
         shape: str = "flat",
         fail_with: Exception | None = None,
         native_dims: int = NATIVE,
+        slot_erase_status: int = 200,
+        slot_erase_body: object | None = None,
     ):
         self.health_status = health_status
         self.health_body = {"status": "ok"} if health_body is None else health_body
@@ -110,6 +124,8 @@ class FakeHttp:
         self.shape = shape
         self.fail_with = fail_with
         self.native_dims = native_dims
+        self.slot_erase_status = slot_erase_status
+        self.slot_erase_body = {"id_slot": 0, "n_erased": 1} if slot_erase_body is None else slot_erase_body
         self.gets: list[str] = []
         self.posts: list[tuple[str, dict]] = []
 
@@ -127,6 +143,8 @@ class FakeHttp:
         if self.fail_with is not None:
             raise self.fail_with
         self.posts.append((path, payload))
+        if path.startswith("/slots/"):
+            return self.slot_erase_status, self.slot_erase_body
         if self.embed_status != 200:
             return self.embed_status, {"error": {"message": "context overflow"}}
         vector = _raw_vector(str(payload.get("content", "")), native_dims=self.native_dims)
@@ -167,9 +185,21 @@ def _server(**kwargs) -> tuple[LlamaServerEmbedBackend, FakeHttp, FakeVocab]:
 def _clear_caches():
     backends._LLAMA_INSTANCES.clear()
     backends._VOCAB_ONLY_INSTANCES.clear()
+    backends._SLOT_ERASE_UNAVAILABLE_WARNED.clear()
     yield
     backends._LLAMA_INSTANCES.clear()
     backends._VOCAB_ONLY_INSTANCES.clear()
+    backends._SLOT_ERASE_UNAVAILABLE_WARNED.clear()
+
+
+@pytest.fixture(autouse=True)
+def _slot_erase_lock_in_tmp_path(monkeypatch, tmp_path):
+    """Every ``LlamaServerEmbedBackend`` built in this module,
+    even one constructed with no explicit ``_lock_path``, must not touch
+    the harness's real DEV-local scratch root. A test of the lock's own
+    behaviour still passes its own ``_lock_path`` explicitly (that override
+    wins), so this only changes what an OMITTED one resolves to."""
+    monkeypatch.setattr(backends, "_slot_erase_lock_path", lambda url: tmp_path / "slot_erase.lock")
 
 
 # ---------------------------------------------------------------------------
@@ -180,8 +210,8 @@ def _clear_caches():
 def test_the_client_posts_the_prepared_text_to_the_native_embedding_endpoint():
     backend, http, _vocab = _server(n_ctx=4096)
     backend.embed_batch(["what is a quorum"], kind="query")
-    assert [path for path, _payload in http.posts] == [LLAMA_SERVER_EMBED_PATH]
-    payload = http.posts[0][1]
+    embed_path, payload = http.posts[-1]
+    assert embed_path == LLAMA_SERVER_EMBED_PATH
     assert payload["content"] == DEFAULT_QUERY_PROMPT + "what is a quorum"
     assert payload["embd_normalize"] == -1, "the client normalises; the server must not"
 
@@ -252,7 +282,8 @@ def test_the_empty_string_is_embedded_and_not_skipped():
     backend, http, _vocab = _server(n_ctx=4096)
     vectors = backend.embed_batch(["", "x"], kind="document")
     assert len(vectors) == 2 and len(vectors[0]) == DIMS
-    assert [payload["content"] for _path, payload in http.posts] == ["", "x"]
+    embed_posts = [payload for path, payload in http.posts if path == LLAMA_SERVER_EMBED_PATH]
+    assert [payload["content"] for payload in embed_posts] == ["", "x"]
 
 
 def test_an_empty_query_still_carries_the_prompt():
@@ -304,6 +335,8 @@ def test_an_already_normalised_server_answer_produces_the_same_unit_vector():
     class ScalingHttp(FakeHttp):
         def post_json(self, path: str, payload: dict):
             status, body = super().post_json(path, payload)
+            if path != LLAMA_SERVER_EMBED_PATH:
+                return status, body
             vector = body["embedding"]
             norm = math.sqrt(sum(v * v for v in vector))
             return status, {"embedding": [v / norm for v in vector]}
@@ -701,3 +734,806 @@ def test_the_table_resolves_without_the_tokenizer_being_present_yet():
     assert backend.tokenizer_model_path is None
     ok, reason = backend.runnable()
     assert ok is False and "tokenizer_model_path" in reason
+
+
+# ---------------------------------------------------------------------------
+# REQ-2026-09-27-09: erase the slot before every embed
+# ---------------------------------------------------------------------------
+
+
+def test_the_slot_is_erased_before_every_embed():
+    backend, http, _vocab = _server(n_ctx=4096)
+    backend.embed_batch(["a", "b"], kind="document")
+    assert [path for path, _payload in http.posts] == [
+        "/slots/0?action=erase",
+        LLAMA_SERVER_EMBED_PATH,
+        "/slots/0?action=erase",
+        LLAMA_SERVER_EMBED_PATH,
+    ]
+    # an empty body -- the erase carries no content, only the query string
+    assert http.posts[0][1] == {}
+
+
+def test_the_erase_covers_every_slot_the_props_endpoint_reports():
+    backend, http, _vocab = _server(
+        n_ctx=4096,
+        http=FakeHttp(props_body={"model_path": "/somewhere/model.gguf", "total_slots": 2}),
+    )
+    backend.embed_batch(["a passage"])
+    assert [path for path, _payload in http.posts] == [
+        "/slots/0?action=erase",
+        "/slots/1?action=erase",
+        LLAMA_SERVER_EMBED_PATH,
+    ]
+
+
+def test_a_501_from_slot_erase_warns_once_and_still_embeds():
+    """The guide's "Determinism needs `--slot-save-path`" paragraph: a build
+    started without that flag answers 501 on the erase route. That must not
+    fail the embed, must warn exactly once (not once per document), and
+    must not keep paying for a round trip that can only ever fail again for
+    the rest of this instance's life."""
+    http = FakeHttp(slot_erase_status=501, slot_erase_body={"error": "not supported"})
+    backend, _http, _vocab = _server(n_ctx=4096, http=http)
+
+    with pytest.warns(RuntimeWarning, match="501"):
+        vector = backend.embed_batch(["a passage"])[0]
+    assert len(vector) == DIMS
+    assert backend.runtime_details()["slot_erase_unsupported"] is True
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # a second warning would raise here
+        backend.embed_batch(["another passage"])
+
+    posts = [path for path, _payload in http.posts]
+    assert posts.count("/slots/0?action=erase") == 1, "no erase attempt after the first 501"
+    assert posts.count(LLAMA_SERVER_EMBED_PATH) == 2, "both embeds still went through"
+
+
+@pytest.mark.parametrize("status", [404, 405])
+def test_a_404_or_405_from_slot_erase_warns_once_and_still_embeds(status):
+    """A 404 (no /slots route at all -- an older build, or a
+    proxy in front of the sidecar that does not forward it) or a 405 (the
+    same route, wrong method) means "the erase is unavailable" exactly as
+    much as a 501 does. The embed that follows would have worked, so this
+    must not fail it either."""
+    http = FakeHttp(slot_erase_status=status, slot_erase_body={"error": "not found"})
+    backend, _http, _vocab = _server(n_ctx=4096, http=http)
+    with pytest.warns(RuntimeWarning, match=str(status)):
+        vector = backend.embed_batch(["a passage"])[0]
+    assert len(vector) == DIMS
+    assert backend.runtime_details()["slot_erase_unsupported"] is True
+
+
+def test_a_5xx_erase_failure_is_not_silently_absorbed():
+    backend, _http, _vocab = _server(
+        n_ctx=4096, http=FakeHttp(slot_erase_status=500, slot_erase_body={"error": "boom"})
+    )
+    with pytest.raises(EmbedBackendNotRunnable) as exc:
+        backend.embed_batch(["a passage"])
+    assert "500" in str(exc.value) and "boom" in str(exc.value)
+
+
+def test_a_transport_failure_on_the_erase_call_is_a_reason_not_a_traceback():
+    class EraseExplodes(FakeHttp):
+        def post_json(self, path: str, payload: dict):
+            if path.startswith("/slots/"):
+                raise OSError("connection reset by peer")
+            return super().post_json(path, payload)
+
+    backend, _http, _vocab = _server(n_ctx=4096, http=EraseExplodes())
+    with pytest.raises(EmbedBackendNotRunnable) as exc:
+        backend.embed_batch(["a passage"])
+    assert "connection reset" in str(exc.value) and "/slots/0" in str(exc.value)
+
+
+def test_the_switch_turns_off_the_erase_and_the_lock():
+    http = FakeHttp()
+    backend, _http, _vocab = _server(n_ctx=4096, http=http, slot_erase=False)
+    vector = backend.embed_batch(["a passage"])[0]
+    assert [path for path, _payload in http.posts] == [LLAMA_SERVER_EMBED_PATH]
+    assert len(vector) == DIMS
+
+
+def test_the_lock_is_held_across_the_erase_and_the_embed(tmp_path):
+    """Two harness processes sharing one sidecar must not interleave between
+    the erase and the embed -- simulated here by holding the SAME lock file
+    externally (:func:`trialerror.offload.lock.single_instance_lock`, the
+    exact primitive the backend itself uses) while a second thread tries to
+    embed through it."""
+    lock_path = tmp_path / "slot_erase.lock"
+    http = FakeHttp()
+    backend, _http, _vocab = _server(n_ctx=4096, http=http, _lock_path=lock_path)
+
+    results: list[list[float]] = []
+    errors: list[Exception] = []
+
+    def run() -> None:
+        try:
+            results.append(backend.embed_batch(["a passage"])[0])
+        except Exception as exc:  # noqa: BLE001 - surfaced via `errors` for the assertion below
+            errors.append(exc)
+
+    with backends.single_instance_lock(lock_path):
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join(timeout=0.3)
+        assert thread.is_alive(), "the backend must wait for the externally-held lock"
+        assert http.posts == [], "neither the erase nor the embed may start before the lock is free"
+
+    thread.join(timeout=5.0)
+    assert not thread.is_alive(), "the backend must proceed once the lock is released"
+    assert errors == []
+    assert len(results) == 1 and len(results[0]) == DIMS
+    assert [path for path, _payload in http.posts] == ["/slots/0?action=erase", LLAMA_SERVER_EMBED_PATH]
+
+
+def test_the_lock_is_held_without_a_break_from_the_erase_to_the_embed(tmp_path):
+    """The test above proves the lock is taken BEFORE the erase.
+    It does not prove the lock stays held continuously through to the
+    embed -- an implementation that released and re-took it between the two
+    calls would pass it too. Here the fake HTTP client itself tries
+    `single_instance_lock` on the SAME path from inside every `post_json`
+    call (both the erase and the embed), and must get `WorkerAlreadyRunning`
+    every time: if the real guard ever let go of the lock between the two
+    calls, one of these inner attempts would succeed instead."""
+    lock_path = tmp_path / "slot_erase.lock"
+
+    class LockProbingHttp(FakeHttp):
+        def post_json(self, path: str, payload: dict):
+            with pytest.raises(backends.WorkerAlreadyRunning):
+                with backends.single_instance_lock(lock_path):
+                    pass
+            return super().post_json(path, payload)
+
+    http = LockProbingHttp()
+    backend, _http, _vocab = _server(n_ctx=4096, http=http, _lock_path=lock_path)
+    backend.embed_batch(["a passage"])
+    assert [path for path, _payload in http.posts] == ["/slots/0?action=erase", LLAMA_SERVER_EMBED_PATH]
+
+
+def test_the_lock_is_released_after_a_failed_erase(tmp_path):
+    lock_path = tmp_path / "slot_erase.lock"
+    backend, _http, _vocab = _server(
+        n_ctx=4096,
+        http=FakeHttp(slot_erase_status=500, slot_erase_body={"error": "boom"}),
+        _lock_path=lock_path,
+    )
+    with pytest.raises(EmbedBackendNotRunnable):
+        backend.embed_batch(["a passage"])
+    with backends.single_instance_lock(lock_path):
+        pass  # WorkerAlreadyRunning here would mean the guard never let go
+
+
+def test_the_lock_is_released_after_a_failed_embed(tmp_path):
+    lock_path = tmp_path / "slot_erase.lock"
+    backend, _http, _vocab = _server(
+        n_ctx=4096, http=FakeHttp(embed_status=500), _lock_path=lock_path
+    )
+    with pytest.raises(EmbedBackendNotRunnable):
+        backend.embed_batch(["a passage"])
+    with backends.single_instance_lock(lock_path):
+        pass  # WorkerAlreadyRunning here would mean the guard never let go
+
+
+def test_the_lock_has_a_deadline_naming_the_file_and_the_holder_pid(tmp_path):
+    """A holder that is alive but not moving (SIGSTOP, a breakpoint, a
+    suspended VM) must not block every embed on this sidecar forever with
+    no message: this holder never releases, so it is refused once the
+    deadline passes with no new holder. ``_lock_deadline_s`` is a test-only
+    seam so this does not have to wait out the real default deadline
+    (:meth:`backends.LlamaServerEmbedBackend._lock_deadline_duration_s`).
+
+    This holder takes the raw OS lock directly, never through
+    ``_slot_erase_guard``, so it never writes the pid-owner file either --
+    exactly the "unknown" case :func:`backends._lock_holder_pid` falls back
+    to (a holder from before that file existed, or any process that took
+    the lock some other way). The real, common case -- a holder that IS
+    another instance of this same backend -- is
+    ``test_the_deadline_refusal_names_the_pid_the_real_holder_wrote``,
+    below. Either way the lock file itself is always named, which is
+    enough to act on."""
+    lock_path = tmp_path / "slot_erase.lock"
+    backend, _http, _vocab = _server(n_ctx=4096, _lock_path=lock_path, _lock_deadline_s=0.3)
+    with backends.single_instance_lock(lock_path):
+        with pytest.raises(EmbedBackendNotRunnable) as exc:
+            backend.embed_batch(["a passage"])
+    message = str(exc.value)
+    assert str(lock_path) in message
+    assert "unknown" in message
+    assert "slot_erase = false" in message
+
+
+_HOLDER_SCRIPT = r"""
+import os, sys, time
+from pathlib import Path
+from trialerror.ingest import backends
+
+lock_path, pid_file = Path(sys.argv[1]), Path(sys.argv[2])
+
+
+class Http:
+    def get_json(self, path):
+        return 200, ({"model_path": "/somewhere/model.gguf"} if path == "/props" else {"status": "ok"})
+
+    def post_json(self, path, payload):
+        if path == "/embedding":
+            pid_file.write_text(str(os.getpid()))  # inside the lock: the guard is held now
+            time.sleep(30)
+        return 200, {"embedding": [0.5] * 8}
+
+
+class Vocab:
+    def tokenize(self, text, add_bos=True, special=False):
+        return list(text)
+
+    def detokenize(self, ids):
+        return bytes(ids)
+
+
+backends.LlamaServerEmbedBackend(
+    model_key="k", dims=4, native_dims=8, n_ctx=4096, tokenizer_model_path="/somewhere/model.gguf",
+    _http=Http(), _tokenizer=Vocab(), _lock_path=lock_path,
+).embed_batch(["x"])
+"""
+
+
+def test_the_deadline_refusal_names_the_pid_the_real_holder_wrote(tmp_path):
+    """A holder that goes through ``_slot_erase_guard`` (the only kind that
+    exists in production) writes its own pid into the lock's sibling
+    ``.owner`` file right after it acquires the lock -- a file no mandatory
+    lock covers on Windows, unlike the lock file itself -- so a waiter's
+    timeout refusal can always name it. The holder runs in a SUBPROCESS and
+    reports its own ``os.getpid()``, so a waiter that named itself (or any
+    other process) would fail this."""
+    import subprocess
+
+    lock_path = tmp_path / "slot_erase.lock"
+    pid_file = tmp_path / "holder.pid"
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = {key: value for key, value in os.environ.items() if not key.startswith("TRIALERROR_")}
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _HOLDER_SCRIPT, str(lock_path), str(pid_file)],
+        cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 30.0
+        # wait for the pid itself, not the file: the holder creates the file before it writes to it
+        while not (pid_file.exists() and pid_file.read_text().strip()) and time.monotonic() < deadline:
+            assert holder.poll() is None, "the holder process died before taking the lock"
+            time.sleep(0.05)
+        assert pid_file.exists(), "the holder never reached its embed"
+        holder_pid = pid_file.read_text().strip()
+        assert holder_pid and holder_pid != str(os.getpid())
+
+        waiter, _http, _vocab = _server(n_ctx=4096, _lock_path=lock_path, _lock_deadline_s=0.3)
+        with pytest.raises(EmbedBackendNotRunnable) as exc:
+            waiter.embed_batch(["another passage"])
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)
+
+    assert f"pid last written to it: {holder_pid})" in str(exc.value)
+    assert str(os.getpid()) not in str(exc.value).replace(str(lock_path), "")
+
+
+def test_a_stale_owner_file_never_names_the_wrong_pid(tmp_path):
+    """A holder that writes no owner file (one running code from before it
+    existed, or one whose owner write failed) leaves the PREVIOUS holder's
+    record behind. The record carries the lock file's mtime from its own
+    acquisition; it no longer matches, so the refusal says "unknown"
+    rather than naming a process that is not the holder."""
+    lock_path = tmp_path / "slot_erase.lock"
+    lock_path.write_text("", encoding="ascii")
+    backends._lock_owner_path(lock_path).write_text("99999 1\n", encoding="ascii")
+    backend, _http, _vocab = _server(n_ctx=4096, _lock_path=lock_path, _lock_deadline_s=0.2)
+    with backends.single_instance_lock(lock_path):
+        with pytest.raises(EmbedBackendNotRunnable) as exc:
+            backend.embed_batch(["a passage"])
+    assert "99999" not in str(exc.value)
+    assert "unknown" in str(exc.value)
+
+
+def test_a_lock_refusal_names_ingest_embed_by_default():
+    backend, _http, _vocab = _server(n_ctx=4096)
+    assert backend.config_table == "ingest.embed"
+
+
+def test_a_lock_refusal_names_the_backends_own_config_table(tmp_path):
+    """A query-side backend's lock refusal must say `[ingest.embed.query]
+    slot_erase`, not always `[ingest.embed]` -- that is the key that
+    actually turns ITS erase off."""
+    lock_path = tmp_path / "slot_erase.lock"
+    backend, _http, _vocab = _server(
+        n_ctx=4096, _lock_path=lock_path, _lock_deadline_s=0.2, config_table="ingest.embed.query"
+    )
+    with backends.single_instance_lock(lock_path):
+        with pytest.raises(EmbedBackendNotRunnable) as exc:
+            backend.embed_batch(["a passage"])
+    assert "[ingest.embed.query] slot_erase = false" in str(exc.value)
+
+
+def test_the_query_side_loader_sets_the_query_side_config_table():
+    backend = load_query_embed_backend(
+        {
+            "backend": "offload",
+            "model_key": "real-key",
+            "dims": 2048,
+            "query": {
+                "backend": LLAMA_SERVER_BACKEND_NAME,
+                "tokenizer_model_path": "/x/model.gguf",
+            },
+        }
+    )
+    assert backend.config_table == "ingest.embed.query"
+
+
+def test_the_document_side_loader_sets_the_document_side_config_table():
+    backend = load_embed_backend(
+        {
+            "backend": LLAMA_SERVER_BACKEND_NAME,
+            "model_key": "real-key",
+            "tokenizer_model_path": "/somewhere/model.gguf",
+        }
+    )
+    assert backend.config_table == "ingest.embed"
+
+
+class _TimeProxy:
+    """The ``time`` module as ``backends`` sees it, with ``time`` and
+    ``sleep`` overridden and everything else (``monotonic``, ``perf_counter``,
+    ...) passed through to the real module -- so a test can drive the clock
+    and record sleeps without patching ``time.time`` itself, which would
+    reach pytest's own internals."""
+
+    def __init__(self, *, now=None, sleep=None):
+        self._now = now
+        self._sleep = sleep
+
+    def time(self):
+        return self._now() if self._now is not None else time.time()
+
+    def sleep(self, seconds):
+        return self._sleep(seconds) if self._sleep is not None else time.sleep(seconds)
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+def _fake_time_module(now_holder, sleeps):
+    return _TimeProxy(now=lambda: now_holder[0], sleep=sleeps.append)
+
+
+def test_the_step_aside_sleeps_exactly_when_a_want_is_fresh(tmp_path, monkeypatch):
+    """``_step_aside_for_waiter`` against a fake clock: no ``.want`` -> no
+    sleep; a ``.want`` younger than ``_WAITER_FRESH_S`` -> one sleep of
+    ``_STEP_ASIDE_S``; an older one -> none. No real time is involved."""
+    lock_path = tmp_path / "slot_erase.lock"
+    backend, _http, _vocab = _server(n_ctx=4096, _lock_path=lock_path)
+    now = [1_000_000.0]
+    sleeps: list[float] = []
+    monkeypatch.setattr(backends, "time", _fake_time_module(now, sleeps))
+    want = backends._lock_want_path(lock_path)
+
+    backend._step_aside_for_waiter()
+    assert sleeps == [], "no .want: nobody is waiting"
+
+    want.write_bytes(b"")
+    for age, sleeps_expected in [(0.0, True), (0.05, True), (0.19, True), (0.21, False), (60.0, False)]:
+        os.utime(want, (now[0] - age, now[0] - age))
+        sleeps.clear()
+        backend._step_aside_for_waiter()
+        assert sleeps == ([backends._STEP_ASIDE_S] if sleeps_expected else []), f"age {age}"
+
+
+def test_a_want_stamped_in_the_future_is_not_a_waiter(tmp_path, monkeypatch):
+    """A clock that stepped back (an NTP correction) or a skewed file server
+    leaves a ``.want`` newer than "now"; its age is negative, and it must
+    not count as fresh -- it would make every text boundary sleep."""
+    lock_path = tmp_path / "slot_erase.lock"
+    backend, _http, _vocab = _server(n_ctx=4096, _lock_path=lock_path)
+    now = [1_000_000.0]
+    sleeps: list[float] = []
+    monkeypatch.setattr(backends, "time", _fake_time_module(now, sleeps))
+    want = backends._lock_want_path(lock_path)
+    want.write_bytes(b"")
+    os.utime(want, (now[0] + 3600.0, now[0] + 3600.0))
+    backend._step_aside_for_waiter()
+    assert sleeps == []
+
+
+def test_a_former_waiter_does_not_step_aside_for_its_own_touch(tmp_path, monkeypatch):
+    """A process that waited touched ``.want`` on every poll, so its last
+    touch is still fresh when it finally takes the lock. Taking the lock
+    sets ``.want`` back to the epoch, so the first boundaries of its own
+    batch do not sleep for nobody."""
+    lock_path = tmp_path / "slot_erase.lock"
+    backend, _http, _vocab = _server(n_ctx=4096, _lock_path=lock_path)
+    sleeps: list[float] = []
+    want = backends._lock_want_path(lock_path)
+    want.write_bytes(b"")  # touched just now, as a polling waiter would
+    assert time.time() - want.stat().st_mtime < backends._WAITER_FRESH_S
+    monkeypatch.setattr(backends, "time", _TimeProxy(sleep=sleeps.append))
+    backend.embed_batch(["one", "two", "three"])
+    assert sleeps == [], "the batch stepped aside for its own stale-by-now touch"
+    assert want.stat().st_mtime == 0
+
+
+def test_the_step_aside_does_nothing_when_the_erase_switch_is_off(tmp_path, monkeypatch):
+    lock_path = tmp_path / "slot_erase.lock"
+    backend, _http, _vocab = _server(n_ctx=4096, _lock_path=lock_path, slot_erase=False)
+    now = [1_000_000.0]
+    sleeps: list[float] = []
+    monkeypatch.setattr(backends, "time", _fake_time_module(now, sleeps))
+    want = backends._lock_want_path(lock_path)
+    want.write_bytes(b"")
+    os.utime(want, (now[0], now[0]))
+    backend._step_aside_for_waiter()
+    assert sleeps == []
+
+
+def test_a_busy_poll_touches_the_want_signal(tmp_path):
+    """The other half of the step-aside: a waiter that finds the lock busy
+    must leave ``<lock>.want`` behind for the holder to see."""
+    lock_path = tmp_path / "slot_erase.lock"
+    want = backends._lock_want_path(lock_path)
+    backend, _http, _vocab = _server(n_ctx=4096, _lock_path=lock_path, _lock_deadline_s=0.2)
+    assert not want.exists()
+    with backends.single_instance_lock(lock_path):
+        with pytest.raises(EmbedBackendNotRunnable):
+            backend.embed_batch(["a passage"])
+    assert want.exists()
+
+
+def test_a_waiter_is_served_between_two_texts_of_a_batch_in_that_order(tmp_path, monkeypatch):
+    """Ordering, with events and no timing: the holder's text k, then the
+    waiter's erase and embed, then the holder's text k+1. The holder's
+    step-aside sleep is replaced by "wait until the waiter's erase POST has
+    happened" (5 s cap), and any existing ``.want`` counts as fresh, so a
+    slow thread cannot change the outcome."""
+    lock_path = tmp_path / "slot_erase.lock"
+    log: list[str] = []
+    log_lock = threading.Lock()
+    waiter_erased = threading.Event()
+    holder_in_text = {name: threading.Event() for name in ("t0", "t1", "t2")}
+    holder_may_finish = {name: threading.Event() for name in ("t0", "t1", "t2")}
+
+    def record(entry: str) -> None:
+        with log_lock:
+            log.append(entry)
+
+    class HolderHttp(FakeHttp):
+        def post_json(self, path: str, payload: dict):
+            if path.startswith("/slots/"):
+                record("holder erase")
+            else:
+                name = str(payload["content"])
+                record(f"holder embed {name}")
+                holder_in_text[name].set()
+                assert holder_may_finish[name].wait(10.0), f"the test never released {name}"
+            return super().post_json(path, payload)
+
+    class WaiterHttp(FakeHttp):
+        def post_json(self, path: str, payload: dict):
+            if path.startswith("/slots/"):
+                record("waiter erase")
+                waiter_erased.set()
+            else:
+                record("waiter embed")
+            return super().post_json(path, payload)
+
+    holder, _h, _v = _server(n_ctx=4096, http=HolderHttp(), _lock_path=lock_path)
+    waiter, _h2, _v2 = _server(n_ctx=4096, http=WaiterHttp(), _lock_path=lock_path)
+    holder_thread = threading.Thread(target=lambda: holder.embed_batch(["t0", "t1", "t2"]))
+    real_sleep = time.sleep
+
+    def sleep(seconds: float) -> None:
+        if threading.current_thread() is holder_thread:
+            assert waiter_erased.wait(5.0), "the waiter never got the lock while the holder stepped aside"
+        else:
+            real_sleep(seconds)
+
+    monkeypatch.setattr(backends, "time", _TimeProxy(sleep=sleep))
+    monkeypatch.setattr(backends, "_WAITER_FRESH_S", 3600.0)
+
+    waiter_thread = threading.Thread(target=lambda: waiter.embed_batch(["q"]))
+    try:
+        holder_thread.start()
+        assert holder_in_text["t0"].wait(10.0), "the holder never reached its first text"
+        waiter_thread.start()
+        deadline = time.monotonic() + 10.0
+        while not backends._lock_want_path(lock_path).exists():
+            assert time.monotonic() < deadline, "the waiter never signalled that it is waiting"
+            real_sleep(0.01)
+        holder_may_finish["t0"].set()
+        assert holder_in_text["t1"].wait(10.0), "the holder never reached its second text"
+    finally:
+        for event in holder_may_finish.values():
+            event.set()
+        holder_thread.join(timeout=10.0)
+        waiter_thread.join(timeout=10.0)
+
+    assert not holder_thread.is_alive() and not waiter_thread.is_alive()
+    assert log[:6] == [
+        "holder erase",
+        "holder embed t0",
+        "waiter erase",
+        "waiter embed",
+        "holder erase",
+        "holder embed t1",
+    ]
+
+
+def test_smoke_a_waiter_behind_a_real_time_batch_does_not_wait_for_the_batch(tmp_path):
+    """A real-time smoke test only -- the deterministic tests above carry the
+    proof; this one just shows the pieces work together on real clocks.
+    Without the ``.want`` signal a query arriving mid-batch waits for the
+    WHOLE batch. Here the batch is 12 texts of 0.15 s each (1.8 s); the
+    waiter, arriving 0.3 s in, must be through well inside half of it (a
+    loose bound, so a slow runner does not flake it; without the signal the
+    wait is about 1.5 s)."""
+    lock_path = tmp_path / "slot_erase.lock"
+    hold_s = 0.15
+
+    class SlowEmbedHttp(FakeHttp):
+        def post_json(self, path: str, payload: dict):
+            if path == LLAMA_SERVER_EMBED_PATH:
+                time.sleep(hold_s)
+            return super().post_json(path, payload)
+
+    holder, _http, _vocab = _server(n_ctx=4096, http=SlowEmbedHttp(), _lock_path=lock_path)
+    texts = [f"statement {index}" for index in range(12)]
+    holder_thread = threading.Thread(target=lambda: holder.embed_batch(texts))
+    holder_thread.start()
+    time.sleep(0.3)
+
+    waiter, _http2, _vocab2 = _server(n_ctx=4096, _lock_path=lock_path)
+    started = time.monotonic()
+    vector = waiter.embed_batch(["a query"])[0]
+    waited = time.monotonic() - started
+    holder_thread.join(timeout=10.0)
+
+    assert len(vector) == DIMS
+    assert not holder_thread.is_alive()
+    assert waited < 0.9, f"the waiter waited {waited:.2f}s -- for the batch, not for a text"
+
+
+def test_an_uncontended_batch_leaves_no_want_signal_and_does_not_sleep(tmp_path):
+    lock_path = tmp_path / "slot_erase.lock"
+    backend, _http, _vocab = _server(n_ctx=4096, _lock_path=lock_path)
+    started = time.monotonic()
+    backend.embed_batch([f"text {index}" for index in range(20)])
+    elapsed = time.monotonic() - started
+    assert not backends._lock_want_path(lock_path).exists()
+    assert elapsed < 1.5, "twenty fake embeds with nobody waiting must not pay the step-aside sleep"
+
+
+def test_a_busy_holder_that_keeps_reacquiring_never_refuses_the_waiter(tmp_path):
+    """The deadline must count time WITHOUT PROGRESS,
+    not total wait time. A holder that keeps re-acquiring the lock (a batch
+    embedding one text after another, each hold a millisecond or two) is
+    healthy, not stuck -- a waiter must never be refused while that keeps
+    happening, even once the total wait passes the nominal deadline."""
+    lock_path = tmp_path / "slot_erase.lock"
+    stop = threading.Event()
+    acquisitions = 0
+
+    def hold_and_release_repeatedly() -> None:
+        nonlocal acquisitions
+        while not stop.is_set():
+            try:
+                with backends.single_instance_lock(lock_path):
+                    acquisitions += 1
+                    time.sleep(0.01)
+            except backends.WorkerAlreadyRunning:
+                # the waiter thread won this particular race for the lock --
+                # not this test's concern, just try again
+                continue
+
+    holder = threading.Thread(target=hold_and_release_repeatedly)
+    holder.start()
+
+    backend, _http, _vocab = _server(n_ctx=4096, _lock_path=lock_path, _lock_deadline_s=0.2)
+    results: list[list[float]] = []
+    errors: list[Exception] = []
+
+    def run() -> None:
+        try:
+            results.append(backend.embed_batch(["a passage"])[0])
+        except Exception as exc:  # noqa: BLE001 - surfaced via `errors` for the assertion below
+            errors.append(exc)
+
+    waiter = threading.Thread(target=run)
+    waiter.start()
+
+    # Keep the holder busy well past the 0.2s nominal deadline before giving
+    # the waiter a clear shot at the lock.
+    time.sleep(0.6)
+    stop.set()
+    holder.join(timeout=5.0)
+    waiter.join(timeout=5.0)
+
+    assert not waiter.is_alive()
+    assert errors == [], f"the waiter must not be refused while the holder keeps making progress: {errors}"
+    assert len(results) == 1 and len(results[0]) == DIMS
+    assert acquisitions > 1, "the holder must have re-acquired more than once for this to test anything"
+
+
+def test_a_non_contention_lock_error_is_not_retried_forever(monkeypatch):
+    """trialerror.offload.lock.single_instance_lock chains the
+    underlying OSError onto WorkerAlreadyRunning. An errno that is not
+    contention (EINVAL, ENOLCK, ...) means the lock call itself is broken
+    -- for example a filesystem with no real flock -- and retrying it can
+    only ever fail the same way again, so this must refuse at once rather
+    than spin until a deadline."""
+    if sys.platform == "win32":
+        import msvcrt
+
+        def _boom(fd, mode, nbytes):
+            raise OSError(errno.EINVAL, "invalid argument")
+
+        monkeypatch.setattr(msvcrt, "locking", _boom)
+    else:
+        import fcntl
+
+        def _boom(fd, operation):
+            raise OSError(errno.ENOLCK, "no locks available")
+
+        monkeypatch.setattr(fcntl, "flock", _boom)
+
+    backend, _http, _vocab = _server(n_ctx=4096, _lock_deadline_s=60.0)
+    started = time.monotonic()
+    with pytest.raises(EmbedBackendNotRunnable) as exc:
+        backend.embed_batch(["a passage"])
+    assert time.monotonic() - started < 5.0, "a non-contention error must not wait for the deadline"
+    assert "not lock contention" in str(exc.value)
+    assert "slot_erase = false" in str(exc.value)
+
+
+def test_the_lock_path_is_normalised_for_scheme_case_and_localhost():
+    """Two harness processes that spell the same sidecar
+    differently (`localhost` vs `127.0.0.1`, or a different-cased scheme)
+    must still serialise through the SAME lock file."""
+    same_a = _REAL_SLOT_ERASE_LOCK_PATH("http://localhost:8871")
+    same_b = _REAL_SLOT_ERASE_LOCK_PATH("http://127.0.0.1:8871")
+    same_c = _REAL_SLOT_ERASE_LOCK_PATH("HTTP://127.0.0.1:8871")
+    different = _REAL_SLOT_ERASE_LOCK_PATH("http://127.0.0.1:9999")
+    assert same_a == same_b == same_c
+    assert different != same_a
+
+
+# ---------------------------------------------------------------------------
+# REQ-2026-09-27-09: the [ingest.embed] / [ingest.embed.query] slot_erase switch
+# ---------------------------------------------------------------------------
+
+
+def test_slot_erase_defaults_to_on_through_the_loader():
+    backend = load_embed_backend(
+        {
+            "backend": LLAMA_SERVER_BACKEND_NAME,
+            "model_key": "real-key",
+            "tokenizer_model_path": "/somewhere/model.gguf",
+        }
+    )
+    assert backend.slot_erase is True
+
+
+def test_slot_erase_false_in_config_reaches_the_backend():
+    backend = load_embed_backend(
+        {
+            "backend": LLAMA_SERVER_BACKEND_NAME,
+            "model_key": "real-key",
+            "tokenizer_model_path": "/somewhere/model.gguf",
+            "slot_erase": False,
+        }
+    )
+    assert backend.slot_erase is False
+
+
+def test_slot_erase_the_string_false_is_parsed_as_false_not_coerced_true():
+    """bool("false") is True (any non-empty string is truthy),
+    which used to turn this switch's "off" spelling silently into "on"."""
+    backend = load_embed_backend(
+        {
+            "backend": LLAMA_SERVER_BACKEND_NAME,
+            "model_key": "real-key",
+            "tokenizer_model_path": "/somewhere/model.gguf",
+            "slot_erase": "false",
+        }
+    )
+    assert backend.slot_erase is False
+
+
+@pytest.mark.parametrize("spelling", ["true", "TRUE", "True", "1", "yes", "on"])
+def test_slot_erase_recognises_the_usual_true_spellings(spelling):
+    backend = load_embed_backend(
+        {
+            "backend": LLAMA_SERVER_BACKEND_NAME,
+            "model_key": "real-key",
+            "tokenizer_model_path": "/somewhere/model.gguf",
+            "slot_erase": spelling,
+        }
+    )
+    assert backend.slot_erase is True
+
+
+@pytest.mark.parametrize("spelling", ["false", "FALSE", "False", "0", "no", "off"])
+def test_slot_erase_recognises_the_usual_false_spellings(spelling):
+    backend = load_embed_backend(
+        {
+            "backend": LLAMA_SERVER_BACKEND_NAME,
+            "model_key": "real-key",
+            "tokenizer_model_path": "/somewhere/model.gguf",
+            "slot_erase": spelling,
+        }
+    )
+    assert backend.slot_erase is False
+
+
+def test_slot_erase_an_unrecognised_value_raises_naming_the_key():
+    with pytest.raises(ValueError) as exc:
+        load_embed_backend(
+            {
+                "backend": LLAMA_SERVER_BACKEND_NAME,
+                "model_key": "real-key",
+                "tokenizer_model_path": "/somewhere/model.gguf",
+                "slot_erase": "sort of",
+            }
+        )
+    assert "ingest.embed.slot_erase" in str(exc.value) and "sort of" in str(exc.value)
+
+
+def test_slot_erase_an_unrecognised_value_message_says_the_values_are_strings():
+    """The accepted spellings ('0', '1', 'yes', ...) are strings, not the
+    bare integers/words they look like -- the message should say so, not
+    just show a quoted list a reader could take as decoration."""
+    with pytest.raises(ValueError) as exc:
+        load_embed_backend(
+            {
+                "backend": LLAMA_SERVER_BACKEND_NAME,
+                "model_key": "real-key",
+                "tokenizer_model_path": "/somewhere/model.gguf",
+                "slot_erase": "sort of",
+            }
+        )
+    assert "string" in str(exc.value).lower()
+
+
+def test_slot_erase_a_bare_integer_is_not_coerced():
+    """1/0 look like booleans but are not TOML booleans -- a config typo
+    that swapped quotes for none must still refuse rather than guess."""
+    with pytest.raises(ValueError):
+        load_embed_backend(
+            {
+                "backend": LLAMA_SERVER_BACKEND_NAME,
+                "model_key": "real-key",
+                "tokenizer_model_path": "/somewhere/model.gguf",
+                "slot_erase": 1,
+            }
+        )
+
+
+def test_slot_erase_is_honoured_on_the_query_side_table_too():
+    backend = load_query_embed_backend(
+        {
+            "backend": "offload",
+            "model_key": "real-key",
+            "dims": 2048,
+            "query": {
+                "backend": LLAMA_SERVER_BACKEND_NAME,
+                "tokenizer_model_path": "/x/model.gguf",
+                "slot_erase": False,
+            },
+        }
+    )
+    assert backend.slot_erase is False
+
+
+def test_a_slot_erase_key_is_harmless_for_the_fake_backend():
+    """Nothing changes for other backends: `load_embed_backend` never reads
+    `slot_erase` outside the llama_server branch, so a config carrying the
+    key for any other backend is simply ignored, as any other unrelated key
+    already is."""
+    backend = load_embed_backend({"backend": "fake", "dims": 4, "slot_erase": False})
+    assert isinstance(backend, backends.FakeEmbedBackend)
+    assert not hasattr(backend, "slot_erase")

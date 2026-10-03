@@ -545,6 +545,27 @@ def test_spawns_count_the_unbooked_ones(tree):
     assert [e["launch_id"] for e in spawns["entries"]] == ["LNCH-01ABCDEF", None]
 
 
+def test_a_keyed_launch_id_wins_over_a_bare_mention_of_a_different_one(tmp_path):
+    """Review finding N3: a prompt that discusses one booking's output while
+    claiming a different one ("review the output of LNCH-A ... launch_id:
+    LNCH-B") must read as B's spawn, not A's -- the explicit `launch_id:`/
+    `launch_id=` form (the budget gate's own convention) wins over the first
+    bare `LNCH-` id anywhere in the text."""
+    project = tmp_path / "projects" / "p"
+    project.mkdir(parents=True)
+    _write_jsonl(
+        project / "s.jsonl",
+        [
+            _assistant(
+                "2026-09-06T05:00:00.000Z", "s",
+                [_tool("Agent", {"description": "a", "prompt": "review the output of LNCH-AAAAAAAA and use launch_id: LNCH-BBBBBBBB for this one"})],
+            )
+        ],
+    )
+    digest = audit.build_digest(audit.AuditOptions(since=SINCE, until=UNTIL, transcripts=tmp_path / "projects"))
+    assert [e["launch_id"] for e in digest["spawns"]["entries"]] == ["LNCH-BBBBBBBB"]
+
+
 def test_tools_are_counted_by_name(tree):
     digest = audit.build_digest(_opts(tree))
     assert digest["tools"]["Bash"] >= 10
@@ -851,6 +872,354 @@ def test_a_program_root_that_is_not_there_is_an_absent_doctor_not_a_clean_bill(t
     assert "program root not found" in cov["detail"]
     assert digest["doctor"]["checks_run"] == 0
     assert digest["doctor"]["counts"] == {"fail": 0, "warn": 0, "pass": 0, "skip": 0}
+
+
+# ---------------------------------------------------------------------------
+# no silent loss at a cap: spread across the window, complete aggregates
+# ---------------------------------------------------------------------------
+
+
+def test_a_capped_section_keeps_rows_from_every_day_and_states_the_sample(tmp_path, monkeypatch):
+    """The bug this fix closes: a chronological cap kept the earliest rows,
+    so a whole busy final day of writes could go completely unseen. Here
+    `file_writes` spans two UTC days, the second far busier; capped at 10,
+    the kept sample must still include rows from BOTH days, and the
+    aggregate must count every write on both days regardless of the cap."""
+    monkeypatch.setitem(audit.CAPS, "file_writes", 10)
+    project = tmp_path / "projects" / "p"
+    project.mkdir(parents=True)
+    rows = [
+        _assistant(
+            f"2026-09-05T01:{i:02d}:00.000Z", "s-day1",
+            [_tool("Write", {"file_path": f"/work/a/day1-{i}.md", "content": "x"})],
+        )
+        for i in range(5)
+    ] + [
+        _assistant(
+            f"2026-09-06T17:{i:02d}:00.000Z", "s-day2",
+            [_tool("Write", {"file_path": f"/work/b/day2-{i}.md", "content": "x"})],
+        )
+        for i in range(30)
+    ]
+    _write_jsonl(project / "s.jsonl", rows)
+    digest = audit.build_digest(
+        audit.AuditOptions(
+            since="2026-09-05T00:00:00Z", until="2026-09-06T23:59:59Z", transcripts=tmp_path / "projects"
+        )
+    )
+    assert len(digest["file_writes"]) == 10
+    assert digest["volume"]["truncated"]["file_writes"] == 25
+    dates = {w["timestamp"][:10] for w in digest["file_writes"]}
+    assert "2026-09-06" in dates  # the busy day must survive the cap
+    assert "2026-09-05" in dates  # so must the quiet one
+
+    # complete aggregates, computed BEFORE the cap: every entry counted, not
+    # just the 10 kept for full text.
+    agg = digest["volume"]["aggregates"]["file_writes"]
+    assert agg["by_day"] == {"2026-09-05": 5, "2026-09-06": 30}
+    assert agg["by_session"] == {"s-day1": 5, "s-day2": 30}
+    assert agg["by_path_prefix"] == {"/work/a": 5, "/work/b": 30}
+
+    # the digest says which rows survived
+    assert "UTC-day" in digest["volume"]["sample"]["file_writes"]
+
+
+def test_a_quiet_day_next_to_a_very_busy_one_still_keeps_a_row(tmp_path, monkeypatch):
+    """Review finding S1: a plain proportional largest-remainder split floors
+    a quiet day's share to zero when it sits next to a day with more than
+    ``cap`` rows on its own -- a 1-row day's 0.25 share lost its remainder to
+    the busy day's 0.75, and the quiet day's one write (here, an SSH key)
+    vanished from the sample entirely, even though the sample note still
+    claimed "every UTC day". Every day with at least one entry must now keep
+    at least one row."""
+    monkeypatch.setitem(audit.CAPS, "file_writes", 10)
+    project = tmp_path / "projects" / "p"
+    project.mkdir(parents=True)
+    rows = [
+        _assistant("2026-09-05T23:30:00.000Z", "s-quiet", [_tool("Write", {"file_path": "/home/agent/.ssh/authorized_keys", "content": "x"})]),
+    ] + [
+        _assistant(f"2026-09-06T{(i // 60) % 24:02d}:{i % 60:02d}:00.000Z", "s-busy", [_tool("Write", {"file_path": f"/work/f{i}.md", "content": "x"})])
+        for i in range(30)
+    ]
+    _write_jsonl(project / "s.jsonl", rows)
+    digest = audit.build_digest(
+        audit.AuditOptions(
+            since="2026-09-05T06:00:00Z", until="2026-09-06T23:59:59Z", transcripts=tmp_path / "projects"
+        )
+    )
+    assert len(digest["file_writes"]) == 10
+    dates = {w["timestamp"][:10] for w in digest["file_writes"]}
+    assert "2026-09-05" in dates  # the quiet day must not vanish
+    assert any(".ssh" in (w.get("path") or "") for w in digest["file_writes"])
+    agg = digest["volume"]["aggregates"]["file_writes"]
+    assert agg["by_day"] == {"2026-09-05": 1, "2026-09-06": 30}  # complete, unaffected by the cap
+
+
+def test_a_cap_smaller_than_the_day_count_says_so_in_the_sample_note(tmp_path, monkeypatch):
+    """When the cap is smaller than the number of distinct days present, no
+    split can give every day a row; the note must say only some days are
+    covered rather than repeating the "every UTC day" claim."""
+    monkeypatch.setitem(audit.CAPS, "file_writes", 2)
+    project = tmp_path / "projects" / "p"
+    project.mkdir(parents=True)
+    rows = [
+        _assistant(f"2026-09-0{d}T01:00:00.000Z", f"s{d}", [_tool("Write", {"file_path": f"/work/f{d}.md", "content": "x"})])
+        for d in range(1, 6)
+    ]
+    _write_jsonl(project / "s.jsonl", rows)
+    digest = audit.build_digest(
+        audit.AuditOptions(
+            since="2026-09-01T00:00:00Z", until="2026-09-05T23:59:59Z", transcripts=tmp_path / "projects"
+        )
+    )
+    assert len(digest["file_writes"]) == 2
+    dates = {w["timestamp"][:10] for w in digest["file_writes"]}
+    assert len(dates) == 2  # two distinct days, not the same day twice
+    note = digest["volume"]["sample"]["file_writes"]
+    assert "only 2 of 5" in note
+    assert "every UTC day" not in note
+
+
+def test_shell_commands_still_keep_every_tagged_command_first_then_spread_the_rest(tmp_path, monkeypatch):
+    """`shell_commands` keeps its existing tagged-first behaviour (an anomaly
+    must never be the thing a cap drops); once every tagged command is kept,
+    the untagged remainder is now spread across the window instead of being
+    the earliest untagged rows only."""
+    monkeypatch.setitem(audit.CAPS, "shell_commands", 3)
+    project = tmp_path / "projects" / "p"
+    project.mkdir(parents=True)
+    rows = [_assistant(f"2026-09-05T01:{i:02d}:00.000Z", "s", [_bash(f"echo plain {i}")]) for i in range(10)]
+    rows.append(_assistant("2026-09-06T20:00:00.000Z", "s", [_bash("rm -rf /workspace")]))
+    _write_jsonl(project / "s.jsonl", rows)
+    digest = audit.build_digest(
+        audit.AuditOptions(
+            since="2026-09-05T00:00:00Z", until="2026-09-06T23:59:59Z", transcripts=tmp_path / "projects"
+        )
+    )
+    assert len(digest["shell_commands"]) == 3
+    assert any("destructive" in c["tags"] for c in digest["shell_commands"])
+    agg = digest["volume"]["aggregates"]["shell_commands"]
+    assert agg["by_tag"]["destructive"] == 1
+    assert agg["by_day"] == {"2026-09-05": 10, "2026-09-06": 1}
+
+
+def test_an_anomaly_tagged_command_is_not_crowded_out_by_ordinary_tagged_traffic(tmp_path, monkeypatch):
+    """Review finding N2: once tagged commands alone exceed the cap, an
+    ordinary tag (`network`, `git_push`, `container`, `cron`,
+    `package_install` -- none of the host pre-check's `COMMAND_ANOMALY_TAGS`)
+    must not crowd out the one `destructive`/`permission`/`secret_path`/
+    `encode`/`exfil_suspect` command a day also had."""
+    monkeypatch.setitem(audit.CAPS, "shell_commands", 5)
+    project = tmp_path / "projects" / "p"
+    project.mkdir(parents=True)
+    rows = [
+        _assistant(f"2026-09-06T{(i // 60) % 24:02d}:{i % 60:02d}:00.000Z", "s", [_bash(f"git push origin br{i}")])
+        for i in range(600)
+    ]
+    rows.append(_assistant("2026-09-06T12:00:00.500Z", "s", [_bash("rm -rf /workspace")]))
+    _write_jsonl(project / "s.jsonl", rows)
+    digest = audit.build_digest(
+        audit.AuditOptions(since="2026-09-06T00:00:00Z", until="2026-09-06T23:59:59Z", transcripts=tmp_path / "projects")
+    )
+    assert len(digest["shell_commands"]) == 5
+    assert any("destructive" in c["tags"] for c in digest["shell_commands"])
+    assert digest["volume"]["aggregates"]["shell_commands"]["by_tag"]["git_push"] == 600  # complete, before the cap
+
+
+# ---------------------------------------------------------------------------
+# S2: aggregates carry the flags the rubric's NOTIFY clauses and Counts rely on
+# ---------------------------------------------------------------------------
+
+
+def test_a_disallowed_host_past_the_network_cap_is_still_named(tmp_path, monkeypatch):
+    """Review finding S2 (probe D): a single disallowed host among hundreds of
+    allowed ones, past the network cap, must still be visible -- both in the
+    sample (kept first, like an anomaly-tagged command) and in the aggregate
+    (`not_allowed`, `by_host`), so it cannot disappear if it ever did fall to
+    the cap."""
+    monkeypatch.setitem(audit.CAPS, "network", 200)
+    project = tmp_path / "projects" / "p"
+    project.mkdir(parents=True)
+    rows = [
+        _assistant(f"2026-09-06T{(i // 60) % 24:02d}:{i % 60:02d}:00.000Z", "s", [_bash(f"curl https://{ALLOWED_HOST}/p{i}")])
+        for i in range(400)
+    ]
+    rows.append(_assistant("2026-09-06T12:00:00.500Z", "s", [_bash(f"curl https://{FOREIGN_HOST}/x")]))
+    _write_jsonl(project / "s.jsonl", rows)
+    digest = audit.build_digest(
+        audit.AuditOptions(
+            since="2026-09-06T00:00:00Z", until="2026-09-06T23:59:59Z", transcripts=tmp_path / "projects",
+            allowed_hosts=[ALLOWED_HOST],
+        )
+    )
+    assert len(digest["network"]) == 200
+    assert any(n["host"] == FOREIGN_HOST for n in digest["network"])
+    agg = digest["volume"]["aggregates"]["network"]
+    assert agg["not_allowed"] == 1
+    assert agg["by_host"][FOREIGN_HOST] == 1
+    assert agg["by_host"][ALLOWED_HOST] == 400
+
+
+def test_a_write_outside_the_allowed_roots_past_the_cap_is_still_named(tmp_path, monkeypatch):
+    """Review finding S2 (probe C): a single outside-root write in the middle
+    of a busy day, past the file_writes cap, must still be visible -- kept
+    in the sample, and in the aggregate (`outside_allowed_roots`,
+    `by_path_prefix_outside`)."""
+    monkeypatch.setitem(audit.CAPS, "file_writes", 500)
+    project = tmp_path / "projects" / "p"
+    project.mkdir(parents=True)
+    rows = [
+        _assistant(
+            f"2026-09-06T{(i // 60) % 24:02d}:{i % 60:02d}:00.000Z", "s",
+            [_tool("Write", {"file_path": f"/work/project/f{i}.md", "content": "x"})],
+        )
+        for i in range(2000)
+    ]
+    rows.append(_assistant("2026-09-06T12:00:00.500Z", "s", [_tool("Write", {"file_path": "/etc/cron.d/evil", "content": "x"})]))
+    _write_jsonl(project / "s.jsonl", rows)
+    digest = audit.build_digest(
+        audit.AuditOptions(
+            since="2026-09-06T00:00:00Z", until="2026-09-06T23:59:59Z", transcripts=tmp_path / "projects",
+            allowed_write_roots=["/work/project"],
+        )
+    )
+    assert len(digest["file_writes"]) == 500
+    assert any(w["path"] == "/etc/cron.d/evil" for w in digest["file_writes"])
+    agg = digest["volume"]["aggregates"]["file_writes"]
+    assert agg["outside_allowed_roots"] == 1
+    assert agg["by_path_prefix_outside"] == {"/etc/cron.d": 1}
+
+
+def test_sensitive_reads_and_permission_flags_aggregate_by_the_thing_matched(tree):
+    """The rubric's NOTIFY clauses ask "which sensitive path" and "which
+    permission flag", not only "how many" -- `by_matched`/`by_match` answer
+    that over every entry, before any cap."""
+    digest = audit.build_digest(_opts(tree))
+    reads_agg = digest["volume"]["aggregates"]["sensitive_reads"]
+    assert reads_agg["by_matched"]  # non-empty: the fixture plants a real sensitive read
+    assert sum(reads_agg["by_matched"].values()) == len(digest["sensitive_reads"])
+    perm_agg = digest["volume"]["aggregates"]["permission_flags"]
+    assert perm_agg["by_match"]
+    assert sum(perm_agg["by_match"].values()) == len(digest["permission_flags"])
+
+
+# ---------------------------------------------------------------------------
+# unmatched bookings, by id
+# ---------------------------------------------------------------------------
+
+
+def test_unmatched_bookings_are_listed_by_id(tmp_path, store, program_root, platform_root):
+    """The bug this fix closes: a booking with no matching transcript spawn
+    must be nameable, not just countable. The digest lists the launch id,
+    booked_ts, agent_kind, model, state and a purpose excerpt for every
+    booking in the window that no spawn entry's launch id matches -- matched
+    against the COMPLETE set of spawns, before their own cap."""
+    from tests._budget_fixtures import open_account_session
+    from trialerror.stores import insert
+
+    from trialerror.util.ids import new_id
+
+    account_id, session_id = open_account_session(store)
+    matched_id = new_id("LNCH")
+    unmatched_id = new_id("LNCH")
+    long_purpose = "implement the digest fix so the audit reads every unmatched booking. " * 3
+    for lid, purpose in ((matched_id, "matched booking"), (unmatched_id, long_purpose)):
+        insert(
+            store,
+            "launch",
+            {
+                "launch_id": lid,
+                "account_id": account_id,
+                "program_id": "P1",
+                "session_id": session_id,
+                "agent_kind": "implementer",
+                "model_class": "top",
+                "model": "claude-sonnet-5",
+                "purpose": purpose,
+                "est_tokens": 100,
+                "booked_ts": "2026-09-06T05:00:00.000Z",
+                "state": "RECONCILED",
+            },
+        )
+    store.platform.commit()
+
+    project = tmp_path / "projects" / "p"
+    project.mkdir(parents=True)
+    _write_jsonl(
+        project / "s.jsonl",
+        [_assistant("2026-09-06T05:01:00.000Z", "s", [_tool("Agent", {"description": "a", "prompt": f"launch {matched_id}"})])],
+    )
+
+    digest = audit.build_digest(
+        audit.AuditOptions(
+            since=SINCE, until=UNTIL, transcripts=tmp_path / "projects",
+            program_root=program_root, platform_root=platform_root,
+        )
+    )
+    assert digest["spawns"]["bookings_booked"] == 2
+    assert digest["spawns"]["bookings_unmatched"] == 1
+    unmatched = digest["spawns"]["unmatched_bookings"]
+    assert len(unmatched) == 1
+    row = unmatched[0]
+    assert row["launch_id"] == unmatched_id
+    assert row["booked_ts"] == "2026-09-06T05:00:00.000Z"
+    assert row["agent_kind"] == "implementer"
+    assert row["model"] == "claude-sonnet-5"
+    assert row["state"] == "RECONCILED"
+    assert row["purpose"] == audit.redact(long_purpose)[:120]
+    assert set(row) == {"launch_id", "booked_ts", "agent_kind", "model", "state", "purpose"}
+    assert matched_id not in json.dumps(unmatched)
+
+
+def test_unmatched_bookings_is_capped_with_a_truncation_count(tmp_path, store, program_root, platform_root, monkeypatch):
+    """Review finding N7: `unmatched_bookings` had no cap at all. A generous
+    one is enough -- `bookings_unmatched` must still report the COMPLETE
+    count even once the list itself is capped, and the drop is counted in
+    `volume.truncated`, the same as every other capped section."""
+    from tests._budget_fixtures import open_account_session
+    from trialerror.stores import insert
+    from trialerror.util.ids import new_id
+
+    monkeypatch.setitem(audit.CAPS, "unmatched_bookings", 3)
+    account_id, session_id = open_account_session(store)
+    for i in range(5):
+        insert(
+            store, "launch",
+            {
+                "launch_id": new_id("LNCH"), "account_id": account_id, "program_id": "P1", "session_id": session_id,
+                "agent_kind": "implementer", "model_class": "top", "model": "claude-sonnet-5", "purpose": f"job {i}",
+                "est_tokens": 1, "booked_ts": f"2026-09-06T0{i}:00:00.000Z", "state": "RECONCILED",
+            },
+        )
+    store.platform.commit()
+
+    digest = audit.build_digest(
+        audit.AuditOptions(since=SINCE, until=UNTIL, transcripts=tmp_path / "projects", program_root=program_root, platform_root=platform_root)
+    )
+    assert digest["spawns"]["bookings_unmatched"] == 5  # the complete count
+    assert len(digest["spawns"]["unmatched_bookings"]) == 3  # capped
+    assert digest["volume"]["truncated"]["unmatched_bookings"] == 2
+
+
+def test_an_aggregates_by_session_breakdown_is_capped_with_a_truncation_count(tmp_path, monkeypatch):
+    """Review finding N7: an aggregate's `by_session` breakdown had no cap,
+    unlike `by_day` (naturally bounded by the window). A generous cap keeps
+    the digest bounded even against a session-id typo generator."""
+    monkeypatch.setitem(audit.CAPS, "file_writes", 500)
+    monkeypatch.setattr(audit, "AGGREGATE_KEY_CAP", 3)
+    project = tmp_path / "projects" / "p"
+    project.mkdir(parents=True)
+    rows = [
+        _assistant(f"2026-09-06T00:{i:02d}:00.000Z", f"s-{i}", [_tool("Write", {"file_path": f"/w/f{i}.md", "content": "x"})])
+        for i in range(5)
+    ]
+    _write_jsonl(project / "s.jsonl", rows)
+    digest = audit.build_digest(
+        audit.AuditOptions(since=SINCE, until=UNTIL, transcripts=tmp_path / "projects")
+    )
+    agg = digest["volume"]["aggregates"]["file_writes"]
+    assert len(agg["by_session"]) == 3
+    assert agg["by_session_truncated"] == 2
 
 
 # ---------------------------------------------------------------------------

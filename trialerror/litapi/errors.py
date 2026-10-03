@@ -15,6 +15,7 @@ __all__ = [
     "ProviderNotFoundError",
     "ProviderUnsupportedOperationError",
     "AllProvidersFailedError",
+    "UnknownProviderError",
     "TransportNotConfiguredError",
 ]
 
@@ -117,6 +118,17 @@ class AllProvidersFailedError(LitApiError):
     of a single opaque message -- the whole point of the redundant-fetch
     design is that a caller can see which single API is the current
     bottleneck."""
+
+    def __init__(self, message: str, *, details: Mapping[str, Any] | None = None):
+        super().__init__(message)
+        self.details = dict(details) if details else {}
+
+
+class UnknownProviderError(LitApiError):
+    """A caller named a provider the client does not have (``search``'s
+    ``providers=``). Raised BEFORE any provider is called, and says which
+    names are valid, so a typo costs no request. ``details`` carries
+    ``{"unknown": [...], "valid": [...]}`` for a caller that wants them as data."""
 
     def __init__(self, message: str, *, details: Mapping[str, Any] | None = None):
         super().__init__(message)

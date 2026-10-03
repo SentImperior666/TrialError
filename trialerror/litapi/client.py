@@ -47,6 +47,7 @@ from trialerror.litapi.errors import (
     ProviderNotFoundError,
     ProviderTransportError,
     ProviderUnsupportedOperationError,
+    UnknownProviderError,
 )
 from trialerror.litapi.models import CitationsPage, WorkRecord, looks_like_identifier, normalize_title, provider_extra
 from trialerror.litapi.providers.arxiv import ArxivProvider
@@ -128,16 +129,33 @@ class SearchResult:
     provider_retries: list[dict[str, Any]] = field(default_factory=list)
     #: Lane FB-acq item 2 -- see :attr:`LookupResult.provider_outcomes`.
     provider_outcomes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: ``search(per_provider=True)`` only, ``None`` otherwise: for each record
+    #: (same order as ``records``), the 1-based rank it held in each provider's
+    #: own list, ``{provider: rank}``.
+    provider_ranks: list[dict[str, int]] | None = None
+    #: ``search(per_provider=True)`` only, ``None`` otherwise: how the records
+    #: were chosen -- ``{"mode", "limit", "order", "kept"}``, ``kept`` being, for
+    #: EVERY provider searched, how many distinct kept records it returned (``0``
+    #: when it failed or returned nothing; a record two providers returned counts
+    #: for each; a provider's repeated identity counts once).
+    selection: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "records": [r.to_dict() for r in self.records],
+        records = [r.to_dict() for r in self.records]
+        if self.provider_ranks is not None:
+            for record, ranks in zip(records, self.provider_ranks):
+                record["provider_ranks"] = dict(ranks)
+        out: dict[str, Any] = {
+            "records": records,
             "providers_succeeded": list(self.providers_succeeded),
             "providers_failed": list(self.providers_failed),
             "provider_query_scope": dict(self.provider_query_scope),
             "provider_retries": list(self.provider_retries),
             "provider_outcomes": {k: dict(v) for k, v in self.provider_outcomes.items()},
         }
+        if self.selection is not None:
+            out["selection"] = dict(self.selection)
+        return out
 
 
 @dataclass
@@ -405,7 +423,9 @@ class LitApiClient:
 
     # -- search ----------------------------------------------------------------
 
-    def search(self, query: str, *, limit: int = 10) -> SearchResult:
+    def search(
+        self, query: str, *, limit: int = 10, per_provider: bool = False, providers: Sequence[str] | None = None,
+    ) -> SearchResult:
         """Search every provider with the caller's query VERBATIM, and retry a
         provider at most once with a normalised query when that provider
         answered with an HTTP error status (lane FB-1 item F10b).
@@ -433,13 +453,40 @@ class LitApiClient:
           exactly the part of an identifier that identifies it.
         - RECORDED in ``provider_retries``, always -- including when the
           retry fails too.
+
+        ``limit`` must be at least 1: a smaller one raises ``ValueError`` before
+        any provider is called (it used to cut the merged list with a zero or
+        negative slice and return an empty, apparently successful, answer).
+
+        ``providers`` searches only the named providers (``None``: all of
+        them, as before). A name this client does not have raises
+        :class:`~trialerror.litapi.errors.UnknownProviderError` before any
+        provider is called. Nothing else changes: each named provider is still
+        asked once, with the same retry rule.
+
+        ``per_provider`` changes what is KEPT, not what is asked. By default the
+        merged list is cut to its first ``limit`` records, and because it is in
+        provider order a first provider that returns ``limit`` records fills it
+        alone. With ``per_provider=True`` each provider that succeeded keeps its
+        own first ``limit`` records, in its own order, and the result may hold
+        ``limit`` x (providers) records. The merge is the same: a record two
+        providers both returned appears once, with both provider names. Order is
+        provider order, then each provider's own rank -- the order the default
+        already uses, so the first provider's block reads the same either way
+        and only a later provider's own hits are added. ``provider_ranks`` gives,
+        per record, the rank it held in each provider's list, and ``selection``
+        says how the records were chosen.
         """
+        if limit < 1:
+            raise ValueError(f"search() needs limit >= 1, got {limit}")
+        selected = self._select_providers(providers)
         all_records: list[WorkRecord] = []
         succeeded: list[str] = []
         failures: list[dict[str, Any]] = []
         retries: list[dict[str, Any]] = []
         outcomes: dict[str, dict[str, Any]] = {}
-        for provider in self.providers:
+        by_provider: list[tuple[str, list[WorkRecord]]] = []
+        for provider in selected:
             try:
                 records = provider.search(query, limit=limit)
             except LitApiError as exc:
@@ -469,22 +516,57 @@ class LitApiClient:
             for r in records:
                 r.providers = [provider.name]
             all_records.extend(records)
+            by_provider.append((provider.name, records[:limit]))
         if not all_records and not succeeded:
             raise AllProvidersFailedError(
                 f"no provider could search for query={query!r}",
                 details={"failures": failures, "provider_outcomes": outcomes},
             )
-        merged = reconcile.reconcile_many(all_records)
+        provider_ranks: list[dict[str, int]] | None = None
+        selection: dict[str, Any] | None = None
+        if per_provider:
+            ranked = reconcile.reconcile_ranked(by_provider)
+            kept = [record for record, _ in ranked]
+            provider_ranks = [ranks for _, ranks in ranked]
+            selection = {
+                "mode": "per_provider",
+                "limit": limit,
+                "order": "provider order, then each provider's own rank",
+                # distinct kept records that provider returned (a merged record counts
+                # once for each provider that returned it); 0 when it failed or was empty
+                "kept": {p.name: sum(1 for ranks in provider_ranks if p.name in ranks) for p in selected},
+            }
+        else:
+            kept = reconcile.reconcile_many(all_records)[:limit]
         return SearchResult(
-            records=merged[:limit],
+            records=kept,
             providers_succeeded=succeeded,
             providers_failed=failures,
             provider_query_scope={
-                p.name: getattr(p, "search_scope", "unspecified") for p in self.providers
+                p.name: getattr(p, "search_scope", "unspecified") for p in selected
             },
             provider_retries=retries,
             provider_outcomes=outcomes,
+            provider_ranks=provider_ranks,
+            selection=selection,
         )
+
+    def _select_providers(self, names: Sequence[str] | None) -> list[Provider]:
+        """The providers a search asks: all of them for ``None``, else the named
+        ones, in this client's own provider order (the order they are merged
+        in), each once however many times it is named."""
+        if names is None:
+            return list(self.providers)
+        if isinstance(names, str):
+            names = [names]
+        valid = [p.name for p in self.providers]
+        unknown = [n for n in dict.fromkeys(names) if n not in valid]
+        if unknown or not names:
+            raise UnknownProviderError(
+                f"unknown provider(s) {unknown}: valid names are {', '.join(valid)}",
+                details={"unknown": unknown, "valid": valid},
+            )
+        return [p for p in self.providers if p.name in names]
 
     # -- citations --------------------------------------------------------------
 

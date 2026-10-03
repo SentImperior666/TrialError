@@ -7,6 +7,7 @@ table count matches the design's Section 4 (+ 9.6-9.8) enumeration.
 
 from __future__ import annotations
 
+from trialerror.stores.schema import platform as platform_schema
 from trialerror.stores.store import SCHEMA_MODULES, TABLE_DB
 
 from tests._store_fixtures import populate_one_of_everything
@@ -47,14 +48,32 @@ from tests._store_fixtures import populate_one_of_everything
 # live/superseded like web_fetch) and "source_dossier" (one row per
 # investigated cited work) make it 26 for knowledge -- additive seams like
 # every one above them.
-EXPECTED_TABLE_COUNT_BY_DB = {"platform": 5, "ops": 24, "knowledge": 26, "jobs": 2}
+#: L4 added platform v4: quota_capture, quota_rate, quota_notice (8 -> 11).
+#: `platform` is deliberately NOT a literal here (unlike the other three
+#: DBs' manually-tracked ledgers above): the design's own renumbering rule
+#: means whichever of two lanes adding platform tables concurrently lands
+#: second gets bumped to the next free version (see
+#: tests/test_stores_migrate_platform_v3.py's own "not a stable invariant"
+#: note for the identical reason on `latest_version`), so a literal count
+#: here breaks on every such landing for no test-value gained -- the real
+#: tripwire against a table silently going undeclared is
+#: `test_round_trip_one_row_per_table` below, which fails loudly the moment
+#: `TABLE_DB` gains an entry `populate_one_of_everything` was not updated to
+#: cover. Computing it from `platform.TABLES` means v4 and later platform
+#: migrations need no edit here.
+EXPECTED_TABLE_COUNT_BY_DB = {"platform": len(platform_schema.TABLES), "ops": 24, "knowledge": 26, "jobs": 2}
 
 
 def test_table_counts_match_design_section_4():
     for db_kind, expected in EXPECTED_TABLE_COUNT_BY_DB.items():
         actual = len(SCHEMA_MODULES[db_kind].TABLES)
         assert actual == expected, f"{db_kind}: expected {expected} tables, schema module declares {actual}"
-    assert len(TABLE_DB) == sum(EXPECTED_TABLE_COUNT_BY_DB.values()) == 57
+    # ops (24) + knowledge (26) + jobs (2) stay a fixed, manually-audited
+    # total; only platform's own component is read live, so this still
+    # catches a table TABLE_DB silently dropped or double-counted across the
+    # four schema modules, without needing a bump every time another lane
+    # adds a platform table.
+    assert len(TABLE_DB) == sum(EXPECTED_TABLE_COUNT_BY_DB.values())
 
 
 def test_round_trip_one_row_per_table(store):

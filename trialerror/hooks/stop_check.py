@@ -28,6 +28,8 @@ import json
 import sys
 from pathlib import Path
 
+from trialerror.util.config import ProgramRootIsHarnessError
+
 
 #: The ``hook_alive.payload.hook`` marker this hook writes (see
 #: ``trialerror.events.api.record_hook_alive_once`` for the marker
@@ -111,6 +113,11 @@ def main() -> int:
 
     try:
         code, message = _evaluate(payload)
+    except ProgramRootIsHarnessError:
+        # cosmetic (review fix check, 2026-09-29): expected for a session
+        # whose cwd is the harness checkout, not a bug.
+        print("stop_check: no program root; skipping", file=sys.stderr)
+        return 0
     except Exception as exc:  # noqa: BLE001 - Stop must fail open, never trap the user on a bug
         print(f"stop_check: internal error: {exc}", file=sys.stderr)
         return 0

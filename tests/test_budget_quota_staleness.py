@@ -345,7 +345,7 @@ def test_quota_capture_stale_says_when_it_had_no_config_to_read(tmp_path, monkey
 # ---------------------------------------------------------------------------
 
 
-def test_the_suite_never_reads_the_machines_own_quota_capture(tmp_path):
+def test_the_suite_never_reads_the_machines_own_quota_capture(tmp_path, real_home):
     """The gate this file tests reads a file on disk, so every OTHER test in
     the suite -- every booking test -- reads one too. ``tests/conftest.py``'s
     autouse ``_isolated_quota_dir`` points ``TRIALERROR_QUOTA_DIR`` at an
@@ -371,9 +371,12 @@ def test_the_suite_never_reads_the_machines_own_quota_capture(tmp_path):
     # directory": on Windows pytest's own temp root lives under the home
     # directory (``AppData\\Local\\Temp``), so the broader claim is false there
     # for a dir that is perfectly isolated, while this one still holds.
-    real_capture_dir = (Path.home() / ".trialerror" / "quota").resolve()
+    # ``real_home``, not ``Path.home()``: the suite's home is a temporary one.
+    real_capture_dir = (real_home / ".trialerror" / "quota").resolve()
     resolved = Path(quota_dir).resolve()
     assert resolved != real_capture_dir and real_capture_dir not in resolved.parents
+    # (Not ``real_home`` alone: pytest's temp base is itself under the user profile.)
+    assert str(real_home / ".trialerror") not in quota_dir
     # Empty: absent is not stale, which is the one reading that cannot age.
     assert booking_quota_reading(tmp_path)["standing"] == "absent"
 

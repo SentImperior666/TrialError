@@ -486,6 +486,73 @@ def test_frontmatter_model_reader_is_path_safe_and_absence_tolerant(tmp_path):
     assert _frontmatter_model(".hidden", tmp_path) is None
 
 
+def test_frontmatter_model_strips_this_plugins_own_namespace_prefix(tmp_path):
+    """N1 (review finding): under ``--plugin-dir``, every plugin agent's
+    real ``subagent_type`` is namespaced ``<plugin>:<agent>`` -- the bare
+    name is refused outright by Claude Code itself -- so the qualified
+    form is the ONLY one a real spawn ever names. Before this fix,
+    ``_frontmatter_model`` joined the qualified string onto ``_AGENT_DIRS``
+    verbatim (looking for a file literally named
+    ``trialerror:myagent.md``), which never exists, so the guard silently
+    made no claim for every real plugin-qualified spawn.
+
+    The prefix stripped is THIS plugin's own name -- ``trialerror:``, read
+    live from ``plugin/.claude-plugin/plugin.json`` (see
+    :func:`test_frontmatter_model_strips_only_this_plugins_own_namespace`
+    below for why it is not any prefix at all)."""
+    from trialerror.hooks.spawn_gate import _frontmatter_model
+
+    agents = tmp_path / "plugin" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "myagent.md").write_text("---\nname: myagent\nmodel: opus\n---\n", encoding="utf-8")
+    assert _frontmatter_model("trialerror:myagent", tmp_path) == "opus"
+    # A qualified name for a file that genuinely doesn't exist still makes no claim.
+    assert _frontmatter_model("trialerror:no-such-agent", tmp_path) is None
+    # A traversal-shaped agent half of the name is still never a filesystem read.
+    assert _frontmatter_model("trialerror:../../etc/passwd", tmp_path) is None
+    assert _frontmatter_model("trialerror:.hidden", tmp_path) is None
+    # The prefix with nothing after it names no agent at all.
+    assert _frontmatter_model("trialerror:", tmp_path) is None
+
+
+def test_frontmatter_model_resolves_the_real_shipped_agents_by_qualified_name():
+    """N1, against the real repo rather than a synthetic fixture -- exactly
+    what the review checked directly: ``trialerror:prompt-only`` and
+    ``trialerror:critic`` are the actual ``subagent_type`` strings a real
+    ``--plugin-dir`` session spawns, and both must resolve to the real
+    files' pinned ``model: opus`` (the module's own fallback root, when
+    ``program_root`` has no ``plugin/agents`` of its own, is this repo's
+    root). A namespaced name for an agent this plugin does not ship stays
+    unknown -- namespacing must never manufacture a claim from nothing."""
+    from trialerror.hooks.spawn_gate import _frontmatter_model
+
+    unrelated_root = REPO_ROOT / "docs"  # has no plugin/agents of its own
+    assert _frontmatter_model("trialerror:prompt-only", unrelated_root) == "opus"
+    assert _frontmatter_model("trialerror:critic", unrelated_root) == "opus"
+    assert _frontmatter_model("trialerror:no-such-agent", unrelated_root) is None
+
+
+def test_frontmatter_model_strips_only_this_plugins_own_namespace():
+    """new-N1 (second review pass): the first fix stripped up to the LAST
+    ``:`` unconditionally, so a name that merely LOOKS namespaced --
+    another loaded plugin's agent sharing a bare name with one of ours, a
+    bare drive letter, a multi-colon name -- resolved against THIS
+    plugin's own file and made a claim about a spawn that has nothing to
+    do with it. Checked directly by the review: ``otherplugin:critic``,
+    ``C:critic`` and ``a:b:critic`` all resolved to ``'opus'`` (this
+    plugin's real ``critic.md``) before this fix. None of them may make
+    ANY claim now -- only this plugin's own ``trialerror:`` prefix
+    (read from its manifest) is ever stripped."""
+    from trialerror.hooks.spawn_gate import _frontmatter_model
+
+    unrelated_root = REPO_ROOT / "docs"  # has no plugin/agents of its own
+    assert _frontmatter_model("otherplugin:critic", unrelated_root) is None
+    assert _frontmatter_model("C:critic", unrelated_root) is None
+    assert _frontmatter_model("a:b:critic", unrelated_root) is None
+    # This plugin's own qualified name is unaffected by the narrowing.
+    assert _frontmatter_model("trialerror:critic", unrelated_root) == "opus"
+
+
 def test_only_the_frontmatter_block_can_pin_a_model(tmp_path):
     """Finding V-8: the pin is read from the ``---`` block, never from the
     body. A prose line beginning ``model:`` used to be read as the file's
@@ -517,3 +584,98 @@ def test_only_the_frontmatter_block_can_pin_a_model(tmp_path):
         encoding="utf-8",
     )
     assert _frontmatter_model("real", tmp_path) == "fable"
+
+
+def _plugin_root(tmp_path, name, agents):
+    """A plugin folder as Claude Code loads it: a manifest and an agents/ folder."""
+    root = tmp_path / f"loaded_{name}"
+    (root / ".claude-plugin").mkdir(parents=True)
+    (root / ".claude-plugin" / "plugin.json").write_text(json.dumps({"name": name}), encoding="utf-8")
+    (root / "agents").mkdir()
+    for agent, model in agents.items():
+        (root / "agents" / f"{agent}.md").write_text(f"---\nname: {agent}\nmodel: {model}\n---\n", encoding="utf-8")
+    return root
+
+
+def test_frontmatter_model_reads_the_plugin_root_the_host_exports(tmp_path, monkeypatch):
+    """A6: ``CLAUDE_PLUGIN_ROOT`` names the plugin whose hook is running. Its
+    manifest gives the plugin's name, and its own ``agents/`` folder is
+    searched first, before the repository's roots."""
+    from trialerror.hooks.spawn_gate import _frontmatter_model
+
+    root = _plugin_root(tmp_path, "trialerror", {"critic": "haiku"})
+    monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(root))
+    unrelated = REPO_ROOT / "docs"
+    # The loaded copy wins over the repository's own critic.md (which pins opus).
+    assert _frontmatter_model("trialerror:critic", unrelated) == "haiku"
+    # An agent only the repository ships is still found afterwards.
+    assert _frontmatter_model("trialerror:prompt-only", unrelated) == "opus"
+    # Another plugin's name, and the bare-prefix and traversal shapes, make no claim.
+    assert _frontmatter_model("other:critic", unrelated) is None
+    assert _frontmatter_model("trialerror:", unrelated) is None
+    assert _frontmatter_model("trialerror:../x", unrelated) is None
+    assert _frontmatter_model("trialerror:a:b", unrelated) is None
+
+
+def test_frontmatter_model_takes_the_plugin_name_from_the_exported_root(tmp_path, monkeypatch):
+    """When the exported root's manifest names a different plugin, that name
+    is the one whose qualified agents are recognised -- not the repository's."""
+    from trialerror.hooks.spawn_gate import _frontmatter_model
+
+    root = _plugin_root(tmp_path, "loadedplug", {"scout": "sonnet"})
+    monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(root))
+    unrelated = REPO_ROOT / "docs"
+    assert _frontmatter_model("loadedplug:scout", unrelated) == "sonnet"
+    assert _frontmatter_model("trialerror:critic", unrelated) is None
+
+
+def test_frontmatter_model_falls_back_to_the_repository_when_the_root_is_unusable(tmp_path, monkeypatch):
+    from trialerror.hooks.spawn_gate import _frontmatter_model
+
+    unrelated = REPO_ROOT / "docs"
+    for bad in (tmp_path / "does-not-exist", tmp_path):
+        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(bad))
+        assert _frontmatter_model("trialerror:critic", unrelated) == "opus"
+    monkeypatch.delenv("CLAUDE_PLUGIN_ROOT")
+    assert _frontmatter_model("trialerror:critic", unrelated) == "opus"
+
+
+def test_the_plugin_name_is_read_once_per_manifest(tmp_path, monkeypatch):
+    from trialerror.hooks import spawn_gate
+
+    root = _plugin_root(tmp_path, "cachedplug", {})
+    monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(root))
+    manifest = root / ".claude-plugin" / "plugin.json"
+    assert spawn_gate._this_plugins_namespace_prefix() == "cachedplug:"
+    manifest.write_text(json.dumps({"name": "renamed"}), encoding="utf-8")
+    assert spawn_gate._this_plugins_namespace_prefix() == "cachedplug:"
+
+
+def test_n9_program_root_is_harness_passes_the_spawn_through_instead_of_failing_closed(tmp_path, monkeypatch):
+    """N9 (fix check): a ProgramRootIsHarnessError from find_program_root()
+    must not reach main()'s own catch-all, which fails CLOSED ("an
+    unexpected bug ... must not fail OPEN") -- every subagent spawn would
+    then be refused for a session whose cwd happens to be the harness
+    checkout. Treated here as "no program root": the spawn passes through,
+    with a stderr note."""
+    from trialerror.hooks import spawn_gate
+    import trialerror.util.config as config_mod
+
+    repo = tmp_path / "fake_checkout"
+    (repo / "trialerror").mkdir(parents=True)
+    (repo / "trialerror" / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "trialerror.toml").write_text('[program]\nid = "fake"\n', encoding="utf-8")
+    monkeypatch.setattr(config_mod, "_HARNESS_PACKAGE_PARENT", repo)
+
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Task",
+        "tool_input": {"prompt": "go do research"},
+        "cwd": str(repo),
+    }
+    code, message = spawn_gate._evaluate(payload)
+
+    assert code == 0  # passed through, not refused
+    assert message is not None
+    assert "no program root was given" in message  # the underlying ProgramRootIsHarnessError's text
+    assert "passing the spawn through" in message

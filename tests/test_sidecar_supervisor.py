@@ -262,7 +262,8 @@ def test_the_configured_env_reaches_the_child(program_root, tmp_path):
     code = f"import os; open({str(marker)!r}, 'w').write(os.environ.get('LD_LIBRARY_PATH', 'MISSING'))"
     config = _config(code=code, env={"LD_LIBRARY_PATH": "/opt/a-vendored-runtime"}, health_url=None)
     start_sidecar(program_root, "embed", config=config)
-    assert _wait_until(marker.is_file)
+    # wait for the child's write, not the file: open(..., 'w') creates it before the write lands
+    assert _wait_until(lambda: marker.is_file() and marker.read_text(encoding="utf-8") != "")
     assert marker.read_text(encoding="utf-8") == "/opt/a-vendored-runtime"
 
 

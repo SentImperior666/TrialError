@@ -10,6 +10,7 @@ its own ``Store`` lifecycle end to end (opens and closes it itself).
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -67,6 +68,9 @@ def test_fresh_venv_pip_install_dash_e_smoke(tmp_path):
         install = subprocess.run(
             [str(venv_python), "-m", "pip", "install", "-e", str(_REPO_ROOT)],
             capture_output=True, text=True, timeout=180,
+            # pip's HTTP cache goes under tmp_path, never into the worktree
+            # (a stray ``pip/cache`` there) or the machine's own pip cache.
+            env={**os.environ, "PIP_CACHE_DIR": str(tmp_path / "pip-cache")},
         )
     except (subprocess.TimeoutExpired, OSError) as exc:
         pytest.skip(f"pip install -e . did not complete in this environment: {exc}")

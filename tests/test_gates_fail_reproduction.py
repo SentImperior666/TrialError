@@ -18,7 +18,7 @@ from contextlib import redirect_stdout
 
 import pytest
 
-from tests.test_artifacts_register_dispositions import DEC, FAILURE_TEXT, World
+from tests.test_artifacts_register_dispositions import DEC, FAILURE_TEXT, World, registered_bytes_evidence
 from trialerror.artifacts import gates as gates_mod
 from trialerror.artifacts.checks import check_gate_illegal_transition_history, check_registration_disposition_consistent
 from trialerror.artifacts.errors import (
@@ -110,6 +110,12 @@ def test_register_as_failed_accepts_a_gate_failed_this_way(world):
     assert json.loads(last["evidence"]) == {
         "path": "register_failed", "decided_by": DEC, "failure_ref": FAILURE_TEXT,
         "basis": OPERATOR_FAIL_PATH, "failed_by": FAIL_DEC,
+        "failure_basis": {
+            "kind": OPERATOR_FAIL_PATH,
+            "decided_by": FAIL_DEC,
+            "failing_checks": [{"name": "admission_order_hash_matches", "message": "admission_order_hash_matches failed"}],
+        },
+        **registered_bytes_evidence(world, aid),
     }
     # a failed result on the record is closed: no new gate on it
     with pytest.raises(ValueError):
@@ -128,7 +134,8 @@ def test_register_as_failed_keeps_its_other_checks_on_this_path(world):
         return str(exc.value)
 
     assert "does not contain" in refused(failure_ref="a statement the artifact never makes")
-    assert "failure_ref is required" in refused(failure_ref="")
+    # on the operator's path the ref is optional, so an explicit empty one is "empty", not "required"
+    assert "failure_ref is empty" in refused(failure_ref="")
     assert "decided_by" in refused(decided_by=" ")
     assert get_gate(world.store, gid)["state"] == "failed"
     assert get_artifact(world.store, aid)["status"] == "in_gate"
@@ -272,19 +279,30 @@ def test_a_generic_advance_cannot_claim_a_reserved_evidence_path(world, path):
     assert snapshot(world, gid) == before
 
 
-def test_register_refuses_once_the_mismatch_no_longer_reads(world):
-    _aid, gid = world.gated()
+def test_the_basis_is_the_frozen_evidence_not_the_live_column(world):
+    """The decision that failed the gate froze its basis in the transition's
+    evidence. A live column that was later rewritten by hand does not change
+    what the registration reads: the failing checks come from the evidence."""
+    aid, gid = world.gated()
     fail(world, gid)
-    update(world.store, "gate", pk_column="gate_id", pk_value=gid, changes={"reproduction_status": "match"})
-    with pytest.raises(RegistrationRefusedError, match="no longer holds"):
-        register_failed(world.store, gate_id=gid, failure_ref=FAILURE_TEXT, decided_by=DEC, by_launch=world.launch)
+    update(world.store, "gate", pk_column="gate_id", pk_value=gid, changes={"reproduction_status": "match", "reproduction_ref": "{}"})
+    register_failed(world.store, gate_id=gid, failure_ref=FAILURE_TEXT, decided_by=DEC, by_launch=world.launch)
+    evidence = json.loads(transitions(world.store, gid)[-1]["evidence"])
+    assert [c["name"] for c in evidence["failure_basis"]["failing_checks"]] == ["admission_order_hash_matches"]
 
 
 def test_the_critic_fail_path_is_unchanged(world):
-    _aid, gid = world.failed()
+    aid, gid = world.failed()
     register_failed(world.store, gate_id=gid, failure_ref=FAILURE_TEXT, decided_by=DEC, by_launch=world.launch)
     evidence = json.loads(transitions(world.store, gid)[-1]["evidence"])
-    assert evidence == {"path": "register_failed", "decided_by": DEC, "failure_ref": FAILURE_TEXT}
+    assert evidence == {
+        "path": "register_failed", "decided_by": DEC, "failure_ref": FAILURE_TEXT,
+        **registered_bytes_evidence(world, aid),
+    }
+    # the critic's path still needs a failure_ref: there is no operator decision to state the failure
+    _aid2, gid2 = world.failed()
+    with pytest.raises(RegistrationRefusedError, match="failure_ref is required"):
+        register_failed(world.store, gate_id=gid2, decided_by=DEC, by_launch=world.launch)
 
 
 def test_the_normal_mismatch_block_is_unchanged(world):

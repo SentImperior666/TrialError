@@ -22,6 +22,7 @@ from trialerror.artifacts.gates import (
     advance_gate,
     apply_union,
     fail_on_reproduction,
+    get_gate,
     open_gate,
     record_verdict,
     submit_gate,
@@ -33,7 +34,7 @@ from trialerror.util.config import find_program_root
 from trialerror.util.envelope import error_envelope, next_action, ok_envelope
 
 GROUP_NAME = "gate"
-HELP = "Gate state machine: open, submit, verdict, apply-union, verify-edit, advance, fail-reproduction."
+HELP = "Gate state machine: open, submit, verdict, apply-union, verify-edit, advance, fail-reproduction, show."
 
 _PROGRAM_ROOT_HELP = "override the program root (default: discover trialerror.toml upward from CWD)"
 
@@ -121,6 +122,13 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     )
     p_fail_repro.add_argument("--by-launch", required=True, dest="by_launch")
     p_fail_repro.set_defaults(handler=_run_fail_reproduction)
+
+    p_show = actions.add_parser(
+        "show", help="show one gate row, including the corrected bytes' hash the gate recorded (post_edit_sha256)"
+    )
+    _add_program_root_arg(p_show)
+    p_show.add_argument("--id", required=True, dest="gate_id")
+    p_show.set_defaults(handler=_run_show)
 
     parser.set_defaults(handler=_run_no_action)
     return parser
@@ -253,6 +261,19 @@ def _run_advance(args: argparse.Namespace) -> dict:
     finally:
         store.close()
     return ok_envelope("gate advance", result=row)
+
+
+def _run_show(args: argparse.Namespace) -> dict:
+    store, err = _open_store(args)
+    if err is not None:
+        return err
+    try:
+        row = get_gate(store, args.gate_id)
+    finally:
+        store.close()
+    if row is None:
+        return error_envelope("gate show", "not_found", f"no such gate: {args.gate_id!r}")
+    return ok_envelope("gate show", result=row)
 
 
 def _run_fail_reproduction(args: argparse.Namespace) -> dict:
